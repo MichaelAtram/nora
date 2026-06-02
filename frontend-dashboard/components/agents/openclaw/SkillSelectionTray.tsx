@@ -1,9 +1,9 @@
-import { CheckCircle2, ChevronLeft, Rocket, X } from "lucide-react";
+import { CheckCircle2, ChevronLeft, Rocket, Trash2, X } from "lucide-react";
 import { DeployClawHubSkill } from "../../../lib/clawhubDeploy";
 
 type SkillSelectionTrayProps = {
   skills: DeployClawHubSkill[];
-  mode?: "deploy" | "install";
+  mode?: "deploy" | "install" | "delete";
   deploying?: boolean;
   installLabel?: string;
   installDisabled?: boolean;
@@ -29,6 +29,9 @@ export default function SkillSelectionTray({
   onClearAll,
 }: SkillSelectionTrayProps) {
   const isDeployMode = mode === "deploy";
+  const isDeleteMode = mode === "delete";
+  const actionIcon = isDeleteMode ? Trash2 : Rocket;
+  const ActionIcon = actionIcon;
 
   return (
     <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -39,12 +42,19 @@ export default function SkillSelectionTray({
           </div>
           <div className="flex items-center gap-2 text-2xl font-black text-slate-900">
             <CheckCircle2 size={20} className="text-emerald-500" />
-            {skills.length} {isDeployMode ? "chosen for this deploy" : "selected for install"}
+            {skills.length}{" "}
+            {isDeployMode
+              ? "chosen for this deploy"
+              : isDeleteMode
+                ? "selected for delete"
+                : "selected for install"}
           </div>
           <p className="max-w-2xl text-sm leading-6 text-slate-600">
             {isDeployMode
               ? "These skills will be saved onto the new agent record when you click deploy. Runtime installation happens later in the deploy lifecycle, not on this page."
-              : "Queue one install job per selected skill for this running agent. Successful installs will update the saved ClawHub skill list and prompt a session restart."}
+              : isDeleteMode
+                ? "Queue one delete job per selected skill for this running agent. Successful deletes will update the ClawHub runtime state and prompt the same restart recommendation used for installs."
+                : "Queue one install job per selected skill for this running agent. Successful installs will update the saved ClawHub skill list and prompt a session restart."}
           </p>
           {skills.length ? (
             <div className="space-y-2">
@@ -87,7 +97,9 @@ export default function SkillSelectionTray({
             <p className="text-sm text-slate-500">
               {isDeployMode
                 ? "No ClawHub skills selected. You can still continue and deploy the agent without any."
-                : "No ClawHub skills selected yet. Pick one or more cards to queue installs."}
+                : isDeleteMode
+                  ? "No ClawHub skills selected for delete yet. Pick one or more installed skills above."
+                  : "No ClawHub skills selected yet. Pick one or more cards to queue installs."}
             </p>
           )}
           {installError ? <p className="text-sm font-medium text-red-600">{installError}</p> : null}
@@ -109,14 +121,17 @@ export default function SkillSelectionTray({
             type="button"
             onClick={isDeployMode ? onDeploy : onInstall}
             disabled={deploying || (!isDeployMode && installDisabled)}
-            className="inline-flex items-center justify-center gap-2 rounded-2xl bg-blue-600 px-5 py-3 text-sm font-black text-white transition-colors hover:bg-blue-700 disabled:opacity-60"
+            className={`inline-flex items-center justify-center gap-2 rounded-2xl px-5 py-3 text-sm font-black text-white transition-colors disabled:opacity-60 ${
+              isDeleteMode ? "bg-rose-600 hover:bg-rose-700" : "bg-blue-600 hover:bg-blue-700"
+            }`}
           >
-            <Rocket size={16} />
+            <ActionIcon size={16} />
             {isDeployMode
               ? deploying
                 ? "Deploying..."
                 : "Deploy Agent & Open Validation"
-              : installLabel || "Install Selected Skills"}
+              : installLabel ||
+                (isDeleteMode ? "Delete Selected Skills" : "Install Selected Skills")}
           </button>
         </div>
       </div>

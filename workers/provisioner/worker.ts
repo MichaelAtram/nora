@@ -44,6 +44,8 @@ const { buildReadinessWarningDetail, persistReadinessWarning } = require("./read
 const { shellSingleQuote } = require("../../agent-runtime/lib/containerCommand");
 const {
   computeMissingSavedSkills,
+  computeOrphanedInstalledSkills,
+  removeSavedSkillEntry,
   normalizeSavedSkillEntry: normalizeSavedClawhubSkillEntry,
 } = require("../../agent-runtime/lib/clawhubReconciliation");
 
@@ -464,6 +466,16 @@ function pickProviderConfigApiVersion(config = {}) {
   return "";
 }
 
+// Azure deployment name (arbitrary per resource). Prefer an explicit config
+// field; fall back to the provider row's `model` column.
+function pickProviderDeployment(config = {}, model = "") {
+  for (const key of ["deployment", "deployment_name", "deploymentName"]) {
+    const value = config[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return typeof model === "string" ? model.trim() : "";
+}
+
 async function fetchUserLlmEnvVars(userId) {
   if (!userId || (process.env.KEY_STORAGE || "database") !== "database") {
     return {};
@@ -471,7 +483,7 @@ async function fetchUserLlmEnvVars(userId) {
 
   try {
     const keysResult = await db.query(
-      "SELECT provider, api_key, config FROM llm_providers WHERE user_id = $1",
+      "SELECT provider, api_key, model, config FROM llm_providers WHERE user_id = $1",
       [userId],
     );
     const { decrypt } = require("./crypto");
@@ -496,6 +508,13 @@ async function fetchUserLlmEnvVars(userId) {
       const apiVersionEnv = envName.replace(/_API_KEY$|_TOKEN$/, "_API_VERSION");
       if (baseUrl && baseUrlEnv !== envName) llmEnvVars[baseUrlEnv] = baseUrl;
       if (apiVersion && apiVersionEnv !== envName) llmEnvVars[apiVersionEnv] = apiVersion;
+      // Foundry deployment names are arbitrary per Azure resource — carry the
+      // saved deployment so the runtime targets the right one (not a hardcoded
+      // "gpt-5.5"). See buildFoundryModelEntries / foundryDefaultModel.
+      if (row.provider === "microsoft-foundry") {
+        const deployment = pickProviderDeployment(cfg, row.model);
+        if (deployment) llmEnvVars.MICROSOFT_FOUNDRY_DEPLOYMENT = deployment;
+      }
     }
     return normalizeEnvValueMap(llmEnvVars);
   } catch (error) {
@@ -690,14 +709,14 @@ function wrapCommandWithContainerTimeout(command, timeoutMs) {
   ].join(" ");
 }
 
-function createClawhubInstallLogger({ jobId, agentId, slug }) {
+function createClawhubSkillJobLogger({ jobId, agentId, slug, operation }) {
   const startedAt = Date.now();
 
   return (step, message, extra = null) => {
     const elapsedMs = Date.now() - startedAt;
     const suffix = extra ? ` ${JSON.stringify(extra)}` : "";
     console.log(
-      `[clawhub-installs] job=${jobId} agent=${agentId} slug=${slug} step=${step} elapsedMs=${elapsedMs} ${message}${suffix}`,
+      `[clawhub-jobs] operation=${operation} job=${jobId} agent=${agentId} slug=${slug} step=${step} elapsedMs=${elapsedMs} ${message}${suffix}`,
     );
   };
 }
@@ -950,7 +969,63 @@ async function appendSavedClawhubSkill(agentId, slug, skillEntry) {
   ]);
 }
 
-async function reconcileSavedClawhubSkills({
+async function removeSavedClawhubSkill(agentId, slug, skillEntry) {
+  const normalizedEntry = normalizeSavedClawhubSkillEntry(slug, skillEntry);
+  const result = await db.query("SELECT clawhub_skills FROM agents WHERE id = $1 LIMIT 1", [
+    agentId,
+  ]);
+  const current = Array.isArray(result.rows[0]?.clawhub_skills)
+    ? result.rows[0].clawhub_skills
+    : [];
+  const next = removeSavedSkillEntry(
+    current,
+    normalizedEntry?.installSlug || slug,
+    normalizedEntry?.author || "",
+  );
+  await db.query("UPDATE agents SET clawhub_skills = $2::jsonb WHERE id = $1", [
+    agentId,
+    JSON.stringify(next),
+  ]);
+}
+
+async function installClawhubSkill(provisioner, containerId, slug) {
+  await ensureClawhubCli(provisioner, containerId);
+  // Keep the install invocation unwrapped (no nested in-container `timeout ... /bin/sh -lc ...`).
+  // A nested timeout caused Nora-driven ClawHub installs to hang even though the same CLI command
+  // completed quickly when run directly in the container. The outer exec timeout below is the single
+  // guardrail. `slug` is shell-quoted (single quotes) so it cannot inject into the container shell.
+  await runProvisionerExecCommand(
+    provisioner,
+    containerId,
+    `cd ${JSON.stringify(OPENCLAW_WORKSPACE_PATH)} && clawhub install ${shellSingleQuote(
+      slug,
+    )} --no-input`,
+    {
+      timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
+      maxOutputBytes: 32768,
+      env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+    },
+  );
+}
+
+async function uninstallClawhubSkill(provisioner, containerId, slug) {
+  await ensureClawhubCli(provisioner, containerId);
+  // `slug` is shell-quoted (single quotes) so it cannot inject into the container shell.
+  await runProvisionerExecCommand(
+    provisioner,
+    containerId,
+    `cd ${JSON.stringify(OPENCLAW_WORKSPACE_PATH)} && clawhub uninstall ${shellSingleQuote(
+      slug,
+    )} --yes`,
+    {
+      timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
+      maxOutputBytes: 32768,
+      env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+    },
+  );
+}
+
+async function reconcileClawhubSkills({
   agentId,
   containerId,
   provisioner,
@@ -972,11 +1047,6 @@ async function reconcileSavedClawhubSkills({
 
   const savedSkills = Array.isArray(agent.clawhub_skills) ? agent.clawhub_skills : [];
 
-  if (!savedSkills.length) {
-    console.log(`${logPrefix} agent=${agentId} No saved ClawHub skills to reconcile`);
-    return;
-  }
-
   let installedSkills = [];
   try {
     installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
@@ -988,34 +1058,25 @@ async function reconcileSavedClawhubSkills({
   }
 
   const missingSkills = computeMissingSavedSkills(savedSkills, installedSkills);
+  const orphanedSkills = computeOrphanedInstalledSkills(savedSkills, installedSkills);
 
-  if (!missingSkills.length) {
-    console.log(`${logPrefix} agent=${agentId} All saved ClawHub skills already present`);
+  if (!missingSkills.length && !orphanedSkills.length) {
+    console.log(`${logPrefix} agent=${agentId} ClawHub runtime already matches saved state`);
     return;
   }
 
-  console.log(
-    `${logPrefix} agent=${agentId} Reconciling ${missingSkills.length} missing ClawHub skill(s)`,
-  );
+  if (missingSkills.length) {
+    console.log(
+      `${logPrefix} agent=${agentId} Reconciling ${missingSkills.length} missing ClawHub skill(s)`,
+    );
+  }
 
   for (const skill of missingSkills) {
     try {
       console.log(
         `${logPrefix} agent=${agentId} slug=${skill.installSlug} Installing missing saved skill`,
       );
-      await ensureClawhubCli(provisioner, containerId);
-      await runProvisionerExecCommand(
-        provisioner,
-        containerId,
-        `cd ${JSON.stringify(OPENCLAW_WORKSPACE_PATH)} && clawhub install ${JSON.stringify(
-          skill.installSlug,
-        )} --no-input`,
-        {
-          timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
-          maxOutputBytes: 32768,
-          env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
-        },
-      );
+      await installClawhubSkill(provisioner, containerId, skill.installSlug);
       console.log(
         `${logPrefix} agent=${agentId} slug=${skill.installSlug} Reconciliation install completed`,
       );
@@ -1030,6 +1091,43 @@ async function reconcileSavedClawhubSkills({
       console.warn(
         `${logPrefix} agent=${agentId} slug=${skill.installSlug} Reconciliation install failed: ${message}`,
       );
+    }
+  }
+
+  // Pruning orphaned runtime skills (installed in the container but not tracked in the agents
+  // table) is destructive and OFF by default: it would silently delete skills an operator
+  // installed manually inside the container. Drift is always surfaced in the merged skill view
+  // and can be removed explicitly via the delete route; set CLAWHUB_PRUNE_ORPHANED_SKILLS=true
+  // to opt into automatic pruning during reconciliation.
+  const pruneOrphans = process.env.CLAWHUB_PRUNE_ORPHANED_SKILLS === "true";
+
+  if (orphanedSkills.length && !pruneOrphans) {
+    console.warn(
+      `${logPrefix} agent=${agentId} Detected ${orphanedSkills.length} orphaned ClawHub skill(s) not in saved state; ` +
+        `automatic pruning is disabled (set CLAWHUB_PRUNE_ORPHANED_SKILLS=true to enable). ` +
+        `Leaving runtime skills in place: ${orphanedSkills.map((skill) => skill.slug).join(", ")}`,
+    );
+  }
+
+  if (orphanedSkills.length && pruneOrphans) {
+    console.warn(
+      `${logPrefix} agent=${agentId} Pruning ${orphanedSkills.length} orphaned ClawHub skill(s) (CLAWHUB_PRUNE_ORPHANED_SKILLS=true)`,
+    );
+    for (const skill of orphanedSkills) {
+      try {
+        console.warn(
+          `${logPrefix} agent=${agentId} slug=${skill.slug} Removing orphaned runtime skill`,
+        );
+        await uninstallClawhubSkill(provisioner, containerId, skill.slug);
+        console.warn(
+          `${logPrefix} agent=${agentId} slug=${skill.slug} Reconciliation uninstall completed`,
+        );
+      } catch (error) {
+        const message = String(error?.message || "");
+        console.warn(
+          `${logPrefix} agent=${agentId} slug=${skill.slug} Reconciliation uninstall failed: ${message}`,
+        );
+      }
     }
   }
 }
@@ -1752,7 +1850,7 @@ const worker = new Worker(
 
         if (resolvedRuntimeFields.runtime_family === "openclaw" && containerId) {
           try {
-            await reconcileSavedClawhubSkills({
+            await reconcileClawhubSkills({
               agentId: id,
               containerId,
               provisioner,
@@ -1843,121 +1941,209 @@ worker.on("completed", (job) => {
   console.log(`Job ${job.id} completed successfully`);
 });
 
-const clawhubInstallWorker = new Worker(
-  "clawhub-installs",
-  async (job) => {
-    const { agentId, slug, skillEntry, persistOnSuccess = true } = job.data || {};
-    const normalizedSlug = String(slug || "").trim();
-    if (!agentId || !normalizedSlug) {
-      throw new Error("ClawHub install job is missing agentId or slug");
+async function loadClawhubJobAgent(agentId) {
+  const result = await db.query(
+    `SELECT id, name, status, container_id, backend_type, runtime_family, deploy_target,
+            execution_target_id, sandbox_profile, clawhub_skills
+       FROM agents
+      WHERE id = $1
+      LIMIT 1`,
+    [agentId],
+  );
+  const agent = result.rows[0];
+  if (!agent) {
+    throw new Error(`Agent not found: ${agentId}`);
+  }
+  if (agent.runtime_family !== "openclaw") {
+    throw new Error("ClawHub mutations are only available for OpenClaw agents.");
+  }
+  if (!agent.container_id || (agent.status !== "running" && agent.status !== "warning")) {
+    throw new Error("Start the agent before managing ClawHub skills.");
+  }
+  return agent;
+}
+
+async function runClawhubInstallJob({
+  agentId,
+  slug,
+  skillEntry,
+  persistOnSuccess = true,
+  provisioner,
+  containerId,
+  logJob,
+}) {
+  logJob("cli-check", "Ensuring clawhub CLI is available");
+  await ensureClawhubCli(provisioner, containerId);
+  logJob("cli-check", "Clawhub CLI is ready");
+
+  logJob("precheck", "Reading installed skills before install");
+  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
+  logJob("precheck", "Read installed skills before install", {
+    installedCount: installedBefore.length,
+  });
+  if (installedBefore.some((entry) => entry.slug === slug)) {
+    logJob("precheck", "Skill already installed before command");
+    if (persistOnSuccess) {
+      logJob("persist", "Persisting already-installed skill to agents table");
+      await appendSavedClawhubSkill(agentId, slug, skillEntry);
+      logJob("persist", "Persisted already-installed skill");
     }
-    const logInstall = createClawhubInstallLogger({
+    return {
+      agentId,
+      slug,
+      operation: "install",
+      installedSkills: installedBefore,
+    };
+  }
+
+  try {
+    logJob("install", "Running clawhub install command", {
+      timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
+    });
+    await installClawhubSkill(provisioner, containerId, slug);
+    logJob("install", "Clawhub install command finished");
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (!message.includes("Already installed")) {
+      logJob("install", "Clawhub install command failed", {
+        error: message,
+      });
+      throw error;
+    }
+    logJob("install", "Clawhub reported skill already installed");
+  }
+
+  logJob("verify", "Reading installed skills after install");
+  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+  logJob("verify", "Read installed skills after install", {
+    installedCount: installedSkills.length,
+  });
+  if (!installedSkills.some((entry) => entry.slug === slug)) {
+    logJob("verify", "Lockfile missing expected slug after install");
+    throw new Error(`ClawHub install completed but ${slug} was not found in lockfile`);
+  }
+
+  if (persistOnSuccess) {
+    logJob("persist", "Persisting successful install to agents table");
+    await appendSavedClawhubSkill(agentId, slug, skillEntry);
+    logJob("persist", "Persisted successful install");
+  }
+
+  return {
+    agentId,
+    slug,
+    operation: "install",
+    installedSkills,
+  };
+}
+
+async function runClawhubDeleteJob({
+  agentId,
+  slug,
+  skillEntry,
+  removeSavedEntryOnSuccess = true,
+  provisioner,
+  containerId,
+  logJob,
+}) {
+  logJob("cli-check", "Ensuring clawhub CLI is available");
+  await ensureClawhubCli(provisioner, containerId);
+  logJob("cli-check", "Clawhub CLI is ready");
+
+  logJob("precheck", "Reading installed skills before delete");
+  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
+  logJob("precheck", "Read installed skills before delete", {
+    installedCount: installedBefore.length,
+  });
+
+  if (installedBefore.some((entry) => entry.slug === slug)) {
+    logJob("delete", "Running clawhub uninstall command", {
+      timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
+    });
+    await uninstallClawhubSkill(provisioner, containerId, slug);
+    logJob("delete", "Clawhub uninstall command finished");
+  } else {
+    logJob("precheck", "Skill already absent before delete");
+  }
+
+  logJob("verify", "Reading installed skills after delete");
+  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+  logJob("verify", "Read installed skills after delete", {
+    installedCount: installedSkills.length,
+  });
+  if (installedSkills.some((entry) => entry.slug === slug)) {
+    logJob("verify", "Lockfile still contains slug after delete");
+    throw new Error(`ClawHub uninstall completed but ${slug} is still present in lockfile`);
+  }
+
+  if (removeSavedEntryOnSuccess) {
+    logJob("persist", "Removing saved ClawHub skill from agents table if present");
+    await removeSavedClawhubSkill(agentId, slug, skillEntry);
+    logJob("persist", "Removed saved ClawHub skill from agents table if present");
+  }
+
+  return {
+    agentId,
+    slug,
+    operation: "delete",
+    installedSkills,
+  };
+}
+
+const clawhubJobsWorker = new Worker(
+  "clawhub-jobs",
+  async (job) => {
+    const {
+      agentId,
+      slug,
+      operation = "install",
+      skillEntry,
+      persistOnSuccess = true,
+      removeSavedEntryOnSuccess = true,
+    } = job.data || {};
+    const normalizedSlug = String(slug || "").trim();
+    const normalizedOperation = String(operation || "").trim() || "install";
+    if (!agentId || !normalizedSlug) {
+      throw new Error("ClawHub job is missing agentId or slug");
+    }
+    if (!["install", "delete"].includes(normalizedOperation)) {
+      throw new Error(`Unsupported ClawHub operation: ${normalizedOperation}`);
+    }
+
+    const logJob = createClawhubSkillJobLogger({
       jobId: job.id,
       agentId,
       slug: normalizedSlug,
+      operation: normalizedOperation,
     });
-
-    const result = await db.query(
-      `SELECT id, name, status, container_id, backend_type, runtime_family, deploy_target,
-              execution_target_id, sandbox_profile, clawhub_skills
-         FROM agents
-        WHERE id = $1
-        LIMIT 1`,
-      [agentId],
-    );
-    const agent = result.rows[0];
-    if (!agent) {
-      throw new Error(`Agent not found: ${agentId}`);
-    }
-    if (agent.runtime_family !== "openclaw") {
-      throw new Error("ClawHub installs are only available for OpenClaw agents.");
-    }
-    if (!agent.container_id || (agent.status !== "running" && agent.status !== "warning")) {
-      throw new Error("Start the agent before installing skills.");
-    }
+    const agent = await loadClawhubJobAgent(agentId);
     const provisioner = await loadBackend(buildAgentRuntimeFields(agent));
 
-    logInstall("start", "Starting install job");
+    logJob("start", `Starting ${normalizedOperation} job`);
 
-    logInstall("cli-check", "Ensuring clawhub CLI is available");
-    await ensureClawhubCli(provisioner, agent.container_id);
-    logInstall("cli-check", "Clawhub CLI is ready");
+    const result =
+      normalizedOperation === "install"
+        ? await runClawhubInstallJob({
+            agentId,
+            slug: normalizedSlug,
+            skillEntry,
+            persistOnSuccess,
+            provisioner,
+            containerId: agent.container_id,
+            logJob,
+          })
+        : await runClawhubDeleteJob({
+            agentId,
+            slug: normalizedSlug,
+            skillEntry,
+            removeSavedEntryOnSuccess,
+            provisioner,
+            containerId: agent.container_id,
+            logJob,
+          });
 
-    logInstall("precheck", "Reading installed skills before install");
-    const installedBefore = await readInstalledClawhubSkills(provisioner, agent.container_id);
-    logInstall("precheck", "Read installed skills before install", {
-      installedCount: installedBefore.length,
-    });
-    if (installedBefore.some((entry) => entry.slug === normalizedSlug)) {
-      logInstall("precheck", "Skill already installed before command");
-      if (persistOnSuccess) {
-        logInstall("persist", "Persisting already-installed skill to agents table");
-        await appendSavedClawhubSkill(agentId, normalizedSlug, skillEntry);
-        logInstall("persist", "Persisted already-installed skill");
-      }
-      logInstall("done", "Install job completed without running clawhub install");
-      return {
-        agentId,
-        slug: normalizedSlug,
-        installedSkills: installedBefore,
-      };
-    }
-
-    try {
-      logInstall("install", "Running clawhub install command", {
-        timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
-      });
-      // Keep the install invocation unwrapped. A nested in-container `timeout ... /bin/sh -lc ...`
-      // caused Nora-driven ClawHub installs to hang/time out even though the same CLI command
-      // completed quickly when run directly in the container. The outer exec timeout remains the
-      // single guardrail for this path.
-      await runProvisionerExecCommand(
-        provisioner,
-        agent.container_id,
-        `cd ${JSON.stringify(OPENCLAW_WORKSPACE_PATH)} && clawhub install ${JSON.stringify(
-          normalizedSlug,
-        )} --no-input`,
-        {
-          timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
-          maxOutputBytes: 32768,
-          env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
-        },
-      );
-      logInstall("install", "Clawhub install command finished");
-    } catch (error) {
-      const message = String(error?.message || "");
-      if (!message.includes("Already installed")) {
-        logInstall("install", "Clawhub install command failed", {
-          error: message,
-        });
-        throw error;
-      }
-      logInstall("install", "Clawhub reported skill already installed");
-    }
-
-    logInstall("verify", "Reading installed skills after install");
-    const installedSkills = await readInstalledClawhubSkills(provisioner, agent.container_id);
-    logInstall("verify", "Read installed skills after install", {
-      installedCount: installedSkills.length,
-    });
-    const installed = installedSkills.some((entry) => entry.slug === normalizedSlug);
-    if (!installed) {
-      logInstall("verify", "Lockfile missing expected slug after install");
-      throw new Error(`ClawHub install completed but ${normalizedSlug} was not found in lockfile`);
-    }
-
-    if (persistOnSuccess) {
-      logInstall("persist", "Persisting successful install to agents table");
-      await appendSavedClawhubSkill(agentId, normalizedSlug, skillEntry);
-      logInstall("persist", "Persisted successful install");
-    }
-
-    logInstall("done", "Install job completed successfully");
-    return {
-      agentId,
-      slug: normalizedSlug,
-      installedSkills,
-    };
+    logJob("done", `${normalizedOperation} job completed successfully`);
+    return result;
   },
   {
     connection,
@@ -1969,12 +2155,16 @@ const clawhubInstallWorker = new Worker(
   },
 );
 
-clawhubInstallWorker.on("failed", (job, err) => {
-  console.error(`[clawhub-installs] Job ${job?.id} failed: ${err.message}`);
+clawhubJobsWorker.on("failed", (job, err) => {
+  console.error(
+    `[clawhub-jobs] operation=${job?.data?.operation || "unknown"} job=${job?.id} failed: ${err.message}`,
+  );
 });
 
-clawhubInstallWorker.on("completed", (job) => {
-  console.log(`[clawhub-installs] Job ${job.id} completed successfully`);
+clawhubJobsWorker.on("completed", (job) => {
+  console.log(
+    `[clawhub-jobs] operation=${job?.data?.operation || "unknown"} job=${job.id} completed successfully`,
+  );
 });
 
 // ── Alert Delivery Worker ────────────────────────────────────────
@@ -2024,7 +2214,7 @@ const HEALTH_PORT = parseInt(process.env.WORKER_HEALTH_PORT || "4001");
 const healthServer = http.createServer((req, res) => {
   if (req.url === "/health") {
     const isReady =
-      worker.isRunning() && clawhubInstallWorker.isRunning() && alertDeliveryWorker.isRunning();
+      worker.isRunning() && clawhubJobsWorker.isRunning() && alertDeliveryWorker.isRunning();
     res.writeHead(isReady ? 200 : 503, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: isReady ? "ok" : "not_ready", uptime: process.uptime() }));
   } else {

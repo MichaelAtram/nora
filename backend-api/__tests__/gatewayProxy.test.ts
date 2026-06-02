@@ -270,7 +270,7 @@ describe("gateway proxy control-plane routes", () => {
     expect(res.body.content).toBe("pong");
     expect(mockFakeWebSocket.connectParams[0]).toEqual(
       expect.objectContaining({
-        minProtocol: 4,
+        minProtocol: 3,
         maxProtocol: 4,
       }),
     );

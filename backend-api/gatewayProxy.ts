@@ -29,7 +29,12 @@ const K8S_NODE_PORT_MIN = 30000;
 const K8S_NODE_PORT_MAX = 32767;
 const GATEWAY_PROXY_PATH_RE = /^[A-Za-z0-9._~/-]*$/;
 const GATEWAY_PROXY_SEARCH_RE = /^\?[A-Za-z0-9._~!$&'()*+,;=:@/?%-]*$/;
-const GATEWAY_PROTOCOL_VERSION = 4;
+// Advertise a protocol RANGE rather than a single version so the handshake
+// negotiates with both the current OpenClaw runtime (speaks v3) and newer
+// gateways (v4+). Pinning a single version that ran ahead of the deployed
+// runtime caused "Gateway handshake failed: protocol mismatch".
+const GATEWAY_MIN_PROTOCOL_VERSION = 3;
+const GATEWAY_MAX_PROTOCOL_VERSION = 4;
 
 // Hostname must be a plain DNS name / IP literal — no URL meta-chars that
 // could alter the parsed origin (no "@", "/", "?", "#", ":", whitespace, etc.).
@@ -309,8 +314,8 @@ class GatewayConnection {
               id: "__connect__",
               method: "connect",
               params: {
-                minProtocol: GATEWAY_PROTOCOL_VERSION,
-                maxProtocol: GATEWAY_PROTOCOL_VERSION,
+                minProtocol: GATEWAY_MIN_PROTOCOL_VERSION,
+                maxProtocol: GATEWAY_MAX_PROTOCOL_VERSION,
                 client: {
                   id: "gateway-client",
                   version: "1.0.0",
@@ -1251,8 +1256,8 @@ function attachGatewayWS(server) {
             id: "__relay_connect__",
             method: "connect",
             params: {
-              minProtocol: GATEWAY_PROTOCOL_VERSION,
-              maxProtocol: GATEWAY_PROTOCOL_VERSION,
+              minProtocol: GATEWAY_MIN_PROTOCOL_VERSION,
+              maxProtocol: GATEWAY_MAX_PROTOCOL_VERSION,
               client: {
                 id: "gateway-client",
                 version: "1.0.0",

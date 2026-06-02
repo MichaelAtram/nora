@@ -25,6 +25,7 @@ const mockReadNamespacedConfigMap = jest.fn();
 const mockReplaceNamespacedConfigMap = jest.fn();
 const mockDeleteNamespacedConfigMap = jest.fn();
 const mockGetNamespacedCustomObject = jest.fn();
+const mockLoadKubeconfigFromFile = jest.fn();
 
 function k8sProfile(overrides = {}) {
   const namespace = overrides.namespace || "openclaw-agents";
@@ -50,7 +51,9 @@ jest.mock(
   "@kubernetes/client-node",
   () => {
     class KubeConfig {
-      loadFromFile() {}
+      loadFromFile(path) {
+        return mockLoadKubeconfigFromFile(path);
+      }
       loadFromCluster() {}
       makeApiClient(api) {
         if (api === CoreV1Api) {
@@ -116,6 +119,7 @@ describe("provisioning runtime/gateway contracts", () => {
     mockReplaceNamespacedConfigMap.mockReset().mockResolvedValue({});
     mockDeleteNamespacedConfigMap.mockReset().mockResolvedValue({});
     mockGetNamespacedCustomObject.mockReset().mockResolvedValue({});
+    mockLoadKubeconfigFromFile.mockReset().mockReturnValue(undefined);
     delete process.env.GATEWAY_HOST;
     delete process.env.NVIDIA_API_KEY;
   });
@@ -181,6 +185,29 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(readiness.ok).toBe(true);
     expect(fetchImpl.mock.calls[0][0]).toBe(`http://agent.internal:${AGENT_RUNTIME_PORT}/health`);
     expect(fetchImpl.mock.calls[1][0]).toBe("http://host.docker.internal:19123/");
+  });
+
+  it("reports missing mounted kubeconfig files with actionable guidance", () => {
+    const missing = new Error(
+      "ENOENT: no such file or directory, open '/kubeconfigs/aks-kubeconfig'",
+    );
+    missing.code = "ENOENT";
+    mockLoadKubeconfigFromFile.mockImplementationOnce(() => {
+      throw missing;
+    });
+
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+
+    expect(() => {
+      new K8sBackend(
+        k8sProfile({
+          label: "AKS East US 2",
+          kubeconfigPath: "/kubeconfigs/aks-kubeconfig",
+        }),
+      );
+    }).toThrow(
+      /AKS East US 2 mounted kubeconfig file was not found at \/kubeconfigs\/aks-kubeconfig.*NORA_KUBECONFIGS_DIR/s,
+    );
   });
 
   it("uses GATEWAY_HOST for published control-plane ports when provided", async () => {

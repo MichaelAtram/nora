@@ -1,16 +1,5 @@
 import type { ReactNode } from "react";
-import {
-  ChevronLeft,
-  Download,
-  Star,
-  Box,
-  Cpu,
-  FileText,
-  Lock,
-  CircleAlert,
-  Check,
-  Plus,
-} from "lucide-react";
+import { ChevronLeft, Download, Star, Box, Cpu, FileText, CircleAlert } from "lucide-react";
 
 export type SkillRequirementItem = {
   kind?: string;
@@ -39,21 +28,12 @@ export type SkillDetail = {
   requirements?: SkillRequirements | null;
 };
 
-export type SkillDetailActionState = {
-  label: string;
-  disabled?: boolean;
-  loading?: boolean;
-  onClick?: () => void;
-  onAction?: () => void;
-};
-
 type SkillDetailPanelProps = {
   skill: SkillDetail | null;
   detail?: SkillDetail | null;
   loading: boolean;
   error: string | null;
   onClose: () => void;
-  action?: SkillDetailActionState;
 };
 
 function formatCount(value: number | undefined) {
@@ -268,14 +248,8 @@ export default function SkillDetailPanel({
   loading,
   error,
   onClose,
-  action,
 }: SkillDetailPanelProps) {
   const activeSkill = detail || skill;
-  const helperText = action
-    ? action.label.toLowerCase().includes("selection")
-      ? "Use this action to add or remove the skill from the deploy selection."
-      : "This action is controlled by the current flow."
-    : "Install is disabled in Phase 1. This panel is read-only while we finish the browse and detail experience.";
 
   return (
     <aside className="lg:sticky lg:top-5">
@@ -308,8 +282,7 @@ export default function SkillDetailPanel({
               Pick a card to open the README and requirements.
             </p>
             <p className="mt-1 text-xs leading-5 text-slate-500">
-              The detail panel is read-only in Phase 1. Install actions will unlock in a later
-              phase.
+              This panel is read-only and focused on the skill's details.
             </p>
           </div>
         ) : (
@@ -331,48 +304,6 @@ export default function SkillDetailPanel({
               <p className="text-sm leading-6 text-slate-600">
                 {activeSkill.description || "No description provided."}
               </p>
-            </div>
-
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-              <div className="flex items-center gap-2 text-sm font-bold text-slate-700">
-                <Lock size={14} className="text-slate-400" />
-                Install
-              </div>
-              <p className="mt-2 text-xs leading-5 text-slate-500">{helperText}</p>
-              <button
-                type="button"
-                onClick={action?.onClick || action?.onAction}
-                disabled={action ? action.disabled || action.loading : true}
-                className="mt-4 inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-80 bg-slate-300 text-slate-500"
-              >
-                {action?.loading ? (
-                  <span className="inline-flex items-center gap-1.5">
-                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                    {action.label}
-                  </span>
-                ) : action ? (
-                  action.disabled ? (
-                    <>
-                      <Lock size={12} />
-                      {action.label}
-                    </>
-                  ) : (
-                    <>
-                      {action.label === "Add to selection" ? (
-                        <Plus size={12} />
-                      ) : (
-                        <Check size={12} />
-                      )}
-                      {action.label}
-                    </>
-                  )
-                ) : (
-                  <>
-                    <Lock size={12} />
-                    Install
-                  </>
-                )}
-              </button>
             </div>
 
             {error ? (

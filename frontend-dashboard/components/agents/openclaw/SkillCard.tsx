@@ -1,4 +1,4 @@
-import { ArrowUpRight, Check, Download, Plus, Star } from "lucide-react";
+import { ArrowUpRight, Download, Star } from "lucide-react";
 
 export type SkillSummary = {
   slug: string;
@@ -45,20 +45,27 @@ export default function SkillCard({
   onToggleSelection,
 }: SkillCardProps) {
   const showStats = typeof skill.downloads === "number" || typeof skill.stars === "number";
+  const handleClick = () => {
+    if (selectable && onToggleSelection) {
+      onToggleSelection(skill);
+    }
+    onSelect(skill);
+  };
 
   return (
-    <div
+    <button
+      type="button"
+      onClick={handleClick}
+      disabled={selectionBusy}
       className={`group flex h-full flex-col rounded-2xl border p-4 text-left shadow-sm transition-all ${
         selected
           ? "border-blue-300 bg-blue-50/70"
-          : "border-slate-200 bg-white hover:-translate-y-0.5 hover:border-blue-200 hover:shadow-md"
-      }`}
+          : selectedForAction
+            ? "border-emerald-300 bg-emerald-50/80"
+            : "border-slate-200 bg-white hover:-translate-y-0.5 hover:border-blue-200 hover:shadow-md"
+      } disabled:opacity-60`}
     >
-      <button
-        type="button"
-        onClick={() => onSelect(skill)}
-        className="flex flex-1 flex-col text-left"
-      >
+      <div className="flex flex-1 flex-col text-left">
         <div className="flex items-start justify-between gap-3">
           <div className="space-y-1">
             <div className="text-sm font-black text-slate-900">{skill.name || skill.slug}</div>
@@ -67,6 +74,11 @@ export default function SkillCard({
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {selectedForAction ? (
+              <span className="rounded-full bg-emerald-100 px-2 py-1 text-[10px] font-black uppercase tracking-[0.18em] text-emerald-700">
+                Selected
+              </span>
+            ) : null}
             {installed ? (
               <span className="rounded-full bg-emerald-100 px-2 py-1 text-[10px] font-black uppercase tracking-[0.18em] text-emerald-700">
                 Installed
@@ -101,23 +113,7 @@ export default function SkillCard({
         ) : null}
 
         <div className="mt-4 text-xs text-slate-400">{formatUpdatedAt(skill.updatedAt)}</div>
-      </button>
-
-      {selectable && onToggleSelection ? (
-        <button
-          type="button"
-          onClick={() => onToggleSelection(skill)}
-          disabled={selectionBusy}
-          className={`mt-4 inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-black transition-colors ${
-            selectedForAction
-              ? "bg-emerald-100 text-emerald-800 hover:bg-emerald-200"
-              : "bg-slate-100 text-slate-700 hover:bg-slate-200"
-          } disabled:opacity-60`}
-        >
-          {selectedForAction ? <Check size={14} /> : <Plus size={14} />}
-          {selectionBusy ? "Updating..." : selectedForAction ? "Selected" : "Add to selection"}
-        </button>
-      ) : null}
-    </div>
+      </div>
+    </button>
   );
 }

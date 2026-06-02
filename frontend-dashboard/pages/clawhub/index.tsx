@@ -12,10 +12,7 @@ import {
   normalizeDeployDraftResources,
   saveDeployDraft,
 } from "../../lib/clawhubDeploy";
-import SkillDetailPanel, {
-  SkillDetail,
-  SkillDetailActionState,
-} from "../../components/agents/openclaw/SkillDetailPanel";
+import SkillDetailPanel, { SkillDetail } from "../../components/agents/openclaw/SkillDetailPanel";
 import SkillGrid from "../../components/agents/openclaw/SkillGrid";
 import SkillSearchBar from "../../components/agents/openclaw/SkillSearchBar";
 import SkillSelectionTray from "../../components/agents/openclaw/SkillSelectionTray";
@@ -342,21 +339,6 @@ export default function ClawHubDeployPage() {
     loadBrowseResults();
   }, [draft]);
 
-  const detailActionState: SkillDetailActionState | undefined = selectedSkillDetail
-    ? {
-        label: selectedCurrentSkill ? "Remove from selection" : "Add to selection",
-        disabled: Boolean(selectionBusySlug && selectionBusySlug !== selectedSkillDetail.slug),
-        loading: selectionBusySlug === selectedSkillDetail.slug,
-        onClick: () => {
-          if (selectedCurrentSkill) {
-            removeSelectedSkill(selectedSkillDetail);
-            return;
-          }
-          addSelectedSkill(selectedSkillDetail);
-        },
-      }
-    : undefined;
-
   return (
     <Layout>
       <div className="space-y-6">
@@ -436,7 +418,6 @@ export default function ClawHubDeployPage() {
               detail={selectedSkillDetail}
               loading={detailLoading}
               error={detailError}
-              action={detailActionState}
               onClose={() => {
                 setSelectedSkill(null);
                 setSelectedSkillDetail(null);

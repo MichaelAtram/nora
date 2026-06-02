@@ -26,9 +26,18 @@
 
 ---
 
-|                                                                                                          |                                                                                                                               |
-| -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| ![OpenClaw UI tab in Nora](.github/readme-assets/proof-operator-openclaw-ui-tab.png) **OpenClaw UI tab** | ![Hermes official dashboard in Nora](.github/readme-assets/proof-operator-hermes-webui-tab.png) **Hermes official dashboard** |
+<p align="center">
+  <video src="https://github.com/solomon2773/nora/raw/master/.github/readme-assets/walkthrough.mp4" controls muted width="900"></video>
+</p>
+
+<p align="center">
+  <img src=".github/readme-assets/proof-operator-openclaw-ui-tab.png" alt="OpenClaw UI tab in Nora" width="380" />
+  &nbsp;&nbsp;
+  <img src=".github/readme-assets/proof-operator-hermes-webui-tab.png" alt="Hermes official dashboard in Nora" width="380" />
+</p>
+<p align="center">
+  <sub><b>OpenClaw UI tab</b> &nbsp;·&nbsp; <b>Hermes official dashboard</b></sub>
+</p>
 
 ## What Is Nora?
 

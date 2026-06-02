@@ -10,6 +10,7 @@ const {
   buildRuntimeBootstrapFiles,
   buildTemplatePayloadBootstrapFiles,
   buildRuntimeEnv,
+  foundryDefaultModel,
 } = require("../../../agent-runtime/lib/runtimeBootstrap");
 const {
   OPENCLAW_GATEWAY_PORT,
@@ -536,8 +537,10 @@ class DockerBackend extends ProvisionerBackend {
       minimax: "minimax/MiniMax-M2.7",
       // Foundry model strings must use OpenClaw's `azure-openai-responses`
       // provider id (see buildOpenClawCustomProviders) — `microsoft-foundry/...`
-      // throws "Unknown model" upstream.
-      "microsoft-foundry": "azure-openai-responses/gpt-5.5",
+      // throws "Unknown model" upstream. The deployment name is resolved from
+      // MICROSOFT_FOUNDRY_DEPLOYMENT (arbitrary per Azure resource), falling
+      // back to "gpt-5.5".
+      "microsoft-foundry": foundryDefaultModel(env || {}),
     };
     const firstProvider = configuredProviders[0];
     const defaultModel = firstProvider ? providerModelDefaults[firstProvider] : undefined;

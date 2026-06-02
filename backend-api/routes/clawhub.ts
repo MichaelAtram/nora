@@ -1,13 +1,13 @@
 // @ts-nocheck
 const express = require("express");
 const { getSkillDetail, listSkills, searchSkills } = require("../clawhubClient");
-const {
-  addClawhubInstallJob,
-  findInFlightClawhubInstallJob,
-  getClawhubInstallJobStatus,
-} = require("../redisQueue");
+const { addClawhubJob, findInFlightClawhubJob, getClawhubJobStatus } = require("../redisQueue");
 const db = require("../db");
 const { runContainerCommand } = require("../authSync");
+const {
+  mergeClawhubSkillState,
+  normalizeSavedSkillEntry,
+} = require("../../agent-runtime/lib/clawhubReconciliation");
 
 const router = express.Router();
 const OPENCLAW_WORKSPACE_PATH = "/root/.openclaw/workspace";
@@ -69,7 +69,7 @@ function normalizeInstalledSkillsLockfile(parsed) {
     .filter((entry) => entry.slug && entry.version);
 }
 
-function validateInstallableAgent(agent) {
+function validateClawhubMutableAgent(agent) {
   if (!agent) {
     const error = new Error("agent_not_found");
     error.statusCode = 404;
@@ -78,54 +78,28 @@ function validateInstallableAgent(agent) {
   }
 
   if (agent.runtime_family !== "openclaw") {
-    const error = new Error("ClawHub installs are only available for OpenClaw agents.");
+    const error = new Error("ClawHub mutations are only available for OpenClaw agents.");
     error.statusCode = 409;
     error.code = "unsupported_runtime";
     throw error;
   }
 
   if (agent.status !== "running" && agent.status !== "warning") {
-    const error = new Error("Start the agent before installing skills.");
+    const error = new Error("Start the agent before managing ClawHub skills.");
     error.statusCode = 409;
     error.code = "container_not_running";
     throw error;
   }
 
   if (!agent.container_id) {
-    const error = new Error("Start the agent before installing skills.");
+    const error = new Error("Start the agent before managing ClawHub skills.");
     error.statusCode = 409;
     error.code = "container_not_running";
     throw error;
   }
 }
 
-function normalizeSavedSkillEntry(slug, input = {}) {
-  const installSlug = typeof slug === "string" ? slug.trim() : "";
-  if (!installSlug) return null;
-
-  const author = typeof input.author === "string" ? input.author.trim() : "";
-  const pagePath =
-    typeof input.pagePath === "string" && input.pagePath.trim()
-      ? input.pagePath.trim()
-      : author
-        ? `${author}/${installSlug}`
-        : installSlug;
-  const installedAtRaw = typeof input.installedAt === "string" ? input.installedAt.trim() : "";
-  const installedAt =
-    installedAtRaw && !Number.isNaN(new Date(installedAtRaw).getTime())
-      ? new Date(installedAtRaw).toISOString()
-      : new Date().toISOString();
-
-  return {
-    source: "clawhub",
-    installSlug,
-    author,
-    pagePath,
-    installedAt,
-  };
-}
-
-function sendInstallError(res, error) {
+function sendClawhubMutationError(res, error) {
   if (error?.statusCode === 404 || error?.code === "agent_not_found") {
     return res.status(404).json({ error: "agent_not_found" });
   }
@@ -133,14 +107,14 @@ function sendInstallError(res, error) {
   if (error?.code === "container_not_running") {
     return res.status(409).json({
       error: "container_not_running",
-      message: "Start the agent before installing skills.",
+      message: "Start the agent before managing ClawHub skills.",
     });
   }
 
   if (error?.code === "unsupported_runtime") {
     return res.status(409).json({
       error: "unsupported_runtime",
-      message: "ClawHub installs are only available for OpenClaw agents.",
+      message: "ClawHub mutations are only available for OpenClaw agents.",
     });
   }
 
@@ -152,7 +126,7 @@ function sendInstallError(res, error) {
   }
 
   return res.status(error?.statusCode || 500).json({
-    error: error?.code || "install_failed",
+    error: error?.code || "clawhub_mutation_failed",
     message: error?.message || "Unexpected error",
   });
 }
@@ -218,7 +192,7 @@ router.get("/skills/:slug", async (req, res) => {
 router.get("/agents/:agentId/skills", async (req, res) => {
   try {
     const agent = await loadOwnedAgent(req.params.agentId, req.user.id);
-    validateInstallableAgent(agent);
+    validateClawhubMutableAgent(agent);
     const { output } = await runContainerCommand(
       agent,
       `if [ -f ${JSON.stringify(CLAWHUB_LOCKFILE_PATH)} ]; then cat ${JSON.stringify(
@@ -227,17 +201,20 @@ router.get("/agents/:agentId/skills", async (req, res) => {
     );
     const parsed = JSON.parse(output || '{"version":1,"skills":{}}');
     return res.json({
-      skills: normalizeInstalledSkillsLockfile(parsed),
+      skills: mergeClawhubSkillState(
+        Array.isArray(agent.clawhub_skills) ? agent.clawhub_skills : [],
+        normalizeInstalledSkillsLockfile(parsed),
+      ),
     });
   } catch (error) {
-    return sendInstallError(res, error);
+    return sendClawhubMutationError(res, error);
   }
 });
 
 router.post("/agents/:agentId/skills/:slug/install", async (req, res) => {
   try {
     const agent = await loadOwnedAgent(req.params.agentId, req.user.id);
-    validateInstallableAgent(agent);
+    validateClawhubMutableAgent(agent);
     const slug = typeof req.params.slug === "string" ? req.params.slug.trim() : "";
     if (!slug) {
       return res.status(404).json({
@@ -273,20 +250,30 @@ router.post("/agents/:agentId/skills/:slug/install", async (req, res) => {
       throw error;
     }
 
-    const existingJob = await findInFlightClawhubInstallJob(agent.id, slug);
+    const existingJob = await findInFlightClawhubJob(agent.id, slug);
     if (existingJob) {
-      const existingStatus = await getClawhubInstallJobStatus(existingJob.id);
+      const existingStatus = await getClawhubJobStatus(existingJob.id);
+      if (existingStatus?.operation === "delete") {
+        return res.status(409).json({
+          error: "conflicting_job",
+          message: "A ClawHub delete job is already in progress for this skill.",
+          jobId: String(existingJob.id),
+          operation: "delete",
+        });
+      }
       return res.status(202).json({
         jobId: String(existingJob.id),
         agentId: agent.id,
         slug,
+        operation: "install",
         status: existingStatus?.status || "pending",
       });
     }
 
-    const job = await addClawhubInstallJob({
+    const job = await addClawhubJob({
       agentId: agent.id,
       slug,
+      operation: "install",
       skillEntry,
       persistOnSuccess: !existingSaved,
     });
@@ -295,10 +282,64 @@ router.post("/agents/:agentId/skills/:slug/install", async (req, res) => {
       jobId: String(job.id),
       agentId: agent.id,
       slug,
+      operation: "install",
       status: "pending",
     });
   } catch (error) {
-    return sendInstallError(res, error);
+    return sendClawhubMutationError(res, error);
+  }
+});
+
+router.post("/agents/:agentId/skills/:slug/delete", async (req, res) => {
+  try {
+    const agent = await loadOwnedAgent(req.params.agentId, req.user.id);
+    validateClawhubMutableAgent(agent);
+    const slug = typeof req.params.slug === "string" ? req.params.slug.trim() : "";
+    if (!slug) {
+      return res.status(404).json({
+        error: "skill_not_found",
+        message: "No skill found with slug: unknown",
+      });
+    }
+
+    const skillEntry = normalizeSavedSkillEntry(slug, req.body || {});
+    const existingJob = await findInFlightClawhubJob(agent.id, slug);
+    if (existingJob) {
+      const existingStatus = await getClawhubJobStatus(existingJob.id);
+      if (existingStatus?.operation === "delete") {
+        return res.status(202).json({
+          jobId: String(existingJob.id),
+          agentId: agent.id,
+          slug,
+          operation: "delete",
+          status: existingStatus?.status || "pending",
+        });
+      }
+      return res.status(409).json({
+        error: "conflicting_job",
+        message: "A ClawHub install job is already in progress for this skill.",
+        jobId: String(existingJob.id),
+        operation: "install",
+      });
+    }
+
+    const job = await addClawhubJob({
+      agentId: agent.id,
+      slug,
+      operation: "delete",
+      skillEntry,
+      removeSavedEntryOnSuccess: true,
+    });
+
+    return res.status(202).json({
+      jobId: String(job.id),
+      agentId: agent.id,
+      slug,
+      operation: "delete",
+      status: "pending",
+    });
+  } catch (error) {
+    return sendClawhubMutationError(res, error);
   }
 });
 
@@ -308,8 +349,13 @@ router.get("/jobs/:jobId", async (req, res) => {
     return res.status(404).json({ error: "job_not_found" });
   }
 
-  const status = await getClawhubInstallJobStatus(jobId);
+  const status = await getClawhubJobStatus(jobId);
   if (!status) {
+    return res.status(404).json({ error: "job_not_found" });
+  }
+
+  const agent = await loadOwnedAgent(status.agentId, req.user.id);
+  if (!agent) {
     return res.status(404).json({ error: "job_not_found" });
   }
 

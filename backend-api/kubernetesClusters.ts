@@ -19,6 +19,21 @@ function getK8sClient() {
   return k8sClient;
 }
 
+function formatKubeconfigLoadError(profile, error) {
+  const label = profile.label || profile.executionTargetId || profile.id || "Kubernetes cluster";
+  const kubeconfigPath = normalizeText(profile.kubeconfigPath);
+  if (kubeconfigPath && error?.code === "ENOENT") {
+    return `${label} mounted kubeconfig file was not found at ${kubeconfigPath}. Make sure NORA_KUBECONFIGS_DIR is mounted with docker-compose.kubernetes.yml and contains this file, or update the Admin Kubeconfig path to the file visible inside the Nora containers.`;
+  }
+  if (kubeconfigPath && error?.code === "EACCES") {
+    return `${label} mounted kubeconfig file is not readable at ${kubeconfigPath}. Make sure the file is readable by the backend-api and worker-provisioner containers.`;
+  }
+  if (kubeconfigPath) {
+    return `${label} mounted kubeconfig file at ${kubeconfigPath} could not be loaded: ${error?.message || "unknown error"}`;
+  }
+  return error?.message || "Kubernetes kubeconfig could not be loaded.";
+}
+
 function hasText(value) {
   return typeof value === "string" ? value.trim() !== "" : value != null;
 }
@@ -548,12 +563,18 @@ async function assertKubernetesExecutionTargetAvailable(runtimeFields = {}) {
 function buildKubeConfig(profile) {
   const k8s = getK8sClient();
   const kc = new k8s.KubeConfig();
-  if (profile.kubeconfigContent) {
-    kc.loadFromString(profile.kubeconfigContent);
-  } else if (profile.kubeconfigPath) {
-    kc.loadFromFile(profile.kubeconfigPath);
-  } else {
-    kc.loadFromCluster();
+  try {
+    if (profile.kubeconfigContent) {
+      kc.loadFromString(profile.kubeconfigContent);
+    } else if (profile.kubeconfigPath) {
+      kc.loadFromFile(profile.kubeconfigPath);
+    } else {
+      kc.loadFromCluster();
+    }
+  } catch (error) {
+    const wrapped = new Error(formatKubeconfigLoadError(profile, error));
+    wrapped.cause = error;
+    throw wrapped;
   }
   if (profile.kubeContext && typeof kc.setCurrentContext === "function") {
     kc.setCurrentContext(profile.kubeContext);

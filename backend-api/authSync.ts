@@ -523,7 +523,14 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
         typeof llmProviders.buildBaseUrlEnvVars === "function"
           ? llmProviders.buildBaseUrlEnvVars(endpointOverrides.byEnvVar || {})
           : {};
-      const customProviderEnv = { ...llmKeysForCustom, ...baseUrlEnvVars };
+      // Carry the deployment too so the re-merged Foundry model registry keeps
+      // the configured deployment (e.g. gpt-5.5-1) and doesn't revert to the
+      // hardcoded fallback, which would resurface "Unknown model".
+      const deploymentEnvVars =
+        typeof llmProviders.buildDeploymentEnvVars === "function"
+          ? llmProviders.buildDeploymentEnvVars(endpointOverrides.deploymentByEnvVar || {})
+          : {};
+      const customProviderEnv = { ...llmKeysForCustom, ...baseUrlEnvVars, ...deploymentEnvVars };
       const customProviders = buildOpenClawCustomProviders(customProviderEnv);
       if (Object.keys(customProviders).length > 0) {
         const providerMergeCommand = buildOpenClawConfigMergeCommand({

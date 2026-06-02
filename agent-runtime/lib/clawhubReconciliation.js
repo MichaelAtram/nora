@@ -20,6 +20,15 @@ function normalizeSavedSkillEntry(slug, entry = {}) {
   };
 }
 
+function normalizeInstalledSkillEntries(entries = []) {
+  return (Array.isArray(entries) ? entries : [])
+    .map((entry) => ({
+      slug: String(entry?.slug || "").trim(),
+      version: String(entry?.version || "").trim(),
+    }))
+    .filter((entry) => entry.slug);
+}
+
 function normalizeSavedSkillEntries(entries = []) {
   const deduped = new Map();
   for (const entry of Array.isArray(entries) ? entries : []) {
@@ -35,16 +44,88 @@ function normalizeSavedSkillEntries(entries = []) {
 
 function computeMissingSavedSkills(savedSkills = [], installedSkills = []) {
   const normalizedSaved = normalizeSavedSkillEntries(savedSkills);
-  const installedSlugs = new Set(
-    (Array.isArray(installedSkills) ? installedSkills : [])
-      .map((entry) => String(entry?.slug || "").trim())
-      .filter(Boolean),
-  );
+  const installedSlugs = new Set(normalizeInstalledSkillEntries(installedSkills).map((entry) => entry.slug));
   return normalizedSaved.filter((entry) => !installedSlugs.has(entry.installSlug));
+}
+
+function computeOrphanedInstalledSkills(savedSkills = [], installedSkills = []) {
+  const normalizedSaved = normalizeSavedSkillEntries(savedSkills);
+  const savedSlugs = new Set(normalizedSaved.map((entry) => entry.installSlug));
+  return normalizeInstalledSkillEntries(installedSkills).filter((entry) => !savedSlugs.has(entry.slug));
+}
+
+function removeSavedSkillEntry(entries = [], slug, author = "") {
+  const normalizedSlug = String(slug || "").trim();
+  const normalizedAuthor = String(author || "").trim();
+  if (!normalizedSlug) {
+    return normalizeSavedSkillEntries(entries);
+  }
+
+  return normalizeSavedSkillEntries(entries).filter((entry) => {
+    if (entry.installSlug !== normalizedSlug) return true;
+    if (!normalizedAuthor) return false;
+    return entry.author !== normalizedAuthor;
+  });
+}
+
+function mergeClawhubSkillState(savedSkills = [], installedSkills = [], pendingJobs = []) {
+  const normalizedSaved = normalizeSavedSkillEntries(savedSkills);
+  const normalizedInstalled = normalizeInstalledSkillEntries(installedSkills);
+  const installedBySlug = new Map(normalizedInstalled.map((entry) => [entry.slug, entry]));
+  const pendingBySlug = new Map(
+    (Array.isArray(pendingJobs) ? pendingJobs : [])
+      .map((job) => [String(job?.slug || "").trim(), job])
+      .filter(([slug]) => slug),
+  );
+  const merged = [];
+
+  for (const saved of normalizedSaved) {
+    const installed = installedBySlug.get(saved.installSlug);
+    const pending = pendingBySlug.get(saved.installSlug);
+    merged.push({
+      slug: saved.installSlug,
+      version: installed?.version || "",
+      saved: true,
+      installed: Boolean(installed),
+      source: "clawhub",
+      author: saved.author,
+      pagePath: saved.pagePath,
+      installedAt: saved.installedAt || null,
+      status: pending?.operation === "delete"
+        ? "pending_delete"
+        : pending?.operation === "install"
+          ? "pending_install"
+          : installed
+            ? "healthy"
+            : "missing_runtime",
+    });
+    installedBySlug.delete(saved.installSlug);
+  }
+
+  for (const installed of installedBySlug.values()) {
+    const pending = pendingBySlug.get(installed.slug);
+    merged.push({
+      slug: installed.slug,
+      version: installed.version || "",
+      saved: false,
+      installed: true,
+      source: "clawhub",
+      author: "",
+      pagePath: installed.slug,
+      installedAt: null,
+      status: pending?.operation === "delete" ? "pending_delete" : "orphaned_runtime",
+    });
+  }
+
+  return merged.sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
 module.exports = {
   computeMissingSavedSkills,
+  computeOrphanedInstalledSkills,
+  mergeClawhubSkillState,
+  normalizeInstalledSkillEntries,
+  removeSavedSkillEntry,
   normalizeSavedSkillEntries,
   normalizeSavedSkillEntry,
 };

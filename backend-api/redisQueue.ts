@@ -44,7 +44,7 @@ const deployQueue = new Queue("deployments", {
   },
 });
 
-const clawhubInstallsQueue = new Queue("clawhub-installs", {
+const clawhubJobsQueue = new Queue("clawhub-jobs", {
   connection,
   defaultJobOptions: {
     attempts: 1,
@@ -96,9 +96,10 @@ async function addAlertDeliveryJob(payload) {
   );
 }
 
-async function addClawhubInstallJob(payload) {
+async function addClawhubJob(payload) {
   const jobId = payload?.jobId || randomUUID();
-  return clawhubInstallsQueue.add("install-skill", { ...payload, jobId }, { jobId });
+  const operation = String(payload?.operation || "").trim() || "install";
+  return clawhubJobsQueue.add(`${operation}-skill`, { ...payload, operation, jobId }, { jobId });
 }
 
 async function addBackupJob(payload) {
@@ -106,10 +107,10 @@ async function addBackupJob(payload) {
   return backupsQueue.add("run-backup", { ...payload, jobId }, { jobId });
 }
 
-async function findInFlightClawhubInstallJob(agentId, slug) {
+async function findInFlightClawhubJob(agentId, slug, operation) {
   if (!agentId || !slug) return null;
 
-  const jobs = await clawhubInstallsQueue.getJobs([
+  const jobs = await clawhubJobsQueue.getJobs([
     "active",
     "waiting",
     "waiting-children",
@@ -124,7 +125,10 @@ async function findInFlightClawhubInstallJob(agentId, slug) {
     if (!job) continue;
     const matchesAgent = String(job.data?.agentId || "") === normalizedAgentId;
     const matchesSlug = String(job.data?.slug || "").trim() === normalizedSlug;
-    if (matchesAgent && matchesSlug) {
+    const matchesOperation = operation
+      ? String(job.data?.operation || "").trim() === String(operation).trim()
+      : true;
+    if (matchesAgent && matchesSlug && matchesOperation) {
       return job;
     }
   }
@@ -149,13 +153,13 @@ function mapClawhubJobState(state) {
   }
 }
 
-async function getClawhubInstallJob(jobId) {
+async function getClawhubJob(jobId) {
   if (!jobId) return null;
-  return clawhubInstallsQueue.getJob(jobId);
+  return clawhubJobsQueue.getJob(jobId);
 }
 
-async function getClawhubInstallJobStatus(jobId) {
-  const job = await getClawhubInstallJob(jobId);
+async function getClawhubJobStatus(jobId) {
+  const job = await getClawhubJob(jobId);
   if (!job) return null;
 
   const state = await job.getState();
@@ -168,10 +172,29 @@ async function getClawhubInstallJobStatus(jobId) {
     jobId: String(job.id),
     agentId: job.data?.agentId || null,
     slug: job.data?.slug || null,
+    operation: job.data?.operation || "install",
     status: mapClawhubJobState(state),
     error: failedReason,
     completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
   };
+}
+
+async function addClawhubInstallJob(payload) {
+  return addClawhubJob({ ...payload, operation: "install" });
+}
+
+async function findInFlightClawhubInstallJob(agentId, slug) {
+  return findInFlightClawhubJob(agentId, slug, "install");
+}
+
+async function getClawhubInstallJob(jobId) {
+  const job = await getClawhubJob(jobId);
+  return job && String(job.data?.operation || "install") === "install" ? job : null;
+}
+
+async function getClawhubInstallJobStatus(jobId) {
+  const status = await getClawhubJobStatus(jobId);
+  return status && status.operation === "install" ? status : null;
 }
 
 /** Retrieve failed jobs (dead letter queue) for inspection. */
@@ -189,14 +212,18 @@ async function retryDLQJob(jobId) {
 
 module.exports = {
   deployQueue,
-  clawhubInstallsQueue,
+  clawhubJobsQueue,
   backupsQueue,
   alertDeliveryQueue,
   addDeploymentJob,
+  addClawhubJob,
   addClawhubInstallJob,
   addBackupJob,
   addAlertDeliveryJob,
+  findInFlightClawhubJob,
   findInFlightClawhubInstallJob,
+  getClawhubJob,
+  getClawhubJobStatus,
   getClawhubInstallJob,
   getClawhubInstallJobStatus,
   getDLQJobs,

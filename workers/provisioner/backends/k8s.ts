@@ -108,6 +108,21 @@ function parseK8sMemoryBytes(value) {
   return amount * (multipliers[suffix] || 1);
 }
 
+function formatKubeconfigLoadError(profile, executionTargetId, error) {
+  const label = profile.label || executionTargetId || "Kubernetes cluster";
+  const kubeconfigPath = String(profile.kubeconfigPath || "").trim();
+  if (kubeconfigPath && error?.code === "ENOENT") {
+    return `${label} mounted kubeconfig file was not found at ${kubeconfigPath}. Make sure NORA_KUBECONFIGS_DIR is mounted with docker-compose.kubernetes.yml and contains this file, or update the Admin Kubeconfig path to the file visible inside the Nora containers.`;
+  }
+  if (kubeconfigPath && error?.code === "EACCES") {
+    return `${label} mounted kubeconfig file is not readable at ${kubeconfigPath}. Make sure the file is readable by the backend-api and worker-provisioner containers.`;
+  }
+  if (kubeconfigPath) {
+    return `${label} mounted kubeconfig file at ${kubeconfigPath} could not be loaded: ${error?.message || "unknown error"}`;
+  }
+  return error?.message || "Kubernetes kubeconfig could not be loaded.";
+}
+
 function podUptimeSeconds(pod) {
   const startedAt =
     pod?.status?.containerStatuses?.find((status) => status?.state?.running?.startedAt)?.state
@@ -338,14 +353,20 @@ class K8sBackend extends ProvisionerBackend {
       this.clusterId,
     );
     this.kc = new k8s.KubeConfig();
-    if (this.profile.kubeconfigContent) {
-      this.kc.loadFromString(this.profile.kubeconfigContent);
-    } else if (this.profile.kubeconfigPath) {
-      this.kc.loadFromFile(this.profile.kubeconfigPath);
-    } else {
-      throw new Error(
-        `${this.profile.label || this.executionTargetId} requires kubeconfig content or a mounted kubeconfig path.`,
-      );
+    try {
+      if (this.profile.kubeconfigContent) {
+        this.kc.loadFromString(this.profile.kubeconfigContent);
+      } else if (this.profile.kubeconfigPath) {
+        this.kc.loadFromFile(this.profile.kubeconfigPath);
+      } else {
+        throw new Error(
+          `${this.profile.label || this.executionTargetId} requires kubeconfig content or a mounted kubeconfig path.`,
+        );
+      }
+    } catch (error) {
+      throw new Error(formatKubeconfigLoadError(this.profile, this.executionTargetId, error), {
+        cause: error,
+      });
     }
     if (this.profile.kubeContext && typeof this.kc.setCurrentContext === "function") {
       this.kc.setCurrentContext(this.profile.kubeContext);

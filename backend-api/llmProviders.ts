@@ -278,19 +278,34 @@ function pickConfigApiVersion(config) {
   return "";
 }
 
+// Azure deployment name (arbitrary per resource). Prefer an explicit config
+// field; fall back to the provider row's `model` column.
+function pickConfigDeployment(config, model) {
+  if (config) {
+    for (const key of ["deployment", "deployment_name", "deploymentName"]) {
+      const value = config[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+  }
+  return typeof model === "string" ? model.trim() : "";
+}
+
 /**
  * Return per-user provider config overrides keyed by env var and provider id.
  * Used to inject {PROVIDER}_BASE_URL / {PROVIDER}_API_VERSION into containers
  * and to write `endpoint` / `api_version` fields into OpenClaw's auth-profiles.json.
  */
 async function getProviderEndpoints(userId) {
-  const result = await db.query("SELECT provider, config FROM llm_providers WHERE user_id = $1", [
-    userId,
-  ]);
+  const result = await db.query(
+    "SELECT provider, model, config FROM llm_providers WHERE user_id = $1",
+    [userId],
+  );
   const byEnvVar = {};
   const byProvider = {};
   const apiVersionByEnvVar = {};
   const apiVersionByProvider = {};
+  const deploymentByEnvVar = {};
+  const deploymentByProvider = {};
   for (const row of result.rows) {
     const envVar = getProviderEnvVar(row.provider);
     if (!envVar) continue;
@@ -305,8 +320,24 @@ async function getProviderEndpoints(userId) {
       apiVersionByEnvVar[envVar] = apiVersion;
       apiVersionByProvider[row.provider] = apiVersion;
     }
+    // Foundry deployment names are arbitrary per Azure resource — surface the
+    // saved deployment so the runtime registers + defaults to the right one.
+    if (row.provider === "microsoft-foundry") {
+      const deployment = pickConfigDeployment(config, row.model);
+      if (deployment) {
+        deploymentByEnvVar[envVar] = deployment;
+        deploymentByProvider[row.provider] = deployment;
+      }
+    }
   }
-  return { byEnvVar, byProvider, apiVersionByEnvVar, apiVersionByProvider };
+  return {
+    byEnvVar,
+    byProvider,
+    apiVersionByEnvVar,
+    apiVersionByProvider,
+    deploymentByEnvVar,
+    deploymentByProvider,
+  };
 }
 
 /**
@@ -335,6 +366,23 @@ function buildApiVersionEnvVars(apiVersionsByEnvVar = {}) {
     const apiVersionEnvVar = keyEnvVar.replace(/_API_KEY$|_TOKEN$/, "_API_VERSION");
     if (apiVersionEnvVar && apiVersionEnvVar !== keyEnvVar) {
       out[apiVersionEnvVar] = apiVersion;
+    }
+  }
+  return out;
+}
+
+/**
+ * Derive {PROVIDER}_DEPLOYMENT env vars from per-user deployment overrides.
+ * Today only Microsoft Foundry uses this (Azure deployment names are arbitrary
+ * per resource); buildOpenClawCustomProviders reads MICROSOFT_FOUNDRY_DEPLOYMENT.
+ */
+function buildDeploymentEnvVars(deploymentsByEnvVar = {}) {
+  const out = {};
+  for (const [keyEnvVar, deployment] of Object.entries(deploymentsByEnvVar)) {
+    if (!deployment) continue;
+    const deploymentEnvVar = keyEnvVar.replace(/_API_KEY$|_TOKEN$/, "_DEPLOYMENT");
+    if (deploymentEnvVar && deploymentEnvVar !== keyEnvVar) {
+      out[deploymentEnvVar] = deployment;
     }
   }
   return out;
@@ -398,6 +446,7 @@ module.exports = {
   getProviderEndpoints,
   buildBaseUrlEnvVars,
   buildApiVersionEnvVars,
+  buildDeploymentEnvVars,
   buildAuthProfiles,
   PROVIDERS,
 };

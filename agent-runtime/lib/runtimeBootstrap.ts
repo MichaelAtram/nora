@@ -304,18 +304,50 @@ const FOUNDRY_DEFAULT_MODELS = [
   { id: "o3", name: "o3 (Azure)", reasoning: true, contextWindow: 200000, maxTokens: 100000 },
 ];
 
-function buildFoundryModelEntries() {
-  return FOUNDRY_DEFAULT_MODELS.map((entry) => ({
-    id: entry.id,
-    name: entry.name,
-    api: "azure-openai-responses",
-    reasoning: entry.reasoning,
-    input: ["text", "image"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: entry.contextWindow,
-    maxTokens: entry.maxTokens,
-    compat: { supportsStore: false, supportsReasoningEffort: true },
-  }));
+// Azure deployment names are arbitrary per resource (e.g. "gpt-5.5-1"), so the
+// real deployment is supplied via MICROSOFT_FOUNDRY_DEPLOYMENT (sourced from the
+// saved provider's model/config). Fall back to the canonical "gpt-5.5" when
+// unset so existing single-deployment setups keep working.
+const FOUNDRY_FALLBACK_DEPLOYMENT = "gpt-5.5";
+
+function resolveFoundryDeployment(env = {}) {
+  const configured = String(env.MICROSOFT_FOUNDRY_DEPLOYMENT || "").trim();
+  return configured || FOUNDRY_FALLBACK_DEPLOYMENT;
+}
+
+// The default model string OpenClaw should boot with for Foundry, e.g.
+// "azure-openai-responses/gpt-5.5-1".
+function foundryDefaultModel(env = {}) {
+  return `${FOUNDRY_OPENCLAW_PROVIDER_ID}/${resolveFoundryDeployment(env)}`;
+}
+
+function buildFoundryModelEntries(env = {}) {
+  // Ensure the actually-configured deployment is registered even if it isn't
+  // one of the well-known ids below — otherwise OpenClaw throws "Unknown model"
+  // for the very deployment we set as default.
+  const deployment = resolveFoundryDeployment(env);
+  const seen = new Set();
+  const entries = [
+    { id: deployment, name: `${deployment} (Azure)`, reasoning: true, contextWindow: 400000, maxTokens: 16384 },
+    ...FOUNDRY_DEFAULT_MODELS,
+  ];
+  return entries
+    .filter((entry) => {
+      if (seen.has(entry.id)) return false;
+      seen.add(entry.id);
+      return true;
+    })
+    .map((entry) => ({
+      id: entry.id,
+      name: entry.name,
+      api: "azure-openai-responses",
+      reasoning: entry.reasoning,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: entry.contextWindow,
+      maxTokens: entry.maxTokens,
+      compat: { supportsStore: false, supportsReasoningEffort: true },
+    }));
 }
 
 // Builds the `models.providers.*` map injected into openclaw.json for
@@ -358,7 +390,7 @@ function buildOpenClawCustomProviders(env = {}) {
       api: "azure-openai-responses",
       baseUrl: foundryBaseUrl,
       apiKey: foundryKey,
-      models: buildFoundryModelEntries(),
+      models: buildFoundryModelEntries(env),
     };
   }
   return providers;
@@ -540,6 +572,8 @@ module.exports = {
   buildOpenClawCustomProviders,
   mapNoraProviderIdToOpenClaw,
   FOUNDRY_OPENCLAW_PROVIDER_ID,
+  resolveFoundryDeployment,
+  foundryDefaultModel,
   buildTemplatePayloadBootstrapCommand,
   buildTemplatePayloadBootstrapFiles,
   buildRuntimeEnv,

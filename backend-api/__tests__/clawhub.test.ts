@@ -8,19 +8,15 @@ jest.mock("../authSync", () => ({
 }));
 
 jest.mock("../redisQueue", () => ({
-  addClawhubInstallJob: jest.fn(),
-  findInFlightClawhubInstallJob: jest.fn(),
-  getClawhubInstallJobStatus: jest.fn(),
+  addClawhubJob: jest.fn(),
+  findInFlightClawhubJob: jest.fn(),
+  getClawhubJobStatus: jest.fn(),
 }));
 
 const { normalizeSkillDetailPayload, parseSkillMarkdown } = require("../clawhubClient");
 const db = require("../db");
 const { runContainerCommand } = require("../authSync");
-const {
-  addClawhubInstallJob,
-  findInFlightClawhubInstallJob,
-  getClawhubInstallJobStatus,
-} = require("../redisQueue");
+const { addClawhubJob, findInFlightClawhubJob, getClawhubJobStatus } = require("../redisQueue");
 const router = require("../routes/clawhub");
 
 function mockJsonResponse(status, payload) {
@@ -290,7 +286,7 @@ Install and manage repos.
     });
   });
 
-  it("returns installed skills normalized from the agent lockfile", async () => {
+  it("returns merged saved/runtime skill state", async () => {
     const handler = getRouteHandler("/agents/:agentId/skills");
     db.query.mockResolvedValueOnce({
       rows: [
@@ -303,7 +299,9 @@ Install and manage repos.
           runtime_family: "openclaw",
           deploy_target: "docker",
           sandbox_profile: "standard",
-          clawhub_skills: [],
+          clawhub_skills: [
+            { installSlug: "github", author: "steipete", pagePath: "steipete/github" },
+          ],
         },
       ],
     });
@@ -324,8 +322,28 @@ Install and manage repos.
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({
       skills: [
-        { slug: "github", version: "2.1.0" },
-        { slug: "notion", version: "1.0.0" },
+        {
+          slug: "github",
+          version: "2.1.0",
+          saved: true,
+          installed: true,
+          source: "clawhub",
+          author: "steipete",
+          pagePath: "steipete/github",
+          installedAt: expect.any(String),
+          status: "healthy",
+        },
+        {
+          slug: "notion",
+          version: "1.0.0",
+          saved: false,
+          installed: true,
+          source: "clawhub",
+          author: "",
+          pagePath: "notion",
+          installedAt: null,
+          status: "orphaned_runtime",
+        },
       ],
     });
   });
@@ -357,7 +375,7 @@ Install and manage repos.
     expect(res.statusCode).toBe(409);
     expect(res.body).toEqual({
       error: "unsupported_runtime",
-      message: "ClawHub installs are only available for OpenClaw agents.",
+      message: "ClawHub mutations are only available for OpenClaw agents.",
     });
   });
 
@@ -388,7 +406,7 @@ Install and manage repos.
     expect(res.statusCode).toBe(409);
     expect(res.body).toEqual({
       error: "container_not_running",
-      message: "Start the agent before installing skills.",
+      message: "Start the agent before managing ClawHub skills.",
     });
   });
 
@@ -440,11 +458,12 @@ Install and manage repos.
       ],
     });
     runContainerCommand.mockResolvedValueOnce({ output: "" });
-    findInFlightClawhubInstallJob.mockResolvedValueOnce({ id: "job-1" });
-    getClawhubInstallJobStatus.mockResolvedValueOnce({
+    findInFlightClawhubJob.mockResolvedValueOnce({ id: "job-1" });
+    getClawhubJobStatus.mockResolvedValueOnce({
       jobId: "job-1",
       agentId: "agent-1",
       slug: "github",
+      operation: "install",
       status: "running",
       error: null,
       completedAt: null,
@@ -463,9 +482,10 @@ Install and manage repos.
       jobId: "job-1",
       agentId: "agent-1",
       slug: "github",
+      operation: "install",
       status: "running",
     });
-    expect(addClawhubInstallJob).not.toHaveBeenCalled();
+    expect(addClawhubJob).not.toHaveBeenCalled();
   });
 
   it("enqueues a new install job and marks persistOnSuccess false when already saved", async () => {
@@ -484,8 +504,8 @@ Install and manage repos.
       ],
     });
     runContainerCommand.mockResolvedValueOnce({ output: "" });
-    findInFlightClawhubInstallJob.mockResolvedValueOnce(null);
-    addClawhubInstallJob.mockResolvedValueOnce({ id: "job-2" });
+    findInFlightClawhubJob.mockResolvedValueOnce(null);
+    addClawhubJob.mockResolvedValueOnce({ id: "job-2" });
 
     const req = {
       params: { agentId: "agent-1", slug: "github" },
@@ -499,9 +519,10 @@ Install and manage repos.
     const res = createMockRes();
     await handler(req, res);
 
-    expect(addClawhubInstallJob).toHaveBeenCalledWith({
+    expect(addClawhubJob).toHaveBeenCalledWith({
       agentId: "agent-1",
       slug: "github",
+      operation: "install",
       skillEntry: {
         source: "clawhub",
         installSlug: "github",
@@ -516,13 +537,150 @@ Install and manage repos.
       jobId: "job-2",
       agentId: "agent-1",
       slug: "github",
+      operation: "install",
+      status: "pending",
+    });
+  });
+
+  it("reuses an in-flight delete job when one already exists", async () => {
+    const handler = getRouteHandler("/agents/:agentId/skills/:slug/delete", "post");
+    db.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-1",
+          user_id: "user-1",
+          status: "running",
+          container_id: "container-1",
+          backend_type: "docker",
+          runtime_family: "openclaw",
+          clawhub_skills: [],
+        },
+      ],
+    });
+    findInFlightClawhubJob.mockResolvedValueOnce({ id: "job-del-1" });
+    getClawhubJobStatus.mockResolvedValueOnce({
+      jobId: "job-del-1",
+      agentId: "agent-1",
+      slug: "github",
+      operation: "delete",
+      status: "running",
+      error: null,
+      completedAt: null,
+    });
+
+    const req = {
+      params: { agentId: "agent-1", slug: "github" },
+      user: { id: "user-1" },
+      body: {},
+    };
+    const res = createMockRes();
+    await handler(req, res);
+
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual({
+      jobId: "job-del-1",
+      agentId: "agent-1",
+      slug: "github",
+      operation: "delete",
+      status: "running",
+    });
+  });
+
+  it("blocks delete when an install job is already in progress", async () => {
+    const handler = getRouteHandler("/agents/:agentId/skills/:slug/delete", "post");
+    db.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-1",
+          user_id: "user-1",
+          status: "running",
+          container_id: "container-1",
+          backend_type: "docker",
+          runtime_family: "openclaw",
+          clawhub_skills: [],
+        },
+      ],
+    });
+    findInFlightClawhubJob.mockResolvedValueOnce({ id: "job-inst-1" });
+    getClawhubJobStatus.mockResolvedValueOnce({
+      jobId: "job-inst-1",
+      agentId: "agent-1",
+      slug: "github",
+      operation: "install",
+      status: "running",
+      error: null,
+      completedAt: null,
+    });
+
+    const req = {
+      params: { agentId: "agent-1", slug: "github" },
+      user: { id: "user-1" },
+      body: {},
+    };
+    const res = createMockRes();
+    await handler(req, res);
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({
+      error: "conflicting_job",
+      message: "A ClawHub install job is already in progress for this skill.",
+      jobId: "job-inst-1",
+      operation: "install",
+    });
+  });
+
+  it("enqueues a delete job for an orphaned runtime skill", async () => {
+    const handler = getRouteHandler("/agents/:agentId/skills/:slug/delete", "post");
+    db.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-1",
+          user_id: "user-1",
+          status: "running",
+          container_id: "container-1",
+          backend_type: "docker",
+          runtime_family: "openclaw",
+          clawhub_skills: [],
+        },
+      ],
+    });
+    findInFlightClawhubJob.mockResolvedValueOnce(null);
+    addClawhubJob.mockResolvedValueOnce({ id: "job-del-2" });
+
+    const req = {
+      params: { agentId: "agent-1", slug: "notion" },
+      user: { id: "user-1" },
+      body: { pagePath: "notion" },
+    };
+    const res = createMockRes();
+    await handler(req, res);
+
+    expect(addClawhubJob).toHaveBeenCalledWith({
+      agentId: "agent-1",
+      slug: "notion",
+      operation: "delete",
+      skillEntry: {
+        source: "clawhub",
+        installSlug: "notion",
+        author: "",
+        pagePath: "notion",
+        installedAt: expect.any(String),
+      },
+      removeSavedEntryOnSuccess: true,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.body).toEqual({
+      jobId: "job-del-2",
+      agentId: "agent-1",
+      slug: "notion",
+      operation: "delete",
       status: "pending",
     });
   });
 
   it("returns job_not_found when the install job lookup misses", async () => {
     const handler = getRouteHandler("/jobs/:jobId");
-    getClawhubInstallJobStatus.mockResolvedValueOnce(null);
+    getClawhubJobStatus.mockResolvedValueOnce(null);
 
     const req = { params: { jobId: "missing-job" } };
     const res = createMockRes();
@@ -534,16 +692,20 @@ Install and manage repos.
 
   it("returns normalized install job status when the job exists", async () => {
     const handler = getRouteHandler("/jobs/:jobId");
-    getClawhubInstallJobStatus.mockResolvedValueOnce({
+    getClawhubJobStatus.mockResolvedValueOnce({
       jobId: "job-3",
       agentId: "agent-1",
       slug: "github",
+      operation: "install",
       status: "success",
       error: null,
       completedAt: "2026-04-21T01:00:00.000Z",
     });
+    db.query.mockResolvedValueOnce({
+      rows: [{ id: "agent-1", user_id: "user-1" }],
+    });
 
-    const req = { params: { jobId: "job-3" } };
+    const req = { params: { jobId: "job-3" }, user: { id: "user-1" } };
     const res = createMockRes();
     await handler(req, res);
 
@@ -552,6 +714,7 @@ Install and manage repos.
       jobId: "job-3",
       agentId: "agent-1",
       slug: "github",
+      operation: "install",
       status: "success",
       error: null,
       completedAt: "2026-04-21T01:00:00.000Z",
