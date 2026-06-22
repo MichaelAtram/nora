@@ -29,11 +29,13 @@ const HERMES_RUNTIME_PORT = 8642;
 const HERMES_HOME = "/opt/data";
 const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
-const HERMES_ENTRYPOINT = "/opt/hermes/docker/entrypoint.sh";
+const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
 const BOOTSTRAP_CONFIGMAP_KEY = "bootstrap.sh";
 const BOOTSTRAP_MOUNT_PATH = "/opt/nora-bootstrap";
 const BOOTSTRAP_SCRIPT_PATH = `${BOOTSTRAP_MOUNT_PATH}/${BOOTSTRAP_CONFIGMAP_KEY}`;
+const K8S_POLICY_STATUS_SUPPORTED = "supported";
+const K8S_POLICY_STATUS_DEGRADED = "degraded";
 const K8S_METRICS_CAPABILITIES = Object.freeze({
   cpu: true,
   memory: true,
@@ -374,6 +376,14 @@ class K8sBackend extends ProvisionerBackend {
     this.coreApi = this.kc.makeApiClient(k8s.CoreV1Api);
     this.appsApi = this.kc.makeApiClient(k8s.AppsV1Api);
     try {
+      this.networkingApi =
+        k8s.NetworkingV1Api && typeof this.kc.makeApiClient === "function"
+          ? this.kc.makeApiClient(k8s.NetworkingV1Api)
+          : null;
+    } catch {
+      this.networkingApi = null;
+    }
+    try {
       this.metricsApi =
         k8s.CustomObjectsApi && typeof this.kc.makeApiClient === "function"
           ? this.kc.makeApiClient(k8s.CustomObjectsApi)
@@ -407,6 +417,8 @@ class K8sBackend extends ProvisionerBackend {
     this.runtimeHost = String(this.profile.runtimeHost || "").trim();
     this.configuredGatewayNodePort = this._normalizePort(this.profile.gatewayNodePort);
     this.configuredRuntimeNodePort = this._normalizePort(this.profile.runtimeNodePort);
+    this.supportsNetworkPolicy = this.profile.supportsNetworkPolicy === true;
+    this.policyEngine = String(this.profile.policyEngine || "").trim();
   }
 
   _normalizeExposureMode(value) {
@@ -575,6 +587,305 @@ class K8sBackend extends ProvisionerBackend {
 
   _servicePortsWithoutNodePorts(ports = []) {
     return ports.map(({ nodePort, ...port }) => ({ ...port }));
+  }
+
+  _sandboxProfileLabelValue(isNemoClaw) {
+    return isNemoClaw ? "nemoclaw" : "standard";
+  }
+
+  _sandboxProfileLabelMap(isNemoClaw) {
+    return { "nora.sandbox.profile": this._sandboxProfileLabelValue(isNemoClaw) };
+  }
+
+  _isIpAddress(value) {
+    return (
+      typeof value === "string" &&
+      (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value.trim()) || /^[0-9a-f:]+$/i.test(value.trim()))
+    );
+  }
+
+  _hostToIpBlock(host) {
+    const normalized = String(host || "").trim();
+    if (!normalized || !this._isIpAddress(normalized)) return null;
+    return normalized.includes(":") ? `${normalized}/128` : `${normalized}/32`;
+  }
+
+  _trustedIngressCidrs() {
+    if (this.loadBalancerSourceRanges.length > 0) {
+      return this.loadBalancerSourceRanges;
+    }
+
+    const runtimeHostBlock = this._hostToIpBlock(this.runtimeHost);
+    return runtimeHostBlock ? [runtimeHostBlock] : [];
+  }
+
+  _policyFamilyConfig(runtimeFamily = "openclaw") {
+    if (runtimeFamily === "hermes") {
+      return {
+        runtimeFamily: "hermes",
+        selector: {
+          app: "hermes-agent",
+          "nora.kubernetes.cluster": String(this.clusterId),
+        },
+        ports: [
+          { protocol: "TCP", port: HERMES_RUNTIME_PORT },
+          { protocol: "TCP", port: HERMES_DASHBOARD_PORT },
+        ],
+        policyPrefix: "nora-hermes",
+      };
+    }
+
+    return {
+      runtimeFamily: "openclaw",
+      selector: {
+        app: "openclaw-agent",
+        "nora.kubernetes.cluster": String(this.clusterId),
+      },
+      ports: [
+        { protocol: "TCP", port: OPENCLAW_GATEWAY_PORT },
+        { protocol: "TCP", port: AGENT_RUNTIME_PORT },
+      ],
+      policyPrefix: "nora-openclaw",
+    };
+  }
+
+  _policyName(runtimeFamily, suffix) {
+    const family = this._policyFamilyConfig(runtimeFamily);
+    return safeK8sName(`${family.policyPrefix}-${suffix}`, `${family.policyPrefix}-${suffix}`);
+  }
+
+  _buildDefaultDenyIngressPolicy(runtimeFamily, namespace) {
+    const family = this._policyFamilyConfig(runtimeFamily);
+    return {
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: this._policyName(runtimeFamily, "default-deny-ingress"),
+        namespace,
+        labels: {
+          "nora.kubernetes.cluster": this.clusterId,
+          "nora.runtime.family": runtimeFamily,
+        },
+      },
+      spec: {
+        podSelector: { matchLabels: family.selector },
+        policyTypes: ["Ingress"],
+      },
+    };
+  }
+
+  _buildTrustedIngressPolicy(runtimeFamily, namespace, cidrs) {
+    const family = this._policyFamilyConfig(runtimeFamily);
+    return {
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: this._policyName(runtimeFamily, "allow-trusted-ingress"),
+        namespace,
+        labels: {
+          "nora.kubernetes.cluster": this.clusterId,
+          "nora.runtime.family": runtimeFamily,
+        },
+      },
+      spec: {
+        podSelector: { matchLabels: family.selector },
+        policyTypes: ["Ingress"],
+        ingress: [
+          {
+            _from: cidrs.map((cidr) => ({ ipBlock: { cidr } })),
+            ports: family.ports,
+          },
+        ],
+      },
+    };
+  }
+
+  _buildNemoclawDenyEgressPolicy(namespace) {
+    return {
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: this._policyName("openclaw", "nemoclaw-default-deny-egress"),
+        namespace,
+        labels: {
+          "nora.kubernetes.cluster": this.clusterId,
+          "nora.runtime.family": "openclaw",
+          "nora.sandbox.profile": "nemoclaw",
+        },
+      },
+      spec: {
+        podSelector: {
+          matchLabels: {
+            ...this._policyFamilyConfig("openclaw").selector,
+            "nora.sandbox.profile": "nemoclaw",
+          },
+        },
+        policyTypes: ["Egress"],
+      },
+    };
+  }
+
+  _buildNemoclawDnsPolicy(namespace) {
+    return {
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: this._policyName("openclaw", "nemoclaw-allow-dns"),
+        namespace,
+        labels: {
+          "nora.kubernetes.cluster": this.clusterId,
+          "nora.runtime.family": "openclaw",
+          "nora.sandbox.profile": "nemoclaw",
+        },
+      },
+      spec: {
+        podSelector: {
+          matchLabels: {
+            ...this._policyFamilyConfig("openclaw").selector,
+            "nora.sandbox.profile": "nemoclaw",
+          },
+        },
+        policyTypes: ["Egress"],
+        egress: [
+          {
+            ports: [
+              { protocol: "UDP", port: 53 },
+              { protocol: "TCP", port: 53 },
+            ],
+          },
+        ],
+      },
+    };
+  }
+
+  _buildNemoclawExternalEgressPolicy(namespace) {
+    return {
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: this._policyName("openclaw", "nemoclaw-allow-external-web"),
+        namespace,
+        labels: {
+          "nora.kubernetes.cluster": this.clusterId,
+          "nora.runtime.family": "openclaw",
+          "nora.sandbox.profile": "nemoclaw",
+        },
+      },
+      spec: {
+        podSelector: {
+          matchLabels: {
+            ...this._policyFamilyConfig("openclaw").selector,
+            "nora.sandbox.profile": "nemoclaw",
+          },
+        },
+        policyTypes: ["Egress"],
+        egress: [
+          {
+            to: [{ ipBlock: { cidr: "0.0.0.0/0" } }],
+            ports: [
+              { protocol: "TCP", port: 80 },
+              { protocol: "TCP", port: 443 },
+            ],
+          },
+        ],
+      },
+    };
+  }
+
+  _buildNetworkPolicies({ runtimeFamily = "openclaw", sandboxProfile = "standard", namespace }) {
+    const trustedIngressCidrs = this._trustedIngressCidrs();
+    if (trustedIngressCidrs.length === 0) {
+      return {
+        policies: [],
+        status: {
+          policyStatus: K8S_POLICY_STATUS_DEGRADED,
+          policyBundleAttempted: false,
+          policyBundleApplied: false,
+          policyIssue:
+            "Trusted ingress CIDRs could not be determined for this execution target, so Kubernetes NetworkPolicy enforcement was skipped.",
+        },
+      };
+    }
+
+    const policies = [
+      this._buildDefaultDenyIngressPolicy(runtimeFamily, namespace),
+      this._buildTrustedIngressPolicy(runtimeFamily, namespace, trustedIngressCidrs),
+    ];
+
+    if (runtimeFamily === "openclaw" && sandboxProfile === "nemoclaw") {
+      policies.push(this._buildNemoclawDenyEgressPolicy(namespace));
+      policies.push(this._buildNemoclawDnsPolicy(namespace));
+      policies.push(this._buildNemoclawExternalEgressPolicy(namespace));
+    }
+
+    return {
+      policies,
+      status: {
+        policyStatus: K8S_POLICY_STATUS_SUPPORTED,
+        policyBundleAttempted: true,
+        policyBundleApplied: true,
+        policyIssue: null,
+      },
+    };
+  }
+
+  async _upsertNetworkPolicy(policy, namespace = this.namespace) {
+    if (!this.networkingApi) {
+      throw new Error("Kubernetes NetworkingV1Api client is not available.");
+    }
+    const name = policy?.metadata?.name;
+    try {
+      await this.networkingApi.createNamespacedNetworkPolicy({
+        namespace,
+        body: policy,
+      });
+    } catch (error) {
+      if (!this._isAlreadyExistsError(error)) throw error;
+
+      const current = this._serviceObject(
+        await this.networkingApi.readNamespacedNetworkPolicy({
+          name,
+          namespace,
+        }),
+      );
+      policy.metadata.resourceVersion = current?.metadata?.resourceVersion;
+      await this.networkingApi.replaceNamespacedNetworkPolicy({
+        name,
+        namespace,
+        body: policy,
+      });
+    }
+  }
+
+  async _reconcileNetworkPolicies({
+    runtimeFamily = "openclaw",
+    sandboxProfile = "standard",
+    namespace,
+  }) {
+    if (!this.supportsNetworkPolicy || !this.networkingApi) {
+      return {
+        policyStatus: K8S_POLICY_STATUS_DEGRADED,
+        policyBundleAttempted: false,
+        policyBundleApplied: false,
+        policyIssue:
+          "Cluster does not currently advertise Kubernetes NetworkPolicy support. Nora deployed in degraded mode and skipped pod-level policy enforcement.",
+      };
+    }
+
+    const { policies, status } = this._buildNetworkPolicies({
+      runtimeFamily,
+      sandboxProfile,
+      namespace,
+    });
+    if (!status.policyBundleAttempted || policies.length === 0) {
+      return status;
+    }
+
+    for (const policy of policies) {
+      await this._upsertNetworkPolicy(policy, namespace);
+    }
+
+    return status;
   }
 
   _serviceObject(response) {
@@ -807,6 +1118,7 @@ class K8sBackend extends ProvisionerBackend {
     runtimeFamily,
     gatewayToken,
     namespace = this.namespace,
+    policyStatus = null,
   }) {
     const host = `${deployName}.${namespace}.svc.cluster.local`;
     const servicePorts =
@@ -833,6 +1145,7 @@ class K8sBackend extends ProvisionerBackend {
         runtimePort,
         gatewayHost: loadBalancerHost,
         gatewayPort: secondaryPort,
+        ...(policyStatus || {}),
       };
     }
 
@@ -860,6 +1173,7 @@ class K8sBackend extends ProvisionerBackend {
         runtimeHost: nodePortHost,
         runtimePort: runtimeNodePort,
         gatewayHost: nodePortHost,
+        ...(policyStatus || {}),
       };
       if (runtimeFamily === "hermes") {
         result.gatewayPort = secondaryNodePort;
@@ -881,6 +1195,7 @@ class K8sBackend extends ProvisionerBackend {
       runtimePort,
       gatewayHost: host,
       gatewayPort: secondaryPort,
+      ...(policyStatus || {}),
     };
   }
 
@@ -1011,6 +1326,11 @@ class K8sBackend extends ProvisionerBackend {
     const apiServerKey = config.gatewayToken || crypto.randomBytes(32).toString("hex");
 
     await this._ensureNamespace(namespace);
+    const policyStatus = await this._reconcileNetworkPolicies({
+      runtimeFamily: "hermes",
+      sandboxProfile: "standard",
+      namespace,
+    });
     console.log(`[k8s] Creating Hermes deployment ${deployName}`);
 
     const hermesBootstrap = buildContainerBootstrap(buildHermesStartCommand(), {
@@ -1121,6 +1441,7 @@ class K8sBackend extends ProvisionerBackend {
       runtimeFamily: "hermes",
       gatewayToken: apiServerKey,
       namespace,
+      policyStatus,
     });
   }
 
@@ -1138,12 +1459,18 @@ class K8sBackend extends ProvisionerBackend {
     }
     const namespace = this._namespaceForRuntimeFamily("openclaw");
     const isNemoClaw = sandboxProfile === "nemoclaw";
+    const sandboxLabelMap = this._sandboxProfileLabelMap(isNemoClaw);
     const nemoModel =
       env?.NEMOCLAW_MODEL ||
       process.env.NEMOCLAW_DEFAULT_MODEL ||
       "nvidia/nemotron-3-super-120b-a12b";
 
     await this._ensureNamespace(namespace);
+    const policyStatus = await this._reconcileNetworkPolicies({
+      runtimeFamily: "openclaw",
+      sandboxProfile: this._sandboxProfileLabelValue(isNemoClaw),
+      namespace,
+    });
 
     console.log(`[k8s] Creating deployment ${deployName}`);
 
@@ -1285,6 +1612,7 @@ class K8sBackend extends ProvisionerBackend {
         "nora.execution.target": this.executionTargetLabelValue,
         "nora.kubernetes.cluster": this.clusterId,
         "openclaw.agent.id": String(id),
+        ...sandboxLabelMap,
       },
       namespace,
     );
@@ -1304,6 +1632,7 @@ class K8sBackend extends ProvisionerBackend {
           "nora.execution.target": this.executionTargetLabelValue,
           "nora.kubernetes.cluster": this.clusterId,
           "openclaw.agent.id": String(id),
+          ...sandboxLabelMap,
         },
       },
       spec: {
@@ -1321,6 +1650,7 @@ class K8sBackend extends ProvisionerBackend {
               "nora.execution.target": this.executionTargetLabelValue,
               "nora.kubernetes.cluster": this.clusterId,
               "openclaw.agent.id": String(id),
+              ...sandboxLabelMap,
             },
           },
           spec: {
@@ -1381,6 +1711,7 @@ class K8sBackend extends ProvisionerBackend {
       runtimeFamily: "openclaw",
       gatewayToken,
       namespace,
+      policyStatus,
     });
   }
 

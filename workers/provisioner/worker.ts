@@ -617,6 +617,27 @@ function sanitizeExecOutput(output = "") {
     .replace(NON_PRINTABLE_RE, "")
     .trim();
 }
+
+/**
+ * Execute a shell command inside an already-running runtime container.
+ *
+ * This is the lowest-level provisioner exec helper used by ClawHub flows and
+ * other runtime repair paths. Callers must shell-escape any interpolated
+ * user-controlled values because `command` is executed via `/bin/sh -lc ...`,
+ * not as a direct argv array.
+ *
+ * @param {object} provisioner Backend-specific provisioner client with `exec`.
+ * @param {string} containerId Runtime container identifier.
+ * @param {string} command Shell command to execute inside the container.
+ * @param {object} [options]
+ * @param {number} [options.timeout=30000] Max time to wait before aborting.
+ * @param {number} [options.maxOutputBytes=65536] Max output bytes to retain.
+ * @param {boolean} [options.tty=false] Whether to allocate a TTY for exec.
+ * @param {string[]} [options.env=[]] Extra env vars for the exec call.
+ * @returns {Promise<{exitCode: number, output: string}>} Sanitized output and
+ * the final container exit code. Rejects on timeout, exec transport failures,
+ * or non-zero exit status.
+ */
 async function runProvisionerExecCommand(
   provisioner,
   containerId,
@@ -709,18 +730,32 @@ function wrapCommandWithContainerTimeout(command, timeoutMs) {
   ].join(" ");
 }
 
-function createClawhubSkillJobLogger({ jobId, agentId, slug, operation }) {
-  const startedAt = Date.now();
-
-  return (step, message, extra = null) => {
-    const elapsedMs = Date.now() - startedAt;
-    const suffix = extra ? ` ${JSON.stringify(extra)}` : "";
-    console.log(
-      `[clawhub-jobs] operation=${operation} job=${jobId} agent=${agentId} slug=${slug} step=${step} elapsedMs=${elapsedMs} ${message}${suffix}`,
-    );
-  };
-}
-
+/**
+ * Push the user's current LLM auth and default-model settings into a running
+ * runtime, then restart and wait for readiness.
+ *
+ * Hermes and OpenClaw update this config in different ways. This function
+ * handles those runtime-specific steps internally so callers only need to care
+ * about one outcome: if it returns `synced`, the new auth/config has been
+ * applied, the runtime has restarted, and health checks passed.
+ *
+ * @param {object} params Reconciliation inputs for the live runtime.
+ * @param {string} params.agentId Agent id used for persisted Hermes lookups.
+ * @param {string} params.userId User id whose provider credentials are read.
+ * @param {string} params.runtimeFamily Runtime family, e.g. `hermes` or `openclaw`.
+ * @param {string} params.resolvedBackend Normalized backend name for exec fallback behavior.
+ * @param {string} params.containerId Runtime container identifier.
+ * @param {object} params.provisioner Backend-specific provisioner client with `exec` and `restart`.
+ * @param {string} params.host Agent host used for readiness checks.
+ * @param {string} params.runtimeHost Runtime host used for readiness checks.
+ * @param {number|string} params.runtimePort Runtime port used for readiness checks.
+ * @param {number|string} params.gatewayHostPort Gateway port exposed on the host.
+ * @param {string} params.gatewayHost Gateway host used for readiness checks.
+ * @param {number|string} params.gatewayPort Gateway port used for readiness checks.
+ * @returns {Promise<{status: "skipped" | "synced"}>} `skipped` when there is
+ * nothing to apply, otherwise `synced` after config write, restart, and
+ * readiness verification succeed.
+ */
 async function reconcileRuntimeLlmAuth({
   agentId,
   userId,
@@ -861,9 +896,139 @@ async function reconcileRuntimeLlmAuth({
   return { status: "synced" };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── Pluggable Backend ────────────────────────────────────
+const backendInstances = new Map();
+
+function backendInstanceKey(runtimeFields = {}) {
+  const backend = normalizeBackendName(
+    runtimeFields.backend_type || runtimeFields.deploy_target || "docker",
+  );
+  if (backend === "docker") {
+    if (runtimeFields.runtime_family === "hermes") return "docker:hermes";
+    if (runtimeFields.sandbox_profile === "nemoclaw") return "docker:nemoclaw";
+  }
+  if (backend === "k8s" && runtimeFields.execution_target_id) {
+    return String(runtimeFields.execution_target_id).trim().toLowerCase() || "k8s";
+  }
+  return backend;
+}
+
+async function loadBackend(runtimeFields = {}) {
+  const key = backendInstanceKey(runtimeFields);
+  // Kubernetes execution targets are Admin-managed records whose exposure mode,
+  // namespaces, kube context, and policy metadata can change at runtime. Rebuild
+  // the adapter from the latest stored profile instead of reusing a stale cached
+  // instance across deploys.
+  if (backendInstances.has(key) && !key.startsWith("k8s:")) return backendInstances.get(key);
+
+  let instance;
+  switch (key) {
+    case "docker":
+      instance = new (require("./backends/docker"))();
+      break;
+    case "docker:hermes":
+      instance = new (require("./backends/hermes"))();
+      break;
+    case "docker:nemoclaw":
+      instance = new (require("./backends/nemoclaw"))();
+      break;
+    case "proxmox":
+      instance = new (require("./backends/proxmox"))();
+      break;
+    default:
+      if (key.startsWith("k8s:")) {
+        backendInstances.delete(key);
+        const profile = await getKubernetesClusterProfile(key);
+        if (!profile) {
+          throw new Error(`Unknown Kubernetes execution target: ${key}`);
+        }
+        instance = new (require("./backends/k8s"))(profile);
+        break;
+      }
+      if (key === "k8s") {
+        throw new Error(
+          "Kubernetes provisioning requires an Admin-registered cluster target such as k8s:aks-eastus2.",
+        );
+      }
+      console.warn(`Unknown backend "${key}", falling back to docker`);
+      instance = new (require("./backends/docker"))();
+      break;
+  }
+
+  backendInstances.set(key, instance);
+  return instance;
+}
+
+function safeK8sName(name, fallback) {
+  return (
+    String(name || fallback || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 63) || fallback
+  );
+}
+
+function defaultK8sDeployName(runtimeFamily, id, name) {
+  const prefix = runtimeFamily === "hermes" ? "nora-hermes" : "nora-oclaw";
+  return safeK8sName(`${prefix}-${name || "agent"}-${id}`, `${prefix}-${id}`);
+}
+
+async function cleanupPreviousK8sRuntime({
+  agentId,
+  jobData = {},
+  fallbackRuntimeFields = {},
+} = {}) {
+  const previousBackend = normalizeBackendName(
+    jobData.previous_backend || jobData.previous_deploy_target || "",
+  );
+  if (previousBackend !== "k8s") return;
+
+  const previousRuntimeFields = buildAgentRuntimeFields({
+    runtime_family: jobData.previous_runtime_family || fallbackRuntimeFields.runtime_family,
+    backend_type: "k8s",
+    deploy_target: "k8s",
+    execution_target_id:
+      jobData.previous_execution_target_id || fallbackRuntimeFields.execution_target_id,
+    sandbox_profile: jobData.previous_sandbox_profile || fallbackRuntimeFields.sandbox_profile,
+  });
+  const previousResourceName =
+    jobData.previous_container_id ||
+    jobData.previous_container_name ||
+    defaultK8sDeployName(previousRuntimeFields.runtime_family, agentId, jobData.name);
+  const previousProvisioner = await loadBackend(previousRuntimeFields);
+
+  console.log(
+    `[provisioner] Destroying previous Kubernetes runtime ${previousResourceName} before redeploying agent ${agentId}`,
+  );
+  await previousProvisioner.destroy(previousResourceName, {
+    agentId,
+    host: jobData.previous_host || null,
+    runtimeFamily: previousRuntimeFields.runtime_family,
+  });
+}
+
 async function markDeploymentLifecycle(db, agentId, status) {
   await db.query("UPDATE agents SET status = $2 WHERE id = $1", [agentId, status]);
   await db.query("UPDATE deployments SET status = $2 WHERE agent_id = $1", [agentId, status]);
+}
+
+// ── ClawHub Helpers ──────────────────────────────────────
+function createClawhubSkillJobLogger({ jobId, agentId, slug, operation }) {
+  const startedAt = Date.now();
+
+  return (step, message, extra = null) => {
+    const elapsedMs = Date.now() - startedAt;
+    const suffix = extra ? ` ${JSON.stringify(extra)}` : "";
+    console.log(
+      `[clawhub-jobs] operation=${operation} job=${jobId} agent=${agentId} slug=${slug} step=${step} elapsedMs=${elapsedMs} ${message}${suffix}`,
+    );
+  };
 }
 
 function normalizeInstalledSkillsLockfile(parsed = {}) {
@@ -881,10 +1046,20 @@ function normalizeInstalledSkillsLockfile(parsed = {}) {
     .filter((entry) => entry.slug);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
+/**
+ * Read `.clawhub/lock.json` from the runtime container and normalize it into a
+ * list of installed skills.
+ *
+ * The helper uses a TTY plus base64 transport because raw Docker exec streams
+ * can prepend framing bytes that corrupt JSON reads. It retries a few times so
+ * short lockfile propagation delays after install/delete do not look like hard
+ * failures.
+ *
+ * @param {object} provisioner Backend-specific provisioner client with `exec`.
+ * @param {string} containerId Runtime container identifier.
+ * @returns {Promise<Array<{slug: string, version: string}>>} The installed
+ * ClawHub skills currently represented in the runtime lockfile.
+ */
 async function readInstalledClawhubSkills(provisioner, containerId) {
   const readCommand =
     `if [ -f ${JSON.stringify(CLAWHUB_LOCKFILE_PATH)} ]; then ` +
@@ -1025,6 +1200,23 @@ async function uninstallClawhubSkill(provisioner, containerId, slug) {
   );
 }
 
+/**
+ * Reconcile the OpenClaw runtime's installed ClawHub skills against Nora's
+ * saved desired state in `agents.clawhub_skills`.
+ *
+ * Missing saved skills are reinstalled so the container matches persisted
+ * state. Runtime-only skills are treated as drift: they stay visible to the UI
+ * and are only auto-pruned when `CLAWHUB_PRUNE_ORPHANED_SKILLS=true`, so a
+ * manual in-container install is not silently removed by default.
+ *
+ * @param {object} params Reconciliation inputs.
+ * @param {string} params.agentId Agent id whose saved ClawHub state is read.
+ * @param {string} params.containerId Runtime container identifier.
+ * @param {object} params.provisioner Backend-specific provisioner client.
+ * @param {string} [params.logPrefix="[clawhub-reconcile]"] Log prefix for reconciliation messages.
+ * @returns {Promise<void>} Resolves after reconciliation attempts finish or no
+ * action is needed.
+ */
 async function reconcileClawhubSkills({
   agentId,
   containerId,
@@ -1132,112 +1324,193 @@ async function reconcileClawhubSkills({
   }
 }
 
-// ── Pluggable Backend ────────────────────────────────────
-const backendInstances = new Map();
-
-function backendInstanceKey(runtimeFields = {}) {
-  const backend = normalizeBackendName(
-    runtimeFields.backend_type || runtimeFields.deploy_target || "docker",
+async function loadClawhubJobAgent(agentId) {
+  const result = await db.query(
+    `SELECT id, name, status, container_id, backend_type, runtime_family, deploy_target,
+            execution_target_id, sandbox_profile, clawhub_skills
+       FROM agents
+      WHERE id = $1
+      LIMIT 1`,
+    [agentId],
   );
-  if (backend === "docker") {
-    if (runtimeFields.runtime_family === "hermes") return "docker:hermes";
-    if (runtimeFields.sandbox_profile === "nemoclaw") return "docker:nemoclaw";
+  const agent = result.rows[0];
+  if (!agent) {
+    throw new Error(`Agent not found: ${agentId}`);
   }
-  if (backend === "k8s" && runtimeFields.execution_target_id) {
-    return String(runtimeFields.execution_target_id).trim().toLowerCase() || "k8s";
+  if (agent.runtime_family !== "openclaw") {
+    throw new Error("ClawHub mutations are only available for OpenClaw agents.");
   }
-  return backend;
-}
-
-async function loadBackend(runtimeFields = {}) {
-  const key = backendInstanceKey(runtimeFields);
-  if (backendInstances.has(key)) return backendInstances.get(key);
-
-  let instance;
-  switch (key) {
-    case "docker":
-      instance = new (require("./backends/docker"))();
-      break;
-    case "docker:hermes":
-      instance = new (require("./backends/hermes"))();
-      break;
-    case "docker:nemoclaw":
-      instance = new (require("./backends/nemoclaw"))();
-      break;
-    case "proxmox":
-      instance = new (require("./backends/proxmox"))();
-      break;
-    default:
-      if (key.startsWith("k8s:")) {
-        const profile = await getKubernetesClusterProfile(key);
-        if (!profile) {
-          throw new Error(`Unknown Kubernetes execution target: ${key}`);
-        }
-        instance = new (require("./backends/k8s"))(profile);
-        break;
-      }
-      if (key === "k8s") {
-        throw new Error(
-          "Kubernetes provisioning requires an Admin-registered cluster target such as k8s:aks-eastus2.",
-        );
-      }
-      console.warn(`Unknown backend "${key}", falling back to docker`);
-      instance = new (require("./backends/docker"))();
-      break;
+  if (!agent.container_id || (agent.status !== "running" && agent.status !== "warning")) {
+    throw new Error("Start the agent before managing ClawHub skills.");
   }
-
-  backendInstances.set(key, instance);
-  return instance;
+  return agent;
 }
 
-function safeK8sName(name, fallback) {
-  return (
-    String(name || fallback || "")
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 63) || fallback
-  );
-}
-
-function defaultK8sDeployName(runtimeFamily, id, name) {
-  const prefix = runtimeFamily === "hermes" ? "nora-hermes" : "nora-oclaw";
-  return safeK8sName(`${prefix}-${name || "agent"}-${id}`, `${prefix}-${id}`);
-}
-
-async function cleanupPreviousK8sRuntime({
+/**
+ * Perform one queued ClawHub install operation for an agent and persist the DB
+ * state only after runtime verification succeeds.
+ *
+ * The job is intentionally idempotent: if the slug is already present in the
+ * runtime lockfile, the function skips the CLI call and optionally backfills
+ * `agents.clawhub_skills`. Fresh installs must appear in the lockfile before
+ * the saved state is updated.
+ *
+ * @param {object} params Install job inputs.
+ * @param {string} params.agentId Agent id whose saved ClawHub state may be updated.
+ * @param {string} params.slug ClawHub slug to install.
+ * @param {object} params.skillEntry Saved-state metadata for the skill.
+ * @param {boolean} [params.persistOnSuccess=true] Whether to persist the skill to `agents.clawhub_skills`.
+ * @param {object} params.provisioner Backend-specific provisioner client.
+ * @param {string} params.containerId Runtime container identifier.
+ * @param {Function} params.logJob Structured job logger for progress events.
+ * @returns {Promise<{agentId: string, slug: string, operation: "install", installedSkills: Array<{slug: string, version: string}>}>}
+ * The verified post-install runtime state for the agent.
+ */
+async function runClawhubInstallJob({
   agentId,
-  jobData = {},
-  fallbackRuntimeFields = {},
-} = {}) {
-  const previousBackend = normalizeBackendName(
-    jobData.previous_backend || jobData.previous_deploy_target || "",
-  );
-  if (previousBackend !== "k8s") return;
+  slug,
+  skillEntry,
+  persistOnSuccess = true,
+  provisioner,
+  containerId,
+  logJob,
+}) {
+  logJob("cli-check", "Ensuring clawhub CLI is available");
+  await ensureClawhubCli(provisioner, containerId);
+  logJob("cli-check", "Clawhub CLI is ready");
 
-  const previousRuntimeFields = buildAgentRuntimeFields({
-    runtime_family: jobData.previous_runtime_family || fallbackRuntimeFields.runtime_family,
-    backend_type: "k8s",
-    deploy_target: "k8s",
-    execution_target_id:
-      jobData.previous_execution_target_id || fallbackRuntimeFields.execution_target_id,
-    sandbox_profile: jobData.previous_sandbox_profile || fallbackRuntimeFields.sandbox_profile,
+  logJob("precheck", "Reading installed skills before install");
+  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
+  logJob("precheck", "Read installed skills before install", {
+    installedCount: installedBefore.length,
   });
-  const previousResourceName =
-    jobData.previous_container_id ||
-    jobData.previous_container_name ||
-    defaultK8sDeployName(previousRuntimeFields.runtime_family, agentId, jobData.name);
-  const previousProvisioner = await loadBackend(previousRuntimeFields);
+  if (installedBefore.some((entry) => entry.slug === slug)) {
+    logJob("precheck", "Skill already installed before command");
+    if (persistOnSuccess) {
+      logJob("persist", "Persisting already-installed skill to agents table");
+      await appendSavedClawhubSkill(agentId, slug, skillEntry);
+      logJob("persist", "Persisted already-installed skill");
+    }
+    return {
+      agentId,
+      slug,
+      operation: "install",
+      installedSkills: installedBefore,
+    };
+  }
 
-  console.log(
-    `[provisioner] Destroying previous Kubernetes runtime ${previousResourceName} before redeploying agent ${agentId}`,
-  );
-  await previousProvisioner.destroy(previousResourceName, {
+  try {
+    logJob("install", "Running clawhub install command", {
+      timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
+    });
+    await installClawhubSkill(provisioner, containerId, slug);
+    logJob("install", "Clawhub install command finished");
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (!message.includes("Already installed")) {
+      logJob("install", "Clawhub install command failed", {
+        error: message,
+      });
+      throw error;
+    }
+    logJob("install", "Clawhub reported skill already installed");
+  }
+
+  logJob("verify", "Reading installed skills after install");
+  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+  logJob("verify", "Read installed skills after install", {
+    installedCount: installedSkills.length,
+  });
+  if (!installedSkills.some((entry) => entry.slug === slug)) {
+    logJob("verify", "Lockfile missing expected slug after install");
+    throw new Error(`ClawHub install completed but ${slug} was not found in lockfile`);
+  }
+
+  if (persistOnSuccess) {
+    logJob("persist", "Persisting successful install to agents table");
+    await appendSavedClawhubSkill(agentId, slug, skillEntry);
+    logJob("persist", "Persisted successful install");
+  }
+
+  return {
     agentId,
-    host: jobData.previous_host || null,
-    runtimeFamily: previousRuntimeFields.runtime_family,
+    slug,
+    operation: "install",
+    installedSkills,
+  };
+}
+
+/**
+ * Perform one queued ClawHub delete operation for an agent and remove the DB
+ * entry only after the runtime lockfile confirms the slug is gone.
+ *
+ * Deletes are also idempotent: if the runtime already lacks the slug, the job
+ * treats that as success and only updates saved state when requested. This
+ * keeps the DB as Nora's desired-state record without requiring the uninstall
+ * command to run on every retry.
+ *
+ * @param {object} params Delete job inputs.
+ * @param {string} params.agentId Agent id whose saved ClawHub state may be updated.
+ * @param {string} params.slug ClawHub slug to remove.
+ * @param {object} params.skillEntry Saved-state metadata used when removing the DB entry.
+ * @param {boolean} [params.removeSavedEntryOnSuccess=true] Whether to remove the skill from `agents.clawhub_skills`.
+ * @param {object} params.provisioner Backend-specific provisioner client.
+ * @param {string} params.containerId Runtime container identifier.
+ * @param {Function} params.logJob Structured job logger for progress events.
+ * @returns {Promise<{agentId: string, slug: string, operation: "delete", installedSkills: Array<{slug: string, version: string}>}>}
+ * The verified post-delete runtime state for the agent.
+ */
+async function runClawhubDeleteJob({
+  agentId,
+  slug,
+  skillEntry,
+  removeSavedEntryOnSuccess = true,
+  provisioner,
+  containerId,
+  logJob,
+}) {
+  logJob("cli-check", "Ensuring clawhub CLI is available");
+  await ensureClawhubCli(provisioner, containerId);
+  logJob("cli-check", "Clawhub CLI is ready");
+
+  logJob("precheck", "Reading installed skills before delete");
+  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
+  logJob("precheck", "Read installed skills before delete", {
+    installedCount: installedBefore.length,
   });
+
+  if (installedBefore.some((entry) => entry.slug === slug)) {
+    logJob("delete", "Running clawhub uninstall command", {
+      timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
+    });
+    await uninstallClawhubSkill(provisioner, containerId, slug);
+    logJob("delete", "Clawhub uninstall command finished");
+  } else {
+    logJob("precheck", "Skill already absent before delete");
+  }
+
+  logJob("verify", "Reading installed skills after delete");
+  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+  logJob("verify", "Read installed skills after delete", {
+    installedCount: installedSkills.length,
+  });
+  if (installedSkills.some((entry) => entry.slug === slug)) {
+    logJob("verify", "Lockfile still contains slug after delete");
+    throw new Error(`ClawHub uninstall completed but ${slug} is still present in lockfile`);
+  }
+
+  if (removeSavedEntryOnSuccess) {
+    logJob("persist", "Removing saved ClawHub skill from agents table if present");
+    await removeSavedClawhubSkill(agentId, slug, skillEntry);
+    logJob("persist", "Removed saved ClawHub skill from agents table if present");
+  }
+
+  return {
+    agentId,
+    slug,
+    operation: "delete",
+    installedSkills,
+  };
 }
 
 const enabledBackends = getEnabledBackends();
@@ -1551,7 +1824,8 @@ const worker = new Worker(
         runtimeHost,
         runtimePort,
         gatewayHost,
-        gatewayPort;
+        gatewayPort,
+        networkPolicyStatus;
       try {
         const abortController = new AbortController();
         let provisionTimeoutHandle = null;
@@ -1618,6 +1892,24 @@ const worker = new Worker(
         runtimePort = result.runtimePort || null;
         gatewayHost = result.gatewayHost || null;
         gatewayPort = result.gatewayPort || null;
+        networkPolicyStatus =
+          result.policyStatus ||
+          result.policyBundleAttempted !== undefined ||
+          result.policyBundleApplied !== undefined ||
+          result.policyIssue !== undefined
+            ? {
+                policyStatus: result.policyStatus || null,
+                policyBundleAttempted:
+                  result.policyBundleAttempted === undefined
+                    ? null
+                    : Boolean(result.policyBundleAttempted),
+                policyBundleApplied:
+                  result.policyBundleApplied === undefined
+                    ? null
+                    : Boolean(result.policyBundleApplied),
+                policyIssue: result.policyIssue || null,
+              }
+            : null;
 
         // Persist container_id immediately so that if the worker crashes or the
         // final status UPDATE fails below, the container can still be located
@@ -1771,7 +2063,8 @@ const worker = new Worker(
               deploy_target = $14,
               execution_target_id = $15,
               sandbox_profile = $16,
-              sandbox_type = $17
+              sandbox_type = $17,
+              network_policy_status = $18
         WHERE id = $1`,
           [
             id,
@@ -1791,6 +2084,7 @@ const worker = new Worker(
             resolvedRuntimeFields.execution_target_id,
             resolvedRuntimeFields.sandbox_profile,
             resolvedRuntimeFields.sandbox_type,
+            networkPolicyStatus,
           ],
         );
         await db.query("UPDATE deployments SET status = 'completed' WHERE agent_id = $1", [id]);
@@ -1940,155 +2234,6 @@ worker.on("failed", async (job, err) => {
 worker.on("completed", (job) => {
   console.log(`Job ${job.id} completed successfully`);
 });
-
-async function loadClawhubJobAgent(agentId) {
-  const result = await db.query(
-    `SELECT id, name, status, container_id, backend_type, runtime_family, deploy_target,
-            execution_target_id, sandbox_profile, clawhub_skills
-       FROM agents
-      WHERE id = $1
-      LIMIT 1`,
-    [agentId],
-  );
-  const agent = result.rows[0];
-  if (!agent) {
-    throw new Error(`Agent not found: ${agentId}`);
-  }
-  if (agent.runtime_family !== "openclaw") {
-    throw new Error("ClawHub mutations are only available for OpenClaw agents.");
-  }
-  if (!agent.container_id || (agent.status !== "running" && agent.status !== "warning")) {
-    throw new Error("Start the agent before managing ClawHub skills.");
-  }
-  return agent;
-}
-
-async function runClawhubInstallJob({
-  agentId,
-  slug,
-  skillEntry,
-  persistOnSuccess = true,
-  provisioner,
-  containerId,
-  logJob,
-}) {
-  logJob("cli-check", "Ensuring clawhub CLI is available");
-  await ensureClawhubCli(provisioner, containerId);
-  logJob("cli-check", "Clawhub CLI is ready");
-
-  logJob("precheck", "Reading installed skills before install");
-  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
-  logJob("precheck", "Read installed skills before install", {
-    installedCount: installedBefore.length,
-  });
-  if (installedBefore.some((entry) => entry.slug === slug)) {
-    logJob("precheck", "Skill already installed before command");
-    if (persistOnSuccess) {
-      logJob("persist", "Persisting already-installed skill to agents table");
-      await appendSavedClawhubSkill(agentId, slug, skillEntry);
-      logJob("persist", "Persisted already-installed skill");
-    }
-    return {
-      agentId,
-      slug,
-      operation: "install",
-      installedSkills: installedBefore,
-    };
-  }
-
-  try {
-    logJob("install", "Running clawhub install command", {
-      timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
-    });
-    await installClawhubSkill(provisioner, containerId, slug);
-    logJob("install", "Clawhub install command finished");
-  } catch (error) {
-    const message = String(error?.message || "");
-    if (!message.includes("Already installed")) {
-      logJob("install", "Clawhub install command failed", {
-        error: message,
-      });
-      throw error;
-    }
-    logJob("install", "Clawhub reported skill already installed");
-  }
-
-  logJob("verify", "Reading installed skills after install");
-  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
-  logJob("verify", "Read installed skills after install", {
-    installedCount: installedSkills.length,
-  });
-  if (!installedSkills.some((entry) => entry.slug === slug)) {
-    logJob("verify", "Lockfile missing expected slug after install");
-    throw new Error(`ClawHub install completed but ${slug} was not found in lockfile`);
-  }
-
-  if (persistOnSuccess) {
-    logJob("persist", "Persisting successful install to agents table");
-    await appendSavedClawhubSkill(agentId, slug, skillEntry);
-    logJob("persist", "Persisted successful install");
-  }
-
-  return {
-    agentId,
-    slug,
-    operation: "install",
-    installedSkills,
-  };
-}
-
-async function runClawhubDeleteJob({
-  agentId,
-  slug,
-  skillEntry,
-  removeSavedEntryOnSuccess = true,
-  provisioner,
-  containerId,
-  logJob,
-}) {
-  logJob("cli-check", "Ensuring clawhub CLI is available");
-  await ensureClawhubCli(provisioner, containerId);
-  logJob("cli-check", "Clawhub CLI is ready");
-
-  logJob("precheck", "Reading installed skills before delete");
-  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
-  logJob("precheck", "Read installed skills before delete", {
-    installedCount: installedBefore.length,
-  });
-
-  if (installedBefore.some((entry) => entry.slug === slug)) {
-    logJob("delete", "Running clawhub uninstall command", {
-      timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
-    });
-    await uninstallClawhubSkill(provisioner, containerId, slug);
-    logJob("delete", "Clawhub uninstall command finished");
-  } else {
-    logJob("precheck", "Skill already absent before delete");
-  }
-
-  logJob("verify", "Reading installed skills after delete");
-  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
-  logJob("verify", "Read installed skills after delete", {
-    installedCount: installedSkills.length,
-  });
-  if (installedSkills.some((entry) => entry.slug === slug)) {
-    logJob("verify", "Lockfile still contains slug after delete");
-    throw new Error(`ClawHub uninstall completed but ${slug} is still present in lockfile`);
-  }
-
-  if (removeSavedEntryOnSuccess) {
-    logJob("persist", "Removing saved ClawHub skill from agents table if present");
-    await removeSavedClawhubSkill(agentId, slug, skillEntry);
-    logJob("persist", "Removed saved ClawHub skill from agents table if present");
-  }
-
-  return {
-    agentId,
-    slug,
-    operation: "delete",
-    installedSkills,
-  };
-}
 
 const clawhubJobsWorker = new Worker(
   "clawhub-jobs",

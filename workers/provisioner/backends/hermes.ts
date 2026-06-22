@@ -19,7 +19,7 @@ const HERMES_RUNTIME_PORT = 8642;
 const HERMES_HOME = "/opt/data";
 const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
-const HERMES_ENTRYPOINT = "/opt/hermes/docker/entrypoint.sh";
+const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
 
 function isMutableImageReference(imgName) {

@@ -1134,6 +1134,10 @@ async function migrateDB() {
        ALTER TABLE agents ADD COLUMN execution_target_id TEXT;
      EXCEPTION WHEN duplicate_column THEN NULL;
      END $$`,
+    `DO $$ BEGIN
+       ALTER TABLE agents ADD COLUMN network_policy_status JSONB;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
     `UPDATE agents
         SET runtime_family = CASE
           WHEN backend_type = 'hermes' THEN 'hermes'
@@ -1222,12 +1226,16 @@ async function migrateDB() {
        load_balancer_class TEXT NOT NULL DEFAULT '',
        load_balancer_ready_timeout_ms INTEGER NOT NULL DEFAULT 600000,
        load_balancer_ready_interval_ms INTEGER NOT NULL DEFAULT 5000,
+       supports_network_policy BOOLEAN NOT NULL DEFAULT false,
+       policy_engine TEXT NOT NULL DEFAULT '',
        last_test_status TEXT,
        last_test_message TEXT,
        last_tested_at TIMESTAMPTZ,
        created_at TIMESTAMPTZ DEFAULT NOW(),
        updated_at TIMESTAMPTZ DEFAULT NOW()
      )`,
+    `DO $$ BEGIN ALTER TABLE kubernetes_clusters ADD COLUMN supports_network_policy BOOLEAN NOT NULL DEFAULT false; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+    `DO $$ BEGIN ALTER TABLE kubernetes_clusters ADD COLUMN policy_engine TEXT NOT NULL DEFAULT ''; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
     `CREATE INDEX IF NOT EXISTS idx_kubernetes_clusters_enabled
        ON kubernetes_clusters(enabled, is_default, label)`,
     `DO $$ BEGIN ALTER TABLE agents ADD COLUMN vcpu INTEGER DEFAULT 1; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,

@@ -1,4 +1,7 @@
 services:
+  postgres:
+    ports: []
+
   backend-api:
     networks:
       - default

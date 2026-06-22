@@ -24,6 +24,9 @@ const mockCreateNamespacedConfigMap = jest.fn();
 const mockReadNamespacedConfigMap = jest.fn();
 const mockReplaceNamespacedConfigMap = jest.fn();
 const mockDeleteNamespacedConfigMap = jest.fn();
+const mockCreateNamespacedNetworkPolicy = jest.fn();
+const mockReadNamespacedNetworkPolicy = jest.fn();
+const mockReplaceNamespacedNetworkPolicy = jest.fn();
 const mockGetNamespacedCustomObject = jest.fn();
 const mockLoadKubeconfigFromFile = jest.fn();
 
@@ -43,6 +46,8 @@ function k8sProfile(overrides = {}) {
     loadBalancerClass: "",
     loadBalancerReadyTimeoutMs: 600000,
     loadBalancerReadyIntervalMs: 5000,
+    supportsNetworkPolicy: false,
+    policyEngine: "",
     ...overrides,
   };
 }
@@ -79,6 +84,13 @@ jest.mock(
             deleteNamespacedDeployment: mockDeleteNamespacedDeployment,
           };
         }
+        if (api === NetworkingV1Api) {
+          return {
+            createNamespacedNetworkPolicy: mockCreateNamespacedNetworkPolicy,
+            readNamespacedNetworkPolicy: mockReadNamespacedNetworkPolicy,
+            replaceNamespacedNetworkPolicy: mockReplaceNamespacedNetworkPolicy,
+          };
+        }
         if (api === CustomObjectsApi) {
           return {
             getNamespacedCustomObject: mockGetNamespacedCustomObject,
@@ -90,9 +102,10 @@ jest.mock(
 
     class CoreV1Api {}
     class AppsV1Api {}
+    class NetworkingV1Api {}
     class CustomObjectsApi {}
 
-    return { KubeConfig, CoreV1Api, AppsV1Api, CustomObjectsApi };
+    return { KubeConfig, CoreV1Api, AppsV1Api, NetworkingV1Api, CustomObjectsApi };
   },
   { virtual: true },
 );
@@ -118,6 +131,11 @@ describe("provisioning runtime/gateway contracts", () => {
     });
     mockReplaceNamespacedConfigMap.mockReset().mockResolvedValue({});
     mockDeleteNamespacedConfigMap.mockReset().mockResolvedValue({});
+    mockCreateNamespacedNetworkPolicy.mockReset().mockResolvedValue({});
+    mockReadNamespacedNetworkPolicy.mockReset().mockResolvedValue({
+      body: { metadata: { resourceVersion: "networkpolicy-rv" } },
+    });
+    mockReplaceNamespacedNetworkPolicy.mockReset().mockResolvedValue({});
     mockGetNamespacedCustomObject.mockReset().mockResolvedValue({});
     mockLoadKubeconfigFromFile.mockReset().mockReturnValue(undefined);
     delete process.env.GATEWAY_HOST;
@@ -303,8 +321,12 @@ describe("provisioning runtime/gateway contracts", () => {
     const container = deployment.spec.template.spec.containers[0];
 
     expect(configMap.data["bootstrap.sh"]).toContain("openclaw@latest");
+    expect(configMap.metadata.labels["nora.sandbox.profile"]).toBe("standard");
     expect(container.command).toEqual(["/bin/sh", "-c"]);
     expect(container.args).toEqual([". /opt/nora-bootstrap/bootstrap.sh"]);
+    expect(deployment.metadata.labels["nora.sandbox.profile"]).toBe("standard");
+    expect(deployment.spec.template.metadata.labels["nora.sandbox.profile"]).toBe("standard");
+    expect(deployment.spec.selector.matchLabels).toEqual({ "openclaw.agent.id": "123" });
     expect(container.volumeMounts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "nora-bootstrap", mountPath: "/opt/nora-bootstrap" }),
@@ -562,6 +584,9 @@ describe("provisioning runtime/gateway contracts", () => {
     const backend = new K8sBackend(
       k8sProfile({
         exposureMode: "load-balancer",
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        loadBalancerSourceRanges: ["203.0.113.10/32"],
         loadBalancerReadyTimeoutMs: 50,
         loadBalancerReadyIntervalMs: 1,
       }),
@@ -581,6 +606,7 @@ describe("provisioning runtime/gateway contracts", () => {
     const configMap = mockCreateNamespacedConfigMap.mock.calls[0][0].body;
     const container = deployment.spec.template.spec.containers[0];
     const envVars = Object.fromEntries(container.env.map((entry) => [entry.name, entry.value]));
+    const policies = mockCreateNamespacedNetworkPolicy.mock.calls.map((call) => call[0].body);
 
     expect(container.image).toBe("registry.example.com/nora-nemoclaw-agent:stable");
     expect(container.workingDir).toBe("/sandbox");
@@ -595,6 +621,320 @@ describe("provisioning runtime/gateway contracts", () => {
     );
     expect(container.args).toEqual([". /opt/nora-bootstrap/bootstrap.sh"]);
     expect(configMap.data["bootstrap.sh"]).toContain("nemoclaw@latest");
+    expect(configMap.metadata.labels["nora.sandbox.profile"]).toBe("nemoclaw");
+    expect(deployment.metadata.labels["nora.sandbox.profile"]).toBe("nemoclaw");
+    expect(deployment.spec.template.metadata.labels["nora.sandbox.profile"]).toBe("nemoclaw");
+    expect(policies).toHaveLength(5);
+    expect(policies.map((policy) => policy.metadata.name)).toEqual(
+      expect.arrayContaining([
+        "nora-openclaw-default-deny-ingress",
+        "nora-openclaw-allow-trusted-ingress",
+        "nora-openclaw-nemoclaw-default-deny-egress",
+        "nora-openclaw-nemoclaw-allow-dns",
+        "nora-openclaw-nemoclaw-allow-external-web",
+      ]),
+    );
+    expect(
+      policies.find((policy) => policy.metadata.name === "nora-openclaw-allow-trusted-ingress")
+        .spec.ingress[0]._from,
+    ).toEqual([{ ipBlock: { cidr: "203.0.113.10/32" } }]);
+  });
+
+  it("skips NetworkPolicy reconciliation and reports degraded policy status when the cluster does not advertise support", async () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(k8sProfile());
+
+    const result = await backend.create({
+      id: "123",
+      name: "Nora QA",
+      vcpu: 2,
+      ram_mb: 2048,
+      env: { OPENAI_API_KEY: "test-key" },
+    });
+
+    expect(mockCreateNamespacedNetworkPolicy).not.toHaveBeenCalled();
+    expect(result.policyStatus).toBe("degraded");
+    expect(result.policyBundleApplied).toBe(false);
+    expect(result.policyIssue).toMatch(/degraded mode/i);
+  });
+
+  it("builds stable OpenClaw baseline NetworkPolicy objects with the expected selectors and ports", () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        exposureMode: "load-balancer",
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        loadBalancerSourceRanges: ["203.0.113.10/32"],
+      }),
+    );
+
+    const { policies, status } = backend._buildNetworkPolicies({
+      runtimeFamily: "openclaw",
+      sandboxProfile: "standard",
+      namespace: "openclaw-agents",
+    });
+
+    expect(status).toEqual({
+      policyStatus: "supported",
+      policyBundleAttempted: true,
+      policyBundleApplied: true,
+      policyIssue: null,
+    });
+    expect(policies.map((policy) => policy.metadata.name)).toEqual([
+      "nora-openclaw-default-deny-ingress",
+      "nora-openclaw-allow-trusted-ingress",
+    ]);
+    expect(policies[0].spec).toEqual({
+      podSelector: {
+        matchLabels: {
+          app: "openclaw-agent",
+          "nora.kubernetes.cluster": "test-cluster",
+        },
+      },
+      policyTypes: ["Ingress"],
+    });
+    expect(policies[1].spec.ingress[0]).toEqual({
+      _from: [{ ipBlock: { cidr: "203.0.113.10/32" } }],
+      ports: [
+        { protocol: "TCP", port: OPENCLAW_GATEWAY_PORT },
+        { protocol: "TCP", port: AGENT_RUNTIME_PORT },
+      ],
+    });
+  });
+
+  it("uses explicit trusted ingress CIDRs even for node-port targets", () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        exposureMode: "node-port",
+        runtimeHost: "172.26.0.2",
+        supportsNetworkPolicy: true,
+        policyEngine: "calico",
+        loadBalancerSourceRanges: ["172.26.0.5/32"],
+      }),
+    );
+
+    const { policies } = backend._buildNetworkPolicies({
+      runtimeFamily: "openclaw",
+      sandboxProfile: "standard",
+      namespace: "openclaw-agents",
+    });
+
+    expect(policies[1].spec.ingress[0]._from).toEqual([{ ipBlock: { cidr: "172.26.0.5/32" } }]);
+  });
+
+  it("builds family-aware Hermes ingress policies with Hermes selectors and ports", () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        exposureMode: "load-balancer",
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        loadBalancerSourceRanges: ["203.0.113.10/32"],
+      }),
+    );
+
+    const { policies } = backend._buildNetworkPolicies({
+      runtimeFamily: "hermes",
+      sandboxProfile: "standard",
+      namespace: "hermes-agents",
+    });
+
+    expect(policies.map((policy) => policy.metadata.name)).toEqual([
+      "nora-hermes-default-deny-ingress",
+      "nora-hermes-allow-trusted-ingress",
+    ]);
+    expect(policies[0].spec.podSelector.matchLabels).toEqual({
+      app: "hermes-agent",
+      "nora.kubernetes.cluster": "test-cluster",
+    });
+    expect(policies[1].spec.ingress[0].ports).toEqual([
+      { protocol: "TCP", port: 8642 },
+      { protocol: "TCP", port: HERMES_DASHBOARD_PORT },
+    ]);
+  });
+
+  it("builds NemoClaw egress policies that target only NemoClaw-labeled OpenClaw pods", () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        exposureMode: "load-balancer",
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        loadBalancerSourceRanges: ["203.0.113.10/32"],
+      }),
+    );
+
+    const { policies } = backend._buildNetworkPolicies({
+      runtimeFamily: "openclaw",
+      sandboxProfile: "nemoclaw",
+      namespace: "openclaw-agents",
+    });
+
+    expect(policies.map((policy) => policy.metadata.name)).toEqual([
+      "nora-openclaw-default-deny-ingress",
+      "nora-openclaw-allow-trusted-ingress",
+      "nora-openclaw-nemoclaw-default-deny-egress",
+      "nora-openclaw-nemoclaw-allow-dns",
+      "nora-openclaw-nemoclaw-allow-external-web",
+    ]);
+
+    const denyEgress = policies.find(
+      (policy) => policy.metadata.name === "nora-openclaw-nemoclaw-default-deny-egress",
+    );
+    const dnsAllow = policies.find(
+      (policy) => policy.metadata.name === "nora-openclaw-nemoclaw-allow-dns",
+    );
+
+    expect(denyEgress.spec.podSelector.matchLabels).toEqual({
+      app: "openclaw-agent",
+      "nora.kubernetes.cluster": "test-cluster",
+      "nora.sandbox.profile": "nemoclaw",
+    });
+    expect(denyEgress.spec.policyTypes).toEqual(["Egress"]);
+    expect(dnsAllow.spec.egress).toEqual([
+      {
+        ports: [
+          { protocol: "UDP", port: 53 },
+          { protocol: "TCP", port: 53 },
+        ],
+      },
+    ]);
+  });
+
+  it("reconciles NetworkPolicy objects before creating the OpenClaw deployment", async () => {
+    mockReadNamespacedService.mockResolvedValueOnce({
+      body: {
+        status: {
+          loadBalancer: {
+            ingress: [{ hostname: "phase3-openclaw-lb.example.com" }],
+          },
+        },
+      },
+    });
+
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        exposureMode: "load-balancer",
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        loadBalancerSourceRanges: ["203.0.113.10/32"],
+      }),
+    );
+
+    const result = await backend.create({
+      id: "phase3-openclaw",
+      name: "Phase3 OpenClaw",
+      vcpu: 2,
+      ram_mb: 2048,
+      env: { OPENAI_API_KEY: "test-key" },
+    });
+
+    expect(mockCreateNamespacedNetworkPolicy).toHaveBeenCalledTimes(2);
+    expect(mockCreateNamespacedDeployment).toHaveBeenCalledTimes(1);
+    expect(
+      mockCreateNamespacedNetworkPolicy.mock.invocationCallOrder[1],
+    ).toBeLessThan(mockCreateNamespacedDeployment.mock.invocationCallOrder[0]);
+    expect(result.policyStatus).toBe("supported");
+    expect(result.policyBundleAttempted).toBe(true);
+    expect(result.policyBundleApplied).toBe(true);
+  });
+
+  it("reconciles family-aware ingress policies before creating the Hermes deployment", async () => {
+    mockReadNamespacedService.mockResolvedValueOnce({
+      body: {
+        status: {
+          loadBalancer: {
+            ingress: [{ hostname: "phase3-hermes-lb.example.com" }],
+          },
+        },
+      },
+    });
+
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        exposureMode: "load-balancer",
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        loadBalancerSourceRanges: ["203.0.113.10/32"],
+        hermesNamespace: "hermes-agents",
+      }),
+    );
+
+    const result = await backend.create({
+      id: "phase3-hermes",
+      name: "Phase3 Hermes",
+      runtimeFamily: "hermes",
+      vcpu: 2,
+      ram_mb: 2048,
+      env: {},
+    });
+
+    const policies = mockCreateNamespacedNetworkPolicy.mock.calls.map((call) => call[0].body);
+    expect(policies.map((policy) => policy.metadata.name)).toEqual([
+      "nora-hermes-default-deny-ingress",
+      "nora-hermes-allow-trusted-ingress",
+    ]);
+    expect(mockCreateNamespacedDeployment).toHaveBeenCalledTimes(1);
+    expect(
+      mockCreateNamespacedNetworkPolicy.mock.invocationCallOrder[1],
+    ).toBeLessThan(mockCreateNamespacedDeployment.mock.invocationCallOrder[0]);
+    expect(result.policyStatus).toBe("supported");
+  });
+
+  it("replaces an existing NetworkPolicy instead of failing on redeploy", async () => {
+    mockCreateNamespacedNetworkPolicy
+      .mockRejectedValueOnce({
+        statusCode: 409,
+        body: { reason: "AlreadyExists", message: "already exists" },
+      })
+      .mockResolvedValue({});
+
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        exposureMode: "load-balancer",
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        loadBalancerSourceRanges: ["203.0.113.10/32"],
+      }),
+    );
+
+    await backend._upsertNetworkPolicy(
+      {
+        apiVersion: "networking.k8s.io/v1",
+        kind: "NetworkPolicy",
+        metadata: {
+          name: "nora-openclaw-default-deny-ingress",
+          namespace: "openclaw-agents",
+        },
+        spec: {
+          podSelector: { matchLabels: { app: "openclaw-agent" } },
+          policyTypes: ["Ingress"],
+        },
+      },
+      "openclaw-agents",
+    );
+
+    expect(mockReadNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "nora-openclaw-default-deny-ingress",
+      namespace: "openclaw-agents",
+    });
+    expect(mockReplaceNamespacedNetworkPolicy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "nora-openclaw-default-deny-ingress",
+        namespace: "openclaw-agents",
+        body: expect.objectContaining({
+          metadata: expect.objectContaining({
+            name: "nora-openclaw-default-deny-ingress",
+            resourceVersion: "networkpolicy-rv",
+          }),
+        }),
+      }),
+    );
   });
 
   it("returns cpu and memory telemetry from kubernetes pod metrics", async () => {
@@ -963,14 +1303,14 @@ describe("Hermes dashboard provisioning", () => {
     expect(config.Cmd).toEqual([
       expect.stringContaining('HERMES_BIN="/opt/hermes/.venv/bin/hermes"'),
     ]);
-    expect(config.Cmd[0]).toContain("exec /opt/hermes/docker/entrypoint.sh bash -lc");
+    expect(config.Cmd[0]).toContain("exec /init bash -lc");
     expect(config.Cmd[0]).toContain(
       'nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open',
     );
     expect(config.Cmd[0]).toContain(">> /opt/data/hermes-dashboard.log 2>&1");
     expect(config.Cmd[0]).not.toContain("/proc/1/fd");
     expect(config.Cmd[0]).toContain('exec "$HERMES_BIN" gateway run');
-    expect(config.Cmd[0].match(/\/opt\/hermes\/docker\/entrypoint\.sh/g)).toHaveLength(1);
+    expect(config.Cmd[0].match(/\/init/g)).toHaveLength(1);
     expect(config.ExposedPorts).toEqual({
       "8642/tcp": {},
       "9119/tcp": {},

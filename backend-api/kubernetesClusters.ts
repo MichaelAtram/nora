@@ -135,6 +135,28 @@ function normalizeBool(value, fallback = false) {
   return fallback;
 }
 
+function normalizeNullableBool(value, fallback = null) {
+  if (value === null || value === undefined || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const normalized = normalizeText(value).toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function detectPolicyEngineFromDaemonSets(items = []) {
+  const names = items
+    .map((item) => normalizeText(item?.metadata?.name).toLowerCase())
+    .filter(Boolean);
+  if (names.some((name) => name.includes("cilium"))) return "cilium";
+  if (names.some((name) => name.includes("calico"))) return "calico";
+  if (names.some((name) => name.includes("azure-npm") || name.includes("npm-"))) {
+    return "azure-npm";
+  }
+  return "";
+}
+
 function maskCluster(row) {
   const profile = rowToProfile(row, { includeSecret: false });
   return {
@@ -164,6 +186,8 @@ function rowToProfile(row, { includeSecret = false } = {}) {
       ? Boolean(row.kubeconfig_encrypted)
       : Boolean(normalizeText(row.kubeconfig_path));
   const testedOk = row.last_test_status === "ok";
+  const supportsNetworkPolicy = row.supports_network_policy === true;
+  const policyEngine = normalizeText(row.policy_engine);
   const issue = !configured
     ? row.credential_mode === "encrypted_kubeconfig"
       ? "Kubernetes cluster requires encrypted kubeconfig content."
@@ -212,6 +236,12 @@ function rowToProfile(row, { includeSecret = false } = {}) {
     loadBalancerClass: normalizeText(row.load_balancer_class),
     loadBalancerReadyTimeoutMs: parsePositiveInteger(row.load_balancer_ready_timeout_ms, 600000),
     loadBalancerReadyIntervalMs: parsePositiveInteger(row.load_balancer_ready_interval_ms, 5000),
+    supportsNetworkPolicy,
+    policyEngine: policyEngine || null,
+    policySupportStatus: supportsNetworkPolicy ? "supported" : "degraded",
+    policyIssue: supportsNetworkPolicy
+      ? null
+      : "Cluster does not currently advertise Kubernetes NetworkPolicy support. Nora will deploy in degraded mode and skip pod-level policy enforcement.",
     configured,
     connected: testedOk,
     available: row.enabled !== false && configured && testedOk,
@@ -321,6 +351,15 @@ function normalizeClusterInput(input = {}, existing = null) {
         existing?.load_balancer_ready_interval_ms,
       5000,
     ),
+    supportsNetworkPolicy: normalizeNullableBool(
+      input.supportsNetworkPolicy ??
+        input.supports_network_policy ??
+        existing?.supports_network_policy,
+      null,
+    ),
+    policyEngine: normalizeText(
+      input.policyEngine ?? input.policy_engine ?? existing?.policy_engine,
+    ),
   };
 }
 
@@ -374,14 +413,15 @@ async function createKubernetesCluster(input = {}) {
        openclaw_namespace, hermes_namespace, exposure_mode, runtime_host,
        runtime_node_port, gateway_node_port, service_annotations,
        load_balancer_source_ranges, load_balancer_class,
-       load_balancer_ready_timeout_ms, load_balancer_ready_interval_ms
+       load_balancer_ready_timeout_ms, load_balancer_ready_interval_ms,
+       supports_network_policy, policy_engine
      ) VALUES(
        $1, $2, $3, $4, $5, $6, $7,
        $8, $9, $10, $11,
        $12, $13, $14, $15,
        $16, $17, $18::jsonb,
        $19::text[], $20,
-       $21, $22
+       $21, $22, $23, $24
      )
      RETURNING *`,
     [
@@ -407,6 +447,8 @@ async function createKubernetesCluster(input = {}) {
       cluster.loadBalancerClass,
       cluster.loadBalancerReadyTimeoutMs,
       cluster.loadBalancerReadyIntervalMs,
+      cluster.supportsNetworkPolicy === true,
+      cluster.policyEngine,
     ],
   );
   if (cluster.isDefault) {
@@ -449,9 +491,11 @@ async function updateKubernetesCluster(clusterId, input = {}) {
             load_balancer_class = $20,
             load_balancer_ready_timeout_ms = $21,
             load_balancer_ready_interval_ms = $22,
-            last_test_status = CASE WHEN $23 THEN NULL ELSE last_test_status END,
-            last_test_message = CASE WHEN $23 THEN NULL ELSE last_test_message END,
-            last_tested_at = CASE WHEN $23 THEN NULL ELSE last_tested_at END,
+            supports_network_policy = COALESCE($23, supports_network_policy),
+            policy_engine = CASE WHEN $24 = '' THEN policy_engine ELSE $24 END,
+            last_test_status = CASE WHEN $25 THEN NULL ELSE last_test_status END,
+            last_test_message = CASE WHEN $25 THEN NULL ELSE last_test_message END,
+            last_tested_at = CASE WHEN $25 THEN NULL ELSE last_tested_at END,
             updated_at = NOW()
       WHERE id = $1
       RETURNING *`,
@@ -478,6 +522,8 @@ async function updateKubernetesCluster(clusterId, input = {}) {
       cluster.loadBalancerClass,
       cluster.loadBalancerReadyTimeoutMs,
       cluster.loadBalancerReadyIntervalMs,
+      cluster.supportsNetworkPolicy,
+      cluster.policyEngine,
       connectionInputChanged,
     ],
   );
@@ -582,6 +628,86 @@ function buildKubeConfig(profile) {
   return kc;
 }
 
+function unwrapKubernetesClientResponse(response) {
+  if (!response || typeof response !== "object") {
+    return response;
+  }
+  return response.body && typeof response.body === "object" ? response.body : response;
+}
+
+async function probeKubernetesNetworkPolicySupport(profile) {
+  const k8s = getK8sClient();
+  const kc = buildKubeConfig(profile);
+  const result = {
+    supportsNetworkPolicy: false,
+    policyEngine: "",
+    message: "Kubernetes API is reachable, but NetworkPolicy support could not be confirmed.",
+  };
+
+  if (!k8s.NetworkingV1Api || !k8s.AuthorizationV1Api) {
+    return result;
+  }
+
+  try {
+    const appsApi = k8s.AppsV1Api ? kc.makeApiClient(k8s.AppsV1Api) : null;
+    if (appsApi?.listNamespacedDaemonSet) {
+      const daemonSets = await appsApi.listNamespacedDaemonSet({
+        namespace: "kube-system",
+        limit: 100,
+      });
+      const daemonSetList = unwrapKubernetesClientResponse(daemonSets);
+      result.policyEngine = detectPolicyEngineFromDaemonSets(daemonSetList?.items || []);
+    }
+  } catch {
+    // Best-effort signal only.
+  }
+
+  try {
+    const authApi = kc.makeApiClient(k8s.AuthorizationV1Api);
+    const namespaces = Array.from(
+      new Set(
+        [
+          normalizeText(profile.openclawNamespace),
+          normalizeText(profile.hermesNamespace),
+          normalizeText(profile.namespace),
+        ].filter(Boolean),
+      ),
+    );
+    const reviews = await Promise.all(
+      namespaces.map((namespace) =>
+        authApi.createSelfSubjectAccessReview({
+          body: {
+            apiVersion: "authorization.k8s.io/v1",
+            kind: "SelfSubjectAccessReview",
+            spec: {
+              resourceAttributes: {
+                namespace,
+                group: "networking.k8s.io",
+                resource: "networkpolicies",
+                verb: "create",
+              },
+            },
+          },
+        }),
+      ),
+    );
+    const allowed = reviews.every(
+      (review) => unwrapKubernetesClientResponse(review)?.status?.allowed === true,
+    );
+    result.supportsNetworkPolicy = allowed && Boolean(result.policyEngine);
+    result.message = result.supportsNetworkPolicy
+      ? `Kubernetes API is reachable and NetworkPolicy support was detected${result.policyEngine ? ` (${result.policyEngine})` : ""}.`
+      : allowed
+        ? "Kubernetes API is reachable, but NetworkPolicy enforcement could not be confirmed from cluster signals."
+        : `Kubernetes API is reachable, but this kubeconfig cannot create NetworkPolicy resources in all required Nora namespaces (${namespaces.join(", ")}).`;
+  } catch (error) {
+    result.message =
+      error?.message || "Kubernetes API is reachable, but NetworkPolicy probing failed.";
+  }
+
+  return result;
+}
+
 async function testKubernetesCluster(clusterId) {
   const profile = await getKubernetesClusterProfile(`k8s:${clusterId}`);
   if (!profile) {
@@ -591,6 +717,8 @@ async function testKubernetesCluster(clusterId) {
   }
   let status = "ok";
   let message = "Kubernetes API is reachable.";
+  let supportsNetworkPolicy = normalizeBool(profile.supportsNetworkPolicy, false);
+  let policyEngine = normalizeText(profile.policyEngine);
   if (!profile.configured) {
     status = "failed";
     message = profile.issue || "Kubernetes cluster is not configured.";
@@ -600,6 +728,10 @@ async function testKubernetesCluster(clusterId) {
       const kc = buildKubeConfig(profile);
       const coreApi = kc.makeApiClient(k8s.CoreV1Api);
       await coreApi.listNamespace({ limit: 1 });
+      const policyProbe = await probeKubernetesNetworkPolicySupport(profile);
+      supportsNetworkPolicy = policyProbe.supportsNetworkPolicy;
+      policyEngine = policyProbe.policyEngine;
+      message = policyProbe.message || message;
     } catch (error) {
       status = "failed";
       message = error?.message || "Kubernetes API test failed.";
@@ -609,11 +741,13 @@ async function testKubernetesCluster(clusterId) {
     `UPDATE kubernetes_clusters
         SET last_test_status = $2,
             last_test_message = $3,
+            supports_network_policy = $4,
+            policy_engine = $5,
             last_tested_at = NOW(),
             updated_at = NOW()
       WHERE id = $1
       RETURNING *`,
-    [profile.id, status, message],
+    [profile.id, status, message, supportsNetworkPolicy, policyEngine],
   );
   return maskCluster(result.rows[0]);
 }

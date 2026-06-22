@@ -840,6 +840,15 @@ function buildKubernetesClusterExecutionTargetEntry(
   const enabled = runtimeFamilyEnabled && cluster.enabled !== false;
   const configured = cluster.configured !== false;
   const available = enabled && configured && cluster.available !== false;
+  const supportsNetworkPolicy = cluster.supportsNetworkPolicy === true;
+  const policyEngine = String(cluster.policyEngine || "").trim() || null;
+  const policySupportStatus =
+    cluster.policySupportStatus || (supportsNetworkPolicy ? "supported" : "degraded");
+  const policyIssue =
+    cluster.policyIssue ||
+    (supportsNetworkPolicy
+      ? null
+      : "Cluster does not currently advertise Kubernetes NetworkPolicy support. Nora will deploy in degraded mode.");
   const issue = available
     ? null
     : cluster.issue || (!enabled ? `${label} is disabled.` : `${label} is not configured.`);
@@ -858,6 +867,10 @@ function buildKubernetesClusterExecutionTargetEntry(
       configured,
       available: optionAvailable,
       issue,
+      supportsNetworkPolicy,
+      policyEngine,
+      policySupportStatus,
+      policyIssue,
       deployTarget: "k8s",
       executionTargetId,
       deployTargetLabel: label,
@@ -902,6 +915,10 @@ function buildKubernetesClusterExecutionTargetEntry(
     clusterName: cluster.clusterName || cluster.cluster_name || "",
     namespace: cluster.openclawNamespace || cluster.namespace || "",
     exposureMode: cluster.exposureMode || cluster.exposure_mode || "",
+    supportsNetworkPolicy,
+    policyEngine,
+    policySupportStatus,
+    policyIssue,
     enabled,
     configured,
     available,
