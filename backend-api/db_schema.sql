@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS kubernetes_clusters (
   load_balancer_ready_interval_ms INTEGER NOT NULL DEFAULT 5000,
   supports_network_policy BOOLEAN NOT NULL DEFAULT false,
   policy_engine TEXT NOT NULL DEFAULT '',
+  policy_settings JSONB NOT NULL DEFAULT '{}'::jsonb,
+  policy_settings_status JSONB NOT NULL DEFAULT '{}'::jsonb,
   last_test_status TEXT,
   last_test_message TEXT,
   last_tested_at TIMESTAMPTZ,

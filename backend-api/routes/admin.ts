@@ -11,7 +11,13 @@ const containerManager = require("../containerManager");
 const releaseUpgrade = require("../releaseUpgrade");
 const kubernetesClusters = require("../kubernetesClusters");
 const { repairHermesAgentConfig } = require("../hermesUi");
-const { addBackupJob, addDeploymentJob, getDLQJobs, retryDLQJob } = require("../redisQueue");
+const {
+  addBackupJob,
+  addDeploymentJob,
+  addKubernetesPolicyReconcileJob,
+  getDLQJobs,
+  retryDLQJob,
+} = require("../redisQueue");
 const backups = require("../backups");
 const { requireAdmin } = require("../middleware/auth");
 const { asyncHandler } = require("../middleware/errorHandler");
@@ -674,6 +680,44 @@ router.post(
             id: cluster.id,
             label: cluster.label,
             status: cluster.lastTestStatus,
+          },
+        },
+      }),
+    );
+    res.json(cluster);
+  }),
+);
+
+router.get(
+  "/kubernetes-clusters/:id/policy-settings",
+  asyncHandler(async (req, res) => {
+    res.json(await kubernetesClusters.getKubernetesClusterPolicySettings(req.params.id));
+  }),
+);
+
+router.put(
+  "/kubernetes-clusters/:id/policy-settings",
+  asyncHandler(async (req, res) => {
+    const cluster = await kubernetesClusters.updateKubernetesClusterPolicySettings(
+      req.params.id,
+      req.body || {},
+    );
+    await addKubernetesPolicyReconcileJob({
+      clusterId: cluster.id,
+      desiredHash: cluster.policySettingsStatus?.desiredHash || cluster.customPolicyDesiredHash,
+    });
+    res.locals.auditContext = { settings: { kind: "kubernetes_clusters", id: cluster.id } };
+    await monitoring.logEvent(
+      "admin_kubernetes_cluster_policy_settings_updated",
+      `Admin updated Kubernetes policy settings for "${cluster.label}"`,
+      adminAuditMetadata(req, {
+        settings: {
+          kind: "kubernetes_clusters",
+          cluster: {
+            id: cluster.id,
+            label: cluster.label,
+            policyState: cluster.customPolicyState,
+            customIngressConfigured: cluster.customIngressConfigured,
           },
         },
       }),

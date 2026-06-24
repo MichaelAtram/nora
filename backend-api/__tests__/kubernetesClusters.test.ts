@@ -30,7 +30,13 @@ jest.mock("@kubernetes/client-node", () => {
   return { KubeConfig, CoreV1Api, AppsV1Api, AuthorizationV1Api, NetworkingV1Api: class {} };
 });
 
-const { rowToProfile, testKubernetesCluster } = require("../kubernetesClusters");
+const {
+  buildPolicySettingsHash,
+  normalizePolicySettings,
+  rowToProfile,
+  testKubernetesCluster,
+  updateKubernetesClusterPolicySettings,
+} = require("../kubernetesClusters");
 
 function kubernetesClusterRow(overrides = {}) {
   return {
@@ -85,6 +91,146 @@ describe("kubernetes cluster registry", () => {
     expect(profile.policyEngine).toBe("cilium");
     expect(profile.policySupportStatus).toBe("supported");
     expect(profile.policyIssue).toBeNull();
+  });
+
+  it("normalizes ports and description for a valid ingress policy rule", () => {
+    const settings = normalizePolicySettings({
+      ingressRules: {
+        openclaw: [
+          {
+            cidr: "203.0.113.10/32",
+            ports: [9090, 18789, 9090],
+            description: " corp vpn ",
+          },
+        ],
+      },
+    });
+
+    expect(settings).toEqual({
+      ingressRules: {
+        openclaw: [
+          {
+            id: expect.any(String),
+            cidr: "203.0.113.10/32",
+            ports: [9090, 18789],
+            description: "corp vpn",
+          },
+        ],
+        hermes: [],
+      },
+    });
+  });
+
+  it("rejects duplicate CIDR entries within the same runtime family", () => {
+    expect(() =>
+      normalizePolicySettings({
+        ingressRules: {
+          openclaw: [
+            { cidr: "203.0.113.10/32", ports: [9090] },
+            { cidr: "203.0.113.10/32", ports: [18789] },
+          ],
+        },
+      }),
+    ).toThrow(/duplicate CIDR/i);
+  });
+
+  it("rejects ingress rules that target ports outside the runtime baseline", () => {
+    expect(() =>
+      normalizePolicySettings({
+        ingressRules: {
+          openclaw: [{ cidr: "203.0.113.10/32", ports: [8080] }],
+        },
+      }),
+    ).toThrow(/18789 and 9090/);
+  });
+
+  it("treats omitted runtime-family buckets as empty lists for full replacement", () => {
+    const settings = normalizePolicySettings({
+      ingressRules: {
+        hermes: [{ cidr: "198.51.100.0/24", ports: [8642] }],
+      },
+    });
+
+    expect(settings).toEqual({
+      ingressRules: {
+        openclaw: [],
+        hermes: [
+          {
+            id: expect.any(String),
+            cidr: "198.51.100.0/24",
+            ports: [8642],
+            description: null,
+          },
+        ],
+      },
+    });
+  });
+
+  it("maps custom policy summary fields onto cluster profiles", () => {
+    const policySettings = {
+      ingressRules: {
+        openclaw: [{ id: "rule-1", cidr: "203.0.113.10/32", ports: [18789, 9090] }],
+        hermes: [],
+      },
+    };
+    const desiredHash = buildPolicySettingsHash(policySettings);
+    const profile = rowToProfile(
+      kubernetesClusterRow({
+        policy_settings: policySettings,
+        policy_settings_status: {
+          state: "applied",
+          desiredHash,
+          appliedHash: desiredHash,
+          customPolicyAppliedAt: "2026-06-22T12:00:00.000Z",
+        },
+      }),
+    );
+
+    expect(profile.customPolicyConfigured).toBe(true);
+    expect(profile.customIngressConfigured).toBe(true);
+    expect(profile.customPolicyApplied).toBe(true);
+    expect(profile.customPolicyState).toBe("applied");
+    expect(profile.customPolicyDesiredHash).toBe(desiredHash);
+    expect(profile.customIngressRuleCounts).toEqual({ openclaw: 1, hermes: 0 });
+  });
+
+  it("persists normalized policy settings with queued desired-hash status", async () => {
+    const updated = kubernetesClusterRow({
+      policy_settings: {
+        ingressRules: {
+          openclaw: [{ id: "rule-1", cidr: "203.0.113.10/32", ports: [18789, 9090] }],
+          hermes: [],
+        },
+      },
+      policy_settings_status: {
+        state: "queued",
+        desiredHash: "hash-queued",
+        appliedHash: null,
+        lastAppliedNamespaces: null,
+        customPolicyIssue: null,
+        customPolicyAppliedAt: null,
+        updatedAt: "2026-06-22T12:00:00.000Z",
+      },
+    });
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [kubernetesClusterRow()] })
+      .mockResolvedValueOnce({ rows: [updated] });
+
+    const cluster = await updateKubernetesClusterPolicySettings("aks-eastus2", {
+      ingressRules: {
+        openclaw: [{ cidr: "203.0.113.10/32", ports: [9090, 18789] }],
+      },
+    });
+
+    expect(cluster.customPolicyState).toBe("queued");
+    expect(cluster.policySettings.ingressRules.openclaw[0]).toEqual({
+      id: "rule-1",
+      cidr: "203.0.113.10/32",
+      ports: [9090, 18789],
+      description: null,
+    });
+    expect(mockDb.query.mock.calls[1][1][1]).toContain('"openclaw"');
+    expect(mockDb.query.mock.calls[1][1][2]).toContain('"state":"queued"');
   });
 
   it("stores actionable connection-test failures for missing mounted kubeconfigs", async () => {

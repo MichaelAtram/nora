@@ -50,6 +50,7 @@ const K8S_UNAVAILABLE_CAPABILITIES = Object.freeze({
   disk: false,
   pids: false,
 });
+const OPERATOR_POLICY_FAMILIES = Object.freeze(["openclaw", "hermes"]);
 
 function parseK8sCpuCores(value) {
   if (value == null) return null;
@@ -700,6 +701,48 @@ class K8sBackend extends ProvisionerBackend {
     };
   }
 
+  _operatorPolicyName(runtimeFamily, suffix) {
+    return this._policyName(runtimeFamily, suffix);
+  }
+
+  _buildOperatorIngressPeers(rules = []) {
+    return rules.map((rule) => ({ ipBlock: { cidr: rule.cidr } }));
+  }
+
+  _buildOperatorIngressPorts(rules = []) {
+    return rules.map((rule) => ({
+      protocol: "TCP",
+      port: rule,
+    }));
+  }
+
+  _buildOperatorIngressPolicy(runtimeFamily, namespace, rules = []) {
+    const family = this._policyFamilyConfig(runtimeFamily);
+    const normalizedRules = Array.isArray(rules) ? rules : [];
+    return {
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: {
+        name: this._operatorPolicyName(runtimeFamily, "operator-allow-ingress"),
+        namespace,
+        labels: {
+          "nora.kubernetes.cluster": this.clusterId,
+          "nora.runtime.family": runtimeFamily,
+          "nora.policy.owner": "operator",
+          "nora.policy.kind": "operator-ingress",
+        },
+      },
+      spec: {
+        podSelector: { matchLabels: family.selector },
+        policyTypes: ["Ingress"],
+        ingress: normalizedRules.map((rule) => ({
+          _from: [{ ipBlock: { cidr: rule.cidr } }],
+          ports: this._buildOperatorIngressPorts(rule.ports),
+        })),
+      },
+    };
+  }
+
   _buildNemoclawDenyEgressPolicy(namespace) {
     return {
       apiVersion: "networking.k8s.io/v1",
@@ -857,6 +900,44 @@ class K8sBackend extends ProvisionerBackend {
     }
   }
 
+  async _deleteNetworkPolicyIfPresent(name, namespace = this.namespace) {
+    if (!this.networkingApi) {
+      throw new Error("Kubernetes NetworkingV1Api client is not available.");
+    }
+    try {
+      await this.networkingApi.deleteNamespacedNetworkPolicy({
+        name,
+        namespace,
+        propagationPolicy: "Foreground",
+      });
+    } catch (error) {
+      if (this._isNotFoundError(error)) return false;
+      throw error;
+    }
+
+    await this._waitForDeleted("NetworkPolicy", name, namespace, () =>
+      this.networkingApi.readNamespacedNetworkPolicy({ name, namespace }),
+    );
+    return true;
+  }
+
+  async _readNetworkPolicyIfPresent(name, namespace = this.namespace) {
+    if (!this.networkingApi) {
+      throw new Error("Kubernetes NetworkingV1Api client is not available.");
+    }
+    try {
+      return this._serviceObject(
+        await this.networkingApi.readNamespacedNetworkPolicy({
+          name,
+          namespace,
+        }),
+      );
+    } catch (error) {
+      if (this._isNotFoundError(error)) return null;
+      throw error;
+    }
+  }
+
   async _reconcileNetworkPolicies({
     runtimeFamily = "openclaw",
     sandboxProfile = "standard",
@@ -886,6 +967,103 @@ class K8sBackend extends ProvisionerBackend {
     }
 
     return status;
+  }
+
+  async _reconcileOperatorIngressPolicies({ runtimeFamily = "openclaw", namespace, rules = [] }) {
+    const name = this._operatorPolicyName(runtimeFamily, "operator-allow-ingress");
+    if (!Array.isArray(rules) || rules.length === 0) {
+      await this._deleteNetworkPolicyIfPresent(name, namespace);
+      const current = await this._readNetworkPolicyIfPresent(name, namespace);
+      if (current) {
+        throw new Error(
+          `Operator ingress policy ${name} still exists in ${namespace} after prune.`,
+        );
+      }
+      return { namespace, name, applied: false, pruned: true };
+    }
+
+    const policy = this._buildOperatorIngressPolicy(runtimeFamily, namespace, rules);
+    await this._upsertNetworkPolicy(policy, namespace);
+    const current = await this._readNetworkPolicyIfPresent(name, namespace);
+    if (!current?.metadata?.name) {
+      throw new Error(`Operator ingress policy ${name} could not be read back from ${namespace}.`);
+    }
+    return { namespace, name, applied: true, pruned: false };
+  }
+
+  async _cleanupStaleOperatorIngressPolicies({
+    runtimeFamily = "openclaw",
+    currentNamespace,
+    previousNamespaces = [],
+  }) {
+    const name = this._operatorPolicyName(runtimeFamily, "operator-allow-ingress");
+    const namespaces = Array.from(
+      new Set(
+        (Array.isArray(previousNamespaces) ? previousNamespaces : [])
+          .map((namespace) => String(namespace || "").trim())
+          .filter(Boolean),
+      ),
+    ).filter((namespace) => namespace !== currentNamespace);
+
+    for (const namespace of namespaces) {
+      await this._deleteNetworkPolicyIfPresent(name, namespace);
+      const current = await this._readNetworkPolicyIfPresent(name, namespace);
+      if (current) {
+        throw new Error(
+          `Stale operator ingress policy ${name} still exists in ${namespace} after cleanup.`,
+        );
+      }
+    }
+  }
+
+  async reconcilePolicySettings({ policySettings = null, policySettingsStatus = null } = {}) {
+    if (!this.supportsNetworkPolicy || !this.networkingApi) {
+      throw new Error(
+        "Cluster does not currently advertise Kubernetes NetworkPolicy support for operator policy reconciliation.",
+      );
+    }
+
+    const settings =
+      policySettings && typeof policySettings === "object"
+        ? policySettings
+        : this.profile.policySettings;
+    const status =
+      policySettingsStatus && typeof policySettingsStatus === "object"
+        ? policySettingsStatus
+        : this.profile.policySettingsStatus || {};
+    const ingressRules =
+      settings?.ingressRules && typeof settings.ingressRules === "object"
+        ? settings.ingressRules
+        : {};
+    const lastAppliedNamespaces =
+      status?.lastAppliedNamespaces && typeof status.lastAppliedNamespaces === "object"
+        ? status.lastAppliedNamespaces
+        : {};
+
+    const appliedNamespaces = {};
+    for (const runtimeFamily of OPERATOR_POLICY_FAMILIES) {
+      const namespace = this._namespaceForRuntimeFamily(runtimeFamily);
+      const rules = Array.isArray(ingressRules[runtimeFamily]) ? ingressRules[runtimeFamily] : [];
+      const previousNamespaces = Array.isArray(lastAppliedNamespaces[runtimeFamily])
+        ? lastAppliedNamespaces[runtimeFamily]
+        : [];
+
+      await this._cleanupStaleOperatorIngressPolicies({
+        runtimeFamily,
+        currentNamespace: namespace,
+        previousNamespaces,
+      });
+      await this._reconcileOperatorIngressPolicies({
+        runtimeFamily,
+        namespace,
+        rules,
+      });
+      appliedNamespaces[runtimeFamily] = [namespace];
+    }
+
+    return {
+      appliedNamespaces,
+    };
   }
 
   _serviceObject(response) {
@@ -1058,6 +1236,9 @@ class K8sBackend extends ProvisionerBackend {
       type: this._serviceType(),
     };
     if (this._isLoadBalancerExposure()) {
+      // Preserve the original client IP so Nora's CIDR-based ingress
+      // NetworkPolicies match the caller rather than an intermediate node IP.
+      spec.externalTrafficPolicy = "Local";
       if (this.loadBalancerSourceRanges.length > 0) {
         spec.loadBalancerSourceRanges = this.loadBalancerSourceRanges;
       }

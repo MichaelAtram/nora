@@ -20,7 +20,10 @@ const {
   applyPersistedHermesState,
   getPersistedHermesState,
 } = require("../../backend-api/hermesUi");
-const { getKubernetesClusterProfile } = require("../../backend-api/kubernetesClusters");
+const {
+  getKubernetesClusterProfile,
+  markKubernetesClusterPolicyStatus,
+} = require("../../backend-api/kubernetesClusters");
 const {
   buildIntegrationSyncEntry,
   decryptSensitiveConfig,
@@ -132,6 +135,11 @@ const CLAWHUB_INSTALL_LOCK_DURATION_MS = Math.max(CLAWHUB_INSTALL_TIMEOUT_MS + 1
 const CLAWHUB_INSTALL_LOCK_RENEW_MS = Math.max(
   Math.min(Math.floor(CLAWHUB_INSTALL_LOCK_DURATION_MS / 2), 120000),
   30000,
+);
+const K8S_POLICY_RECONCILE_CONCURRENCY = parsePositiveInteger(
+  process.env.K8S_POLICY_RECONCILE_WORKER_CONCURRENCY,
+  1,
+  { min: 1, max: 8 },
 );
 
 const PROVIDER_ENV_MAP = Object.freeze({
@@ -961,6 +969,70 @@ async function loadBackend(runtimeFields = {}) {
 
   backendInstances.set(key, instance);
   return instance;
+}
+
+async function runKubernetesPolicyReconcileJob({ clusterId }) {
+  const normalizedClusterId = String(clusterId || "").trim().toLowerCase();
+  if (!normalizedClusterId) {
+    throw new Error("Kubernetes policy reconcile job is missing clusterId");
+  }
+
+  const executionTargetId = `k8s:${normalizedClusterId}`;
+  const profile = await getKubernetesClusterProfile(executionTargetId);
+  if (!profile) {
+    console.warn(
+      `[k8s-policy-settings] Skipping reconcile for missing cluster ${normalizedClusterId}`,
+    );
+    return { skipped: true, clusterId: normalizedClusterId, reason: "cluster_missing" };
+  }
+
+  const desiredHash =
+    profile.policySettingsStatus?.desiredHash || profile.customPolicyDesiredHash || null;
+  const now = new Date().toISOString();
+
+  await markKubernetesClusterPolicyStatus(normalizedClusterId, {
+    state: "applying",
+    desiredHash,
+    customPolicyIssue: null,
+    updatedAt: now,
+  });
+
+  try {
+    const backend = await loadBackend({
+      backend_type: "k8s",
+      deploy_target: "k8s",
+      execution_target_id: executionTargetId,
+      runtime_family: "openclaw",
+      sandbox_profile: "standard",
+    });
+    const reconcileResult = await backend.reconcilePolicySettings({
+      policySettings: profile.policySettings,
+      policySettingsStatus: profile.policySettingsStatus,
+    });
+    await markKubernetesClusterPolicyStatus(normalizedClusterId, {
+      state: "applied",
+      desiredHash,
+      appliedHash: desiredHash,
+      lastAppliedNamespaces: reconcileResult.appliedNamespaces,
+      customPolicyIssue: null,
+      customPolicyAppliedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    return {
+      clusterId: normalizedClusterId,
+      desiredHash,
+      state: "applied",
+      appliedNamespaces: reconcileResult.appliedNamespaces,
+    };
+  } catch (error) {
+    await markKubernetesClusterPolicyStatus(normalizedClusterId, {
+      state: "failed",
+      desiredHash,
+      customPolicyIssue: error?.message || "Kubernetes policy reconcile failed.",
+      updatedAt: new Date().toISOString(),
+    });
+    throw error;
+  }
 }
 
 function safeK8sName(name, fallback) {
@@ -2312,6 +2384,40 @@ clawhubJobsWorker.on("completed", (job) => {
   );
 });
 
+const k8sPolicySettingsWorker = new Worker(
+  "k8s-policy-settings",
+  async (job) => {
+    const clusterId = String(job?.data?.clusterId || "").trim();
+    if (!clusterId) {
+      throw new Error("Kubernetes policy reconcile job is missing clusterId");
+    }
+    console.log(
+      `[k8s-policy-settings] Starting reconcile for cluster ${clusterId} (job ${job.id})`,
+    );
+    const result = await runKubernetesPolicyReconcileJob({ clusterId });
+    console.log(
+      `[k8s-policy-settings] Reconcile completed for cluster ${clusterId} (${result.state || "skipped"})`,
+    );
+    return result;
+  },
+  {
+    connection,
+    concurrency: K8S_POLICY_RECONCILE_CONCURRENCY,
+  },
+);
+
+k8sPolicySettingsWorker.on("failed", (job, err) => {
+  console.error(
+    `[k8s-policy-settings] job=${job?.id} cluster=${job?.data?.clusterId || "unknown"} failed: ${err.message}`,
+  );
+});
+
+k8sPolicySettingsWorker.on("completed", (job) => {
+  console.log(
+    `[k8s-policy-settings] job=${job?.id} cluster=${job?.data?.clusterId || "unknown"} completed successfully`,
+  );
+});
+
 // ── Alert Delivery Worker ────────────────────────────────────────
 // Each job is one (rule, webhook channel) pair. runAlertDeliveryJob throws
 // on non-2xx so BullMQ retries with exponential backoff (configured on the
@@ -2359,7 +2465,10 @@ const HEALTH_PORT = parseInt(process.env.WORKER_HEALTH_PORT || "4001");
 const healthServer = http.createServer((req, res) => {
   if (req.url === "/health") {
     const isReady =
-      worker.isRunning() && clawhubJobsWorker.isRunning() && alertDeliveryWorker.isRunning();
+      worker.isRunning() &&
+      clawhubJobsWorker.isRunning() &&
+      k8sPolicySettingsWorker.isRunning() &&
+      alertDeliveryWorker.isRunning();
     res.writeHead(isReady ? 200 : 503, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: isReady ? "ok" : "not_ready", uptime: process.uptime() }));
   } else {

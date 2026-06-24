@@ -27,6 +27,7 @@ const mockDeleteNamespacedConfigMap = jest.fn();
 const mockCreateNamespacedNetworkPolicy = jest.fn();
 const mockReadNamespacedNetworkPolicy = jest.fn();
 const mockReplaceNamespacedNetworkPolicy = jest.fn();
+const mockDeleteNamespacedNetworkPolicy = jest.fn();
 const mockGetNamespacedCustomObject = jest.fn();
 const mockLoadKubeconfigFromFile = jest.fn();
 
@@ -89,6 +90,7 @@ jest.mock(
             createNamespacedNetworkPolicy: mockCreateNamespacedNetworkPolicy,
             readNamespacedNetworkPolicy: mockReadNamespacedNetworkPolicy,
             replaceNamespacedNetworkPolicy: mockReplaceNamespacedNetworkPolicy,
+            deleteNamespacedNetworkPolicy: mockDeleteNamespacedNetworkPolicy,
           };
         }
         if (api === CustomObjectsApi) {
@@ -133,9 +135,10 @@ describe("provisioning runtime/gateway contracts", () => {
     mockDeleteNamespacedConfigMap.mockReset().mockResolvedValue({});
     mockCreateNamespacedNetworkPolicy.mockReset().mockResolvedValue({});
     mockReadNamespacedNetworkPolicy.mockReset().mockResolvedValue({
-      body: { metadata: { resourceVersion: "networkpolicy-rv" } },
+      body: { metadata: { name: "existing-networkpolicy", resourceVersion: "networkpolicy-rv" } },
     });
     mockReplaceNamespacedNetworkPolicy.mockReset().mockResolvedValue({});
+    mockDeleteNamespacedNetworkPolicy.mockReset().mockResolvedValue({});
     mockGetNamespacedCustomObject.mockReset().mockResolvedValue({});
     mockLoadKubeconfigFromFile.mockReset().mockReturnValue(undefined);
     delete process.env.GATEWAY_HOST;
@@ -548,6 +551,7 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(service.spec).toEqual(
       expect.objectContaining({
         type: "LoadBalancer",
+        externalTrafficPolicy: "Local",
         loadBalancerSourceRanges: ["203.0.113.10/32", "198.51.100.0/24"],
         loadBalancerClass: "eks.amazonaws.com/nlb",
       }),
@@ -935,6 +939,171 @@ describe("provisioning runtime/gateway contracts", () => {
         }),
       }),
     );
+  });
+
+  it("builds operator-managed ingress policies with CIDR-scoped peer rules", () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+      }),
+    );
+
+    const policy = backend._buildOperatorIngressPolicy("openclaw", "openclaw-agents", [
+      {
+        cidr: "203.0.113.10/32",
+        ports: [OPENCLAW_GATEWAY_PORT, AGENT_RUNTIME_PORT],
+      },
+    ]);
+
+    expect(policy.metadata).toEqual(
+      expect.objectContaining({
+        name: "nora-openclaw-operator-allow-ingress",
+        namespace: "openclaw-agents",
+        labels: expect.objectContaining({
+          "nora.policy.owner": "operator",
+          "nora.policy.kind": "operator-ingress",
+          "nora.runtime.family": "openclaw",
+        }),
+      }),
+    );
+    expect(policy.spec).toEqual({
+      podSelector: {
+        matchLabels: {
+          app: "openclaw-agent",
+          "nora.kubernetes.cluster": "test-cluster",
+        },
+      },
+      policyTypes: ["Ingress"],
+      ingress: [
+        {
+          _from: [{ ipBlock: { cidr: "203.0.113.10/32" } }],
+          ports: [
+            { protocol: "TCP", port: OPENCLAW_GATEWAY_PORT },
+            { protocol: "TCP", port: AGENT_RUNTIME_PORT },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("reconciles operator-managed ingress policies for both runtime families", async () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        openclawNamespace: "openclaw-agents",
+        hermesNamespace: "hermes-agents",
+      }),
+    );
+
+    const result = await backend.reconcilePolicySettings({
+      policySettings: {
+        ingressRules: {
+          openclaw: [{ cidr: "203.0.113.10/32", ports: [OPENCLAW_GATEWAY_PORT] }],
+          hermes: [{ cidr: "198.51.100.0/24", ports: [8642, HERMES_DASHBOARD_PORT] }],
+        },
+      },
+      policySettingsStatus: {
+        lastAppliedNamespaces: {
+          openclaw: ["openclaw-agents"],
+          hermes: ["hermes-agents"],
+        },
+      },
+    });
+
+    expect(result).toEqual({
+      appliedNamespaces: {
+        openclaw: ["openclaw-agents"],
+        hermes: ["hermes-agents"],
+      },
+    });
+    expect(mockCreateNamespacedNetworkPolicy).toHaveBeenCalledTimes(2);
+    expect(mockCreateNamespacedNetworkPolicy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        namespace: "openclaw-agents",
+        body: expect.objectContaining({
+          metadata: expect.objectContaining({
+            name: "nora-openclaw-operator-allow-ingress",
+          }),
+        }),
+      }),
+    );
+    expect(mockCreateNamespacedNetworkPolicy).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        namespace: "hermes-agents",
+        body: expect.objectContaining({
+          metadata: expect.objectContaining({
+            name: "nora-hermes-operator-allow-ingress",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("prunes empty operator-managed rules and cleans up stale namespaces", async () => {
+    const notFoundError = {
+      statusCode: 404,
+      body: { reason: "NotFound", message: "not found" },
+    };
+    mockReadNamespacedNetworkPolicy.mockReset().mockRejectedValue(notFoundError);
+
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(
+      k8sProfile({
+        supportsNetworkPolicy: true,
+        policyEngine: "cilium",
+        openclawNamespace: "openclaw-agents",
+        hermesNamespace: "hermes-agents",
+      }),
+    );
+
+    const result = await backend.reconcilePolicySettings({
+      policySettings: {
+        ingressRules: {
+          openclaw: [],
+          hermes: [],
+        },
+      },
+      policySettingsStatus: {
+        lastAppliedNamespaces: {
+          openclaw: ["legacy-openclaw", "openclaw-agents"],
+          hermes: ["legacy-hermes", "hermes-agents"],
+        },
+      },
+    });
+
+    expect(result).toEqual({
+      appliedNamespaces: {
+        openclaw: ["openclaw-agents"],
+        hermes: ["hermes-agents"],
+      },
+    });
+    expect(mockDeleteNamespacedNetworkPolicy).toHaveBeenCalledTimes(4);
+    expect(mockDeleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "nora-openclaw-operator-allow-ingress",
+      namespace: "legacy-openclaw",
+      propagationPolicy: "Foreground",
+    });
+    expect(mockDeleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "nora-openclaw-operator-allow-ingress",
+      namespace: "openclaw-agents",
+      propagationPolicy: "Foreground",
+    });
+    expect(mockDeleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "nora-hermes-operator-allow-ingress",
+      namespace: "legacy-hermes",
+      propagationPolicy: "Foreground",
+    });
+    expect(mockDeleteNamespacedNetworkPolicy).toHaveBeenCalledWith({
+      name: "nora-hermes-operator-allow-ingress",
+      namespace: "hermes-agents",
+      propagationPolicy: "Foreground",
+    });
   });
 
   it("returns cpu and memory telemetry from kubernetes pod metrics", async () => {

@@ -11,6 +11,7 @@ process.env.JWT_SECRET = JWT_SECRET;
 
 const mockDb = { query: jest.fn() };
 const mockAddDeploymentJob = jest.fn();
+const mockAddKubernetesPolicyReconcileJob = jest.fn();
 const mockGetDLQJobs = jest.fn();
 const mockRetryDLQJob = jest.fn();
 const mockBuildAgentStatsResponse = jest.fn();
@@ -78,6 +79,7 @@ const mockAssertKubernetesExecutionTargetAvailable = jest.fn().mockResolvedValue
 jest.mock("../db", () => mockDb);
 jest.mock("../redisQueue", () => ({
   addDeploymentJob: mockAddDeploymentJob,
+  addKubernetesPolicyReconcileJob: mockAddKubernetesPolicyReconcileJob,
   getDLQJobs: mockGetDLQJobs,
   retryDLQJob: mockRetryDLQJob,
 }));
@@ -85,6 +87,8 @@ jest.mock("../kubernetesClusters", () => ({
   assertKubernetesExecutionTargetAvailable: mockAssertKubernetesExecutionTargetAvailable,
   listKubernetesExecutionTargets: jest.fn().mockResolvedValue([]),
   listKubernetesClusters: jest.fn().mockResolvedValue([]),
+  getKubernetesClusterPolicySettings: jest.fn(),
+  updateKubernetesClusterPolicySettings: jest.fn(),
 }));
 jest.mock("../scheduler", () => ({
   selectNode: jest.fn().mockResolvedValue({ name: "worker-01" }),
@@ -327,6 +331,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockDb.query.mockReset();
   mockAddDeploymentJob.mockReset();
+  mockAddKubernetesPolicyReconcileJob.mockReset();
   mockGetDLQJobs.mockReset();
   mockRetryDLQJob.mockReset();
   mockBuildAgentStatsResponse.mockReset();
@@ -406,6 +411,149 @@ describe("admin routes", () => {
   it("rejects non-admin access to /admin/agents", async () => {
     const res = await withToken(request(app).get("/admin/agents"), userToken);
     expect(res.status).toBe(403);
+  });
+
+  it("returns Kubernetes policy settings for admins", async () => {
+    const kubernetesClustersModule = require("../kubernetesClusters");
+    kubernetesClustersModule.getKubernetesClusterPolicySettings.mockResolvedValueOnce({
+      id: "aks-eastus2",
+      label: "AKS East US 2",
+      policySettings: {
+        ingressRules: {
+          openclaw: [
+            {
+              id: "rule-1",
+              cidr: "203.0.113.10/32",
+              ports: [18789, 9090],
+              description: "corp vpn",
+            },
+          ],
+          hermes: [],
+        },
+      },
+      policySettingsStatus: {
+        state: "queued",
+        desiredHash: "hash-1",
+      },
+      customPolicyConfigured: true,
+      customIngressConfigured: true,
+      customPolicyApplied: false,
+      customPolicyState: "queued",
+      customPolicyDesiredHash: "hash-1",
+      supportsNetworkPolicy: true,
+      policyEngine: "cilium",
+    });
+
+    const res = await withToken(
+      request(app).get("/admin/kubernetes-clusters/aks-eastus2/policy-settings"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.policySettings.ingressRules.openclaw).toHaveLength(1);
+    expect(res.body.policySettingsStatus).toEqual({
+      state: "queued",
+      desiredHash: "hash-1",
+    });
+    expect(kubernetesClustersModule.getKubernetesClusterPolicySettings).toHaveBeenCalledWith(
+      "aks-eastus2",
+    );
+  });
+
+  it("updates Kubernetes policy settings, seeds queued status, and enqueues reconcile", async () => {
+    const kubernetesClustersModule = require("../kubernetesClusters");
+    const monitoringModule = require("../monitoring");
+    kubernetesClustersModule.updateKubernetesClusterPolicySettings.mockResolvedValueOnce({
+      id: "aks-eastus2",
+      label: "AKS East US 2",
+      policySettings: {
+        ingressRules: {
+          openclaw: [
+            {
+              id: "rule-1",
+              cidr: "203.0.113.10/32",
+              ports: [18789, 9090],
+              description: "corp vpn",
+            },
+          ],
+          hermes: [],
+        },
+      },
+      policySettingsStatus: {
+        state: "queued",
+        desiredHash: "hash-queued",
+      },
+      customPolicyConfigured: true,
+      customIngressConfigured: true,
+      customPolicyApplied: false,
+      customPolicyState: "queued",
+      customPolicyDesiredHash: "hash-queued",
+    });
+
+    const res = await withToken(
+      request(app)
+        .put("/admin/kubernetes-clusters/aks-eastus2/policy-settings")
+        .send({
+          ingressRules: {
+            openclaw: [
+              {
+                cidr: "203.0.113.10/32",
+                ports: [9090, 18789, 9090],
+                description: "corp vpn",
+              },
+            ],
+          },
+        }),
+      adminToken,
+    );
+
+    expect(res.status).toBe(200);
+    expect(kubernetesClustersModule.updateKubernetesClusterPolicySettings).toHaveBeenCalledWith(
+      "aks-eastus2",
+      {
+        ingressRules: {
+          openclaw: [
+            {
+              cidr: "203.0.113.10/32",
+              ports: [9090, 18789, 9090],
+              description: "corp vpn",
+            },
+          ],
+        },
+      },
+    );
+    expect(mockAddKubernetesPolicyReconcileJob).toHaveBeenCalledWith({
+      clusterId: "aks-eastus2",
+      desiredHash: "hash-queued",
+    });
+    expect(monitoringModule.logEvent).toHaveBeenCalledWith(
+      "admin_kubernetes_cluster_policy_settings_updated",
+      expect.stringContaining("AKS East US 2"),
+      expect.any(Object),
+    );
+    expect(res.body.customPolicyState).toBe("queued");
+  });
+
+  it("surfaces Kubernetes policy-settings validation errors", async () => {
+    const kubernetesClustersModule = require("../kubernetesClusters");
+    const error = new Error("openclaw ingress rules may only target ports 18789 and 9090.");
+    error.statusCode = 400;
+    kubernetesClustersModule.updateKubernetesClusterPolicySettings.mockRejectedValueOnce(error);
+
+    const res = await withToken(
+      request(app)
+        .put("/admin/kubernetes-clusters/aks-eastus2/policy-settings")
+        .send({
+          ingressRules: {
+            openclaw: [{ cidr: "203.0.113.10/32", ports: [8080] }],
+          },
+        }),
+      adminToken,
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/18789 and 9090/);
+    expect(mockAddKubernetesPolicyReconcileJob).not.toHaveBeenCalled();
   });
 
   it("returns deployment defaults for admins", async () => {
