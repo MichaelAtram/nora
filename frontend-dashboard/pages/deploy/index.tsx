@@ -23,6 +23,7 @@ import {
   RefreshCw,
   Trash2,
   Download,
+  Globe,
 } from "lucide-react";
 import { fetchWithAuth } from "../../lib/api";
 import { useToast } from "../../components/Toast";
@@ -30,6 +31,7 @@ import {
   activeExecutionTargetFromConfig,
   containerNamePrefixForSelection,
   formatRuntimeFamilyLabel,
+  mergeRemoteHostsIntoConfig,
   pickExecutionTargetSelection,
   pickRuntimeFamilySelection,
   runtimeFamilyFromConfig,
@@ -183,6 +185,8 @@ export default function Deploy() {
   const [migrationDraft, setMigrationDraft] = useState(null);
   const [migrationBusyAction, setMigrationBusyAction] = useState("");
   const [migrationSource, setMigrationSource] = useState(() => createEmptyMigrationSource());
+  const [adoptUrl, setAdoptUrl] = useState("");
+  const [adoptGatewayToken, setAdoptGatewayToken] = useState("");
   const [platformConfig, setPlatformConfig] = useState(null);
   const [viewerRole, setViewerRole] = useState("user");
   const migrationUploadInputRef = useRef(null);
@@ -230,9 +234,19 @@ export default function Deploy() {
       .then((r) => (r.ok ? r.json() : null))
       .then((profile) => setViewerRole(profile?.role || "user"))
       .catch(() => {});
-    fetch("/api/config/backends")
-      .then((r) => r.json())
-      .then(setBackendConfig)
+    // Fetch the global catalog and the operator's own connected remote hosts,
+    // then merge the hosts in as selectable targets before storing the config.
+    Promise.all([
+      fetch("/api/config/backends")
+        .then((r) => r.json())
+        .catch(() => null),
+      fetchWithAuth("/api/remote-hosts")
+        .then((r) => (r.ok ? r.json() : []))
+        .catch(() => []),
+    ])
+      .then(([config, hosts]) => {
+        if (config) setBackendConfig(mergeRemoteHostsIntoConfig(config, hosts));
+      })
       .catch(() => {});
     fetch("/api/config/platform")
       .then((r) => r.json())
@@ -369,6 +383,11 @@ export default function Deploy() {
     ).sort((left, right) => left - right);
   }, [platformConfig?.selfhosted?.max_disk_gb, selDisk]);
   const canDeployExecutionTarget = Boolean(activeSandboxOption?.available);
+  // Adopt mode registers an already-running external runtime by URL + token — it
+  // skips provisioning, so the execution-target / sandbox / resource selectors and
+  // the ClawHub step don't apply.
+  const isAdopt = deploymentMode === "adopt";
+  const canAdopt = Boolean(name.trim() && adoptUrl.trim() && adoptGatewayToken.trim());
   const isNemoClaw = activeSandboxOption?.id === "nemoclaw";
   const effectiveRuntimeFamily =
     runtimeFamilyLocked ||
@@ -568,8 +587,49 @@ export default function Deploy() {
     }
   }
 
+  async function adoptExternalRuntime() {
+    setLoading(true);
+    try {
+      const res = await fetchWithAuth("/api/agents/adopt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: name.trim(),
+          runtime_family: effectiveRuntimeFamily,
+          url: adoptUrl.trim(),
+          gateway_token: adoptGatewayToken.trim(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok) {
+        clearDeployDraft();
+        window.location.href = data?.id ? `/app/agents/${data.id}` : "/app/agents";
+        return;
+      }
+      if (res.status === 402) {
+        toast.error(data.error || fallbackLimitErrorMessage());
+        return;
+      }
+      toast.error(data.error || "Could not adopt the runtime. Check the URL and token.");
+    } catch (error) {
+      console.error(error);
+      toast.error("Network error while adopting the runtime.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handlePrimaryAction() {
-    if (loading || atLimit || !name.trim() || !canDeployExecutionTarget) return;
+    if (loading || atLimit || !name.trim()) return;
+
+    if (isAdopt) {
+      if (!canAdopt) return;
+      await adoptExternalRuntime();
+      return;
+    }
+
+    if (!canDeployExecutionTarget) return;
 
     const nextDraft = buildCurrentDeployDraft();
     if (!nextDraft) return;
@@ -773,14 +833,20 @@ export default function Deploy() {
               </div>
               <div>
                 <h1 className="text-xl sm:text-2xl md:text-3xl font-black text-slate-900 tracking-tight leading-none">
-                  {deploymentMode === "migrate" ? "Migrate Existing Agent" : "Deploy New Agent"}
+                  {isAdopt
+                    ? "Adopt Existing Runtime"
+                    : deploymentMode === "migrate"
+                      ? "Migrate Existing Agent"
+                      : "Deploy New Agent"}
                 </h1>
                 <p className="text-slate-400 font-medium mt-1">
-                  {deploymentMode === "migrate"
-                    ? "Inspect an existing OpenClaw or Hermes runtime, then recreate it under Nora control."
-                    : isHermes
-                      ? "Provision a new Hermes runtime path to your Nora control plane."
-                      : "Provision a new OpenClaw runtime path to your Nora control plane."}
+                  {isAdopt
+                    ? "Register an OpenClaw or Hermes runtime that's already running elsewhere, by its URL and gateway token."
+                    : deploymentMode === "migrate"
+                      ? "Inspect an existing OpenClaw or Hermes runtime, then recreate it under Nora control."
+                      : isHermes
+                        ? "Provision a new Hermes runtime path to your Nora control plane."
+                        : "Provision a new OpenClaw runtime path to your Nora control plane."}
                 </p>
               </div>
             </div>
@@ -790,11 +856,13 @@ export default function Deploy() {
                 Fast path to activation
               </p>
               <p className="text-sm text-blue-700/80 leading-relaxed">
-                {deploymentMode === "migrate"
-                  ? "This flow does not adopt the old runtime in place. Nora inspects the source, stores a migration draft, then recreates the workload as a Nora-managed agent so files, managed secrets, and runtime validation all land in one control surface."
-                  : isHermes
-                    ? "The goal of this screen is not just deployment - it is a complete first-run loop. Once the agent is live, finish activation by syncing an LLM provider and validating runtime health, logs, and terminal access."
-                    : "The goal of this screen is not just deployment - it is a complete first-run loop. Once the agent is live, finish activation by syncing an LLM provider and validating chat, logs, and terminal access."}
+                {isAdopt
+                  ? "Adoption does not provision anything. Nora validates the endpoint, then monitors and proxies the existing runtime so you can chat, view its dashboard, and track health from one control surface. Lifecycle (start/stop) stays with whoever runs it; “Deregister” later just removes it from Nora."
+                  : deploymentMode === "migrate"
+                    ? "This flow does not adopt the old runtime in place. Nora inspects the source, stores a migration draft, then recreates the workload as a Nora-managed agent so files, managed secrets, and runtime validation all land in one control surface."
+                    : isHermes
+                      ? "The goal of this screen is not just deployment - it is a complete first-run loop. Once the agent is live, finish activation by syncing an LLM provider and validating runtime health, logs, and terminal access."
+                      : "The goal of this screen is not just deployment - it is a complete first-run loop. Once the agent is live, finish activation by syncing an LLM provider and validating chat, logs, and terminal access."}
               </p>
             </div>
           </div>
@@ -886,7 +954,7 @@ export default function Deploy() {
                   ) : null}
                 </div>
 
-                <div className="grid gap-3 md:grid-cols-2">
+                <div className="grid gap-3 md:grid-cols-3">
                   <button
                     type="button"
                     onClick={() => setDeploymentMode("blank")}
@@ -925,6 +993,27 @@ export default function Deploy() {
                         <p className="text-sm font-black text-slate-900">Migrate Existing</p>
                         <p className="text-xs text-slate-500">
                           Import files, managed state, and supported secrets first.
+                        </p>
+                      </div>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeploymentMode("adopt")}
+                    className={`rounded-2xl border-2 px-5 py-5 text-left transition-all ${
+                      deploymentMode === "adopt"
+                        ? "border-blue-500 bg-blue-50"
+                        : "border-slate-200 bg-white hover:border-slate-300"
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-blue-500 text-white">
+                        <Globe size={20} />
+                      </div>
+                      <div>
+                        <p className="text-sm font-black text-slate-900">Adopt Existing</p>
+                        <p className="text-xs text-slate-500">
+                          Monitor a runtime already running elsewhere, by URL + token.
                         </p>
                       </div>
                     </div>
@@ -1361,290 +1450,338 @@ export default function Deploy() {
                   })}
                 </div>
               ) : null}
-              <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
-                Container Name{" "}
-                <span className="text-slate-300 font-medium normal-case tracking-normal">
-                  (optional)
-                </span>
-              </label>
-              <input
-                className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold text-slate-900 font-mono outline-none transition-all focus:ring-2 focus:ring-blue-500/20 focus:bg-white focus:border-blue-500/40 placeholder:text-slate-400 placeholder:font-sans"
-                placeholder={suggestedContainerName}
-                value={containerName}
-                onChange={(e) => setContainerName(e.target.value)}
-              />
+              {!isAdopt && (
+                <>
+                  <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
+                    Container Name{" "}
+                    <span className="text-slate-300 font-medium normal-case tracking-normal">
+                      (optional)
+                    </span>
+                  </label>
+                  <input
+                    className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold text-slate-900 font-mono outline-none transition-all focus:ring-2 focus:ring-blue-500/20 focus:bg-white focus:border-blue-500/40 placeholder:text-slate-400 placeholder:font-sans"
+                    placeholder={suggestedContainerName}
+                    value={containerName}
+                    onChange={(e) => setContainerName(e.target.value)}
+                  />
+                </>
+              )}
             </div>
 
-            <div className="flex flex-col gap-3">
-              <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
-                Execution Target
-              </label>
-              <div
-                className={`grid grid-cols-1 ${visibleExecutionTargets.length > 2 ? "md:grid-cols-2" : "md:grid-cols-2"} gap-3`}
-              >
-                {visibleExecutionTargets.map((target) => {
-                  const Icon = executionTargetIcon(target.id);
-                  const isSelected = selectedExecutionTarget === target.id;
-                  const isAvailable = target.available;
-                  return (
-                    <button
-                      key={target.id}
-                      type="button"
-                      onClick={() => {
-                        if (isAvailable) setSelectedExecutionTarget(target.id);
-                      }}
-                      className={`relative p-5 rounded-2xl border-2 text-left transition-all ${
-                        !isAvailable
-                          ? "border-slate-200 bg-slate-100 opacity-70 cursor-not-allowed"
-                          : isSelected
-                            ? "border-blue-500 bg-blue-50"
-                            : "border-slate-200 bg-slate-50 hover:border-slate-300"
-                      }`}
-                      disabled={!isAvailable}
-                    >
-                      <div className="flex items-start justify-between gap-3 mb-1">
-                        <div className="flex items-center gap-2">
-                          <Icon
-                            size={16}
-                            className={!isAvailable ? "text-slate-400" : "text-blue-600"}
-                          />
-                          <span className="text-sm font-bold text-slate-900">{target.label}</span>
-                        </div>
-                        <MaturityBadge
-                          maturityTier={target.maturityTier}
-                          maturityLabel={target.maturityLabel}
-                        />
-                      </div>
-                      <p className="text-[11px] text-slate-500 leading-relaxed">{target.summary}</p>
-                      {target.clusterName || target.namespace || target.exposureMode ? (
-                        <p className="mt-2 text-[11px] font-semibold leading-relaxed text-slate-600">
-                          {[
-                            target.clusterName ? `Cluster ${target.clusterName}` : "",
-                            target.namespace ? `Namespace ${target.namespace}` : "",
-                            target.exposureMode || "",
-                          ]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </p>
-                      ) : null}
-                      <div className="flex flex-wrap gap-2 mt-3">
-                        <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-1 text-[10px] font-bold text-slate-600 border border-slate-200">
-                          {target.runtimeFamilyLabel || "OpenClaw"}
-                        </span>
-                        {target.providerLabel ? (
-                          <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-1 text-[10px] font-bold text-slate-600 border border-slate-200">
-                            {target.providerLabel}
-                          </span>
-                        ) : null}
-                        {target.supportsSandboxSelection ? (
-                          <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-1 text-[10px] font-bold text-slate-600 border border-slate-200">
-                            Sandbox choice available
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-1 text-[10px] font-bold text-slate-600 border border-slate-200">
-                            {`Sandbox: ${target.defaultSandboxProfile === "nemoclaw" ? "NemoClaw" : "Standard"}`}
-                          </span>
-                        )}
-                      </div>
-                      {!isAvailable && target.issue ? (
-                        <p className="text-[10px] text-amber-600 font-medium mt-2">
-                          {target.issue}
-                        </p>
-                      ) : null}
-                    </button>
-                  );
-                })}
-              </div>
-              {visibleExecutionTargets.length === 0 ? (
-                <p className="text-xs text-amber-600 ml-2">
-                  {isAdmin
-                    ? "No execution targets are enabled for this Nora control plane."
-                    : "No onboarding-ready execution targets are enabled for this Nora control plane."}
+            {isAdopt && (
+              <div className="flex flex-col gap-3">
+                <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
+                  Runtime URL
+                </label>
+                <input
+                  className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold text-slate-900 outline-none transition-all focus:ring-2 focus:ring-blue-500/20 focus:bg-white focus:border-blue-500/40 placeholder:text-slate-400"
+                  placeholder={
+                    isHermes
+                      ? "https://runtime.example.com:9119"
+                      : "https://runtime.example.com:18789"
+                  }
+                  value={adoptUrl}
+                  onChange={(e) => setAdoptUrl(e.target.value)}
+                />
+                <p className="text-xs text-slate-500 ml-2">
+                  The reachable address of your already-running{" "}
+                  {isHermes ? "Hermes dashboard" : "OpenClaw gateway"}. Nora monitors and proxies it
+                  — it does not provision or control the runtime.
                 </p>
-              ) : null}
-            </div>
-
-            {showSandboxSelection && (
-              <div className="flex flex-col gap-3">
-                <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
-                  Sandbox
+                <label className="mt-2 text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
+                  Gateway Token
                 </label>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  {visibleSandboxOptions.map((profile) => {
-                    const Icon = sandboxIcon(profile.id);
-                    const isSelected = selectedSandboxProfile === profile.id;
-                    const isAvailable = profile.available;
+                <input
+                  type="password"
+                  className="w-full px-6 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm font-bold text-slate-900 outline-none transition-all focus:ring-2 focus:ring-blue-500/20 focus:bg-white focus:border-blue-500/40 placeholder:text-slate-400"
+                  placeholder="Gateway / API token"
+                  value={adoptGatewayToken}
+                  onChange={(e) => setAdoptGatewayToken(e.target.value)}
+                />
+                <p className="text-xs text-slate-500 ml-2">
+                  Used to authenticate Nora to your runtime. Keep it secret.
+                </p>
+              </div>
+            )}
 
-                    return (
-                      <button
-                        key={profile.id}
-                        type="button"
-                        onClick={() => {
-                          if (isAvailable) setSelectedSandboxProfile(profile.id);
-                        }}
-                        className={`relative p-5 rounded-2xl border-2 text-left transition-all ${
-                          !isAvailable
-                            ? "border-slate-200 bg-slate-100 opacity-70 cursor-not-allowed"
-                            : isSelected
-                              ? profile.id === "nemoclaw"
-                                ? "border-green-500 bg-green-50"
-                                : "border-blue-500 bg-blue-50"
-                              : "border-slate-200 bg-slate-50 hover:border-slate-300"
-                        }`}
-                        disabled={!isAvailable}
-                      >
-                        <div className="flex items-start justify-between gap-3 mb-1">
-                          <div className="flex items-center gap-2">
-                            <Icon
-                              size={16}
-                              className={
-                                !isAvailable
-                                  ? "text-slate-400"
-                                  : profile.id === "nemoclaw"
-                                    ? "text-green-600"
-                                    : "text-blue-600"
-                              }
+            {!isAdopt && (
+              <>
+                <div className="flex flex-col gap-3">
+                  <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
+                    Execution Target
+                  </label>
+                  <div
+                    className={`grid grid-cols-1 ${visibleExecutionTargets.length > 2 ? "md:grid-cols-2" : "md:grid-cols-2"} gap-3`}
+                  >
+                    {visibleExecutionTargets.map((target) => {
+                      const Icon = executionTargetIcon(target.id);
+                      const isSelected = selectedExecutionTarget === target.id;
+                      const isAvailable = target.available;
+                      return (
+                        <button
+                          key={target.id}
+                          type="button"
+                          onClick={() => {
+                            if (isAvailable) setSelectedExecutionTarget(target.id);
+                          }}
+                          className={`relative p-5 rounded-2xl border-2 text-left transition-all ${
+                            !isAvailable
+                              ? "border-slate-200 bg-slate-100 opacity-70 cursor-not-allowed"
+                              : isSelected
+                                ? "border-blue-500 bg-blue-50"
+                                : "border-slate-200 bg-slate-50 hover:border-slate-300"
+                          }`}
+                          disabled={!isAvailable}
+                        >
+                          <div className="flex items-start justify-between gap-3 mb-1">
+                            <div className="flex items-center gap-2">
+                              <Icon
+                                size={16}
+                                className={!isAvailable ? "text-slate-400" : "text-blue-600"}
+                              />
+                              <span className="text-sm font-bold text-slate-900">
+                                {target.label}
+                              </span>
+                            </div>
+                            <MaturityBadge
+                              maturityTier={target.maturityTier}
+                              maturityLabel={target.maturityLabel}
                             />
-                            <span className="text-sm font-bold text-slate-900">
-                              {profile.label}
-                            </span>
                           </div>
-                          <MaturityBadge
-                            maturityTier={profile.maturityTier}
-                            maturityLabel={profile.maturityLabel}
-                          />
-                        </div>
-                        <p className="text-[11px] text-slate-500 leading-relaxed">
-                          {profile.summary}
-                        </p>
-                        {!isAvailable && profile.issue ? (
-                          <p className="text-[10px] text-amber-600 font-medium mt-2">
-                            {profile.issue}
+                          <p className="text-[11px] text-slate-500 leading-relaxed">
+                            {target.summary}
                           </p>
-                        ) : null}
-                      </button>
-                    );
-                  })}
+                          {target.clusterName || target.namespace || target.exposureMode ? (
+                            <p className="mt-2 text-[11px] font-semibold leading-relaxed text-slate-600">
+                              {[
+                                target.clusterName ? `Cluster ${target.clusterName}` : "",
+                                target.namespace ? `Namespace ${target.namespace}` : "",
+                                target.exposureMode || "",
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
+                            </p>
+                          ) : null}
+                          <div className="flex flex-wrap gap-2 mt-3">
+                            <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-1 text-[10px] font-bold text-slate-600 border border-slate-200">
+                              {target.runtimeFamilyLabel || "OpenClaw"}
+                            </span>
+                            {target.providerLabel ? (
+                              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-1 text-[10px] font-bold text-slate-600 border border-slate-200">
+                                {target.providerLabel}
+                              </span>
+                            ) : null}
+                            {target.supportsSandboxSelection ? (
+                              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-1 text-[10px] font-bold text-slate-600 border border-slate-200">
+                                Sandbox choice available
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center rounded-full bg-white/80 px-2 py-1 text-[10px] font-bold text-slate-600 border border-slate-200">
+                                {`Sandbox: ${target.defaultSandboxProfile === "nemoclaw" ? "NemoClaw" : "Standard"}`}
+                              </span>
+                            )}
+                          </div>
+                          {!isAvailable && target.issue ? (
+                            <p className="text-[10px] text-amber-600 font-medium mt-2">
+                              {target.issue}
+                            </p>
+                          ) : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {visibleExecutionTargets.length === 0 ? (
+                    <p className="text-xs text-amber-600 ml-2">
+                      {isAdmin
+                        ? "No execution targets are enabled for this Nora control plane."
+                        : "No onboarding-ready execution targets are enabled for this Nora control plane."}
+                    </p>
+                  ) : null}
                 </div>
-              </div>
-            )}
 
-            {isNemoClaw && activeSandboxOption?.models?.length > 0 && (
-              <div className="flex flex-col gap-3">
-                <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
-                  Nemotron Model
-                </label>
-                <div className="flex items-center gap-3 px-4 py-3 bg-green-50 border border-green-200 rounded-2xl">
-                  <Brain size={16} className="text-green-600 shrink-0" />
-                  <select
-                    value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                    className="flex-1 bg-transparent text-sm font-bold text-slate-900 outline-none"
-                  >
-                    {activeSandboxOption.models.map((model) => (
-                      <option key={model} value={model}>
-                        {model.replace("nvidia/", "")}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex items-center gap-4 text-[10px] text-green-700 font-medium ml-2 flex-wrap">
-                  <span className="flex items-center gap-1">
-                    <ShieldCheck size={10} /> Deny-by-default network
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <Shield size={10} /> Capability-restricted
-                  </span>
-                </div>
-              </div>
-            )}
+                {showSandboxSelection && (
+                  <div className="flex flex-col gap-3">
+                    <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
+                      Sandbox
+                    </label>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {visibleSandboxOptions.map((profile) => {
+                        const Icon = sandboxIcon(profile.id);
+                        const isSelected = selectedSandboxProfile === profile.id;
+                        const isAvailable = profile.available;
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100 flex flex-col gap-2">
-                <div className="flex items-center gap-2 text-blue-600">
-                  <Cpu size={16} />
-                  <span className="text-[10px] font-black uppercase tracking-widest">vCPU</span>
-                </div>
-                {isSelfHosted ? (
-                  <select
-                    value={selVcpu}
-                    onChange={(e) => {
-                      resourceSelectionDirtyRef.current = true;
-                      setSelVcpu(Number(e.target.value));
-                    }}
-                    className="text-xl font-black text-slate-900 bg-transparent outline-none"
-                  >
-                    {Array.from(
-                      { length: platformConfig?.selfhosted?.max_vcpu || 16 },
-                      (_, i) => i + 1,
-                    ).map((v) => (
-                      <option key={v} value={v}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <span className="text-xl font-black text-slate-900">
-                    {sub?.vcpu || deploymentDefaults.vcpu}
-                  </span>
+                        return (
+                          <button
+                            key={profile.id}
+                            type="button"
+                            onClick={() => {
+                              if (isAvailable) setSelectedSandboxProfile(profile.id);
+                            }}
+                            className={`relative p-5 rounded-2xl border-2 text-left transition-all ${
+                              !isAvailable
+                                ? "border-slate-200 bg-slate-100 opacity-70 cursor-not-allowed"
+                                : isSelected
+                                  ? profile.id === "nemoclaw"
+                                    ? "border-green-500 bg-green-50"
+                                    : "border-blue-500 bg-blue-50"
+                                  : "border-slate-200 bg-slate-50 hover:border-slate-300"
+                            }`}
+                            disabled={!isAvailable}
+                          >
+                            <div className="flex items-start justify-between gap-3 mb-1">
+                              <div className="flex items-center gap-2">
+                                <Icon
+                                  size={16}
+                                  className={
+                                    !isAvailable
+                                      ? "text-slate-400"
+                                      : profile.id === "nemoclaw"
+                                        ? "text-green-600"
+                                        : "text-blue-600"
+                                  }
+                                />
+                                <span className="text-sm font-bold text-slate-900">
+                                  {profile.label}
+                                </span>
+                              </div>
+                              <MaturityBadge
+                                maturityTier={profile.maturityTier}
+                                maturityLabel={profile.maturityLabel}
+                              />
+                            </div>
+                            <p className="text-[11px] text-slate-500 leading-relaxed">
+                              {profile.summary}
+                            </p>
+                            {!isAvailable && profile.issue ? (
+                              <p className="text-[10px] text-amber-600 font-medium mt-2">
+                                {profile.issue}
+                              </p>
+                            ) : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
                 )}
-                <span className="text-[10px] text-slate-400 font-medium">cores</span>
-              </div>
-              <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100 flex flex-col gap-2">
-                <div className="flex items-center gap-2 text-emerald-600">
-                  <MemoryStick size={16} />
-                  <span className="text-[10px] font-black uppercase tracking-widest">RAM</span>
-                </div>
-                {isSelfHosted ? (
-                  <select
-                    value={selRam}
-                    onChange={(e) => {
-                      resourceSelectionDirtyRef.current = true;
-                      setSelRam(Number(e.target.value));
-                    }}
-                    className="text-xl font-black text-slate-900 bg-transparent outline-none"
-                  >
-                    {ramOptions.map((value) => (
-                      <option key={value} value={value}>
-                        {value >= 1024 ? `${value / 1024} GB` : `${value} MB`}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <span className="text-xl font-black text-slate-900">
-                    {(sub?.ram_mb || deploymentDefaults.ram_mb) / 1024}
-                  </span>
+
+                {isNemoClaw && activeSandboxOption?.models?.length > 0 && (
+                  <div className="flex flex-col gap-3">
+                    <label className="text-xs font-black text-slate-400 uppercase tracking-widest leading-none ml-2">
+                      Nemotron Model
+                    </label>
+                    <div className="flex items-center gap-3 px-4 py-3 bg-green-50 border border-green-200 rounded-2xl">
+                      <Brain size={16} className="text-green-600 shrink-0" />
+                      <select
+                        value={selectedModel}
+                        onChange={(e) => setSelectedModel(e.target.value)}
+                        className="flex-1 bg-transparent text-sm font-bold text-slate-900 outline-none"
+                      >
+                        {activeSandboxOption.models.map((model) => (
+                          <option key={model} value={model}>
+                            {model.replace("nvidia/", "")}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-4 text-[10px] text-green-700 font-medium ml-2 flex-wrap">
+                      <span className="flex items-center gap-1">
+                        <ShieldCheck size={10} /> Deny-by-default network
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <Shield size={10} /> Capability-restricted
+                      </span>
+                    </div>
+                  </div>
                 )}
-                <span className="text-[10px] text-slate-400 font-medium">GB</span>
-              </div>
-              <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100 flex flex-col gap-2">
-                <div className="flex items-center gap-2 text-purple-600">
-                  <HardDrive size={16} />
-                  <span className="text-[10px] font-black uppercase tracking-widest">Disk</span>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100 flex flex-col gap-2">
+                    <div className="flex items-center gap-2 text-blue-600">
+                      <Cpu size={16} />
+                      <span className="text-[10px] font-black uppercase tracking-widest">vCPU</span>
+                    </div>
+                    {isSelfHosted ? (
+                      <select
+                        value={selVcpu}
+                        onChange={(e) => {
+                          resourceSelectionDirtyRef.current = true;
+                          setSelVcpu(Number(e.target.value));
+                        }}
+                        className="text-xl font-black text-slate-900 bg-transparent outline-none"
+                      >
+                        {Array.from(
+                          { length: platformConfig?.selfhosted?.max_vcpu || 16 },
+                          (_, i) => i + 1,
+                        ).map((v) => (
+                          <option key={v} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span className="text-xl font-black text-slate-900">
+                        {sub?.vcpu || deploymentDefaults.vcpu}
+                      </span>
+                    )}
+                    <span className="text-[10px] text-slate-400 font-medium">cores</span>
+                  </div>
+                  <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100 flex flex-col gap-2">
+                    <div className="flex items-center gap-2 text-emerald-600">
+                      <MemoryStick size={16} />
+                      <span className="text-[10px] font-black uppercase tracking-widest">RAM</span>
+                    </div>
+                    {isSelfHosted ? (
+                      <select
+                        value={selRam}
+                        onChange={(e) => {
+                          resourceSelectionDirtyRef.current = true;
+                          setSelRam(Number(e.target.value));
+                        }}
+                        className="text-xl font-black text-slate-900 bg-transparent outline-none"
+                      >
+                        {ramOptions.map((value) => (
+                          <option key={value} value={value}>
+                            {value >= 1024 ? `${value / 1024} GB` : `${value} MB`}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span className="text-xl font-black text-slate-900">
+                        {(sub?.ram_mb || deploymentDefaults.ram_mb) / 1024}
+                      </span>
+                    )}
+                    <span className="text-[10px] text-slate-400 font-medium">GB</span>
+                  </div>
+                  <div className="p-5 rounded-2xl bg-slate-50 border border-slate-100 flex flex-col gap-2">
+                    <div className="flex items-center gap-2 text-purple-600">
+                      <HardDrive size={16} />
+                      <span className="text-[10px] font-black uppercase tracking-widest">Disk</span>
+                    </div>
+                    {isSelfHosted ? (
+                      <select
+                        value={selDisk}
+                        onChange={(e) => {
+                          resourceSelectionDirtyRef.current = true;
+                          setSelDisk(Number(e.target.value));
+                        }}
+                        className="text-xl font-black text-slate-900 bg-transparent outline-none"
+                      >
+                        {diskOptions.map((value) => (
+                          <option key={value} value={value}>
+                            {value}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span className="text-xl font-black text-slate-900">
+                        {sub?.disk_gb || deploymentDefaults.disk_gb}
+                      </span>
+                    )}
+                    <span className="text-[10px] text-slate-400 font-medium">GB SSD</span>
+                  </div>
                 </div>
-                {isSelfHosted ? (
-                  <select
-                    value={selDisk}
-                    onChange={(e) => {
-                      resourceSelectionDirtyRef.current = true;
-                      setSelDisk(Number(e.target.value));
-                    }}
-                    className="text-xl font-black text-slate-900 bg-transparent outline-none"
-                  >
-                    {diskOptions.map((value) => (
-                      <option key={value} value={value}>
-                        {value}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <span className="text-xl font-black text-slate-900">
-                    {sub?.disk_gb || deploymentDefaults.disk_gb}
-                  </span>
-                )}
-                <span className="text-[10px] text-slate-400 font-medium">GB SSD</span>
-              </div>
-            </div>
+              </>
+            )}
 
             <button
               onClick={handlePrimaryAction}
@@ -1652,8 +1789,10 @@ export default function Deploy() {
                 loading ||
                 atLimit ||
                 !name.trim() ||
-                !canDeployExecutionTarget ||
-                (deploymentMode === "migrate" && !migrationDraft?.id)
+                (isAdopt
+                  ? !canAdopt
+                  : !canDeployExecutionTarget ||
+                    (deploymentMode === "migrate" && !migrationDraft?.id))
               }
               className="w-full flex items-center justify-center gap-3 bg-blue-600 hover:bg-blue-700 transition-all text-sm font-black text-white px-8 py-5 rounded-2xl shadow-xl shadow-blue-500/30 active:scale-95 disabled:opacity-50 group"
             >
@@ -1664,13 +1803,15 @@ export default function Deploy() {
               )}
               {atLimit
                 ? "Agent Limit Reached"
-                : deploymentMode === "migrate" && !migrationDraft?.id
-                  ? "Prepare Migration Draft First"
-                  : !canDeployExecutionTarget
-                    ? "Selected Runtime Path Unavailable"
-                    : usesClawHubStep
-                      ? "Next: Choose Skills"
-                      : "Deploy Agent"}
+                : isAdopt
+                  ? "Adopt Runtime"
+                  : deploymentMode === "migrate" && !migrationDraft?.id
+                    ? "Prepare Migration Draft First"
+                    : !canDeployExecutionTarget
+                      ? "Selected Runtime Path Unavailable"
+                      : usesClawHubStep
+                        ? "Next: Choose Skills"
+                        : "Deploy Agent"}
             </button>
           </div>
 

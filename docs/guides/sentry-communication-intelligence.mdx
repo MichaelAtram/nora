@@ -5,52 +5,75 @@
 Sentry is a communication-triage agent built as an Agent Hub template. It watches the chats you point it at, stays silent on the noise, and surfaces only what needs you — direct mentions, real asks, decisions, deadlines, and the topics you care about.
 
 <Tip>
-  **Sentry** is just the default name. On first run the agent asks what you'd like to call it — rename it, or keep "Sentry."
+  **Sentry** is just the default name. On first run the agent asks what you'd like to call it —
+  rename it, or keep "Sentry."
 </Tip>
 
 ## Two different connections
+
 Sentry uses two separate things — don't confuse them:
+
 - **The channel that reaches you** (Channels tab) — how Sentry escalates to you.
 - **The sources it monitors** — the chats it reads (live via Integrations, or imported logs).
 
 ## Step 1 — Install from Agent Hub
+
 Open **Agent Hub**, find **Communication Intelligence Claw**, and click **Install**. See [Publish and install Agent Hub templates](/guides/agent-hub).
 
+<Frame caption="Agent Hub — Communication Intelligence Claw template detail before installation">
+  ![Sentry template detail](/images/guides/agent-templates/sentry-communication-intelligence.png)
+</Frame>
+
 ## Step 2 — Connect a channel to reach you
+
 Sentry needs **one** channel to escalate to you (Channels tab).
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">At [developers.facebook.com](https://developers.facebook.com), add the **WhatsApp** product.</Step>
-  <Step title="Copy credentials">Copy the **Phone Number ID** and an **Access Token**.</Step>
-  <Step title="Add the channel">Agent → **Channels** tab → add **WhatsApp** → paste the values.</Step>
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
+  </Step>
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
+  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Or use Telegram / Slack / Discord / email — see [Configure channels](/guides/channels).
+Or use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels).
 
 ## Step 3 — Point Sentry at what to watch
+
 Two ways, mix as needed:
 
 - **Live monitoring** — connect a source in the **Integrations** tab so Sentry reads it directly:
-  <CardGroup cols={3}>
-    <Card title="Slack" href="/guides/integrations/slack" icon="slack" arrow>Monitor channels/DMs.</Card>
-    <Card title="Microsoft Teams" href="/guides/integrations/teams" icon="microsoft" arrow>Monitor chats.</Card>
-    <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>Monitor threads.</Card>
+  <CardGroup cols={2}>
+    <Card title="Slack" href="/guides/integrations/slack" icon="slack" arrow>
+      Monitor channels/DMs.
+    </Card>
+    <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>
+      Monitor threads.
+    </Card>
   </CardGroup>
 - **Imported logs** — paste or import chat exports (WhatsApp/WeChat/group logs); no integration required.
 
 ## Step 4 — Run the bootstrap
+
 Send any first message. Sentry introduces itself, offers to rename, gets your reach-me channel connected, helps you point it at sources, then captures the people, channels, topics, and trigger rules that decide when it breaks silence.
 
 ## What Sentry will and won't do
+
 - **Silence by default** — it filters attention, it doesn't amplify chatter.
 - **Grounded** — never fabricates context; flags what still needs confirmation.
 
 ## Troubleshooting
+
 <AccordionGroup>
   <Accordion title="Sentry says a source isn't connected, but I added it">
-    Sentry reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the **Integrations** tab.
+    Sentry reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the
+    **Integrations** tab.
   </Accordion>
   <Accordion title="Too many (or too few) escalations">
-    Tune the trigger rules — key people, in-scope channels, topics, and what's always noise. Sentry escalates only when a trigger fires.
+    Tune the trigger rules — key people, in-scope channels, topics, and what's always noise. Sentry
+    escalates only when a trigger fires.
   </Accordion>
 </AccordionGroup>

@@ -48,7 +48,14 @@ test.describe("Complete platform journey", () => {
     };
 
     await page.goto("/signup");
-    await expect(page.getByRole("heading", { name: /create operator account/i })).toBeVisible();
+    // The signup heading is race-prone: it renders "Create operator account" by
+    // default, then flips to "Claim this server" once the async bootstrap-status
+    // fetch confirms a zero-user instance. On a fresh E2E stack the page settles
+    // on the claim variant, so accept either heading (same idiom as
+    // navigation.spec.ts) — this is just a "signup page is ready" gate.
+    await expect(
+      page.getByRole("heading", { name: /create operator account|claim this server/i }),
+    ).toBeVisible();
 
     await page.getByLabel(/email address/i).fill(admin.email);
     await page.getByLabel(/^password$/i).fill(admin.password);

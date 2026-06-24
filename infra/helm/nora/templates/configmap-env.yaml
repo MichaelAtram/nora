@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nora-env
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "config") | nindent 4 }}
+data:
+  NODE_ENV: production
+  PLATFORM_MODE: {{ .Values.platformMode | quote }}
+  ENABLED_BACKENDS: {{ .Values.enabledBackends | quote }}
+  ENABLED_RUNTIME_FAMILIES: {{ .Values.enabledRuntimeFamilies | quote }}
+  ENABLED_SANDBOX_PROFILES: {{ .Values.enabledSandboxProfiles | quote }}
+  NEXTAUTH_URL: {{ .Values.publicUrl | quote }}
+  CORS_ORIGINS: {{ .Values.publicUrl | quote }}
+  DB_HOST: {{ include "nora.dbHost" . | quote }}
+  DB_PORT: {{ include "nora.dbPort" . | quote }}
+  DB_USER: {{ include "nora.dbUser" . | quote }}
+  DB_NAME: {{ include "nora.dbName" . | quote }}
+  REDIS_HOST: {{ include "nora.redisHost" . | quote }}
+  REDIS_PORT: {{ include "nora.redisPort" . | quote }}
+  {{- range $key, $value := .Values.backendEnv }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

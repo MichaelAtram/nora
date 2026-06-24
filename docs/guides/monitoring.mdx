@@ -16,9 +16,25 @@ GET /api/monitoring/metrics
 
 Use this endpoint to get a high-level picture of your deployment before drilling into individual agents.
 
+## Fleet needs-attention
+
+The operator dashboard (`/app`) shows a **Needs attention** strip at the top that lists the agents you should look at right now and why. It is derived server-side at read time from existing state — no extra configuration — and stays hidden when the fleet is healthy, so it never adds noise to an all-clear deployment.
+
+It surfaces these reasons:
+
+| Reason             | Severity | Condition                                                              |
+| ------------------ | -------- | --------------------------------------------------------------------- |
+| Errored            | error    | Agent status is `error`                                               |
+| Budget cap reached | error    | Agent is paused at a budget cap (`paused_reason = budget_exceeded`)   |
+| Stuck deploying    | warning  | Agent has been queued or deploying for more than 10 minutes           |
+| Approaching budget | warning  | A running agent has crossed a budget soft threshold                   |
+| Stalled telemetry  | warning  | A running agent has reported no container stats for more than 5 minutes |
+
+Errors sort before warnings. The strip covers the agents you can access — directly owned plus workspace-shared. It is backed by the [fleet needs-attention roll-up](/api/monitoring) API (`GET /monitoring/fleet-status`, requires the `monitoring:read` scope), and the `nora doctor` [Fleet-health check](/guides/doctor) is built on the same roll-up.
+
 ## Agent-level metrics
 
-Each agent exposes a live stats snapshot and a historical stats series. Stats are collected every **10 seconds** and retained for **24 hours**.
+Each agent exposes a live stats snapshot and a historical stats series. Stats are collected every **5 seconds** and retained for **7 days**.
 
 ### Live stats
 
@@ -45,7 +61,7 @@ The response includes the following fields:
 | `running`         | boolean | Whether the container is currently running                          |
 
 <Note>
-  Live stats require a running container. If the agent is stopped or has no container, the endpoint returns a `409` error.
+  If the agent is stopped or has no container, the endpoint still returns `200` with `current.running: false` and an `error` field (e.g. "No container assigned") rather than live metrics.
 </Note>
 
 ### Historical stats
@@ -66,6 +82,8 @@ GET /api/agents/:id/stats/history?range=15m
 | `1h`      | Last 1 hour               |
 | `6h`      | Last 6 hours              |
 | `24h`     | Last 24 hours             |
+| `3d`      | Last 3 days               |
+| `7d`      | Last 7 days               |
 
 You can also query a custom window using ISO timestamps:
 
@@ -73,7 +91,7 @@ You can also query a custom window using ISO timestamps:
 GET /api/agents/:id/stats/history?from=2026-04-10T08:00:00Z&to=2026-04-10T09:00:00Z
 ```
 
-Each data point in the history response contains the same metric fields as the live stats endpoint, plus a `recorded_at` timestamp. Results are ordered by `recorded_at` ascending and capped at 2000 rows per query.
+Each data point in the history response contains the same metric fields as the live stats endpoint, plus a `recorded_at` timestamp. Results are ordered by `recorded_at` ascending and capped at 5000 rows for short windows (≤ 1 hour, returned un-aggregated) and 4000 rows for larger windows, which are time-bucketed/aggregated server-side.
 
 **Historical stat fields:**
 
@@ -159,6 +177,18 @@ To view one workspace's cost breakdown:
 ```http theme={null}
 GET /api/workspaces/:id/cost?period_days=30
 ```
+
+## Per-agent budget caps
+
+You can cap an agent's LLM spend so it pauses itself before it runs away. Open an agent's **Settings** tab and set one budget per period — `daily`, `weekly`, or `monthly` — each with a USD hard limit and a soft-threshold percent (default `80`).
+
+Nora enforces budgets automatically:
+
+- When spend crosses the soft threshold, Nora emits an `agent.budget_soft_exceeded` event as an early warning.
+- When spend reaches 100% of a period's limit, Nora pauses the runtime automatically, emits `agent.budget_exceeded`, and sets `paused_reason = budget_exceeded`.
+- Manually starting a still-over-cap agent clears `paused_reason`, but the budget sweep re-pauses it on its next cycle (within roughly a minute) while it remains over cap.
+
+Manage budgets through the API with `GET /api/agents/:id/budget`, `PUT /api/agents/:id/budget`, and `DELETE /api/agents/:id/budget/:budgetId` (see the [agents API reference](/api/agents)).
 
 ## Performance data
 

@@ -15,6 +15,10 @@ const {
 
 const router = express.Router();
 const FIRST_USER_ADMIN_LOCK_KEY = 20260408;
+const DUPLICATE_SIGNUP_MESSAGE = "Account already exists for this email";
+const SIGNUP_CHALLENGE_MESSAGE = "Complete the verification challenge and try again";
+const TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const RECAPTCHA_SITEVERIFY_URL = "https://www.google.com/recaptcha/api/siteverify";
 
 function isOAuthLoginEnabled() {
   return process.env.OAUTH_LOGIN_ENABLED === "true";
@@ -27,6 +31,127 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "Too many attempts, please try again later" },
 });
+
+function parsePositiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const signupBurstLimiter = rateLimit({
+  windowMs: parsePositiveIntegerEnv("SIGNUP_RATE_LIMIT_BURST_WINDOW_MS", 10 * 60 * 1000),
+  max: parsePositiveIntegerEnv("SIGNUP_RATE_LIMIT_BURST_MAX", 5),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many signup attempts, please try again later" },
+});
+
+const signupDailyLimiter = rateLimit({
+  windowMs: parsePositiveIntegerEnv("SIGNUP_RATE_LIMIT_DAILY_WINDOW_MS", 24 * 60 * 60 * 1000),
+  max: parsePositiveIntegerEnv("SIGNUP_RATE_LIMIT_DAILY_MAX", 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many signup attempts, please try again later" },
+});
+
+function createHttpError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function normalizeSignupBotProtectionProvider(value) {
+  const provider = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!provider) return "";
+  if (["none", "turnstile", "recaptcha"].includes(provider)) return provider;
+  return "invalid";
+}
+
+function getSignupBotProtectionConfig() {
+  const explicitProvider = normalizeSignupBotProtectionProvider(
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER,
+  );
+
+  if (explicitProvider === "none") return { provider: "none" };
+  if (explicitProvider === "invalid") {
+    return { provider: "invalid", error: "Invalid SIGNUP_BOT_PROTECTION_PROVIDER" };
+  }
+
+  const hasTurnstileSecret = Boolean(process.env.SIGNUP_TURNSTILE_SECRET);
+  const hasRecaptchaSecret = Boolean(process.env.SIGNUP_RECAPTCHA_SECRET);
+  let provider = explicitProvider;
+
+  if (!provider) {
+    if (hasTurnstileSecret && hasRecaptchaSecret) {
+      return {
+        provider: "invalid",
+        error:
+          "Both signup bot protection secrets are configured; set SIGNUP_BOT_PROTECTION_PROVIDER",
+      };
+    }
+    if (hasTurnstileSecret) provider = "turnstile";
+    if (hasRecaptchaSecret) provider = "recaptcha";
+  }
+
+  if (!provider) return { provider: "none" };
+
+  const secret =
+    provider === "turnstile"
+      ? process.env.SIGNUP_TURNSTILE_SECRET
+      : process.env.SIGNUP_RECAPTCHA_SECRET;
+
+  if (!secret) {
+    return {
+      provider: "invalid",
+      error: `Missing secret for signup ${provider} bot protection`,
+    };
+  }
+
+  return { provider, secret };
+}
+
+function getSignupBotProtectionToken(body = {}) {
+  return String(body.botProtectionToken || body.turnstileToken || body.recaptchaToken || "").trim();
+}
+
+async function verifySignupBotProtection(req) {
+  const config = getSignupBotProtectionConfig();
+  if (config.provider === "none") return;
+  if (config.provider === "invalid") {
+    throw createHttpError(config.error || "Signup bot protection is misconfigured", 500);
+  }
+
+  const token = getSignupBotProtectionToken(req.body);
+  if (!token) throw createHttpError(SIGNUP_CHALLENGE_MESSAGE, 403);
+
+  const body = new URLSearchParams({
+    secret: config.secret,
+    response: token,
+  });
+  if (req.ip) body.set("remoteip", req.ip);
+
+  const endpoint =
+    config.provider === "turnstile" ? TURNSTILE_SITEVERIFY_URL : RECAPTCHA_SITEVERIFY_URL;
+  let verifyRes;
+  let verifyData;
+  try {
+    verifyRes = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    verifyData = await verifyRes.json().catch(() => ({}));
+  } catch {
+    throw createHttpError(SIGNUP_CHALLENGE_MESSAGE, 403);
+  }
+
+  if (!verifyRes.ok || !verifyData?.success) {
+    throw createHttpError(SIGNUP_CHALLENGE_MESSAGE, 403);
+  }
+}
 
 // Precomputed bcrypt hash of a random high-entropy string. Used as a constant-
 // time dummy comparison target when a login attempt references a non-existent
@@ -75,9 +200,35 @@ async function nextRegisteredUserRole(client) {
   return result.rows[0]?.has_users ? "user" : "admin";
 }
 
+async function findExistingUserByEmail(email) {
+  const result = await db.query("SELECT id FROM users WHERE email=$1 LIMIT 1", [email]);
+  return result.rows[0] || null;
+}
+
+function isDuplicateUserError(error) {
+  return (
+    error?.code === "23505" ||
+    /duplicate key value/i.test(String(error?.message || "")) ||
+    /unique constraint/i.test(String(error?.message || ""))
+  );
+}
+
 // ─── Public routes ────────────────────────────────────────────────
 
-router.post("/signup", authLimiter, async (req, res) => {
+// First-run claim check: true until the first user registers (who becomes the
+// platform admin). The login/signup pages use it to render "Claim this server"
+// instead of a generic signup. Deliberately exposes only a boolean — user
+// count or emails would aid enumeration.
+router.get("/bootstrap-status", async (req, res) => {
+  try {
+    const { rows } = await db.query("SELECT 1 FROM users LIMIT 1");
+    res.json({ needsFirstAdmin: rows.length === 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post("/signup", signupBurstLimiter, signupDailyLimiter, async (req, res) => {
   const { email, password } = req.body;
   const normalizedEmail = normalizeEmail(email);
   const emailErr = validateEmail(normalizedEmail);
@@ -85,6 +236,10 @@ router.post("/signup", authLimiter, async (req, res) => {
   const pwErr = validatePassword(password);
   if (pwErr) return res.status(400).json({ error: pwErr });
   try {
+    await verifySignupBotProtection(req);
+    const existingUser = await findExistingUserByEmail(normalizedEmail);
+    if (existingUser) return res.status(409).json({ error: DUPLICATE_SIGNUP_MESSAGE });
+
     const hash = await bcrypt.hash(password, 10);
     const user = await withUserCreationLock(async (client) => {
       const role = await nextRegisteredUserRole(client);
@@ -96,7 +251,15 @@ router.post("/signup", authLimiter, async (req, res) => {
     });
     res.json(user);
   } catch (e) {
-    res.status(e.statusCode || 500).json({ error: e.message });
+    if (isDuplicateUserError(e)) {
+      return res.status(409).json({ error: DUPLICATE_SIGNUP_MESSAGE });
+    }
+    const statusCode = e.statusCode || 500;
+    if (statusCode >= 500) {
+      console.error("Signup failed:", e.message);
+      return res.status(500).json({ error: "Could not create account" });
+    }
+    res.status(statusCode).json({ error: e.message });
   }
 });
 
@@ -132,7 +295,7 @@ router.post("/login", authLimiter, async (req, res) => {
   }
 });
 
-router.post("/oauth-login", authLimiter, async (req, res) => {
+router.post("/oauth-login", authLimiter, async (req, res, next) => {
   if (!isOAuthLoginEnabled()) {
     return res.status(403).json({
       error: "OAuth login is disabled until server-side provider verification is implemented",
@@ -243,13 +406,13 @@ router.post("/oauth-login", authLimiter, async (req, res) => {
     ) {
       return res.status(401).json({ error: e.message });
     }
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
 // ─── Protected routes (require authenticateToken) ─────────────────
 
-router.patch("/password", authenticateToken, async (req, res) => {
+router.patch("/password", authenticateToken, async (req, res, next) => {
   try {
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword || !newPassword)
@@ -266,11 +429,11 @@ router.patch("/password", authenticateToken, async (req, res) => {
     await db.query("UPDATE users SET password_hash = $1 WHERE id = $2", [hash, req.user.id]);
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.get("/me", authenticateToken, async (req, res) => {
+router.get("/me", authenticateToken, async (req, res, next) => {
   try {
     const [result, languageSettings] = await Promise.all([
       db.query(
@@ -296,7 +459,7 @@ router.get("/me", authenticateToken, async (req, res) => {
       created_at: user.created_at,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 

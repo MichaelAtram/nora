@@ -1,9 +1,9 @@
-# Azure Portal screenshots — AKS setup
+# Azure Portal screenshots - AKS setup
 
-Reference images for the AKS setup guide. The checked-in SVGs are screenshot-style references for the fields operators need to find in the Azure Portal; replace them with manual portal captures if you need exact tenant-specific screenshots.
+These are real Azure Portal screenshots/crops used by the AKS provisioner-backend docs.
 
-## Expected files
+- `cluster-overview.png` - crop from Microsoft Learn AKS source image `articles/aks/media/access-private-cluster/azure-portal-cloud-shell-connect.png`.
+- `connect-cluster.png` - crop from Microsoft Learn AKS source image `articles/aks/media/access-private-cluster/azure-portal-cloud-shell-connect.png`.
+- `networking.png` - scaled from Microsoft Learn AKS source image `articles/aks/media/api-server-authorized-ip-ranges/azure-portal-existing-ranges.png`.
 
-- `cluster-overview.svg` — AKS cluster overview blade. Shows cluster name + resource group.
-- `connect-cluster.svg` — **Connect** blade with the `az aks get-credentials` command highlighted.
-- `networking.svg` — **Settings → Networking** showing the LoadBalancer SKU.
+Do not replace these with generated art or hand-drawn stand-ins. Refresh with real Azure Portal captures when the Azure UI changes.

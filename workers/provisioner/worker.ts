@@ -3,7 +3,11 @@ const { Worker } = require("bullmq");
 const IORedis = require("ioredis");
 const { Pool } = require("pg");
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
-const { runtimeUrlForAgent } = require("../../agent-runtime/lib/agentEndpoints");
+const { NEMOCLAW_DEFAULT_MODEL } = require("../../agent-runtime/lib/nemoclawDefaults");
+const {
+  runtimeUrlForAgent,
+  buildRuntimeAuthHeaders,
+} = require("../../agent-runtime/lib/agentEndpoints");
 const {
   getDefaultBackend,
   getEnabledBackends,
@@ -24,10 +28,18 @@ const {
   getKubernetesClusterProfile,
   markKubernetesClusterPolicyStatus,
 } = require("../../backend-api/kubernetesClusters");
+const { getRemoteHostProfile } = require("../../backend-api/remoteHosts");
+const {
+  allocateGatewayPort,
+  LOCAL_HOST_KEY,
+  DASHBOARD_PORT_PURPOSE,
+  RUNTIME_PORT_PURPOSE,
+} = require("../../backend-api/portAllocations");
 const {
   buildIntegrationSyncEntry,
   decryptSensitiveConfig,
 } = require("../../backend-api/integrations");
+const mcpServers = require("../../backend-api/mcpServers");
 const {
   HERMES_INTEGRATIONS_CONFIG_FILE,
   HERMES_INTEGRATIONS_DIR,
@@ -42,6 +54,9 @@ const {
   buildOpenClawCustomProviders,
   mapNoraProviderIdToOpenClaw,
 } = require("../../agent-runtime/lib/runtimeBootstrap");
+const {
+  buildHermesRuntimeBootstrapEnv,
+} = require("../../agent-runtime/lib/hermesRuntimeBootstrap");
 const { waitForAgentReadiness } = require("./healthChecks");
 const { buildReadinessWarningDetail, persistReadinessWarning } = require("./readinessWarning");
 const { shellSingleQuote } = require("../../agent-runtime/lib/containerCommand");
@@ -143,6 +158,9 @@ const K8S_POLICY_RECONCILE_CONCURRENCY = parsePositiveInteger(
 );
 
 const PROVIDER_ENV_MAP = Object.freeze({
+  // Zero-key demo stub; the sister NORA_DEMO_LLM_BASE_URL env var comes from
+  // the provider row's config.baseUrl through the standard mechanism below.
+  demo: "NORA_DEMO_LLM_TOKEN",
   anthropic: "ANTHROPIC_API_KEY",
   openai: "OPENAI_API_KEY",
   google: "GEMINI_API_KEY",
@@ -171,6 +189,9 @@ const PROVIDER_ENV_ENDPOINT_MAP = Object.freeze({
 });
 
 const PROVIDER_MODEL_DEFAULTS = Object.freeze({
+  // Bare model id — prefixed with the OpenClaw provider id (nora-demo) via
+  // mapNoraProviderIdToOpenClaw, same as microsoft-foundry below.
+  demo: "nora-demo-1",
   anthropic: "claude-sonnet-4-5",
   openai: "gpt-5.5",
   google: "gemini-3.1-pro-preview",
@@ -181,13 +202,13 @@ const PROVIDER_MODEL_DEFAULTS = Object.freeze({
   together: "together/moonshotai/Kimi-K2.5",
   cohere: "command-r-plus",
   xai: "grok-4",
-  nvidia: "nvidia/nvidia/nemotron-3-super-120b-a12b",
+  nvidia: NEMOCLAW_DEFAULT_MODEL,
   moonshot: "kimi-k2.5",
   zai: "glm-5",
   minimax: "MiniMax-M2.7",
   // Bare deployment name — buildDefaultModelCommand prefixes it with the
   // OpenClaw provider id (azure-openai-responses) via mapNoraProviderIdToOpenClaw.
-  "microsoft-foundry": "gpt-5.5",
+  "microsoft-foundry": "gpt-5.5-1",
 });
 
 const HERMES_NATIVE_PROVIDER_MAP = Object.freeze({
@@ -322,7 +343,48 @@ function pickProviderBaseUrl(config = {}) {
   return "";
 }
 
-function buildHermesModelConfig(defaultProvider = null) {
+function normalizeUrlForCompare(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\/+$/, "");
+}
+
+function resolveHermesProviderBaseUrl(defaultProvider = null) {
+  if (!defaultProvider) return "";
+  const providerId = String(defaultProvider.provider || "").trim();
+  if (!providerId) return "";
+
+  const savedConfig = normalizeProviderConfig(defaultProvider.config);
+  const savedBaseUrl = pickProviderBaseUrl(savedConfig);
+  return savedBaseUrl || HERMES_CUSTOM_PROVIDER_BASE_URLS[providerId] || "";
+}
+
+function resolveHermesModelApiKey(defaultProvider = null, envVars = {}) {
+  const providerId = String(defaultProvider?.provider || "").trim();
+  const envVar = PROVIDER_ENV_MAP[providerId];
+  return envVar && envVars?.[envVar] ? String(envVars[envVar]) : "";
+}
+
+function attachHermesCustomApiKey(modelConfig = null, defaultProvider = null, envVars = {}) {
+  if (!modelConfig || String(modelConfig.provider || "").trim() !== "custom") return modelConfig;
+
+  const apiKey = resolveHermesModelApiKey(defaultProvider, envVars);
+  if (!apiKey) return modelConfig;
+
+  const defaultBaseUrl = resolveHermesProviderBaseUrl(defaultProvider);
+  const modelBaseUrl = String(modelConfig.baseUrl || "").trim();
+  if (
+    modelBaseUrl &&
+    defaultBaseUrl &&
+    normalizeUrlForCompare(modelBaseUrl) !== normalizeUrlForCompare(defaultBaseUrl)
+  ) {
+    return modelConfig;
+  }
+
+  return { ...modelConfig, apiKey };
+}
+
+function buildHermesModelConfig(defaultProvider = null, envVars = {}) {
   if (!defaultProvider) return null;
 
   const providerId = String(defaultProvider.provider || "").trim();
@@ -350,17 +412,26 @@ function buildHermesModelConfig(defaultProvider = null) {
     };
   }
 
-  const resolvedBaseUrl = savedBaseUrl || HERMES_CUSTOM_PROVIDER_BASE_URLS[providerId] || "";
+  const resolvedBaseUrl = resolveHermesProviderBaseUrl(defaultProvider);
 
   if (!resolvedBaseUrl) {
     throw new Error(`Provider ${providerId} needs a base URL before Hermes can use it`);
   }
 
-  return {
+  const modelConfig = {
     provider: "custom",
     defaultModel: modelId,
     baseUrl: resolvedBaseUrl,
   };
+  const apiKey = resolveHermesModelApiKey(defaultProvider, envVars);
+  return apiKey ? { ...modelConfig, apiKey } : modelConfig;
+}
+
+function buildHermesRuntimeBootstrapEnvFor(defaultProvider = null, envVars = {}) {
+  return buildHermesRuntimeBootstrapEnv({
+    envVars,
+    modelConfig: buildHermesModelConfig(defaultProvider, envVars),
+  });
 }
 
 function hasMeaningfulHermesModelConfig(modelConfig = {}) {
@@ -409,11 +480,31 @@ function buildHermesEnvWriteCommand(envVars = {}) {
   ].join("\n");
 }
 
+function buildHermesPythonCommand(script) {
+  const encoded = Buffer.from(String(script || ""), "utf8").toString("base64");
+  return [
+    "set -eu",
+    'HERMES_ROOT="/opt/hermes"',
+    'HERMES_PYTHON="$HERMES_ROOT/.venv/bin/python"',
+    'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_PYTHON="$HERMES_ROOT/.venv/bin/python3"; fi',
+    'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_PYTHON="$(command -v python3 2>/dev/null || true)"; fi',
+    '[ -n "$HERMES_PYTHON" ] || exit 127',
+    'if [ -d "$HERMES_ROOT" ]; then cd "$HERMES_ROOT"; fi',
+    'PYTHONPATH="$HERMES_ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$HERMES_PYTHON" - <<\'PY\'',
+    "import base64",
+    "__nora_globals = {'__name__': '__main__'}",
+    `exec(base64.b64decode(${JSON.stringify(encoded)}).decode('utf-8'), __nora_globals)`,
+    "PY",
+  ].join("\n");
+}
+
 function buildHermesModelConfigWriteCommand(modelConfig = {}) {
   const payloadJson = JSON.stringify(modelConfig || {});
-  return `
-python3 - <<'PY'
+  const script = `
 import json
+import grp
+import os
+import pwd
 from pathlib import Path
 
 from hermes_cli.config import get_config_path, load_config, save_config
@@ -438,6 +529,8 @@ model = dict(current_model) if isinstance(current_model, dict) else {}
 default_model = str(payload.get("defaultModel") or "").strip()
 provider = str(payload.get("provider") or "").strip()
 base_url = str(payload.get("baseUrl") or "").strip()
+api_key_present = "apiKey" in payload or "api_key" in payload
+api_key = str(payload.get("apiKey") or payload.get("api_key") or "").strip()
 
 if default_model:
     model["default"] = default_model
@@ -454,6 +547,14 @@ if base_url:
 else:
     model.pop("base_url", None)
 
+if api_key_present:
+    if api_key:
+        model["api_key"] = api_key
+    else:
+        model.pop("api_key", None)
+elif provider and provider != "custom":
+    model.pop("api_key", None)
+
 if model:
     config["model"] = model
 else:
@@ -461,9 +562,20 @@ else:
 
 config_path = Path(get_config_path())
 save_config(config)
+try:
+    user = pwd.getpwnam("hermes")
+    group = grp.getgrnam("hermes")
+    os.chown(config_path, user.pw_uid, group.gr_gid)
+except Exception:
+    pass
+try:
+    config_path.chmod(0o600)
+except Exception:
+    pass
 
 print(json.dumps({"ok": True}))
-PY`.trim();
+`;
+  return buildHermesPythonCommand(script);
 }
 
 function pickProviderConfigApiVersion(config = {}) {
@@ -557,9 +669,18 @@ async function runRuntimeCommand(agent, command, { timeout = 30000 } = {}) {
     throw new Error("Agent runtime endpoint unavailable");
   }
 
+  // gateway_token is encrypted at rest; decrypt() is transparent to legacy
+  // plaintext, so it is safe whether the agent row was freshly selected
+  // (encrypted) or carries an in-memory plaintext token.
+  const { decrypt } = require("./crypto");
   const response = await fetch(runtimeUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...buildRuntimeAuthHeaders(
+        agent && agent.gateway_token ? decrypt(agent.gateway_token) : null,
+      ),
+    },
     body: JSON.stringify({
       command,
       timeout,
@@ -777,6 +898,7 @@ async function reconcileRuntimeLlmAuth({
   gatewayHostPort,
   gatewayHost,
   gatewayPort,
+  gatewayToken,
 } = {}) {
   const llmEnvVars = await fetchUserLlmEnvVars(userId);
   const defaultProvider = await fetchDefaultProvider(userId);
@@ -793,6 +915,7 @@ async function reconcileRuntimeLlmAuth({
     gateway_host_port: gatewayHostPort,
     gateway_host: gatewayHost,
     gateway_port: gatewayPort,
+    gateway_token: gatewayToken,
   };
 
   if (runtimeFamily === "hermes") {
@@ -808,7 +931,9 @@ async function reconcileRuntimeLlmAuth({
       }
     }
 
-    const modelConfig = persistedModelConfig || buildHermesModelConfig(defaultProvider);
+    const modelConfig = persistedModelConfig
+      ? attachHermesCustomApiKey(persistedModelConfig, defaultProvider, llmEnvVars)
+      : buildHermesModelConfig(defaultProvider, llmEnvVars);
     if (modelConfig) {
       await runProvisionerExecCommand(
         provisioner,
@@ -867,7 +992,17 @@ async function reconcileRuntimeLlmAuth({
   // Merge custom-provider registrations (Microsoft Foundry) into openclaw.json
   // before the restart so model strings like `microsoft-foundry/<deployment>`
   // resolve instead of throwing "Unknown model" on first request.
-  const customProviders = buildOpenClawCustomProviders(llmEnvVars);
+  const customProviderEnv =
+    defaultProvider?.provider === "microsoft-foundry"
+      ? {
+          ...llmEnvVars,
+          ...(defaultProvider.model ? { MICROSOFT_FOUNDRY_DEPLOYMENT: defaultProvider.model } : {}),
+          ...(buildDefaultOpenClawModel(defaultProvider)
+            ? { NORA_DEFAULT_OPENCLAW_MODEL: buildDefaultOpenClawModel(defaultProvider) }
+            : {}),
+        }
+      : llmEnvVars;
+  const customProviders = buildOpenClawCustomProviders(customProviderEnv);
   if (Object.keys(customProviders).length > 0) {
     const providerMergeCommand = buildOpenClawConfigMergeCommand({
       models: { providers: customProviders },
@@ -922,6 +1057,15 @@ function backendInstanceKey(runtimeFields = {}) {
   if (backend === "k8s" && runtimeFields.execution_target_id) {
     return String(runtimeFields.execution_target_id).trim().toLowerCase() || "k8s";
   }
+  if (backend === "remote-docker" && runtimeFields.execution_target_id) {
+    const target =
+      String(runtimeFields.execution_target_id).trim().toLowerCase() || "remote-docker";
+    // Encode the runtime/sandbox path so OpenClaw, Hermes, and NemoClaw agents
+    // on the same remote host do not share one cached adapter.
+    if (runtimeFields.runtime_family === "hermes") return `hermes:${target}`;
+    if (runtimeFields.sandbox_profile === "nemoclaw") return `nemoclaw:${target}`;
+    return target;
+  }
   return backend;
 }
 
@@ -962,6 +1106,52 @@ async function loadBackend(runtimeFields = {}) {
           "Kubernetes provisioning requires an Admin-registered cluster target such as k8s:aks-eastus2.",
         );
       }
+      if (key.startsWith("hermes:remote:")) {
+        const executionTargetId = key.slice("hermes:".length);
+        const profile = await getRemoteHostProfile(executionTargetId);
+        if (!profile) {
+          throw new Error(`Unknown remote host execution target: ${executionTargetId}`);
+        }
+        if (!profile.configured) {
+          throw new Error(
+            profile.issue || `Remote host ${executionTargetId} is not configured for provisioning.`,
+          );
+        }
+        instance = new (require("./backends/remote-hermes"))(profile);
+        break;
+      }
+      if (key.startsWith("nemoclaw:remote:")) {
+        const executionTargetId = key.slice("nemoclaw:".length);
+        const profile = await getRemoteHostProfile(executionTargetId);
+        if (!profile) {
+          throw new Error(`Unknown remote host execution target: ${executionTargetId}`);
+        }
+        if (!profile.configured) {
+          throw new Error(
+            profile.issue || `Remote host ${executionTargetId} is not configured for provisioning.`,
+          );
+        }
+        instance = new (require("./backends/remote-nemoclaw"))(profile);
+        break;
+      }
+      if (key.startsWith("remote:")) {
+        const profile = await getRemoteHostProfile(key);
+        if (!profile) {
+          throw new Error(`Unknown remote host execution target: ${key}`);
+        }
+        if (!profile.configured) {
+          throw new Error(
+            profile.issue || `Remote host ${key} is not configured for provisioning.`,
+          );
+        }
+        instance = new (require("./backends/remote-docker"))(profile);
+        break;
+      }
+      if (key === "remote-docker") {
+        throw new Error(
+          "Remote Docker provisioning requires a registered host target such as remote:my-laptop.",
+        );
+      }
       console.warn(`Unknown backend "${key}", falling back to docker`);
       instance = new (require("./backends/docker"))();
       break;
@@ -972,7 +1162,9 @@ async function loadBackend(runtimeFields = {}) {
 }
 
 async function runKubernetesPolicyReconcileJob({ clusterId }) {
-  const normalizedClusterId = String(clusterId || "").trim().toLowerCase();
+  const normalizedClusterId = String(clusterId || "")
+    .trim()
+    .toLowerCase();
   if (!normalizedClusterId) {
     throw new Error("Kubernetes policy reconcile job is missing clusterId");
   }
@@ -1610,12 +1802,27 @@ const worker = new Worker(
     try {
       const agentRowResult = await db.query(
         `SELECT image, template_payload, sandbox_type, backend_type, runtime_family,
-            deploy_target, execution_target_id, sandbox_profile, gateway_token
+            deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers
        FROM agents
       WHERE id = $1`,
         [id],
       );
       const agentRow = agentRowResult.rows[0] || {};
+      // gateway_token is encrypted at rest. Decrypt the stored value in place so
+      // the reuse path (k8s/Hermes pass it back into the container as the runtime
+      // password) gets plaintext. A rotated/corrupted key → treat as no reusable
+      // token so the backend generates a fresh one rather than failing the deploy.
+      if (agentRow.gateway_token) {
+        const { decrypt } = require("./crypto");
+        try {
+          agentRow.gateway_token = decrypt(agentRow.gateway_token);
+        } catch (err) {
+          console.warn(
+            `[provisioner] Could not decrypt stored gateway_token for agent ${id} — generating a fresh token: ${err.message}`,
+          );
+          agentRow.gateway_token = null;
+        }
+      }
       const storedRuntimeFields = buildAgentRuntimeFields(agentRow);
       const resolvedRuntimeFields = buildAgentRuntimeFields({
         runtime_family: storedRuntimeFields.runtime_family,
@@ -1664,6 +1871,10 @@ const worker = new Worker(
       const llmEnvVars = await fetchUserLlmEnvVars(userId);
       const defaultLlmProvider = await fetchDefaultProvider(userId);
       const defaultOpenClawModel = buildDefaultOpenClawModel(defaultLlmProvider);
+      const hermesRuntimeBootstrapEnv =
+        resolvedRuntimeFields.runtime_family === "hermes"
+          ? buildHermesRuntimeBootstrapEnvFor(defaultLlmProvider, llmEnvVars)
+          : {};
       if (Object.keys(llmEnvVars).length > 0) {
         console.log(
           `[provisioner] Injecting ${Object.keys(llmEnvVars).length} LLM provider key(s) for user ${userId}`,
@@ -1672,6 +1883,9 @@ const worker = new Worker(
 
       // Fetch integration credentials for this agent and inject as env vars into the container
       let integrationEnvVars = {};
+      // Decrypted creds for providers the operator enabled as MCP servers, keyed
+      // by provider — resolved into an openclaw.json mcpServers block below.
+      const mcpIntegrationsByProvider = {};
       try {
         const INTEGRATION_ENV_MAP = {
           huggingface: "HF_TOKEN",
@@ -1854,6 +2068,19 @@ const worker = new Worker(
               integrationEnvVars[cfgEnvName] = String(cfgValue);
             }
           }
+          // Stash the decrypted token+config for providers that can back an MCP
+          // server, so an enabled MCP server gets the credential its own server
+          // expects (which differs from the generic tool env var above).
+          if (mcpServers.isSupportedProvider(row.provider) && row.access_token) {
+            try {
+              mcpIntegrationsByProvider[row.provider] = {
+                token: decrypt(row.access_token),
+                config: cfg,
+              };
+            } catch {
+              // Already logged above when the tool token failed to decrypt.
+            }
+          }
         }
         if (Object.keys(integrationEnvVars).length > 0) {
           console.log(
@@ -1881,6 +2108,26 @@ const worker = new Worker(
         );
       }
 
+      // Resolve the agent's enabled MCP servers into openclaw.json entries
+      // (credential-injected). Empty unless the operator enabled one and the
+      // backing integration is connected. OpenClaw-only; ignored elsewhere.
+      let mcpServerEntries = [];
+      try {
+        mcpServerEntries = mcpServers.resolveMcpEntries({
+          enabledIds: agentRow.mcp_servers,
+          integrationsByProvider: mcpIntegrationsByProvider,
+        });
+        if (mcpServerEntries.length > 0) {
+          console.log(
+            `[provisioner] Wiring ${mcpServerEntries.length} MCP server(s) for agent ${id}: ${mcpServerEntries
+              .map((e) => e.name)
+              .join(", ")}`,
+          );
+        }
+      } catch (e) {
+        console.warn(`[provisioner] Failed to resolve MCP servers for agent ${id}:`, e.message);
+      }
+
       const configuredProvisionTimeout = parseTimeoutMs(process.env.PROVISION_TIMEOUT_MS, 840000);
       const jobTimeout = parseTimeoutMs(job?.opts?.timeout, 900000);
       const PROVISION_TIMEOUT = Math.min(
@@ -1897,12 +2144,61 @@ const worker = new Worker(
         runtimePort,
         gatewayHost,
         gatewayPort,
-        networkPolicyStatus;
+        networkPolicyStatus,
+        dashboardPort;
       try {
         const abortController = new AbortController();
         let provisionTimeoutHandle = null;
         if (resolvedBackend === "k8s" && container_name) {
           containerId = container_name;
+        }
+        // Reserve a collision-safe published gateway port for docker / remote-docker
+        // agents (k8s/proxmox manage their own ports). Idempotent per agent+host,
+        // so redeploys keep the same port; released via ON DELETE CASCADE.
+        let allocatedGatewayPort;
+        let allocatedRuntimePort;
+        let allocatedDashboardPort;
+        {
+          const deployTarget = resolvedRuntimeFields.deploy_target;
+          const allocationHostKey =
+            deployTarget === "remote-docker"
+              ? String(resolvedRuntimeFields.execution_target_id || "")
+                  .trim()
+                  .toLowerCase() || null
+              : deployTarget === "docker"
+                ? LOCAL_HOST_KEY
+                : null;
+          if (allocationHostKey) {
+            allocatedGatewayPort = await allocateGatewayPort({
+              hostKey: allocationHostKey,
+              agentId: id,
+            });
+            // Remote Hermes needs a SECOND published host port for its dashboard
+            // UI (9119), distinct from the runtime API port (8642 = the 'gateway'
+            // slot used for the readiness probe). Local Hermes reaches the
+            // dashboard on the compose network (no host publish), and OpenClaw has
+            // no separate dashboard, so neither allocates this slot.
+            if (
+              deployTarget === "remote-docker" &&
+              resolvedRuntimeFields.runtime_family === "hermes"
+            ) {
+              allocatedDashboardPort = await allocateGatewayPort({
+                hostKey: allocationHostKey,
+                agentId: id,
+                purpose: DASHBOARD_PORT_PURPOSE,
+              });
+            }
+            if (
+              deployTarget === "remote-docker" &&
+              resolvedRuntimeFields.runtime_family === "openclaw"
+            ) {
+              allocatedRuntimePort = await allocateGatewayPort({
+                hostKey: allocationHostKey,
+                agentId: id,
+                purpose: RUNTIME_PORT_PURPOSE,
+              });
+            }
+          }
         }
         const createPromise = provisioner.create({
           id,
@@ -1912,8 +2208,12 @@ const worker = new Worker(
           ram_mb,
           disk_gb,
           container_name,
+          gatewayHostPort: allocatedGatewayPort,
+          runtimeHostPort: allocatedRuntimePort,
+          dashboardHostPort: allocatedDashboardPort,
           gatewayToken: agentRow.gateway_token || undefined,
           templatePayload,
+          mcpServers: mcpServerEntries,
           runtimeFamily: resolvedRuntimeFields.runtime_family,
           deployTarget: resolvedRuntimeFields.deploy_target,
           executionTargetId: resolvedRuntimeFields.execution_target_id,
@@ -1936,6 +2236,7 @@ const worker = new Worker(
             ...(defaultOpenClawModel && resolvedRuntimeFields.runtime_family === "openclaw"
               ? { NORA_DEFAULT_OPENCLAW_MODEL: defaultOpenClawModel }
               : {}),
+            ...hermesRuntimeBootstrapEnv,
             ...agentSecretEnvVars,
             ...integrationEnvVars,
             ...llmEnvVars,
@@ -1982,6 +2283,7 @@ const worker = new Worker(
                 policyIssue: result.policyIssue || null,
               }
             : null;
+        dashboardPort = result.dashboardPort || null;
 
         // Persist container_id immediately so that if the worker crashes or the
         // final status UPDATE fails below, the container can still be located
@@ -2086,6 +2388,7 @@ const worker = new Worker(
                 gateway_host_port: gatewayHostPort,
                 gateway_host: gatewayHost,
                 gateway_port: gatewayPort,
+                dashboard_port: dashboardPort,
               },
               persistedHermesState,
               { restart: true },
@@ -2115,7 +2418,11 @@ const worker = new Worker(
         throw err;
       }
 
-      // Update agent with real container info
+      // Update agent with real container info. gateway_token is encrypted at
+      // rest (no-op when ENCRYPTION_KEY is unset); the in-memory gatewayToken
+      // stays plaintext for the integration-sync auth call below.
+      const { encrypt } = require("./crypto");
+      const gatewayTokenForStorage = gatewayToken ? encrypt(gatewayToken) : gatewayToken;
       try {
         await db.query(
           `UPDATE agents
@@ -2136,14 +2443,15 @@ const worker = new Worker(
               execution_target_id = $15,
               sandbox_profile = $16,
               sandbox_type = $17,
-              network_policy_status = $18
+              network_policy_status = $18,
+              dashboard_port = $19
         WHERE id = $1`,
           [
             id,
             containerId,
             host,
             resolvedRuntimeFields.backend_type,
-            gatewayToken,
+            gatewayTokenForStorage,
             containerName || null,
             gatewayHostPort ? parseInt(gatewayHostPort, 10) : null,
             runtimeHost || null,
@@ -2157,6 +2465,7 @@ const worker = new Worker(
             resolvedRuntimeFields.sandbox_profile,
             resolvedRuntimeFields.sandbox_type,
             networkPolicyStatus,
+            dashboardPort ? parseInt(dashboardPort, 10) : null,
           ],
         );
         await db.query("UPDATE deployments SET status = 'completed' WHERE agent_id = $1", [id]);
@@ -2202,6 +2511,7 @@ const worker = new Worker(
               gatewayHostPort,
               gatewayHost,
               gatewayPort,
+              gatewayToken,
             });
             if (authSyncResult.status === "synced") {
               console.log(`[provisioner] Post-deploy LLM auth sync completed for agent ${id}`);
@@ -2252,7 +2562,10 @@ const worker = new Worker(
             );
             await fetch(runtimeUrl, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+                ...buildRuntimeAuthHeaders(gatewayToken),
+              },
               body: JSON.stringify({ integrations: syncData }),
             });
             console.log(`[provisioner] Synced ${syncData.length} integration(s) to agent ${id}`);
@@ -2459,6 +2772,37 @@ alertDeliveryWorker.on("completed", (job) => {
   console.log(`[alert-deliveries] Job ${job.id} delivered`);
 });
 
+// ── Scheduled Agent Run Worker ───────────────────────────────────
+// The backend sweep enqueues one job per due schedule; runScheduledAction
+// (backend-api) executes the prompt/lifecycle action against the agent. It
+// throws on failure so BullMQ applies the queue's bounded retry.
+const { runScheduledAction } = require("../../backend-api/scheduleRunner");
+const SCHEDULE_RUN_CONCURRENCY = parsePositiveInteger(
+  process.env.SCHEDULE_RUN_WORKER_CONCURRENCY,
+  5,
+);
+
+const scheduleRunWorker = new Worker(
+  "agent-schedules",
+  async (job) => runScheduledAction(job.data),
+  { connection, concurrency: SCHEDULE_RUN_CONCURRENCY },
+);
+
+scheduleRunWorker.on("failed", (job, err) => {
+  if (!job) return;
+  const attemptsMade = job.attemptsMade || 0;
+  const maxAttempts = job.opts?.attempts || 2;
+  console.error(
+    `[agent-schedules] Job ${job.id} (schedule ${job.data?.scheduleId}) attempt ${attemptsMade}/${maxAttempts} failed: ${err.message}`,
+  );
+});
+
+scheduleRunWorker.on("completed", (job) => {
+  console.log(
+    `[agent-schedules] Job ${job.id} ran (${job.data?.actionType} on agent ${job.data?.agentId})`,
+  );
+});
+
 // ── Health Check Server ──────────────────────────────────────────
 const http = require("http");
 const HEALTH_PORT = parseInt(process.env.WORKER_HEALTH_PORT || "4001");
@@ -2467,8 +2811,9 @@ const healthServer = http.createServer((req, res) => {
     const isReady =
       worker.isRunning() &&
       clawhubJobsWorker.isRunning() &&
+      alertDeliveryWorker.isRunning() &&
       k8sPolicySettingsWorker.isRunning() &&
-      alertDeliveryWorker.isRunning();
+      scheduleRunWorker.isRunning();
     res.writeHead(isReady ? 200 : 503, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: isReady ? "ok" : "not_ready", uptime: process.uptime() }));
   } else {

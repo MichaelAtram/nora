@@ -3,6 +3,8 @@ const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
 const integrations = require("../integrations");
+const mcpServers = require("../mcpServers");
+const { runtimeAuthHeaders } = require("../runtimeAuth");
 const { encrypt, decrypt } = require("../crypto");
 const { rpcCall } = require("../gatewayProxy");
 const { runContainerCommand, syncAuthToUserAgents } = require("../authSync");
@@ -36,6 +38,10 @@ const SINGLETON_INTEGRATION_PROVIDERS = new Set(["wecom"]);
 router.use("/agents/:id/integrations", requireAccessibleAgent("editor", "id"));
 // API keys must carry integrations:read or integrations:write to call these.
 router.use("/agents/:id/integrations", scopeByMethod("integrations:read", "integrations:write"));
+
+// Per-agent MCP server management reuses the same access + scope gates.
+router.use("/agents/:id/mcp-servers", requireAccessibleAgent("editor", "id"));
+router.use("/agents/:id/mcp-servers", scopeByMethod("integrations:read", "integrations:write"));
 
 function base64Url(buffer) {
   return Buffer.from(buffer)
@@ -319,7 +325,7 @@ async function syncIntegrationsToAgent(agentId, { strict = false, strictHermes =
     const syncData = await integrations.getIntegrationsForSync(agentId);
     const response = await fetch(runtimeUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...(await runtimeAuthHeaders(agent)) },
       body: JSON.stringify({ integrations: syncData }),
     });
     if (!response.ok) {
@@ -417,7 +423,7 @@ async function invokeAgentIntegrationTool(agentId, payload = {}) {
 
   const response = await fetch(runtimeUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await runtimeAuthHeaders(agent)) },
     body: JSON.stringify(payload),
   });
   const data = await response.json().catch(() => ({}));
@@ -436,6 +442,31 @@ async function invokeAgentIntegrationTool(agentId, payload = {}) {
 router.get("/agents/:id/integrations", async (req, res) => {
   try {
     res.json(await integrations.listIntegrations(req.params.id));
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+// List the MCP servers available to this agent (supported providers annotated
+// with connected/enabled), and let an operator set which are enabled. Changing
+// the set requires a redeploy to re-merge the runtime config.
+router.get("/agents/:id/mcp-servers", async (req, res) => {
+  try {
+    res.json({ servers: await mcpServers.getAvailableMcpServers(req.params.id) });
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+router.put("/agents/:id/mcp-servers", async (req, res) => {
+  try {
+    const providers = Array.isArray(req.body?.providers) ? req.body.providers : [];
+    const enabled = await mcpServers.setAgentMcpServerIds(req.params.id, providers);
+    res.json({
+      enabled,
+      redeployRequired: true,
+      servers: await mcpServers.getAvailableMcpServers(req.params.id),
+    });
   } catch (e) {
     res.status(e.statusCode || 500).json({ error: e.message });
   }
@@ -1185,22 +1216,22 @@ router.post("/agents/:id/integrations/tools/invoke", async (req, res) => {
 
 // ─── Integration catalog ──────────────────────────────────────────
 
-router.get("/integrations/catalog", async (req, res) => {
+router.get("/integrations/catalog", async (req, res, next) => {
   try {
     const { category } = req.query;
     res.json(await integrations.getCatalog(category));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.get("/integrations/catalog/:catalogId", async (req, res) => {
+router.get("/integrations/catalog/:catalogId", async (req, res, next) => {
   try {
     const item = await integrations.getCatalogItem(req.params.catalogId);
     if (!item) return res.status(404).json({ error: "Not found" });
     res.json(item);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 

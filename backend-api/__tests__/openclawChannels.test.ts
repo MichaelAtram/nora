@@ -616,10 +616,6 @@ describe("openclaw channel catalog compatibility", () => {
       .mockResolvedValueOnce({
         hash: "cfg-type-telegram",
         config: { channels: {} },
-      })
-      .mockResolvedValueOnce({
-        path: "channels.telegram",
-        children: [],
       });
 
     const result = await getOpenClawChannelType(agent, "telegram");
@@ -635,6 +631,7 @@ describe("openclaw channel catalog compatibility", () => {
         }),
       ],
     });
+    expect(mockRpcCall).toHaveBeenCalledTimes(2);
   });
 
   it("returns minimum Slack setup fields with conditional credential requirements", async () => {
@@ -645,10 +642,6 @@ describe("openclaw channel catalog compatibility", () => {
       .mockResolvedValueOnce({
         hash: "cfg-type-slack",
         config: { channels: {} },
-      })
-      .mockResolvedValueOnce({
-        path: "channels.slack",
-        children: [],
       });
 
     const result = await getOpenClawChannelType(agent, "slack");
@@ -675,6 +668,31 @@ describe("openclaw channel catalog compatibility", () => {
         }),
       ]),
     );
+    expect(mockRpcCall).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns QR login metadata without schema walking for pairing-only channels", async () => {
+    mockRpcCall
+      .mockResolvedValueOnce({
+        channelMeta: [{ id: "feishu", label: "Feishu" }],
+      })
+      .mockResolvedValueOnce({
+        hash: "cfg-type-feishu",
+        config: { channels: {} },
+      });
+
+    const result = await getOpenClawChannelType(agent, "feishu");
+
+    expect(result).toMatchObject({
+      type: "feishu",
+      configFields: [],
+      actions: {
+        canQrLogin: true,
+        loginKind: "cli",
+      },
+      hasComplexFields: false,
+    });
+    expect(mockRpcCall).toHaveBeenCalledTimes(2);
   });
 
   it("starts and polls allowlisted OpenClaw CLI login channels", async () => {

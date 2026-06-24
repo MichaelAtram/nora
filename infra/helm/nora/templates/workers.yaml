@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nora-worker-provisioner
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "worker-provisioner") | nindent 4 }}
+spec:
+  replicas: {{ .Values.workerProvisioner.replicas }}
+  selector:
+    matchLabels:
+      {{- include "nora.selectorLabels" (dict "root" . "component" "worker-provisioner") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nora.selectorLabels" (dict "root" . "component" "worker-provisioner") | nindent 8 }}
+    spec:
+      {{- include "nora.imagePullSecrets" . | nindent 6 }}
+      {{- include "nora.waitForDbInit" . | nindent 6 }}
+      containers:
+        - name: worker-provisioner
+          image: {{ include "nora.image" (dict "root" . "name" "nora-worker-provisioner") }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: health
+              containerPort: 4001
+          {{- include "nora.controlPlaneEnvFrom" . | nindent 10 }}
+          env:
+            - name: DEPLOYMENT_WORKER_CONCURRENCY
+              value: {{ .Values.workerProvisioner.concurrency | quote }}
+            {{- include "nora.extraEnv" (dict "root" . "extra" .Values.commonEnv) | nindent 12 }}
+          {{- if .Values.kubeconfigs.existingSecret }}
+          volumeMounts:
+            - name: kubeconfigs
+              mountPath: /kubeconfigs
+              readOnly: true
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.workerProvisioner.resources | nindent 12 }}
+      {{- if .Values.kubeconfigs.existingSecret }}
+      volumes:
+        - name: kubeconfigs
+          secret:
+            secretName: {{ .Values.kubeconfigs.existingSecret }}
+      {{- end }}
+{{- if .Values.workerBackup.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nora-worker-backup
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "worker-backup") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "nora.selectorLabels" (dict "root" . "component" "worker-backup") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nora.selectorLabels" (dict "root" . "component" "worker-backup") | nindent 8 }}
+    spec:
+      {{- include "nora.imagePullSecrets" . | nindent 6 }}
+      {{- include "nora.waitForDbInit" . | nindent 6 }}
+      containers:
+        - name: worker-backup
+          image: {{ include "nora.image" (dict "root" . "name" "nora-worker-backup") }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: health
+              containerPort: 4002
+          {{- include "nora.controlPlaneEnvFrom" . | nindent 10 }}
+          env:
+            - name: BACKUP_WORKER_CONCURRENCY
+              value: {{ .Values.workerBackup.concurrency | quote }}
+            - name: NODE_PATH
+              value: /app/node_modules
+            {{- include "nora.extraEnv" (dict "root" . "extra" .Values.commonEnv) | nindent 12 }}
+          {{- if .Values.backupsVolume.enabled }}
+          volumeMounts:
+            - name: nora-backups
+              mountPath: /var/lib/nora-backups
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.workerBackup.resources | nindent 12 }}
+      {{- if .Values.backupsVolume.enabled }}
+      volumes:
+        - name: nora-backups
+          persistentVolumeClaim:
+            claimName: nora-backups
+      {{- end }}
+{{- end }}

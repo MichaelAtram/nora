@@ -8,6 +8,7 @@ const db = require("./db");
 const containerManager = require("./containerManager");
 const llmProviders = require("./llmProviders");
 const { runtimeUrlForAgent } = require("../agent-runtime/lib/agentEndpoints");
+const { runtimeAuthHeaders } = require("./runtimeAuth");
 const { waitForAgentReadiness } = require("./healthChecks");
 const { resolveAgentRuntimeFamily } = require("./agentRuntimeFields");
 const { shellSingleQuote } = require("../agent-runtime/lib/containerCommand");
@@ -16,6 +17,8 @@ const {
   buildOpenClawCustomProviders,
   mapNoraProviderIdToOpenClaw,
 } = require("../agent-runtime/lib/runtimeBootstrap");
+const { buildHermesRuntimeBootstrapEnv } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
+const { NEMOCLAW_DEFAULT_MODEL } = require("../agent-runtime/lib/nemoclawDefaults");
 
 const providerCatalog = Array.isArray(llmProviders.PROVIDERS)
   ? llmProviders.PROVIDERS
@@ -36,13 +39,13 @@ const PROVIDER_MODEL_DEFAULTS = {
   together: "together/moonshotai/Kimi-K2.5",
   cohere: "command-r-plus",
   xai: "grok-4",
-  nvidia: "nvidia/nvidia/nemotron-3-super-120b-a12b",
+  nvidia: NEMOCLAW_DEFAULT_MODEL,
   moonshot: "kimi-k2.5",
   zai: "glm-5",
   minimax: "MiniMax-M2.7",
   // Bare deployment name — buildDefaultModelCommand prefixes it with the
   // OpenClaw provider id (azure-openai-responses) via mapNoraProviderIdToOpenClaw.
-  "microsoft-foundry": "gpt-5.5",
+  "microsoft-foundry": "gpt-5.5-1",
 };
 
 const HERMES_NATIVE_PROVIDER_MAP = Object.freeze({
@@ -95,7 +98,57 @@ function pickProviderBaseUrl(config = {}) {
   return "";
 }
 
-function buildHermesModelConfig(defaultProvider = null) {
+function getProviderEnvVar(providerId) {
+  return providerCatalogById.get(providerId)?.envVar || "";
+}
+
+function normalizeUrlForCompare(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\/+$/, "");
+}
+
+function resolveHermesModelApiKey(defaultProvider = null, envVars = {}) {
+  const providerId = String(defaultProvider?.provider || "").trim();
+  const envVar = getProviderEnvVar(providerId);
+  return envVar && envVars?.[envVar] ? String(envVars[envVar]) : "";
+}
+
+function attachHermesCustomApiKey(modelConfig = null, defaultProvider = null, envVars = {}) {
+  if (!modelConfig || String(modelConfig.provider || "").trim() !== "custom") return modelConfig;
+
+  const apiKey = resolveHermesModelApiKey(defaultProvider, envVars);
+  if (!apiKey) return modelConfig;
+
+  const defaultBaseUrl = resolveHermesProviderBaseUrl(defaultProvider);
+  const modelBaseUrl = String(modelConfig.baseUrl || "").trim();
+  if (
+    modelBaseUrl &&
+    defaultBaseUrl &&
+    normalizeUrlForCompare(modelBaseUrl) !== normalizeUrlForCompare(defaultBaseUrl)
+  ) {
+    return modelConfig;
+  }
+
+  return { ...modelConfig, apiKey };
+}
+
+function resolveHermesProviderBaseUrl(defaultProvider = null) {
+  if (!defaultProvider) return "";
+  const providerId = String(defaultProvider.provider || "").trim();
+  if (!providerId) return "";
+
+  const savedConfig = normalizeProviderConfig(defaultProvider.config);
+  const savedBaseUrl = pickProviderBaseUrl(savedConfig);
+  const catalogBaseUrl =
+    typeof providerCatalogById.get(providerId)?.endpoint === "string"
+      ? providerCatalogById.get(providerId).endpoint.trim()
+      : "";
+
+  return savedBaseUrl || catalogBaseUrl || HERMES_CUSTOM_PROVIDER_BASE_URLS[providerId] || "";
+}
+
+function buildHermesModelConfig(defaultProvider = null, envVars = {}) {
   if (!defaultProvider) return null;
 
   const providerId = String(defaultProvider.provider || "").trim();
@@ -105,10 +158,6 @@ function buildHermesModelConfig(defaultProvider = null) {
 
   const savedConfig = normalizeProviderConfig(defaultProvider.config);
   const savedBaseUrl = pickProviderBaseUrl(savedConfig);
-  const catalogBaseUrl =
-    typeof providerCatalogById.get(providerId)?.endpoint === "string"
-      ? providerCatalogById.get(providerId).endpoint.trim()
-      : "";
   const modelId =
     typeof defaultProvider.model === "string" && defaultProvider.model.trim()
       ? defaultProvider.model.trim()
@@ -127,18 +176,19 @@ function buildHermesModelConfig(defaultProvider = null) {
     };
   }
 
-  const resolvedBaseUrl =
-    savedBaseUrl || catalogBaseUrl || HERMES_CUSTOM_PROVIDER_BASE_URLS[providerId] || "";
+  const resolvedBaseUrl = resolveHermesProviderBaseUrl(defaultProvider);
 
   if (!resolvedBaseUrl) {
     throw new Error(`Provider ${providerId} needs a base URL before Hermes can use it`);
   }
 
-  return {
+  const modelConfig = {
     provider: "custom",
     defaultModel: modelId,
     baseUrl: resolvedBaseUrl,
   };
+  const apiKey = resolveHermesModelApiKey(defaultProvider, envVars);
+  return apiKey ? { ...modelConfig, apiKey } : modelConfig;
 }
 
 function hasMeaningfulHermesModelConfig(modelConfig = {}) {
@@ -231,14 +281,8 @@ function buildAuthProfilesWriteCommand(authProfiles) {
 }
 
 function buildDefaultModelCommand(defaultProvider = null) {
-  if (!defaultProvider) return null;
-
-  const modelId = defaultProvider.model || PROVIDER_MODEL_DEFAULTS[defaultProvider.provider];
-  if (!modelId) return null;
-
-  // Translate Nora provider id → OpenClaw provider id (Foundry → azure-openai-responses).
-  const openclawProvider = mapNoraProviderIdToOpenClaw(defaultProvider.provider);
-  const fullModel = modelId.includes("/") ? modelId : `${openclawProvider}/${modelId}`;
+  const fullModel = buildDefaultOpenClawModel(defaultProvider);
+  if (!fullModel) return null;
 
   return (
     'OPENCLAW_BIN="${OPENCLAW_CLI_PATH:-/usr/local/bin/openclaw}"; ' +
@@ -248,6 +292,30 @@ function buildDefaultModelCommand(defaultProvider = null) {
       .map((arg) => JSON.stringify(String(arg)))
       .join(" ")}`
   );
+}
+
+function buildDefaultOpenClawModel(defaultProvider = null) {
+  if (!defaultProvider) return null;
+
+  const modelId = defaultProvider.model || PROVIDER_MODEL_DEFAULTS[defaultProvider.provider];
+  if (!modelId) return null;
+
+  // Translate Nora provider id → OpenClaw provider id (Foundry → azure-openai-responses).
+  const openclawProvider = mapNoraProviderIdToOpenClaw(defaultProvider.provider);
+  return modelId.includes("/") ? modelId : `${openclawProvider}/${modelId}`;
+}
+
+function buildCustomProviderEnv(baseEnv = {}, defaultProvider = null) {
+  const providerId = String(defaultProvider?.provider || "").trim();
+  if (providerId !== "microsoft-foundry") return baseEnv;
+
+  const fullModel = buildDefaultOpenClawModel(defaultProvider);
+  const deployment = String(defaultProvider?.model || "").trim();
+  return {
+    ...baseEnv,
+    ...(deployment ? { MICROSOFT_FOUNDRY_DEPLOYMENT: deployment } : {}),
+    ...(fullModel ? { NORA_DEFAULT_OPENCLAW_MODEL: fullModel } : {}),
+  };
 }
 
 function escapeDotenvValue(value) {
@@ -296,7 +364,7 @@ async function runRuntimeCommand(agent, command, { timeout = 30000 } = {}) {
 
   const response = await fetch(runtimeUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await runtimeAuthHeaders(agent)) },
     body: JSON.stringify({
       command,
       timeout,
@@ -395,7 +463,66 @@ async function writeAuthToContainer(agent, authProfiles) {
 }
 
 async function writeHermesEnvToContainer(agent, envVars) {
+  if (
+    typeof containerManager.isKubernetesAgent === "function" &&
+    containerManager.isKubernetesAgent(agent)
+  ) {
+    return containerManager.updateEnv(agent, {
+      ...envVars,
+      ...buildHermesRuntimeBootstrapEnv({ envVars }),
+    });
+  }
   return runContainerCommand(agent, buildHermesEnvWriteCommand(envVars));
+}
+
+function pickDockerComposeNetworkAddress(info = {}) {
+  const networks = info?.NetworkSettings?.Networks || {};
+  for (const [name, network] of Object.entries(networks)) {
+    if (name.endsWith("_default") && network?.IPAddress) {
+      return network.IPAddress;
+    }
+  }
+  for (const [name, network] of Object.entries(networks)) {
+    if (name !== "bridge" && network?.IPAddress) {
+      return network.IPAddress;
+    }
+  }
+  return info?.NetworkSettings?.IPAddress || "";
+}
+
+async function refreshDockerRuntimeAddress(agent) {
+  const backendType = String(agent?.backend_type || "")
+    .trim()
+    .toLowerCase();
+  if (backendType !== "docker" || !agent?.container_id || !agent?.id) return null;
+
+  try {
+    const Docker = require("dockerode");
+    const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+    const info = await docker.getContainer(agent.container_id).inspect();
+    const host = pickDockerComposeNetworkAddress(info);
+    if (!host) return null;
+
+    agent.host = host;
+    agent.runtime_host = host;
+    await db.query("UPDATE agents SET host = $2, runtime_host = $2 WHERE id = $1", [
+      agent.id,
+      host,
+    ]);
+    return host;
+  } catch (error) {
+    console.warn(
+      `[authSync] Failed to refresh Docker runtime host for agent ${agent.id}:`,
+      error.message,
+    );
+    return null;
+  }
+}
+
+async function restartAgentAndRefreshAddress(agent) {
+  const result = await containerManager.restart(agent);
+  await refreshDockerRuntimeAddress(agent);
+  return result;
 }
 
 /**
@@ -461,11 +588,14 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
           persistedModelConfig = null;
         }
 
+        const envVars = await buildHermesManagedEnvForAgent(userId, agent.id);
         if (!persistedModelConfig && !hasHermesModelConfig) {
-          hermesModelConfig = buildHermesModelConfig(defaultProvider);
+          hermesModelConfig = buildHermesModelConfig(defaultProvider, envVars);
           hasHermesModelConfig = true;
         }
-        const envVars = await buildHermesManagedEnvForAgent(userId, agent.id);
+        const selectedHermesModelConfig = persistedModelConfig
+          ? attachHermesCustomApiKey(persistedModelConfig, defaultProvider, envVars)
+          : hermesModelConfig;
         if (
           onlyIfAuthPresent &&
           Object.keys(envVars).length === 0 &&
@@ -475,12 +605,12 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
           results.push({ agentId: agent.id, status: "skipped" });
           continue;
         }
-        if (persistedModelConfig || hermesModelConfig) {
+        if (selectedHermesModelConfig) {
           const { persistHermesModelConfig } = require("./hermesUi");
-          await persistHermesModelConfig(agent, persistedModelConfig || hermesModelConfig);
+          await persistHermesModelConfig(agent, selectedHermesModelConfig);
         }
         await writeHermesEnvToContainer(agent, envVars);
-        await containerManager.restart(agent);
+        await restartAgentAndRefreshAddress(agent);
         const readiness = await waitForAgentReadiness({
           host: agent.host,
           runtimeHost: agent.runtime_host,
@@ -530,7 +660,10 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
         typeof llmProviders.buildDeploymentEnvVars === "function"
           ? llmProviders.buildDeploymentEnvVars(endpointOverrides.deploymentByEnvVar || {})
           : {};
-      const customProviderEnv = { ...llmKeysForCustom, ...baseUrlEnvVars, ...deploymentEnvVars };
+      const customProviderEnv = buildCustomProviderEnv(
+        { ...llmKeysForCustom, ...baseUrlEnvVars, ...deploymentEnvVars },
+        defaultProvider,
+      );
       const customProviders = buildOpenClawCustomProviders(customProviderEnv);
       if (Object.keys(customProviders).length > 0) {
         const providerMergeCommand = buildOpenClawConfigMergeCommand({
@@ -552,7 +685,7 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
         }
       }
 
-      await containerManager.restart(agent);
+      await restartAgentAndRefreshAddress(agent);
 
       const readiness = await waitForAgentReadiness({
         host: agent.host,

@@ -11,8 +11,11 @@ AKS uses the same Kubernetes adapter as every Kubernetes provider. Nora stores p
 - Azure subscription with permission to create AKS clusters.
 - An existing AKS cluster (or create one — Azure Portal → **Kubernetes services** → **Create**).
 
-<Frame caption="Azure Portal — AKS cluster overview (cluster name + resource group)">
-  ![AKS cluster overview](/images/provisioner-backends/k8s/aks/cluster-overview.svg)
+Use the cluster **Overview** blade to confirm the AKS cluster name and resource group before
+running the CLI commands below.
+
+<Frame caption="Azure Portal — AKS cluster overview (cluster name and resource group)">
+  ![AKS cluster overview](/images/provisioner-backends/k8s/aks/cluster-overview.png)
 </Frame>
 
 ### 2. Install and log in with Azure CLI
@@ -84,7 +87,7 @@ az aks get-credentials \
 You can copy this command directly from the cluster's **Connect** blade in the Azure Portal.
 
 <Frame caption="Azure Portal — Cluster → Connect: copy the get-credentials command">
-  ![AKS connect blade](/images/provisioner-backends/k8s/aks/connect-cluster.svg)
+  ![AKS Connect blade](/images/provisioner-backends/k8s/aks/connect-cluster.png)
 </Frame>
 
 ### 5. Verify access from the host
@@ -164,13 +167,13 @@ For a public load balancer, leave **Service annotations JSON** empty and restric
 For an internal AKS load balancer:
 
 ```json theme={null}
-{"service.beta.kubernetes.io/azure-load-balancer-internal":"true"}
+{ "service.beta.kubernetes.io/azure-load-balancer-internal": "true" }
 ```
 
 Confirm the LoadBalancer SKU in the Azure Portal under **Settings → Networking** matches what your subnet policies allow.
 
 <Frame caption="Azure Portal — Cluster → Settings → Networking (LoadBalancer SKU)">
-  ![AKS networking](/images/provisioner-backends/k8s/aks/networking.svg)
+  ![AKS networking settings](/images/provisioner-backends/k8s/aks/networking.png)
 </Frame>
 
 Do not set the Admin **Runtime host** to the AKS API server address. Nora uses the Kubernetes API through kubeconfig, and agent gateway/runtime traffic uses the per-agent Service address.
@@ -207,7 +210,7 @@ cd e2e
 KUBECONFIG_PATH=$PWD/../.secrets/aks-kubeconfig npm run smoke:k8s-aks
 ```
 
-This script is operator-run only — it provisions real workloads against a live AKS cluster and is not part of CI. Set `K8S_SMOKE_RUNTIME_FAMILIES=openclaw` for a single-runtime check, or `KEEP_ENV=true` to leave the stack running after the script finishes.
+This script is operator-run only — it provisions real workloads against a live AKS cluster and is not part of CI. Set `K8S_SMOKE_RUNTIME_FAMILIES=openclaw` for a single-runtime check, `K8S_SMOKE_CELLS=openclaw:nemoclaw` plus `NVIDIA_API_KEY` for a NemoClaw run, or `KEEP_ENV=true` to leave the stack running after the script finishes.
 
 ## Promote to production
 

@@ -1,21 +1,23 @@
 # Run secure agents with NemoClaw sandboxes
 
-> Deploy agents with NVIDIA NemoClaw sandboxes for OpenShell policy controls, approval workflows, and Nemotron model support in Nora.
+> Deploy agents with Nora's experimental NVIDIA NemoClaw sandbox profile for OpenShell policy controls, approval workflows, and Nemotron model support.
 
-NemoClaw is a Docker-hosted sandbox backend that wraps the OpenClaw agent runtime with NVIDIA OpenShell policy controls. Instead of running your agent in a standard Docker container, NemoClaw adds a policy layer that can allow or deny specific actions the agent tries to take, and can require operator approval before certain operations proceed. This makes it well-suited for security-sensitive workflows, compliance environments, or any situation where you need auditability and control over what an agent is permitted to do.
+NemoClaw is an experimental sandbox profile that wraps the OpenClaw agent runtime with NVIDIA OpenShell policy controls. Instead of running your agent with the standard sandbox profile, NemoClaw adds a policy layer that can allow or deny specific actions the agent tries to take, and can require operator approval before certain operations proceed. This makes it well-suited for security-sensitive workflows, compliance environments, or any situation where you need auditability and control over what an agent is permitted to do.
 
 <Warning>
-  NemoClaw must be enabled by your operator before you can use it. If `NEMOCLAW_ENABLED` is not set to `true` in the server environment, attempting to deploy a NemoClaw agent will return an error. Contact your Nora operator to enable it.
+  NemoClaw must be enabled by your operator before you can use it. If `nemoclaw` is not included in
+  `ENABLED_SANDBOX_PROFILES` in the server environment, attempting to deploy a NemoClaw agent will
+  return an error. Contact your Nora operator to enable it.
 </Warning>
 
 ## When to use NemoClaw
 
 Use a NemoClaw sandbox when:
 
-* You need to restrict or audit the actions your agent takes at runtime.
-* Your organization requires approval workflows before the agent performs sensitive operations.
-* You want to use NVIDIA Nemotron models, which are only available in the NemoClaw sandbox.
-* You are operating in a compliance-sensitive environment where a standard Docker sandbox is insufficient.
+- You need to restrict or audit the actions your agent takes at runtime.
+- Your organization requires approval workflows before the agent performs sensitive operations.
+- You want to use NVIDIA Nemotron models, which are only available in the NemoClaw sandbox.
+- You are operating in a compliance-sensitive environment where a standard Docker sandbox is insufficient.
 
 For general-purpose agents that do not have strict policy requirements, the standard sandbox is simpler and faster to deploy.
 
@@ -31,8 +33,25 @@ NemoClaw agents use NVIDIA's Nemotron family of models via the NVIDIA API. The f
 | `nvidia/nemotron-3-nano-30b-a3b`           | Lightweight 30B Nemotron Nano                    |
 
 <Note>
-  To use these models you must have an NVIDIA API key saved in **Settings** under the NVIDIA provider. See [Add and sync LLM provider keys](/guides/manage-providers).
+  To use these models, save an NVIDIA API key in **Settings** under the NVIDIA provider. If no user
+  key is saved, self-hosted operators may provide a platform fallback with `NVIDIA_API_KEY`, but
+  user keys are preferred because they keep usage attribution tied to the deploying account.
 </Note>
+
+## Supported deploy targets
+
+NemoClaw runs as an OpenClaw sandbox profile on these deploy targets:
+
+| Target           | Status    | Notes                                                                                                                    |
+| ---------------- | --------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Local Docker     | Supported | Uses the local Docker socket and the NemoClaw sandbox image.                                                             |
+| Remote Docker    | Supported | Requires a connected remote host target such as `remote:gpu-vps`; Nora publishes the gateway port on that host.          |
+| K3s / Kubernetes | Supported | Uses the Kubernetes adapter with `sandbox_profile=nemoclaw`; API keys are injected through per-agent Kubernetes Secrets. |
+| AKS / GKE / EKS  | Supported | Same Kubernetes adapter as K3s; use LoadBalancer exposure or the cluster exposure mode configured in Admin.              |
+
+The default sandbox image is `ghcr.io/solomon2773/nora-nemoclaw-agent:latest`. For air-gapped
+hosts or private clusters, build `nora-nemoclaw-agent:local`, preload it onto the target nodes, and
+set `NEMOCLAW_SANDBOX_IMAGE=nora-nemoclaw-agent:local`.
 
 ## Deploy a NemoClaw agent
 
@@ -43,13 +62,14 @@ Deploying a NemoClaw agent follows the same steps as a standard agent, with one 
     Navigate to **Deploy** in the sidebar.
   </Step>
 
-  <Step title="Enter a name and set resources">
-    Enter an agent name and configure vCPU, RAM, and disk as you would for any agent.
-  </Step>
+<Step title="Enter a name and set resources">
+  Enter an agent name and configure vCPU, RAM, and disk as you would for any agent.
+</Step>
 
-  <Step title="Select the NemoClaw sandbox">
-    In the **Sandbox type** field, choose **NemoClaw**. If this option is greyed out or returns an error, NemoClaw is not enabled on your instance.
-  </Step>
+<Step title="Select the NemoClaw sandbox">
+  In the **Sandbox type** field, choose **NemoClaw**. If this option is greyed out or returns an
+  error, NemoClaw is not enabled on your instance.
+</Step>
 
   <Step title="Confirm and deploy">
     Click **Confirm & Deploy Agent**. Nora queues the deployment with `sandbox: nemoclaw`. The deployment type is logged as `NemoClaw + OpenClaw`.

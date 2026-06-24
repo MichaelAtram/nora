@@ -1450,6 +1450,17 @@ function docsBackedDescription(channelId, fallback = "") {
   return docsSetupDefinitionFor(channelId)?.description || fallback || "";
 }
 
+function buildDocsBackedTypeMeta(channelId, meta = {}) {
+  const docsDefinition = docsSetupDefinitionFor(channelId);
+  if (!docsDefinition) return null;
+
+  return serializeTypeMeta(channelId, meta, {
+    description: docsDefinition.description || "",
+    configFields: mergeDocsBackedConfigFields(channelId, []),
+    hasComplexFields: false,
+  });
+}
+
 function requireSupportedQrChannel(channelId) {
   if (!OPENCLAW_QR_LOGIN_CHANNELS.has(channelId)) {
     throw createHttpError(
@@ -1556,6 +1567,20 @@ async function getOpenClawChannelType(agent, channelId) {
     mergeSchemaEntriesIntoTypeMeta(typeMetaById, schemaEntries);
   }
   const meta = typeMetaById.get(channelId) || {};
+
+  const docsBackedMeta = buildDocsBackedTypeMeta(channelId, meta);
+  if (docsBackedMeta) {
+    return docsBackedMeta;
+  }
+
+  if (OPENCLAW_QR_LOGIN_CHANNELS.has(channelId)) {
+    return serializeTypeMeta(channelId, meta, {
+      description: "Link this channel through the OpenClaw pairing flow.",
+      configFields: [],
+      hasComplexFields: false,
+    });
+  }
+
   const basePath = `channels.${channelId}`;
   const lookup = await safeLookup(agent, basePath);
   const fieldState = lookup

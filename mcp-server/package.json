@@ -1,0 +1,49 @@
+{
+  "name": "@noraai/mcp-server",
+  "version": "0.1.1",
+  "description": "MCP server for the Nora agent ops control plane — operate your agent fleet from Claude Code, Claude Desktop, Cursor, or any MCP client.",
+  "mcpName": "io.github.solomon2773/nora",
+  "license": "Apache-2.0",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "nora-mcp": "./src/index.js"
+  },
+  "files": [
+    "src/**/*.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/solomon2773/nora.git",
+    "directory": "mcp-server"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "nora",
+    "agents",
+    "openclaw",
+    "hermes",
+    "ops"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3"
+  }
+}

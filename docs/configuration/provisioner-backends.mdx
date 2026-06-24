@@ -1,8 +1,8 @@
 # Choose a provisioner backend for agents
 
-> Compare Docker, Proxmox, and Kubernetes provisioner backends to pick the right agent isolation and scaling strategy for your Nora deployment.
+> Compare Docker, Kubernetes, experimental NemoClaw sandboxing, and planned Proxmox placement to pick the right agent isolation and scaling strategy for your Nora deployment.
 
-Nora provisions agent runtimes onto execution targets selected in the Deploy flow. Docker is the default path. Proxmox is enabled through `.env`, while Kubernetes clusters are registered in **Admin -> Kubernetes** so one Nora control plane can manage several clusters at once.
+Nora provisions agent runtimes onto execution targets selected in the Deploy flow. Docker and Kubernetes are GA paths. Docker is the default. Kubernetes clusters are registered in **Admin -> Kubernetes** so one Nora control plane can manage several clusters at once. NemoClaw is an experimental sandbox profile layered onto supported targets. Proxmox is a planned execution target and remains release-blocked in current Nora releases.
 
 ![Deploy wizard — Execution Target picker rendering the enabled backends](/images/configuration/deploy-backend-picker.png)
 
@@ -11,8 +11,8 @@ Nora provisions agent runtimes onto execution targets selected in the Deploy flo
     Single-host deployments, local development, and quick evaluation.
   </Card>
 
-<Card title="Proxmox" icon="server" href="/configuration/provisioner-backends/proxmox">
-  Proxmox-managed LXC runtime placement with API and SSH bootstrap.
+<Card title="Proxmox (planned)" icon="server" href="/configuration/provisioner-backends/proxmox">
+  Planned Proxmox-managed LXC runtime placement. Not supported in the current release.
 </Card>
 
   <Card title="Kubernetes" icon="cloud" href="/configuration/provisioner-backends/kubernetes">
@@ -24,6 +24,7 @@ Nora provisions agent runtimes onto execution targets selected in the Deploy flo
 
 |                        | Docker                                  | Proxmox                                      | Kubernetes                                |
 | ---------------------- | --------------------------------------- | -------------------------------------------- | ----------------------------------------- |
+| **Support status**     | GA                                      | Planned / release-blocked                    | GA                                        |
 | **Deployment scale**   | Single host                             | Private VM/LXC fleet                         | Multi-node cluster                        |
 | **Agent isolation**    | Container                               | Proxmox LXC                                  | Pod and namespace boundaries              |
 | **Setup complexity**   | Low                                     | Medium - Proxmox API plus SSH bootstrap      | Medium to high - cluster and kubeconfig   |
@@ -40,7 +41,7 @@ ENABLED_BACKENDS=docker
 ENABLED_SANDBOX_PROFILES=standard
 ```
 
-Use `ENABLED_BACKENDS=docker,proxmox` when you want both local Docker and Proxmox visible in the deploy flow. Do not add Kubernetes labels to `ENABLED_BACKENDS`; the Kubernetes deploy targets come only from the Admin cluster registry.
+Use `ENABLED_BACKENDS=docker` for normal onboarding. Proxmox is a known but release-blocked target; adding `proxmox` only surfaces the blocked roadmap target for operator awareness. Do not add Kubernetes labels to `ENABLED_BACKENDS`; the Kubernetes deploy targets come only from the Admin cluster registry.
 
 Register Kubernetes clusters in **Admin -> Kubernetes**. Each enabled registry row with a passing **Test** result becomes a separate deploy target with an id like `k8s:aks-eastus2`, while persisted agents still use the base `k8s` adapter internally. Failed, untested, or disabled clusters stay visible in Admin but are hidden from the Deploy page for both OpenClaw and Hermes. The Deploy page shows the cluster label, provider, actual cluster name, namespace, and exposure mode so operators can tell AKS, GKE, EKS, K3s, Kind, or generic clusters apart.
 

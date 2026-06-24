@@ -155,7 +155,13 @@ async function listAvailableProviders(request: APIRequestContext, token: string)
 
 async function getPreferredProvider(request: APIRequestContext, token: string) {
   const providers = await listAvailableProviders(request, token);
-  return providers.find((provider) => provider?.id && provider?.name) || null;
+  // Skip keyless providers (the built-in demo stub): this helper feeds the
+  // settings flow that types an API key into the provider form.
+  return (
+    providers.find(
+      (provider) => provider?.id && provider?.name && provider?.requiresApiKey !== false,
+    ) || null
+  );
 }
 
 async function waitForCondition<T>(

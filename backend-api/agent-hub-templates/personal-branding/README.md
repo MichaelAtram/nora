@@ -38,25 +38,29 @@ One agent that helps you ghostwrite for yourself on X and LinkedIn. Learns your 
 Full walkthrough with screenshots: **[Echo setup guide](https://noradocs.solomontsao.com/guides/echo-personal-branding)**.
 
 ### 1. Install Echo from Agent Hub
+
 Install the **Echo Personal Branding** listing into a workspace. Nora materializes the agent and its files for you — you don't copy markdown by hand.
 
 ### 2. Connect your platform(s) — Integrations tab
+
 Open the agent → **Integrations** tab. Connect the platform(s) you want to manage (at least one):
 
-- **Twitter / X** — click *Authorize with X*. Requires an X OAuth 2.0 app ([setup guide](https://noradocs.solomontsao.com/guides/integrations/twitter)).
-- **LinkedIn** — click *Authorize with LinkedIn*. Requires a LinkedIn developer app ([setup guide](https://noradocs.solomontsao.com/guides/integrations/linkedin)).
+- **Twitter / X** — click _Authorize with X_. Requires an X OAuth 2.0 app ([setup guide](https://noradocs.solomontsao.com/guides/integrations/twitter)).
+- **LinkedIn** — click _Authorize with LinkedIn_. Requires a LinkedIn developer app ([setup guide](https://noradocs.solomontsao.com/guides/integrations/linkedin)).
 
 You can start with just one and add the other later.
 
 ### 3. Connect one channel — Channels tab
+
 Open the agent → **Channels** tab and connect **at least one** way for Echo to reach you (you only need one):
 
-- **WhatsApp** (recommended) — Meta WhatsApp Cloud API; needs a Phone Number ID + Access Token.
-- Or **Telegram**, **Slack**, **Discord**, or **email**.
+- **WhatsApp** (recommended) - use Nora's **Link** action and scan the QR/pairing prompt.
+- Or **Telegram**, **Slack**, **Discord**, or another OpenClaw catalog channel.
 
 See the [channels guide](https://noradocs.solomontsao.com/guides/channels) for the per-channel fields.
 
 ### 4. Say hi
+
 Start the runtime and send your first message ("hey" works). Echo introduces herself and what she does, then runs the bootstrap flow — picks your platform(s), learns your voice from samples, and calibrates. 15–20 minutes and you're live.
 
 > **How integrations reach Echo:** when you connect X or LinkedIn in the Integrations tab, Nora automatically writes `integrations/NORA_INTEGRATIONS.md` into the workspace and updates `TOOLS.md` — you never edit those files. Echo reads that list to know what's connected.
@@ -92,6 +96,7 @@ You can bail halfway through and resume later. You can also re-run bootstrap any
 ## The Guardrails That Matter
 
 The `openclaw.json` blocks all publishing and engagement APIs by default:
+
 - `x-post`, `x-reply`, `x-dm-send`, `x-follow`, `x-like`, `x-repost` — denied
 - `linkedin-post`, `linkedin-comment`, `linkedin-dm-send`, `linkedin-connect` — denied
 

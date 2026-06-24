@@ -38,6 +38,8 @@ const OPENCLAW_CLI =
     ? process.env.OPENCLAW_CLI_PATH.trim()
     : "/usr/local/bin/openclaw";
 const OPENCLAW_GATEWAY_PORT = Number.parseInt(process.env.OPENCLAW_GATEWAY_PORT || "19611", 10);
+const OPENCLAW_GATEWAY_MIN_PROTOCOL_VERSION = 3;
+const OPENCLAW_GATEWAY_MAX_PROTOCOL_VERSION = 4;
 const OPENCLAW_SESSIONS_ROOT = "/root/.openclaw/agents/main/sessions";
 const OPENCLAW_GATEWAY_TOKEN =
   typeof process.env.OPENCLAW_GATEWAY_TOKEN === "string"
@@ -2336,8 +2338,8 @@ async function sendGatewayChatMessage({ sessionKey, message } = {}) {
             id: "__connect__",
             method: "connect",
             params: {
-              minProtocol: 4,
-              maxProtocol: 4,
+              minProtocol: OPENCLAW_GATEWAY_MIN_PROTOCOL_VERSION,
+              maxProtocol: OPENCLAW_GATEWAY_MAX_PROTOCOL_VERSION,
               client: {
                 id: "gateway-client",
                 version: "1.0.0",
@@ -2492,7 +2494,7 @@ async function executeEmailPoll({ integration, input }) {
         uidValidity,
         lastSeenUid,
       });
-      return {
+      const result = {
         mailbox,
         initialized: true,
         initialSyncMode: "start_from_now",
@@ -2529,7 +2531,7 @@ async function executeEmailPoll({ integration, input }) {
         lastSeenUid,
         initializedAt: checkpoint.initialized_at,
       });
-      return {
+      const result = {
         mailbox,
         checkpointReset: true,
         reason: "uidvalidity_changed",

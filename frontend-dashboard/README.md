@@ -8,41 +8,54 @@ Runs on `/app/*` behind nginx. Users manage their AI agents, configure LLM provi
 
 ## Pages
 
-| Route | Description |
-|---|---|
-| `/app` | Dashboard home — agent overview and quick stats |
-| `/app/agents` | Agent fleet list with status indicators |
-| `/app/agents/[id]` | Agent detail with 7-tab interface |
-| `/app/deploy` | Deploy a new agent (Docker, Proxmox, K8s) |
-| `/app/agent-hub` | Browse, share, and install agent templates |
-| `/app/workspaces` | Manage isolated workspaces |
-| `/app/monitoring` | Real-time metrics via SSE |
-| `/app/settings` | User profile, LLM provider keys, connected accounts |
+| Route                       | Description                                                                                              |
+| --------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `/app`                      | Redirects to `/app/agents`                                                                               |
+| `/app/dashboard`            | Dashboard home: fleet roll-up, quick stats, and activation checklist                                     |
+| `/app/getting-started`      | First-run activation checklist / zero-key demo onboarding                                                |
+| `/app/agents`               | Agent fleet list with status indicators                                                                  |
+| `/app/agents/[id]`          | Agent detail with runtime-filtered tab interface (up to 10 tabs)                                         |
+| `/app/agents/[id]/versions` | Agent deploy-draft version history                                                                       |
+| `/app/deploy`               | Deploy a new agent (Docker or K8s/Kubernetes GA; Proxmox visible only as release-blocked roadmap target) |
+| `/app/agent-hub`            | Browse, share, and install agent templates                                                               |
+| `/app/workspaces`           | Manage isolated workspaces                                                                               |
+| `/app/monitoring`           | Real-time metrics via SSE                                                                                |
+| `/app/logs`                 | Standalone cross-agent log browser                                                                       |
+| `/app/cost`                 | All-workspaces cost dashboard (grouped by workspace)                                                     |
+| `/app/clawhub`              | ClawHub skill catalog browser used when building a deploy draft                                          |
+| `/app/settings`             | User profile, LLM provider keys, connected accounts                                                      |
 
 ## Agent Detail Tabs
 
-Each agent's `/app/agents/[id]` page has 7 tabs:
+Each agent's `/app/agents/[id]` page exposes a runtime-filtered tab set (up to 10 base tabs, filtered by runtime family and sandbox profile):
 
 - **Overview** — status, actions (start/stop/restart/redeploy), resource info
+- **Metrics** — agent resource and runtime metrics
 - **Terminal** — interactive xterm.js terminal via WebSocket
 - **Logs** — real-time log streaming
-- **OpenClaw** — 5 sub-panels: Chat, Files, Extensions, Gate (WS-RPC), Identity (Ed25519)
-- **Channels** — manage 9 channel types with dynamic config forms
-- **Integrations** — browse 60+ integrations with config modals
-- **Settings** — agent config, danger zone
+- **OpenClaw** (gateway runtimes only) — 7 sub-panels: Official Dashboard, Status, Chat, Integrations, ClawHub, Cron, Channels
+- **Hermes WebUI** (Hermes only) — embedded Hermes dashboard
+- **NemoClaw** (nemoclaw sandbox only) — sandbox profile controls
+- **Files** — agent workspace file browser
+- **Backups** — agent backup management
+- **Settings** — agent config, per-agent LLM budget hard caps (auto-pause when spend crosses 100%), danger zone
+
+Channels and Integrations are not top-level tabs — they are sub-panels inside the OpenClaw tab. The Integrations sub-panel browses 60+ integrations with config modals and adds per-agent MCP server management (expose a connected integration to the agent's OpenClaw runtime as an MCP server).
 
 ## Key Components
 
-| Component | Purpose |
-|---|---|
-| `AgentTerminal.tsx` | xterm.js terminal with FitAddon, WebSocket |
-| `TabBar.tsx` | 7-tab navigation bar |
-| `OpenClawTab.tsx` | 5-panel OpenClaw interface |
-| `ChannelsTab.tsx` | Channel CRUD with dynamic config forms |
-| `IntegrationsTab.tsx` | Catalog browser with 17-category filter |
-| `IntegrationCard.tsx` | Card with config modal for connecting |
-| `LLMSetupWizard.tsx` | 3-step provider setup (select → configure → done) |
-| `Layout.tsx` / `Sidebar.tsx` / `Topbar.tsx` | App shell layout |
+| Component                                   | Purpose                                             |
+| ------------------------------------------- | --------------------------------------------------- |
+| `AgentTerminal.tsx`                         | xterm.js terminal with FitAddon, WebSocket          |
+| `TabBar.tsx`                                | Runtime-filtered tab navigation bar (up to 10 tabs) |
+| `OpenClawTab.tsx`                           | 7-panel OpenClaw interface                          |
+| `ChannelsTab.tsx`                           | Channel CRUD with dynamic config forms              |
+| `IntegrationsTab.tsx`                       | Catalog browser with 17-category filter             |
+| `IntegrationCard.tsx`                       | Card with config modal for connecting               |
+| `BudgetSection.tsx`                         | Per-agent LLM budget hard caps (Settings tab)       |
+| `McpServersSection.tsx`                     | Per-agent MCP server management (Integrations panel)|
+| `LLMSetupWizard.tsx`                        | 3-step provider setup (select → configure → done)   |
+| `Layout.tsx` / `Sidebar.tsx` / `Topbar.tsx` | App shell layout                                    |
 
 ## Development
 
@@ -53,11 +66,11 @@ docker compose logs -f frontend-dashboard
 # Local development (outside Docker)
 cd frontend-dashboard
 npm install
-npm run dev   # Starts on port 3001
+npm run dev   # Starts on http://localhost:3000 (honors $PORT; default 3000)
 ```
 
 ## Configuration
 
-| Variable | Default | Description |
-|---|---|
-| `basePath` | `/app` | Next.js base path, set in `next.config.ts` |
+| Variable   | Default | Description                                |
+| ---------- | ------- | ------------------------------------------ |
+| `basePath` | `/app`  | Next.js base path, set in `next.config.ts` |

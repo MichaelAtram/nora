@@ -26,7 +26,7 @@ Each workspace listing has a `shareTarget`:
 | `community`  | ❌                  | ✅                |
 | `both`       | ✅                  | ✅                |
 
-Switching to `community` or `both` triggers a sync to the upstream hub. The upstream review state is mirrored back into `centralShareStatus` (`not_shared`, `pending`, `approved`, `rejected`). Reviewers in the upstream hub can request changes, and the listing's `centralError` surfaces the reason.
+Switching to `community` or `both` triggers a sync to the upstream hub. The upstream review state is mirrored back into `centralShareStatus` (`not_shared`, `queued`, `submitted`, `failed`). Reviewers in the upstream hub can request changes, and the listing's `centralError` surfaces the reason.
 
 <Note>
   "Community" doesn't have to mean public. The upstream hub is whatever `NORA_AGENT_HUB_URL` points at — the default public catalog, or an Agent Hub you self-host for your own company. Point it at your own hub and `community`/`both` sharing becomes a private, org-internal catalog: every operator publishes to and installs from a shared company hub without anything leaving your infrastructure.

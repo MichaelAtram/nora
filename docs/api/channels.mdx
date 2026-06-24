@@ -1,303 +1,169 @@
 # Channels API: configure agent communication
 
-> Create and manage communication channels for Nora agents. Supports inbound and outbound messaging, connection testing, and message history retrieval.
+> Manage agent communication channels. OpenClaw agents use runtime-managed channel catalog endpoints; legacy agents use Nora's built-in channel adapters.
 
-Channels define how an agent sends and receives messages with the outside world — email, Slack, webhooks, and other transport types. Each channel belongs to a specific agent and carries a `type`, a `name`, and a `config` object whose structure depends on the channel type. You can create multiple channels per agent, test them to verify connectivity, and retrieve their message history.
+All channel endpoints require access to the agent. Direct owners, authorized workspace members, and platform admins can read or mutate according to their normal agent permissions.
+
+## Runtime behavior
+
+| Runtime               | Backing system                           | Supported actions                                                                                                                  |
+| --------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| OpenClaw              | OpenClaw gateway config and pairing APIs | List catalog rows, load type metadata, save setup, link QR/CLI channels, logout supported channels, enable/disable configured rows |
+| Legacy / non-OpenClaw | Nora `channels` table and adapter layer  | Create, update, delete, test-message, inbound webhook logging, message history                                                     |
 
 <Note>
-  All channel endpoints require that you own the agent. Requests for agents belonging to other users return `403 Forbidden`.
+  OpenClaw channels do not expose Nora's legacy test-message or message-history APIs. For OpenClaw,
+  use the channel's Setup, Link, Logout, and Enable/Disable actions.
 </Note>
 
-***
+---
 
 ## List channels
 
-Return all channels configured for an agent.
+Return the channel payload for an agent.
 
-```
+```http
 GET /agents/:id/channels
 ```
 
-### Path parameters
-
-<ParamField path="id" type="string" required>
-  Agent UUID.
-</ParamField>
-
 ### Response
 
-<ResponseField name="id" type="string">Channel UUID.</ResponseField>
-<ResponseField name="agent_id" type="string">Parent agent UUID.</ResponseField>
-<ResponseField name="type" type="string">Channel type, e.g. `slack`, `webhook`, `email`.</ResponseField>
-<ResponseField name="name" type="string">Human-readable channel name.</ResponseField>
-<ResponseField name="config" type="object">Channel-specific configuration object.</ResponseField>
-<ResponseField name="enabled" type="boolean">Whether the channel is active.</ResponseField>
-<ResponseField name="created_at" type="string">ISO 8601 creation timestamp.</ResponseField>
+<ResponseField name="runtime" type="string">
+  `openclaw` or `legacy`.
+</ResponseField>
+<ResponseField name="title" type="string">
+  Display title for the channel surface.
+</ResponseField>
+<ResponseField name="description" type="string">
+  Display description for the channel surface.
+</ResponseField>
+<ResponseField name="capabilities" type="object">
+  Feature flags such as `supportsTesting`, `supportsMessageHistory`, and
+  `supportsLazyTypeDefinitions`.
+</ResponseField>
+<ResponseField name="channels" type="array">
+  Configured rows for legacy agents, or OpenClaw catalog rows for OpenClaw agents.
+</ResponseField>
+<ResponseField name="availableTypes" type="array">
+  Channel type metadata used by the dashboard setup form.
+</ResponseField>
 
-<CodeGroup>
-  ```bash curl theme={null}
-  curl http://localhost:8080/api/agents/a1b2c3d4-e5f6-7890-abcd-ef1234567890/channels \
-    -H "Authorization: Bearer $TOKEN"
-  ```
-</CodeGroup>
-
-```json theme={null}
-[
-  {
-    "id": "e6f7a8b9-c0d1-2345-efab-234567890123",
-    "agent_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "type": "slack",
-    "name": "Alerts",
-    "config": { "webhook_url": "https://hooks.slack.com/services/..." },
-    "enabled": true,
-    "created_at": "2025-03-01T08:00:00.000Z"
-  }
-]
+```json
+{
+  "runtime": "openclaw",
+  "title": "OpenClaw Channels",
+  "capabilities": {
+    "supportsTesting": false,
+    "supportsMessageHistory": false,
+    "supportsArbitraryNames": false,
+    "supportsLazyTypeDefinitions": true
+  },
+  "channels": [
+    {
+      "id": "whatsapp",
+      "type": "whatsapp",
+      "name": "WhatsApp",
+      "configured": false,
+      "enabled": false,
+      "actions": { "canQrLogin": true, "loginKind": "web", "canDelete": false }
+    }
+  ],
+  "availableTypes": [{ "type": "whatsapp", "label": "WhatsApp (QR link)" }]
+}
 ```
 
-***
+---
 
-## Create a channel
+## Get channel type metadata
 
-Add a new communication channel to an agent.
+Load setup metadata for one channel type.
 
+```http
+GET /agents/:id/channels/types/:type
 ```
+
+For OpenClaw agents, `:type` is the OpenClaw channel id such as `whatsapp`, `telegram`, `slack`, `feishu`, or `zalouser`. Nora returns docs-backed setup fields for built-in OpenClaw channels and uses the runtime schema as a best-effort fallback for custom channels.
+
+---
+
+## Create or setup a channel
+
+```http
 POST /agents/:id/channels
 ```
 
-### Path parameters
+For OpenClaw agents, this saves setup into `channels.<type>` through the OpenClaw config API. For legacy agents, it creates a Nora channel row.
 
-<ParamField path="id" type="string" required>
-  Agent UUID.
-</ParamField>
-
-### Request body
-
-<ParamField body="type" type="string" required>
-  Channel type. Examples: `slack`, `webhook`, `email`, `discord`.
-</ParamField>
-
-<ParamField body="name" type="string" required>
-  Human-readable name for this channel, maximum 100 characters.
-</ParamField>
-
-<ParamField body="config" type="object">
-  Channel-specific configuration. The required fields depend on the `type`. For example, a `webhook` channel needs a `url`; a `slack` channel needs a `webhook_url`.
-</ParamField>
-
-### Response
-
-Returns the created channel record.
-
-<ResponseField name="id" type="string">New channel UUID.</ResponseField>
-<ResponseField name="agent_id" type="string">Parent agent UUID.</ResponseField>
-<ResponseField name="type" type="string">Channel type.</ResponseField>
-<ResponseField name="name" type="string">Channel name.</ResponseField>
-<ResponseField name="config" type="object">Channel configuration.</ResponseField>
-<ResponseField name="enabled" type="boolean">`true` by default.</ResponseField>
-<ResponseField name="created_at" type="string">ISO 8601 creation timestamp.</ResponseField>
-
-<CodeGroup>
-  ```bash curl theme={null}
-  curl -X POST \
-    http://localhost:8080/api/agents/a1b2c3d4-e5f6-7890-abcd-ef1234567890/channels \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"type":"slack","name":"Alerts","config":{"webhook_url":"https://hooks.slack.com/services/..."}}'
-  ```
-</CodeGroup>
-
-```json theme={null}
+```json
 {
-  "id": "e6f7a8b9-c0d1-2345-efab-234567890123",
-  "agent_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "type": "slack",
-  "name": "Alerts",
-  "config": { "webhook_url": "https://hooks.slack.com/services/..." },
-  "enabled": true,
-  "created_at": "2025-03-10T09:00:00.000Z"
+  "type": "telegram",
+  "config": { "botToken": "123456:ABC-DEF" },
+  "enabled": true
 }
 ```
 
-| Status | Condition                |
-| ------ | ------------------------ |
-| `400`  | Missing `type` or `name` |
+OpenClaw responses use the setup result shape:
 
-***
+```json
+{ "success": true, "channel": "telegram", "restart": "requested" }
+```
+
+Legacy responses return the stored channel record with an `id`.
+
+---
 
 ## Update a channel
 
-Modify the name, config, or enabled state of an existing channel.
-
-```
+```http
 PATCH /agents/:id/channels/:cid
 ```
 
-### Path parameters
+For OpenClaw agents, `:cid` is the channel type id. Use this to save config changes or toggle `enabled`. For legacy agents, `:cid` is the channel UUID.
 
-<ParamField path="id" type="string" required>
-  Agent UUID.
-</ParamField>
+---
 
-<ParamField path="cid" type="string" required>
-  Channel UUID.
-</ParamField>
+## Link or pair an OpenClaw channel
 
-### Request body
-
-<ParamField body="name" type="string">
-  Updated channel name.
-</ParamField>
-
-<ParamField body="config" type="object">
-  Updated configuration object. Merged with existing config.
-</ParamField>
-
-<ParamField body="enabled" type="boolean">
-  Enable or disable the channel.
-</ParamField>
-
-### Response
-
-Returns the updated channel record.
-
-<CodeGroup>
-  ```bash curl theme={null}
-  curl -X PATCH \
-    http://localhost:8080/api/agents/a1b2c3d4-e5f6-7890-abcd-ef1234567890/channels/e6f7a8b9-c0d1-2345-efab-234567890123 \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"enabled":false}'
-  ```
-</CodeGroup>
-
-***
-
-## Delete a channel
-
-Permanently remove a channel from an agent.
-
+```http
+POST /agents/:id/channels/:cid/connect
+POST /agents/:id/channels/:cid/login
+POST /agents/:id/channels/:cid/login/wait
 ```
+
+These routes are available only for OpenClaw-managed channels. WhatsApp uses the web QR pairing provider. Feishu/Lark and Zalo Personal Account use the allowlisted OpenClaw CLI login flow.
+
+---
+
+## Logout an OpenClaw channel
+
+```http
+POST /agents/:id/channels/:cid/logout
+```
+
+Logout is exposed only for OpenClaw channel types Nora allows today: `whatsapp`, `telegram`, and `qqbot`.
+
+---
+
+## Legacy-only actions
+
+These routes remain available for legacy Nora adapter channels and return `409` for OpenClaw-managed channels.
+
+```http
 DELETE /agents/:id/channels/:cid
-```
-
-### Path parameters
-
-<ParamField path="id" type="string" required>
-  Agent UUID.
-</ParamField>
-
-<ParamField path="cid" type="string" required>
-  Channel UUID.
-</ParamField>
-
-### Response
-
-<ResponseField name="success" type="boolean">`true` when the channel was deleted.</ResponseField>
-
-<CodeGroup>
-  ```bash curl theme={null}
-  curl -X DELETE \
-    http://localhost:8080/api/agents/a1b2c3d4-e5f6-7890-abcd-ef1234567890/channels/e6f7a8b9-c0d1-2345-efab-234567890123 \
-    -H "Authorization: Bearer $TOKEN"
-  ```
-</CodeGroup>
-
-```json theme={null}
-{ "success": true }
-```
-
-***
-
-## Test a channel
-
-Send a test message through a channel to verify the configuration is correct. No data is persisted.
-
-```
 POST /agents/:id/channels/:cid/test
+GET /agents/:id/channels/:cid/messages?limit=50
 ```
 
-### Path parameters
+Legacy test sends a real test message through the adapter. Legacy messages are ordered newest first and include `direction`, `content`, `metadata`, and `created_at`.
 
-<ParamField path="id" type="string" required>
-  Agent UUID.
-</ParamField>
+---
 
-<ParamField path="cid" type="string" required>
-  Channel UUID.
-</ParamField>
+## Inbound webhooks
 
-### Response
+Legacy adapters can receive inbound events through:
 
-<ResponseField name="success" type="boolean">`true` when the test message was delivered.</ResponseField>
-<ResponseField name="message" type="string">Human-readable result.</ResponseField>
-
-<CodeGroup>
-  ```bash curl theme={null}
-  curl -X POST \
-    http://localhost:8080/api/agents/a1b2c3d4-e5f6-7890-abcd-ef1234567890/channels/e6f7a8b9-c0d1-2345-efab-234567890123/test \
-    -H "Authorization: Bearer $TOKEN"
-  ```
-</CodeGroup>
-
-```json theme={null}
-{
-  "success": true,
-  "message": "Test message delivered"
-}
+```http
+POST /api/webhooks/:channelId
 ```
 
-***
-
-## Get messages
-
-Retrieve the message history for a channel. Messages are ordered newest first.
-
-```
-GET /agents/:id/channels/:cid/messages
-```
-
-### Path parameters
-
-<ParamField path="id" type="string" required>
-  Agent UUID.
-</ParamField>
-
-<ParamField path="cid" type="string" required>
-  Channel UUID.
-</ParamField>
-
-### Query parameters
-
-<ParamField query="limit" type="number" default="50">
-  Maximum number of messages to return.
-</ParamField>
-
-### Response
-
-<ResponseField name="id" type="string">Message UUID.</ResponseField>
-<ResponseField name="channel_id" type="string">Parent channel UUID.</ResponseField>
-<ResponseField name="direction" type="string">`inbound` or `outbound`.</ResponseField>
-<ResponseField name="content" type="string">Message text content.</ResponseField>
-<ResponseField name="metadata" type="object">Additional message metadata (headers, event type, etc.).</ResponseField>
-<ResponseField name="created_at" type="string">ISO 8601 timestamp.</ResponseField>
-
-<CodeGroup>
-  ```bash curl theme={null}
-  curl "http://localhost:8080/api/agents/a1b2c3d4-e5f6-7890-abcd-ef1234567890/channels/e6f7a8b9-c0d1-2345-efab-234567890123/messages?limit=20" \
-    -H "Authorization: Bearer $TOKEN"
-  ```
-</CodeGroup>
-
-```json theme={null}
-[
-  {
-    "id": "f7a8b9c0-d1e2-3456-fabc-345678901234",
-    "channel_id": "e6f7a8b9-c0d1-2345-efab-234567890123",
-    "direction": "outbound",
-    "content": "Agent started successfully.",
-    "metadata": {},
-    "created_at": "2025-03-10T09:05:00.000Z"
-  }
-]
-```
+Nora accepts the payload, logs it as inbound message history, and forwards it to the agent runtime if the agent is running. OpenClaw-managed channels use the OpenClaw runtime's own inbound mechanisms instead of this legacy webhook logger.

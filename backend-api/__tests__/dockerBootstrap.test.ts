@@ -4,6 +4,7 @@ const path = require("path");
 const {
   buildOpenClawConfigMergeScript,
   buildOpenClawConfigMergeCommand,
+  buildMcpServersConfig,
   buildOpenClawCustomProviders,
   buildOpenClawInstallCommand,
   buildRuntimeBootstrapCommand,
@@ -219,6 +220,22 @@ describe("OpenClaw bootstrap helpers", () => {
         expect(model.compat).toEqual(expect.objectContaining({ supportsStore: false }));
       }
     });
+
+    it("adds the saved Foundry deployment name as an OpenClaw model", () => {
+      const result = buildOpenClawCustomProviders({
+        MICROSOFT_FOUNDRY_API_KEY: "ms-key",
+        MICROSOFT_FOUNDRY_BASE_URL: "https://st-eastus2.openai.azure.com/openai/v1/",
+        MICROSOFT_FOUNDRY_DEPLOYMENT: "gpt-5.5-1",
+      });
+
+      expect(result["azure-openai-responses"].models[0]).toEqual(
+        expect.objectContaining({
+          id: "gpt-5.5-1",
+          name: "gpt-5.5-1 (Azure deployment)",
+          api: "azure-openai-responses",
+        }),
+      );
+    });
   });
 
   describe("mapNoraProviderIdToOpenClaw", () => {
@@ -381,6 +398,29 @@ describe("Provisioner backends", () => {
     expect(startupScript.content).toContain('"apiKey": "ms-key"');
   });
 
+  it("embeds a per-agent mcpServers block into the startup merge script", () => {
+    // buildMcpServersConfig produces the openclaw.json mcpServers shape; when it
+    // is placed on the gatewayConfig, _buildBootstrapFiles ships it verbatim
+    // into the deep-merge so OpenClaw spawns the stdio server with its creds.
+    const dockerBackend = new DockerBackend();
+    const mcpServers = buildMcpServersConfig([
+      {
+        name: "gitlab",
+        npmPackage: "@modelcontextprotocol/server-gitlab",
+        env: { GITLAB_PERSONAL_ACCESS_TOKEN: "glpat-secret" },
+      },
+    ]);
+    const files = dockerBackend._buildBootstrapFiles({
+      gatewayConfig: { gateway: { bind: "lan", mode: "local" }, mcpServers },
+      pairedJson: '{"device":"paired"}',
+      buildAuthScript: 'console.log("build auth");',
+    });
+    const startupScript = files.find((file) => file.name === "opt/openclaw-runtime/start.sh");
+    expect(startupScript.content).toContain('"mcpServers"');
+    expect(startupScript.content).toContain("@modelcontextprotocol/server-gitlab");
+    expect(startupScript.content).toContain('"GITLAB_PERSONAL_ACCESS_TOKEN": "glpat-secret"');
+  });
+
   it("wires the executable guard into OpenClaw startup paths", () => {
     const k8sSource = fs.readFileSync(
       path.resolve(__dirname, "../../workers/provisioner/backends/k8s.ts"),
@@ -402,5 +442,27 @@ describe("Provisioner backends", () => {
 
     expect(k8sSource).toContain('"$OPENCLAW_BIN" gateway');
     expect(nemoclawSource).toContain('"$OPENCLAW_BIN" gateway');
+  });
+});
+
+// Every module runtimeBootstrap.ts (and the other shipped runtime files)
+// require()s relatively must itself be in RUNTIME_FILES — otherwise the
+// in-container runtime server crashes at load with MODULE_NOT_FOUND (this
+// happened with mcpServersConfig). Walk the shipped sources and assert closure.
+describe("runtime bundle closure", () => {
+  it("ships every relatively-required module into the container", () => {
+    const runtimeBootstrap = require("../../agent-runtime/lib/runtimeBootstrap");
+    const shipped = runtimeBootstrap.buildRuntimeBootstrapFiles();
+    const shippedNames = new Set(shipped.map((f) => f.relPath));
+    const missing = [];
+    for (const file of shipped) {
+      const requires = [...file.source.matchAll(/require\(["']\.\/([A-Za-z0-9_-]+)["']\)/g)];
+      for (const [, mod] of requires) {
+        if (!shippedNames.has(`${mod}.ts`) && !shippedNames.has(`${mod}.js`)) {
+          missing.push(`${file.relPath} requires ./${mod}`);
+        }
+      }
+    }
+    expect(missing).toEqual([]);
   });
 });

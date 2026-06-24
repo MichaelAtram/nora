@@ -1,0 +1,164 @@
+# Default values for the Nora chart.
+#
+# One Nora release per namespace: Services use fixed compose-parity names
+# (backend-api, postgres, redis, ...) so the bundled nginx config and the
+# application's connection defaults work unchanged.
+
+global:
+  # Registry prefix for the published Nora images.
+  imageRegistry: ghcr.io/solomon2773
+  # Image tag for all Nora services. Empty resolves to "v<chart appVersion>".
+  imageTag: ""
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets: []
+
+# Public origin operators will reach Nora on. Feeds NEXTAUTH_URL and
+# CORS_ORIGINS. With ingress enabled, set this to https://<ingress host>.
+publicUrl: http://localhost:8080
+
+platformMode: selfhosted
+# Kubernetes is the only usable agent deploy target when Nora itself runs in a
+# pod: the provisioner has no Docker socket in-cluster (see chart README).
+enabledBackends: k8s
+enabledRuntimeFamilies: openclaw
+enabledSandboxProfiles: standard
+
+secrets:
+  # Name of an existing Secret carrying JWT_SECRET, ENCRYPTION_KEY,
+  # NORA_BACKUP_ENCRYPTION_KEY, NORA_API_KEY_HASH_SECRET, and DB_PASSWORD.
+  # Leave empty to let the chart create one from the values below.
+  existingSecret: ""
+  # Required when existingSecret is empty (no insecure defaults are shipped):
+  #   openssl rand -hex 32   # for each of the four keys below
+  jwtSecret: ""
+  encryptionKey: ""
+  backupEncryptionKey: ""
+  apiKeyHashSecret: ""
+  dbPassword: ""
+
+# Extra non-secret environment variables applied to backend-api and both
+# workers (the control-plane processes). See .env.example for the catalog.
+backendEnv: {}
+
+# Extra environment variables applied to every Nora pod.
+commonEnv: {}
+
+nginx:
+  image: nginx:1.29
+  replicas: 1
+  service:
+    # ClusterIP behind an Ingress; switch to LoadBalancer/NodePort to expose
+    # the edge directly.
+    type: ClusterIP
+    port: 80
+    nodePort: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+ingress:
+  enabled: false
+  className: ""
+  host: nora.example.com
+  annotations: {}
+  tls: []
+  # tls:
+  #   - secretName: nora-tls
+  #     hosts: [nora.example.com]
+
+frontendMarketing:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+
+frontendDashboard:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+
+adminDashboard:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+
+backendApi:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+
+workerProvisioner:
+  replicas: 1
+  concurrency: 6
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+workerBackup:
+  enabled: true
+  concurrency: 2
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+
+# Kubeconfigs for agent deploy targets registered in Admin -> Kubernetes.
+# Point at an existing Secret whose keys are kubeconfig files; it is mounted
+# read-only at /kubeconfigs in backend-api and the provisioner.
+kubeconfigs:
+  existingSecret: ""
+
+# Shared volume for managed local backups (backend-api + worker-backup).
+# ReadWriteOnce only works when both pods land on one node (single-node
+# clusters such as k3s or Kind). On multi-node clusters use a ReadWriteMany
+# storage class here, or configure S3/SSH backup storage in Admin settings
+# and disable this volume.
+backupsVolume:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+postgresql:
+  # In-chart PostgreSQL (official postgres image). Disable to bring your own;
+  # then fill in external.* below.
+  enabled: true
+  image: postgres:15
+  auth:
+    username: nora
+    database: nora
+  persistence:
+    size: 10Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  external:
+    host: ""
+    port: 5432
+    username: nora
+    database: nora
+
+redis:
+  # In-chart Redis (official redis image). Queue state is transient; no
+  # persistence by default. Disable to bring your own.
+  enabled: true
+  image: redis:7
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+  external:
+    host: ""
+    port: 6379

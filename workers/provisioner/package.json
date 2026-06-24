@@ -22,5 +22,9 @@
   "devDependencies": {
     "@types/node": "^25.6.0",
     "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "form-data": ">=4.0.6",
+    "protobufjs": "^7.6.3"
   }
 }

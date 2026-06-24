@@ -9,23 +9,27 @@ Watches the chats you point it at, stays quiet on the noise, and surfaces only w
 Full walkthrough: **[Sentry setup guide](https://noradocs.solomontsao.com/guides/sentry-communication-intelligence)**.
 
 ### 1. Install from Agent Hub
+
 Install the **Communication Intelligence Claw** listing into a workspace.
 
 ### 2. Connect one channel — Channels tab
-Open the agent → **Channels** tab → connect **one** way for Sentry to *reach you* with escalations (you only need one):
 
-- **WhatsApp** (recommended) — Meta WhatsApp Cloud API; needs a Phone Number ID + Access Token.
-- Or **Telegram**, **Slack**, **Discord**, or **email**.
+Open the agent → **Channels** tab → connect **one** way for Sentry to _reach you_ with escalations (you only need one):
+
+- **WhatsApp** (recommended) - use Nora's **Link** action and scan the QR/pairing prompt.
+- Or **Telegram**, **Slack**, **Discord**, or another OpenClaw catalog channel.
 
 This is how Sentry reaches you — separate from the chats it monitors.
 
 ### 3. Point Sentry at what to watch
+
 Two ways, mix as needed:
 
-- **Live monitoring** — connect a source in the **Integrations** tab (**Slack**, **Microsoft Teams**, or **email**) so Sentry reads it directly.
+- **Live monitoring** — connect a source in the **Integrations** tab (**Slack** or **email**) so Sentry reads it directly.
 - **Imported logs** — paste or import chat exports (WhatsApp/WeChat/group logs); no integration required.
 
 ### 4. Say hi
+
 Start the runtime and send a first message. Sentry introduces itself, offers to rename, gets your channel connected, then captures the people, channels, topics, and trigger rules that decide when it breaks silence.
 
 > **How integrations flow in:** if you connect a live source, Nora writes `integrations/NORA_INTEGRATIONS.md` and updates `TOOLS.md` automatically — you never edit those.

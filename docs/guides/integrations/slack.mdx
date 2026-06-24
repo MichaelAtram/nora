@@ -40,11 +40,11 @@ A Slack MCP server is available:
 
 - **Package:** `@modelcontextprotocol/server-slack`
 - **Docs:** [github.com/modelcontextprotocol/servers/tree/main/src/slack](https://github.com/modelcontextprotocol/servers/tree/main/src/slack)
-- **Env:** `SLACK_BOT_TOKEN` — Nora injects this automatically.
+- **Env:** `SLACK_BOT_TOKEN` — set this in the MCP server config to the value Nora injects as `SLACK_TOKEN`.
 
 ## Environment variables Nora injects
 
 | Variable                | Source                   |
 | ----------------------- | ------------------------ |
-| `SLACK_BOT_TOKEN`       | Bot Token field          |
+| `SLACK_TOKEN`           | Bot Token field          |
 | `SLACK_DEFAULT_CHANNEL` | Default Channel (if set) |

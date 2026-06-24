@@ -3,6 +3,7 @@ import { Puzzle, Search, Loader2 } from "lucide-react";
 import IntegrationCard from "./IntegrationCard";
 import ActiveIntegrationsPanel from "./ActiveIntegrationsPanel";
 import IntegrationDetailPanel from "./IntegrationDetailPanel";
+import McpServersSection from "./McpServersSection";
 import { fetchWithAuth } from "../../lib/api";
 import { useToast } from "../Toast";
 import { emitAgentDataChanged, subscribeToAgentDataChanged } from "./agentEvents";
@@ -284,6 +285,9 @@ export default function IntegrationsTab({ agentId }) {
           </div>
         </div>
       )}
+
+      {/* MCP Servers */}
+      <McpServersSection agentId={agentId} />
 
       {/* Catalog Browser */}
       <div className="space-y-4">

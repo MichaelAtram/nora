@@ -4,6 +4,7 @@ const containerManager = require("./containerManager");
 const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
 const { runContainerCommand } = require("./authSync");
 const { waitForAgentReadiness } = require("./healthChecks");
+const { buildHermesRuntimeBootstrapEnv } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
 
 const HERMES_CHANNEL_REDACTED = "[REDACTED]";
 
@@ -645,6 +646,9 @@ def repair_surrogates(value):
 async function repairHermesAgentConfig(agent) {
   const script = `
 import json
+import grp
+import os
+import pwd
 from pathlib import Path
 
 from hermes_cli.config import get_config_path, load_config, save_config
@@ -668,6 +672,14 @@ print(json.dumps({
 }
 
 async function persistHermesModelConfig(agent, modelConfig = {}) {
+  if (
+    typeof containerManager.isKubernetesAgent === "function" &&
+    containerManager.isKubernetesAgent(agent)
+  ) {
+    await containerManager.updateEnv(agent, buildHermesRuntimeBootstrapEnv({ modelConfig }));
+    return { ok: true };
+  }
+
   const payloadJson = JSON.stringify(modelConfig || {});
   const script = `
 import json
@@ -683,6 +695,8 @@ model = dict(current_model) if isinstance(current_model, dict) else {}
 default_model = str(payload.get("defaultModel") or "").strip()
 provider = str(payload.get("provider") or "").strip()
 base_url = str(payload.get("baseUrl") or "").strip()
+api_key_present = "apiKey" in payload or "api_key" in payload
+api_key = str(payload.get("apiKey") or payload.get("api_key") or "").strip()
 
 if default_model:
     model["default"] = default_model
@@ -699,6 +713,14 @@ if base_url:
 else:
     model.pop("base_url", None)
 
+if api_key_present:
+    if api_key:
+        model["api_key"] = api_key
+    else:
+        model.pop("api_key", None)
+elif provider and provider != "custom":
+    model.pop("api_key", None)
+
 if model:
     config["model"] = model
 else:
@@ -706,6 +728,16 @@ else:
 
 config_path = Path(get_config_path())
 save_config(config)
+try:
+    user = pwd.getpwnam("hermes")
+    group = grp.getgrnam("hermes")
+    os.chown(config_path, user.pw_uid, group.gr_gid)
+except Exception:
+    pass
+try:
+    config_path.chmod(0o600)
+except Exception:
+    pass
 
 print(json.dumps({
     "ok": True,

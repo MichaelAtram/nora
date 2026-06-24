@@ -1,11 +1,22 @@
 // @ts-nocheck
 const DEFAULT_RUNTIME_FAMILY = "openclaw";
+const {
+  NEMOCLAW_DEFAULT_MODEL,
+  getNemoClawDefaultModel,
+  getNemoClawSandboxImage,
+} = require("./nemoclawDefaults");
 const KNOWN_RUNTIME_FAMILIES = Object.freeze(["openclaw", "hermes"]);
-const KNOWN_DEPLOY_TARGETS = Object.freeze(["docker", "k8s", "proxmox"]);
+const KNOWN_DEPLOY_TARGETS = Object.freeze(["docker", "k8s", "remote-docker", "proxmox"]);
 const KNOWN_BACKENDS = KNOWN_DEPLOY_TARGETS;
+// "external" is a recognized deploy_target VALUE for an adopted, already-running
+// runtime (BYOC Phase C). It is deliberately NOT in KNOWN_DEPLOY_TARGETS: you do
+// not "deploy to" external (no provisioner, no deploy-catalog card) — you adopt a
+// runtime by URL + token. It only needs to normalize, carry metadata, and resolve
+// a maturity tier for an existing agent row.
+const EXTERNAL_DEPLOY_TARGET = "external";
 const KNOWN_SANDBOX_PROFILES = Object.freeze(["standard", "nemoclaw"]);
 const PROXMOX_RELEASE_BLOCKER_ISSUE =
-  "Proxmox execution target is not configured for this Nora control plane.";
+  "Proxmox execution target is not supported in this Nora release.";
 
 const OPENCLAW_OPERATOR_CONTRACT = Object.freeze([
   "deploy/redeploy",
@@ -101,15 +112,35 @@ const EXECUTION_TARGET_METADATA = Object.freeze({
       "Use the Kubernetes adapter for K3s, AKS, GKE, EKS, or any conformant cluster reachable through the configured kubeconfig.",
     badges: ["Cluster workload", "Service-backed", "Kube API"],
   }),
+  "remote-docker": Object.freeze({
+    id: "remote-docker",
+    label: "Remote Docker host",
+    shortLabel: "Remote host",
+    summary:
+      "Run agents on your own remote machine — Mac, Windows, VPS, or cloud instance — reached over SSH instead of the local Docker host.",
+    detail:
+      "Nora connects to the remote machine's Docker daemon over SSH and runs the selected runtime there. Register a host in the operator console to make it selectable.",
+    badges: ["Bring your own compute", "SSH", "Remote daemon"],
+  }),
   proxmox: Object.freeze({
     id: "proxmox",
     label: "Proxmox",
     shortLabel: "Proxmox",
     summary:
-      "Provision agents as Proxmox LXCs when your infrastructure standard is VM and LXC orchestration through the Proxmox API.",
+      "Planned Proxmox LXC runtime placement for operators whose infrastructure standard is VM and LXC orchestration through the Proxmox API.",
     detail:
-      "Use Proxmox when Nora should create LXCs through the Proxmox API instead of scheduling onto Docker or Kubernetes.",
-    badges: ["LXC", "Proxmox API", "Infrastructure-specific"],
+      "Proxmox is tracked as a roadmap execution target. Current releases keep it visible for operator awareness, but block normal onboarding and deploy selection.",
+    badges: ["Roadmap", "LXC", "Proxmox API"],
+  }),
+  external: Object.freeze({
+    id: "external",
+    label: "External runtime",
+    shortLabel: "External",
+    summary:
+      "An already-running OpenClaw or Hermes runtime that Nora did not provision, adopted by its reachable URL and gateway token.",
+    detail:
+      "Nora monitors and proxies access to the external runtime but does not control its lifecycle. Register it from the operator console; deregistering only removes it from Nora.",
+    badges: ["Bring your own compute", "Adopted", "Not provisioned"],
   }),
 });
 
@@ -135,7 +166,7 @@ const SANDBOX_PROFILE_METADATA = Object.freeze({
 });
 
 const NEMOCLAW_MODELS = Object.freeze([
-  "nvidia/nemotron-3-super-120b-a12b",
+  NEMOCLAW_DEFAULT_MODEL,
   "nvidia/llama-3.1-nemotron-ultra-253b-v1",
   "nvidia/llama-3.3-nemotron-super-49b-v1.5",
   "nvidia/nemotron-3-nano-30b-a3b",
@@ -153,6 +184,8 @@ function normalizeDeployTargetName(value) {
     .trim()
     .toLowerCase();
   if (normalized.startsWith("k8s:")) return "k8s";
+  if (normalized.startsWith("remote:")) return "remote-docker";
+  if (normalized === EXTERNAL_DEPLOY_TARGET) return EXTERNAL_DEPLOY_TARGET;
   return KNOWN_DEPLOY_TARGETS.includes(normalized) ? normalized : "docker";
 }
 
@@ -173,6 +206,15 @@ function normalizeExecutionTargetId(value) {
       .replace(/^-|-$/g, "");
     return clusterId ? `k8s:${clusterId}` : "k8s";
   }
+  if (normalized.startsWith("remote:")) {
+    const hostId = normalized
+      .slice(7)
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    return hostId ? `remote:${hostId}` : "remote-docker";
+  }
+  if (normalized === EXTERNAL_DEPLOY_TARGET) return EXTERNAL_DEPLOY_TARGET;
   return KNOWN_DEPLOY_TARGETS.includes(normalized) ? normalized : null;
 }
 
@@ -200,6 +242,8 @@ function isKnownDeployTarget(value) {
     .toLowerCase();
   return (
     normalized.startsWith("k8s:") ||
+    normalized.startsWith("remote:") ||
+    normalized === EXTERNAL_DEPLOY_TARGET ||
     KNOWN_DEPLOY_TARGETS.includes(normalized)
   );
 }
@@ -291,8 +335,7 @@ function getKubernetesProviderMetadata(options = {}) {
   );
   const metadata =
     KUBERNETES_PROVIDER_METADATA[providerId] || KUBERNETES_PROVIDER_METADATA.kubernetes;
-  const customLabel =
-    typeof options === "object" ? String(options.providerLabel || "").trim() : "";
+  const customLabel = typeof options === "object" ? String(options.providerLabel || "").trim() : "";
   return customLabel
     ? {
         ...metadata,
@@ -381,23 +424,14 @@ function buildMaturityFields(maturityTier) {
   };
 }
 
-function resolveMaturityTier({ runtimeFamily, deployTarget, sandboxProfile }) {
-  if (normalizeSandboxProfileName(sandboxProfile) === "nemoclaw") return "experimental";
-  const normalizedRuntimeFamily = normalizeRuntimeFamilyName(runtimeFamily);
+function resolveMaturityTier({ deployTarget, sandboxProfile }) {
   const normalizedDeployTarget = normalizeDeployTargetName(deployTarget);
 
-  if (normalizedRuntimeFamily === "hermes" && normalizedDeployTarget === "proxmox") {
-    return "beta";
-  }
-
-  switch (normalizedDeployTarget) {
-    case "k8s":
-      return "ga";
-    case "proxmox":
-      return "beta";
-    default:
-      return "ga";
-  }
+  if (normalizedDeployTarget === "proxmox") return "blocked";
+  if (normalizedDeployTarget === "remote-docker") return "experimental";
+  if (normalizedDeployTarget === EXTERNAL_DEPLOY_TARGET) return "experimental";
+  if (normalizeSandboxProfileName(sandboxProfile) === "nemoclaw") return "experimental";
+  return "ga";
 }
 
 function parseList(rawValue, isKnown, normalize) {
@@ -419,7 +453,12 @@ function parseList(rawValue, isKnown, normalize) {
 function parseEnabledBackendList(rawValue) {
   return parseList(
     rawValue,
-    (value) => ["docker", "proxmox"].includes(String(value || "").trim().toLowerCase()),
+    (value) =>
+      ["docker", "proxmox"].includes(
+        String(value || "")
+          .trim()
+          .toLowerCase(),
+      ),
     normalizeDeployTargetName,
   );
 }
@@ -454,7 +493,7 @@ function getEnabledSandboxProfiles(env = process.env, options = {}) {
 
 function executionTargetsForRuntimeFamily(runtimeFamily) {
   return normalizeRuntimeFamilyName(runtimeFamily) === "hermes"
-    ? ["docker", "k8s", "proxmox"]
+    ? ["docker", "k8s", "remote-docker", "proxmox"]
     : [...KNOWN_DEPLOY_TARGETS];
 }
 
@@ -470,10 +509,6 @@ function getEnabledDeployTargets(env = process.env, options = {}) {
   );
   const supportedTargets = new Set(executionTargetsForRuntimeFamily(runtimeFamily));
   return getEnabledBackends(env).filter((target) => supportedTargets.has(target));
-}
-
-function hasAnyValue(env, keys) {
-  return keys.some((key) => typeof env[key] === "string" && env[key].trim() !== "");
 }
 
 function isProxmoxApiTokenId(value) {
@@ -494,26 +529,17 @@ function baseDeployTargetIssue(deployTarget, env = process.env, selection = {}) 
         return null;
       }
       return "Kubernetes execution target requires an Admin-registered cluster such as k8s:aks-eastus2.";
-    case "proxmox":
-      if (!env.PROXMOX_API_URL || !env.PROXMOX_TOKEN_ID || !env.PROXMOX_TOKEN_SECRET) {
-        return "Proxmox execution target requires PROXMOX_API_URL, PROXMOX_TOKEN_ID, and PROXMOX_TOKEN_SECRET.";
-      }
-      if (!isProxmoxApiTokenId(env.PROXMOX_TOKEN_ID)) {
-        return "Proxmox execution target requires PROXMOX_TOKEN_ID in API token format user@realm!tokenname.";
-      }
-      if (!env.PROXMOX_SSH_HOST || !env.PROXMOX_SSH_USER) {
-        return "Proxmox execution target requires PROXMOX_SSH_HOST and PROXMOX_SSH_USER for pct bootstrap.";
-      }
+    case "remote-docker":
       if (
-        !hasAnyValue(env, [
-          "PROXMOX_SSH_PRIVATE_KEY",
-          "PROXMOX_SSH_PRIVATE_KEY_PATH",
-          "PROXMOX_SSH_PASSWORD",
-        ])
+        normalizeExecutionTargetId(
+          selection.executionTargetId || selection.execution_target_id,
+        )?.startsWith("remote:")
       ) {
-        return "Proxmox execution target requires SSH key or password authentication.";
+        return null;
       }
-      return null;
+      return "Remote Docker execution target requires a registered host such as remote:my-laptop.";
+    case "proxmox":
+      return PROXMOX_RELEASE_BLOCKER_ISSUE;
     default:
       return null;
   }
@@ -599,8 +625,12 @@ function getRuntimeSelectionStatus(selection = {}, env = process.env) {
     ) || deployTarget;
   const hasRegisteredKubernetesTarget =
     deployTarget === "k8s" && String(executionTargetId || "").startsWith("k8s:");
+  const hasRegisteredRemoteTarget =
+    deployTarget === "remote-docker" && String(executionTargetId || "").startsWith("remote:");
   const deployTargetEnabled =
-    hasRegisteredKubernetesTarget || getEnabledDeployTargets(env, { runtimeFamily }).includes(deployTarget);
+    hasRegisteredKubernetesTarget ||
+    hasRegisteredRemoteTarget ||
+    getEnabledDeployTargets(env, { runtimeFamily }).includes(deployTarget);
   const enabled =
     getEnabledRuntimeFamilies(env).includes(runtimeFamily) &&
     deployTargetEnabled &&
@@ -742,14 +772,8 @@ function buildSandboxProfileOption(runtimeFamily, deployTarget, sandboxProfile, 
     selectionId: `${normalizedRuntimeFamily}:${normalizedDeployTarget}:${normalizedSandboxProfile}`,
     selectionType: "sandbox_profile",
     models: normalizedSandboxProfile === "nemoclaw" ? [...NEMOCLAW_MODELS] : [],
-    defaultModel:
-      normalizedSandboxProfile === "nemoclaw"
-        ? env.NEMOCLAW_DEFAULT_MODEL || NEMOCLAW_MODELS[0]
-        : null,
-    sandboxImage:
-      normalizedSandboxProfile === "nemoclaw"
-        ? env.NEMOCLAW_SANDBOX_IMAGE || "ghcr.io/nvidia/openshell-community/sandboxes/openclaw"
-        : null,
+    defaultModel: normalizedSandboxProfile === "nemoclaw" ? getNemoClawDefaultModel(env) : null,
+    sandboxImage: normalizedSandboxProfile === "nemoclaw" ? getNemoClawSandboxImage(env) : null,
     availableForOnboarding: maturityFields.onboardingVisible && status.available,
     ...maturityFields,
   };
@@ -993,12 +1017,8 @@ function getSandboxProfileCatalog(env = process.env, options = {}) {
           : null,
       executionTargets: relatedTargets.map((target) => target.id),
       models: sandboxProfile === "nemoclaw" ? [...NEMOCLAW_MODELS] : [],
-      defaultModel:
-        sandboxProfile === "nemoclaw" ? env.NEMOCLAW_DEFAULT_MODEL || NEMOCLAW_MODELS[0] : null,
-      sandboxImage:
-        sandboxProfile === "nemoclaw"
-          ? env.NEMOCLAW_SANDBOX_IMAGE || "ghcr.io/nvidia/openshell-community/sandboxes/openclaw"
-          : null,
+      defaultModel: sandboxProfile === "nemoclaw" ? getNemoClawDefaultModel(env) : null,
+      sandboxImage: sandboxProfile === "nemoclaw" ? getNemoClawSandboxImage(env) : null,
       availableForOnboarding:
         maturityFields.onboardingVisible && relatedOptions.some((option) => option.available),
       ...maturityFields,
@@ -1071,9 +1091,7 @@ function buildBackendEnablementMessage(backendOrStatus, env = process.env) {
       ? backendOrStatus
       : getBackendStatus(backendOrStatus, env);
   if (status.id === "k8s") {
-    return (
-      `${status.label} is not enabled. Register a Kubernetes cluster in Admin -> Kubernetes.`
-    );
+    return `${status.label} is not enabled. Register a Kubernetes cluster in Admin -> Kubernetes.`;
   }
   return `${status.label} is not enabled. Enable it with ` + `ENABLED_BACKENDS=${status.id}.`;
 }

@@ -35,7 +35,7 @@ Credentials can be set via env at startup or managed at runtime from **Admin Set
   </Step>
 
   <Step title="Click New backup">
-    Optionally name the backup (defaults to a timestamped label). Confirm. Nora queues a backup job on the `backups` queue and the panel shows it as `pending`. The backup worker (`workers/backup`) picks it up, snapshots the agent state, encrypts the archive, and uploads it to the configured destination.
+    Optionally name the backup (defaults to a timestamped label). Confirm. Nora queues a backup job on the `backups` queue and the panel shows it as `queued`. The backup worker (`workers/backup`) picks it up, snapshots the agent state, encrypts the archive, and uploads it to the configured destination.
 
     <Note>
       Backup jobs have a hard `Promise.race` timeout of `NORA_BACKUP_JOB_TIMEOUT_MS` (default 30 minutes). Long-running snapshots are aborted at the timeout — agents holding open large datasets may need a higher value.
@@ -43,7 +43,7 @@ Credentials can be set via env at startup or managed at runtime from **Admin Set
   </Step>
 
   <Step title="Wait for completion">
-    The backup transitions through `pending` → `running` → `completed` (or `failed`). When complete, the **Download** action becomes available.
+    The backup transitions through `queued` → `running` → `ready` / `ready_with_warnings` (or `failed`). When complete, the **Download** action becomes available.
   </Step>
 </Steps>
 
@@ -56,7 +56,7 @@ Each agent has its own schedule. From the Backups panel, click **Schedule**:
 | Field            | Notes                                                                   |
 | ---------------- | ----------------------------------------------------------------------- |
 | **Enabled**      | Master toggle for the schedule.                                         |
-| **Frequency**    | One of `hourly`, `daily`, `weekly`, `monthly`.                          |
+| **Frequency**    | One of `hourly`, `daily`, `weekly`.                                     |
 | **Retain**       | How many scheduled backups to keep before pruning the oldest.           |
 | **Next run at**  | Computed from the frequency and the most recent successful backup.      |
 
@@ -68,7 +68,7 @@ The public API exposes **copy** restore only — it materializes the backup into
 
 <Steps>
   <Step title="Click Restore on a backup row">
-    From the agent's Backups panel, click the **Restore** action on any `completed` backup.
+    From the agent's Backups panel, click the **Restore** action on any `ready` (or `ready_with_warnings`) backup.
   </Step>
 
   <Step title="Confirm the destination">
@@ -106,8 +106,8 @@ PaaS deployments override these per subscription tier. See [Platform modes](/con
 ## Troubleshooting
 
 <AccordionGroup>
-  <Accordion title="Backup stays in 'pending' forever">
-    Check that the `nora-backup-worker` container is running. Its health endpoint is `http://backup-worker:4002/health`. If unhealthy, the BullMQ `backups` queue has nothing draining it.
+  <Accordion title="Backup stays in 'queued' forever">
+    Check that the `worker-backup` container is running. Its health endpoint is `http://worker-backup:4002/health`. If unhealthy, the BullMQ `backups` queue has nothing draining it.
   </Accordion>
 
   <Accordion title="Restore archive fails to decrypt">
@@ -119,6 +119,6 @@ PaaS deployments override these per subscription tier. See [Platform modes](/con
   </Accordion>
 
   <Accordion title="SSH upload hangs">
-    The SSH destination uses sftp under the hood. Check that the remote user can write to `NORA_BACKUP_SSH_REMOTE_PATH` and that the host is reachable from inside the backup-worker container.
+    The SSH destination uses sftp under the hood. Check that the remote user can write to `NORA_BACKUP_SSH_REMOTE_PATH` and that the host is reachable from inside the `worker-backup` container.
   </Accordion>
 </AccordionGroup>

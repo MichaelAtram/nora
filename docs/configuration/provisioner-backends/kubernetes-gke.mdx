@@ -13,7 +13,10 @@ GKE uses the same Kubernetes adapter as every Kubernetes provider. Nora stores p
 - An existing GKE cluster (or create one — GCP Console → **Kubernetes Engine → Clusters → Create**).
 - `kubectl` installed on the host that runs Nora.
 
-<Frame caption="GCP Console — Kubernetes Engine cluster details">
+Use the cluster details page in Google Cloud Console to confirm the GKE cluster name, location
+type, and region or zone before creating the kubeconfig.
+
+<Frame caption="Google Cloud Console — Kubernetes Engine cluster details">
   ![GKE cluster details](/images/provisioner-backends/k8s/gke/cluster-details.png)
 </Frame>
 
@@ -29,8 +32,8 @@ KUBECONFIG=./.secrets/gke-kubeconfig \
 
 Use `--zone <zone>` instead of `--region <region>` for zonal clusters. You can copy the exact command from the cluster's **Connect** dialog.
 
-<Frame caption="GCP Console — Cluster → Connect dialog (get-credentials command)">
-  ![GKE connect dialog](/images/provisioner-backends/k8s/gke/connect-dialog.png)
+<Frame caption="Google Cloud Console — Cluster → Connect dialog (get-credentials command)">
+  ![GKE Connect dialog](/images/provisioner-backends/k8s/gke/connect-dialog.png)
 </Frame>
 
 ### 3. Verify access from the host
@@ -53,8 +56,8 @@ For two or more GKE clusters, put each kubeconfig under `NORA_KUBECONFIGS_DIR` a
 
 Confirm region / VPC alignment in the Console's **Networking** tab before exposing services to the public internet.
 
-<Frame caption="GCP Console — Cluster → Networking (region + VPC)">
-  ![GKE networking](/images/provisioner-backends/k8s/gke/networking.png)
+<Frame caption="Google Cloud Console — create cluster review with Networking complete">
+  ![GKE networking review](/images/provisioner-backends/k8s/gke/networking.png)
 </Frame>
 
 ### 5. Start the stack
@@ -120,7 +123,7 @@ Set the Admin **Load balancer class** field to `networking.gke.io/l4-regional-ex
 For clusters that use the annotation path instead of `loadBalancerClass`:
 
 ```json theme={null}
-{"cloud.google.com/l4-rbs":"enabled"}
+{ "cloud.google.com/l4-rbs": "enabled" }
 ```
 
 Leave **Service annotations JSON** empty unless your cluster policy requires provider-specific Service annotations.

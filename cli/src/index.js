@@ -9,6 +9,8 @@ const commands = {
   workspaces: require("./commands/workspaces"),
   agents: require("./commands/agents"),
   monitoring: require("./commands/monitoring"),
+  mcp: require("./commands/mcp"),
+  doctor: require("./commands/doctor"),
 };
 
 function printRootHelp() {
@@ -70,8 +72,9 @@ async function main(argv) {
     return 0;
   }
 
-  await cmd.run(rest, flags);
-  return 0;
+  // Commands may return a process exit code (e.g. doctor returns non-zero when
+  // the control plane is unhealthy); default to 0 when they return nothing.
+  return (await cmd.run(rest, flags)) || 0;
 }
 
 main(process.argv.slice(2))

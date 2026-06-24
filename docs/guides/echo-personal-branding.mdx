@@ -7,20 +7,24 @@ Echo is a ghostwriting-oriented Agent Hub template for X and LinkedIn. It runs a
 You can run Echo for **X only, LinkedIn only, or both** — the platform you pick during bootstrap drives everything downstream.
 
 <Tip>
-  **Echo** is just the default name. Bootstrap's first question is what you'd like to call the agent — rename it to anything, or keep "Echo." This guide calls it Echo throughout.
+  **Echo** is just the default name. Bootstrap's first question is what you'd like to call the agent
+  — rename it to anything, or keep "Echo." This guide calls it Echo throughout.
 </Tip>
 
 ## Before you install
 
 <Steps>
   <Step title="A running Nora instance with dashboard access">
-    You'll connect integrations and channels from the agent's detail page, so you need `editor` access to the destination workspace.
+    You'll connect integrations and channels from the agent's detail page, so you need `editor`
+    access to the destination workspace.
   </Step>
   <Step title="Decide which platform(s) to manage">
-    X only, LinkedIn only, or both. You can start with one and add the other later — it's not a permanent choice.
+    X only, LinkedIn only, or both. You can start with one and add the other later — it's not a
+    permanent choice.
   </Step>
   <Step title="Have 5+ writing samples ready">
-    Real posts, emails, or texts that sound like you. Echo extracts your voice from these during bootstrap. Quality matters more than format.
+    Real posts, emails, or texts that sound like you. Echo extracts your voice from these during
+    bootstrap. Quality matters more than format.
   </Step>
 </Steps>
 
@@ -30,21 +34,30 @@ From the dashboard, open **Agent Hub**, find the **Echo Personal Branding** list
 
 See [Publish and install Agent Hub templates](/guides/agent-hub) for the general install flow.
 
+<Frame caption="Agent Hub — Echo Personal Branding template detail before installation">
+  ![Echo template detail](/images/guides/agent-templates/echo-personal-branding.png)
+</Frame>
+
 ## Step 2 — Connect your platform(s)
 
 Open the agent → **Integrations** tab. Connect **at least one** of the two platforms — only the one(s) you plan to manage.
 
 <CardGroup cols={2}>
   <Card title="Twitter / X" href="/guides/integrations/twitter" icon="twitter" arrow>
-    Click <b>Authorize with X</b>. Requires an X OAuth 2.0 app with the <code>tweet.read</code>, <code>tweet.write</code>, <code>users.read</code>, and <code>offline.access</code> scopes.
+    Click <b>Authorize with X</b>. Requires an X OAuth 2.0 app with the <code>tweet.read</code>,{" "}
+    <code>tweet.write</code>, <code>users.read</code>, and <code>offline.access</code> scopes.
   </Card>
   <Card title="LinkedIn" href="/guides/integrations/linkedin" icon="linkedin" arrow>
-    Click <b>Authorize with LinkedIn</b>. Requires a LinkedIn developer app with the <code>openid</code>, <code>profile</code>, <code>email</code>, and <code>w_member_social</code> scopes.
+    Click <b>Authorize with LinkedIn</b>. Requires a LinkedIn developer app with the{" "}
+    <code>openid</code>, <code>profile</code>, <code>email</code>, and <code>w_member_social</code>{" "}
+    scopes.
   </Card>
 </CardGroup>
 
 <Note>
-  The OAuth app setup (registering the redirect URI, copying the Client ID/Secret) is covered in the per-provider guides linked above. Nora runs the full authorize → callback flow — you never paste a long-lived token.
+  The OAuth app setup (registering the redirect URI, copying the Client ID/Secret) is covered in the
+  per-provider guides linked above. Nora runs the full authorize → callback flow — you never paste a
+  long-lived token.
 </Note>
 
 When you connect a provider, Nora automatically writes `integrations/NORA_INTEGRATIONS.md` into the agent's workspace and updates `TOOLS.md`. Echo reads that file to know what's connected — you never edit it by hand.
@@ -56,18 +69,17 @@ Echo needs **one** communication channel to reach you with briefs, drafts, and a
 WhatsApp is the recommended example:
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">
-    At [developers.facebook.com](https://developers.facebook.com), create an app and add the **WhatsApp** product (Meta's WhatsApp Cloud API).
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
   </Step>
-  <Step title="Copy your credentials">
-    From the WhatsApp setup screen, copy the **Phone Number ID** and an **Access Token**. Optionally set a webhook **Verify Token** if you want Echo to receive inbound replies.
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
   </Step>
-  <Step title="Add the channel in Nora">
-    Open the agent → **Channels** tab → add **WhatsApp** → paste the Phone Number ID and Access Token. Credentials are encrypted at rest and never shown back in full.
-  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Prefer something else? Telegram, Slack, Discord, and email all work — see [Configure channels](/guides/channels) for each one's required fields. You only need one.
+Prefer something else? Use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels) for each one's required fields. You only need one.
 
 ## Step 4 — Run the bootstrap
 
@@ -87,13 +99,13 @@ You can bail and resume later, or re-run anytime with **"rebootstrap"**.
 
 Your choice in bootstrap (`enabled_platforms`) cascades through every behavior file. Echo never acts on a platform you didn't enable.
 
-| Behavior | X only | LinkedIn only | Both |
-| --- | --- | --- | --- |
-| Drafts | X posts/threads/replies | LinkedIn posts/comments | Both, adapted per platform |
-| Heartbeats (briefs, scans, reviews) | Scoped to X | Scoped to LinkedIn | Both platforms |
-| `PLATFORMS.md` playbook | X section only | LinkedIn section only | Both + cross-platform section |
-| `VOICE.md` platform shifts | X register only | LinkedIn register only | Both registers |
-| Cross-platform adaptation | — | — | Active (post 12–24h apart) |
+| Behavior                            | X only                  | LinkedIn only           | Both                          |
+| ----------------------------------- | ----------------------- | ----------------------- | ----------------------------- |
+| Drafts                              | X posts/threads/replies | LinkedIn posts/comments | Both, adapted per platform    |
+| Heartbeats (briefs, scans, reviews) | Scoped to X             | Scoped to LinkedIn      | Both platforms                |
+| `PLATFORMS.md` playbook             | X section only          | LinkedIn section only   | Both + cross-platform section |
+| `VOICE.md` platform shifts          | X register only         | LinkedIn register only  | Both registers                |
+| Cross-platform adaptation           | —                       | —                       | Active (post 12–24h apart)    |
 
 Started with one and want the other? Just tell Echo **"add X"** or **"add LinkedIn"** — she'll walk you through connecting it and switch on its workflows.
 
@@ -119,6 +131,6 @@ Started with one and want the other? Just tell Echo **"add X"** or **"add Linked
     Confirm the redirect URI registered in your developer app exactly matches the one Nora's integration modal shows (`https://<your-nora-host>/api/integrations/twitter/oauth/callback` or `.../linkedin/oauth/callback`), and that the required scopes are enabled. See the [X](/guides/integrations/twitter) and [LinkedIn](/guides/integrations/linkedin) guides.
   </Accordion>
   <Accordion title="I pasted a token into the chat by mistake">
-    Rotate it immediately (in the provider's developer console or, for a channel, the provider's app), then enter the replacement in the correct tab — **Integrations** for X/LinkedIn, **Channels** for WhatsApp/Telegram/etc. Echo never stores credentials from chat.
+    Rotate it immediately (in the provider's developer console or, for a channel, the provider's app), then enter the replacement in the correct tab — **Integrations** for X/LinkedIn, **Channels** for Telegram/Slack/etc. Echo never stores credentials from chat.
   </Accordion>
 </AccordionGroup>

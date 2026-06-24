@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nora-nginx-config
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "nginx") | nindent 4 }}
+data:
+  nginx.conf: |
+{{ .Files.Get "files/nginx-k8s.conf" | indent 4 }}

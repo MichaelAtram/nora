@@ -13,6 +13,8 @@ By participating in this project, you agree to follow the [Code of Conduct](./CO
 
 ## Good First Contribution Types
 
+Looking for a concrete starting point? Browse the [`good first issue`](https://github.com/solomon2773/nora/labels/good%20first%20issue) label — small, self-contained tasks with a clear done-state. More broadly, valuable contributions include:
+
 - Fix a reproducible bug
 - Improve onboarding or self-hosted docs
 - Add tests for an existing behavior

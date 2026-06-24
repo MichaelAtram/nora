@@ -23,6 +23,7 @@ const {
   resolveAgentSandboxProfile,
 } = require("./agentRuntimeFields");
 const { getKubernetesClusterProfile } = require("./kubernetesClusters");
+const { getRemoteHostProfile } = require("./remoteHosts");
 
 // Lazy-load backends so missing optional deps (e.g. @kubernetes/client-node)
 // don't crash the API server when only Docker is used.
@@ -131,9 +132,11 @@ function resolveBackendPath(name) {
 
 async function getBackendInstance(type, agent = {}) {
   const cacheKey =
-    type === "k8s" || type === "k3s" || type === "kubernetes"
+    type === "k8s" || type === "k3s" || type === "kubernetes" || type === "remote-docker"
       ? resolveAgentExecutionTargetId(agent)
-      : type;
+      : type === "remote-hermes" || type === "remote-nemoclaw"
+        ? `${type}:${resolveAgentExecutionTargetId(agent)}`
+        : type;
   if (backendCache[cacheKey]) return backendCache[cacheKey];
 
   switch (type) {
@@ -169,6 +172,51 @@ async function getBackendInstance(type, agent = {}) {
       backendCache[cacheKey] = new K8sBackend(profile);
       break;
     }
+    case "remote-docker": {
+      const RemoteDockerBackend = require(resolveBackendPath("remote-docker"));
+      const executionTargetId = resolveAgentExecutionTargetId(agent);
+      const profile = await getRemoteHostProfile(executionTargetId);
+      if (!profile) {
+        throw new Error(
+          "Remote Docker lifecycle operations require a registered remote host execution target.",
+        );
+      }
+      if (!profile.configured) {
+        throw new Error(profile.issue || "Remote host is not configured for lifecycle operations.");
+      }
+      backendCache[cacheKey] = new RemoteDockerBackend(profile);
+      break;
+    }
+    case "remote-nemoclaw": {
+      const RemoteNemoClawBackend = require(resolveBackendPath("remote-nemoclaw"));
+      const executionTargetId = resolveAgentExecutionTargetId(agent);
+      const profile = await getRemoteHostProfile(executionTargetId);
+      if (!profile) {
+        throw new Error(
+          "Remote NemoClaw lifecycle operations require a registered remote host execution target.",
+        );
+      }
+      if (!profile.configured) {
+        throw new Error(profile.issue || "Remote host is not configured for lifecycle operations.");
+      }
+      backendCache[cacheKey] = new RemoteNemoClawBackend(profile);
+      break;
+    }
+    case "remote-hermes": {
+      const RemoteHermesBackend = require(resolveBackendPath("remote-hermes"));
+      const executionTargetId = resolveAgentExecutionTargetId(agent);
+      const profile = await getRemoteHostProfile(executionTargetId);
+      if (!profile) {
+        throw new Error(
+          "Remote Hermes lifecycle operations require a registered remote host execution target.",
+        );
+      }
+      if (!profile.configured) {
+        throw new Error(profile.issue || "Remote host is not configured for lifecycle operations.");
+      }
+      backendCache[cacheKey] = new RemoteHermesBackend(profile);
+      break;
+    }
     default:
       throw new Error(`Unknown backend type: ${type}`);
   }
@@ -190,6 +238,12 @@ async function backendFor(agent) {
     if (resolveAgentSandboxProfile(agent) === "nemoclaw") {
       return getBackendInstance("docker:nemoclaw", agent);
     }
+  }
+  if (type === "remote-docker" && resolveAgentRuntimeFamily(agent) === "hermes") {
+    return getBackendInstance("remote-hermes", agent);
+  }
+  if (type === "remote-docker" && resolveAgentSandboxProfile(agent) === "nemoclaw") {
+    return getBackendInstance("remote-nemoclaw", agent);
   }
   return getBackendInstance(type, agent);
 }
@@ -223,6 +277,15 @@ module.exports = {
     return isKubernetesAgent(agent)
       ? backend.restart(id, lifecycleOptions(agent))
       : backend.restart(id);
+  },
+
+  async updateEnv(agent, envVars = {}) {
+    const id = resolveKubernetesRuntimeId(agent, "update env");
+    const backend = await backendFor(agent);
+    if (typeof backend.updateEnv !== "function") {
+      throw new Error(`Backend ${resolveAgentBackendType(agent)} does not support env updates`);
+    }
+    return backend.updateEnv(id, envVars, lifecycleOptions(agent));
   },
 
   async destroy(agent) {

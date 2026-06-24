@@ -2,6 +2,7 @@
 const express = require("express");
 const db = require("../db");
 const monitoring = require("../monitoring");
+const fleetStatus = require("../fleetStatus");
 const metricsModule = require("../metrics");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { findAccessibleAgent, requireAccessibleAgent } = require("../middleware/ownership");
@@ -86,6 +87,13 @@ router.get(
   "/monitoring/metrics",
   asyncHandler(async (req, res) => {
     res.json(await monitoring.getMetrics({ userId: req.user.id }));
+  }),
+);
+
+router.get(
+  "/monitoring/fleet-status",
+  asyncHandler(async (req, res) => {
+    res.json(await fleetStatus.getFleetAttention({ userId: req.user.id }));
   }),
 );
 

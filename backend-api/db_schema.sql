@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS agents (
   gateway_host TEXT,
   gateway_port INTEGER,
   gateway_host_port INTEGER,
+  dashboard_port INTEGER,
   gateway_token TEXT,
   container_id TEXT,
   container_name TEXT,
@@ -46,6 +47,8 @@ CREATE TABLE IF NOT EXISTS agents (
   vcpu INTEGER DEFAULT 1,
   ram_mb INTEGER DEFAULT 1024,
   disk_gb INTEGER DEFAULT 10,
+  paused_reason TEXT,
+  mcp_servers JSONB DEFAULT '[]',
   created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -85,6 +88,47 @@ CREATE TABLE IF NOT EXISTS kubernetes_clusters (
 
 CREATE INDEX IF NOT EXISTS idx_kubernetes_clusters_enabled
   ON kubernetes_clusters(enabled, is_default, label);
+
+CREATE TABLE IF NOT EXISTS remote_hosts (
+  id TEXT PRIMARY KEY,
+  owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  is_default BOOLEAN NOT NULL DEFAULT false,
+  ssh_host TEXT NOT NULL DEFAULT '',
+  ssh_port INTEGER NOT NULL DEFAULT 22,
+  ssh_user TEXT NOT NULL DEFAULT '',
+  ssh_auth_mode TEXT NOT NULL DEFAULT 'key',
+  ssh_private_key_encrypted TEXT,
+  ssh_password_encrypted TEXT,
+  ssh_passphrase_encrypted TEXT,
+  gateway_host TEXT NOT NULL DEFAULT '',
+  docker_host TEXT NOT NULL DEFAULT '',
+  last_test_status TEXT,
+  last_test_message TEXT,
+  last_tested_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_remote_hosts_owner
+  ON remote_hosts(owner_user_id, enabled, is_default, label);
+
+CREATE TABLE IF NOT EXISTS gateway_port_allocations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  host_key TEXT NOT NULL,
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  port INTEGER NOT NULL,
+  -- Which published port this row holds for the agent on host_key. Lets one
+  -- agent reserve several collision-safe ports on the same physical host
+  -- (e.g. remote Hermes: 'gateway' = runtime API 8642, 'dashboard' = UI 9119).
+  purpose TEXT NOT NULL DEFAULT 'gateway',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(host_key, port)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gateway_port_allocations_agent
+  ON gateway_port_allocations(agent_id);
 
 CREATE TABLE IF NOT EXISTS deployments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -181,6 +225,10 @@ CREATE TABLE IF NOT EXISTS platform_settings (
   -- normalizeBackupPlanLimits on read. Keep the schema default empty so the
   -- two stay in sync from a single source of truth.
   backup_plan_limits JSONB NOT NULL DEFAULT '{}'::jsonb,
+  -- Dev-mode only: the generated JWT secret persisted so sessions survive
+  -- restarts when JWT_SECRET is not configured. Never used in production
+  -- (boot fails there without an explicit JWT_SECRET).
+  dev_jwt_secret TEXT,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -314,6 +362,22 @@ CREATE TABLE IF NOT EXISTS workspace_agents (
 
 CREATE INDEX IF NOT EXISTS idx_workspace_agents_agent
   ON workspace_agents(agent_id);
+
+-- Shared BYOC remote hosts (Phase C3). A host's owner can share it into a
+-- workspace they belong to; workspace members then use it per their workspace
+-- role (editor+ deploys/reaches, viewer sees read-only). Host config/credentials
+-- stay with the owner. Mirrors workspace_agents.
+CREATE TABLE IF NOT EXISTS workspace_remote_hosts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+  remote_host_id TEXT REFERENCES remote_hosts(id) ON DELETE CASCADE,
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(workspace_id, remote_host_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_remote_hosts_host
+  ON workspace_remote_hosts(remote_host_id);
 
 -- Per-workspace membership (Phase 0 of multi-tenant RBAC).
 -- workspaces.user_id remains as the creator denormalization; permission checks
@@ -483,6 +547,52 @@ CREATE TABLE IF NOT EXISTS workspace_budgets (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(workspace_id, period)
 );
+
+-- Per-agent LLM spend budgets. Soft crossings emit alert events; hard
+-- crossings additionally pause the runtime (agents.paused_reason records why).
+CREATE TABLE IF NOT EXISTS agent_budgets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  period TEXT NOT NULL DEFAULT 'monthly'
+    CHECK (period IN ('daily', 'weekly', 'monthly')),
+  limit_usd NUMERIC(12, 2) NOT NULL,
+  soft_threshold_pct INTEGER NOT NULL DEFAULT 80
+    CHECK (soft_threshold_pct BETWEEN 0 AND 100),
+  last_alerted_at TIMESTAMPTZ,
+  last_alerted_pct INTEGER,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(agent_id, period)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_budgets_agent ON agent_budgets(agent_id);
+
+-- Control-plane scheduled agent runs (recurring cron triggers). The backend
+-- sweep claims due rows (FOR UPDATE SKIP LOCKED), computes the next fire, and
+-- enqueues each run; the worker executes the action (a prompt or a lifecycle op)
+-- and records an agent.schedule.run event. min_interval is enforced in the app
+-- so a too-frequent cron can't thrash an agent.
+CREATE TABLE IF NOT EXISTS agent_schedules (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  name TEXT NOT NULL,
+  cron TEXT NOT NULL,
+  timezone TEXT NOT NULL DEFAULT 'UTC',
+  action_type TEXT NOT NULL DEFAULT 'prompt'
+    CHECK (action_type IN ('prompt', 'restart', 'stop', 'start', 'redeploy')),
+  prompt TEXT,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  last_run_at TIMESTAMPTZ,
+  last_status TEXT,
+  next_run_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_schedules_due
+  ON agent_schedules(next_run_at) WHERE enabled;
+CREATE INDEX IF NOT EXISTS idx_agent_schedules_agent ON agent_schedules(agent_id);
 
 CREATE TABLE IF NOT EXISTS integration_catalog (
   id VARCHAR(50) PRIMARY KEY,

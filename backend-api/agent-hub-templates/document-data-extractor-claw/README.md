@@ -9,18 +9,22 @@ Pulls the exact fields you need out of documents, emails, and forms and returns 
 Full walkthrough: **[Dex setup guide](https://noradocs.solomontsao.com/guides/dex-document-extractor)**.
 
 ### 1. Install from Agent Hub
+
 Install the **Document Data Extractor Claw** listing into a workspace.
 
 ### 2. Connect one channel — Channels tab
+
 Open the agent → **Channels** tab → connect **one** way for Dex to reach you (you only need one):
 
-- **WhatsApp** (recommended) — Meta WhatsApp Cloud API; needs a Phone Number ID + Access Token.
-- Or **Telegram**, **Slack**, **Discord**, or **email**.
+- **WhatsApp** (recommended) - use Nora's **Link** action and scan the QR/pairing prompt.
+- Or **Telegram**, **Slack**, **Discord**, or another OpenClaw catalog channel.
 
 ### 3. (Optional) Connect an output destination — Integrations tab
+
 Dex extracts fine from pasted documents — no integration required. To write results straight out, connect **Airtable**, **Google Sheets**, or **Email** in the **Integrations** tab.
 
 ### 4. Say hi
+
 Start the runtime and send a first message. Dex introduces itself, offers to rename, gets your channel connected, then defines a field schema per document type and your preferred output format.
 
 > **How integrations flow in:** if you connect a destination, Nora writes `integrations/NORA_INTEGRATIONS.md` and updates `TOOLS.md` automatically — you never edit those.

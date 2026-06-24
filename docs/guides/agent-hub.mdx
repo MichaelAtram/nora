@@ -18,7 +18,7 @@ This is the core value: an agent that one person builds becomes a one-click inst
 
 A listing bundles everything an agent needs to run:
 
-- **Runtime configuration** — runtime family (OpenClaw or Hermes), deploy target (Docker, Kubernetes, Proxmox), sandbox profile, and the default container image.
+- **Runtime configuration** — runtime family (OpenClaw or Hermes), deploy target (Docker or Kubernetes today; Proxmox is planned), sandbox profile, and the default container image.
 - **Workspace files** — the markdown that defines the agent's behavior: identity, operating rules, scheduled tasks, and any bootstrap script that runs on first message.
 - **Integration wiring** — which providers the agent expects, so you know what to connect after install.
 
@@ -36,8 +36,14 @@ See [Agent Hub concepts](/concepts/agent-hub) for the underlying model — listi
 
 The fastest way to see the full flow is to install a built-in template and configure it end to end.
 
-<Card title="Set up Echo, the personal-branding agent" href="/guides/echo-personal-branding" icon="feather" arrow>
-  A worked example: install the Echo listing, connect X and/or LinkedIn in the Integrations tab, connect a channel (WhatsApp) in the Channels tab, and run the bootstrap that learns your voice.
+<Card
+  title="Set up Echo, the personal-branding agent"
+  href="/guides/echo-personal-branding"
+  icon="feather"
+  arrow
+>
+  A worked example: install the Echo listing, connect X and/or LinkedIn in the Integrations tab,
+  connect a channel (WhatsApp) in the Channels tab, and run the bootstrap that learns your voice.
 </Card>
 
 ## Install a listing
@@ -49,9 +55,10 @@ The fastest way to see the full flow is to install a built-in template and confi
     From the dashboard, open **Agent Hub** in the workspace navigation. The catalog shows three filters: **Internal** (your workspace's listings), **Community** (synced from the upstream hub), and **Built-in** (platform-seeded templates).
   </Step>
 
-  <Step title="Select a listing">
-    Click any listing to open its detail page. You'll see the runtime family, deploy target, sandbox profile, default image, and any bootstrap files or integrations the template wires up.
-  </Step>
+<Step title="Select a listing">
+  Click any listing to open its detail page. You'll see the runtime family, deploy target, sandbox
+  profile, default image, and any bootstrap files or integrations the template wires up.
+</Step>
 
   <Step title="Click Install">
     Choose the workspace (defaults to the current one) and an agent name. Nora materializes the latest version of the listing into a new agent in `queued` status. The deployment job runs the same path as a manual deploy.
@@ -61,6 +68,7 @@ The fastest way to see the full flow is to install a built-in template and confi
     <Note>
       Installing requires the `editor` role on the destination workspace.
     </Note>
+
   </Step>
 </Steps>
 
@@ -80,6 +88,7 @@ The fastest way to see the full flow is to install a built-in template and confi
     - **Description** — short description shown in the catalog.
     - **Category** — free-form label used for filtering.
     - **Share target** — `internal` (your workspace only), `community` (push to the upstream hub), or `both`.
+
   </Step>
 
   <Step title="Confirm">
@@ -88,6 +97,7 @@ The fastest way to see the full flow is to install a built-in template and confi
     <Tip>
       Use `internal` first to verify the listing installs cleanly in another workspace before sharing it publicly.
     </Tip>
+
   </Step>
 </Steps>
 
@@ -139,9 +149,11 @@ The Agent Hub source-catalog API key authenticates Nora to the upstream hub. Man
     Check the agent detail page for the new agent — the deploy job's `failedReason` shows up there. Common causes: the destination workspace lacks the runtime family, deploy target, or sandbox profile the listing requires.
   </Accordion>
 
-  <Accordion title="Community sync stays in pending">
-    Open the listing detail page and check `centralError`. If it mentions auth, regenerate the source-catalog API key. If it mentions validation, the upstream hub rejected the payload — usually for a missing description or an unsupported runtime ID.
-  </Accordion>
+<Accordion title="Community sync stays in pending">
+  Open the listing detail page and check `centralError`. If it mentions auth, regenerate the
+  source-catalog API key. If it mentions validation, the upstream hub rejected the payload — usually
+  for a missing description or an unsupported runtime ID.
+</Accordion>
 
   <Accordion title="Reports aren't visible to me">
     Reports are reviewed in the upstream hub. The publishing workspace sees the report's resolution mirrored back; reporters see their own report status under **Settings → My reports**.

@@ -8,10 +8,14 @@ jest.mock("../containerManager", () => mockContainerManager);
 jest.mock("../agentTelemetry", () => ({
   collectAgentTelemetrySample: mockCollectTelemetry,
 }));
+// Mocked so backgroundTasks doesn't pull in the real gatewayProxy chain; the
+// external reconcile tests inject their own healthProbe anyway.
+jest.mock("../externalHealth", () => ({ probeExternalAgentHealth: jest.fn() }));
 
 const {
   collectBackgroundTelemetry,
   reconcileBackgroundAgentStatuses,
+  reconcileExternalAgentStatuses,
 } = require("../backgroundTasks");
 
 describe("background tasks", () => {
@@ -41,7 +45,7 @@ describe("background tasks", () => {
         id: "agent-k8s-1",
         backend_type: "k8s",
         container_id: "oclaw-agent-123",
-      })
+      }),
     );
     expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
@@ -62,11 +66,10 @@ describe("background tasks", () => {
 
     await reconcileBackgroundAgentStatuses();
 
-    expect(mockDb.query).toHaveBeenNthCalledWith(
-      2,
-      "UPDATE agents SET status = $1 WHERE id = $2",
-      ["stopped", "agent-err-1"]
-    );
+    expect(mockDb.query).toHaveBeenNthCalledWith(2, "UPDATE agents SET status = $1 WHERE id = $2", [
+      "stopped",
+      "agent-err-1",
+    ]);
   });
 
   it("collects telemetry for running agents and prunes old samples", async () => {
@@ -91,11 +94,79 @@ describe("background tasks", () => {
       expect.objectContaining({
         id: "agent-run-1",
         backend_type: "docker",
-      })
+      }),
     );
     expect(mockDb.query).toHaveBeenNthCalledWith(
       2,
-      "DELETE FROM container_stats WHERE recorded_at < NOW() - INTERVAL '7 days'"
+      "DELETE FROM container_stats WHERE recorded_at < NOW() - INTERVAL '7 days'",
     );
+  });
+
+  describe("external runtime reconciliation", () => {
+    it("only queries external agents (not provisioned ones)", async () => {
+      mockDb.query.mockResolvedValueOnce({ rows: [] });
+      await reconcileExternalAgentStatuses({ healthProbe: jest.fn() });
+      expect(mockDb.query.mock.calls[0][0]).toMatch(/deploy_target = 'external'/);
+    });
+
+    it("recovers a reachable external agent to running", async () => {
+      mockDb.query.mockResolvedValueOnce({
+        rows: [{ id: "ext-1", status: "stopped", deploy_target: "external" }],
+      });
+      mockDb.query.mockResolvedValueOnce({ rows: [] });
+      const healthProbe = jest.fn().mockResolvedValue({ running: true });
+
+      await reconcileExternalAgentStatuses({ healthProbe });
+
+      expect(healthProbe).toHaveBeenCalledWith(expect.objectContaining({ id: "ext-1" }));
+      expect(mockDb.query).toHaveBeenNthCalledWith(
+        2,
+        "UPDATE agents SET status = $1 WHERE id = $2",
+        ["running", "ext-1"],
+      );
+    });
+
+    it("marks an unreachable external agent as stopped", async () => {
+      mockDb.query.mockResolvedValueOnce({
+        rows: [{ id: "ext-2", status: "running", deploy_target: "external" }],
+      });
+      mockDb.query.mockResolvedValueOnce({ rows: [] });
+      const healthProbe = jest.fn().mockResolvedValue({ running: false });
+
+      await reconcileExternalAgentStatuses({ healthProbe });
+
+      expect(mockDb.query).toHaveBeenNthCalledWith(
+        2,
+        "UPDATE agents SET status = $1 WHERE id = $2",
+        ["stopped", "ext-2"],
+      );
+    });
+
+    it("treats a probe that throws as not running (best-effort)", async () => {
+      mockDb.query.mockResolvedValueOnce({
+        rows: [{ id: "ext-3", status: "running", deploy_target: "external" }],
+      });
+      mockDb.query.mockResolvedValueOnce({ rows: [] });
+      const healthProbe = jest.fn().mockRejectedValue(new Error("boom"));
+
+      await reconcileExternalAgentStatuses({ healthProbe });
+
+      expect(mockDb.query).toHaveBeenNthCalledWith(
+        2,
+        "UPDATE agents SET status = $1 WHERE id = $2",
+        ["stopped", "ext-3"],
+      );
+    });
+
+    it("leaves an unchanged status alone (no UPDATE)", async () => {
+      mockDb.query.mockResolvedValueOnce({
+        rows: [{ id: "ext-4", status: "running", deploy_target: "external" }],
+      });
+      const healthProbe = jest.fn().mockResolvedValue({ running: true });
+
+      await reconcileExternalAgentStatuses({ healthProbe });
+
+      expect(mockDb.query).toHaveBeenCalledTimes(1); // only the SELECT
+    });
   });
 });

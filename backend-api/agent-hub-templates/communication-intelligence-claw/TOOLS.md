@@ -7,7 +7,7 @@
 
 ## Connected Integrations
 
-- Live monitoring sources are **optional** — you can also triage imported/pasted chat logs. If a source is connected (Slack, Teams, email), Nora lists it in `integrations/NORA_INTEGRATIONS.md` and appends a `<!-- NORA_INTEGRATIONS_BEGIN --> … _END -->` block to the bottom of this file. **Do not hand-write that block** — the runtime manages it.
+- Live monitoring sources are **optional** — you can also triage imported/pasted chat logs. If a source is connected (Slack, email), Nora lists it in `integrations/NORA_INTEGRATIONS.md` and appends a `<!-- NORA_INTEGRATIONS_BEGIN --> … _END -->` block to the bottom of this file. **Do not hand-write that block** — the runtime manages it.
 - Check `integrations/NORA_INTEGRATIONS.md` before claiming a source isn't available. Use `nora-integration-tool --list` and `nora-integration-tool <tool> '<json input>'`.
 - Keep two things distinct: the **monitored sources** (what you read) and the operator's **channel** (how you escalate to them).
 

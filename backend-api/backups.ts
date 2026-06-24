@@ -28,6 +28,8 @@ const {
 } = require("./agentPayloads");
 const { getDefaultAgentImage } = require("../agent-runtime/lib/agentImages");
 const { getRuntimeSelectionStatus } = require("../agent-runtime/lib/backendCatalog");
+const { assertKubernetesExecutionTargetAvailable } = require("./kubernetesClusters");
+const { assertRemoteHostExecutionTargetAvailable } = require("./remoteHosts");
 const { buildAgentRuntimeFields, resolveRequestedRuntimeFields } = require("./agentRuntimeFields");
 
 const gzipAsync = promisify(gzip);
@@ -1487,6 +1489,12 @@ async function restoreBackupInPlace({ backupId, targetAgentId, confirmAgentName,
     fallback: targetRuntime,
   });
   assertRuntimeSelectionAvailable(runtimeFields);
+  // Deep execution-target checks (parity with the deploy route): the cluster /
+  // remote host must still exist + be connected. Owner-scoped to the target
+  // agent's owner so an admin cross-tenant restore still validates against the
+  // owner's registered host, not the admin actor.
+  await assertKubernetesExecutionTargetAvailable(runtimeFields);
+  await assertRemoteHostExecutionTargetAvailable(runtimeFields, { ownerUserId: target.user_id });
   const containerName = resolveContainerName({
     currentName: target.container_name,
     agentName: target.name,

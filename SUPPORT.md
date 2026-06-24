@@ -7,7 +7,7 @@ Use this page to pick the fastest open-source route for your situation.
 Start here if you want to self-host Nora and bring it online on your own infrastructure.
 
 - [README Quick Start](README.md#quick-start)
-- [README Configuration](README.md#configuration)
+- [Configuration & environment variables](https://noradocs.solomontsao.com/configuration/platform-modes)
 - [`infra/setup-tls.sh`](infra/setup-tls.sh)
 
 Best fit:

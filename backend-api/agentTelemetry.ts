@@ -3,6 +3,7 @@ const db = require("./db");
 const containerManager = require("./containerManager");
 const { buildAgentRuntimeFields, isNemoClawSandbox } = require("./agentRuntimeFields");
 const { runtimeUrlForAgent } = require("../agent-runtime/lib/agentEndpoints");
+const { runtimeAuthHeaders } = require("./runtimeAuth");
 const path = require("path");
 const telemetryModulePath = resolveTelemetryModulePath();
 const {
@@ -405,8 +406,8 @@ async function collectAgentTelemetrySample(agent) {
   return persistTelemetrySample(agent.id, telemetry);
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+async function fetchJson(url, headers = {}) {
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(5000) });
   if (!response.ok) {
     throw new Error(`Runtime returned ${response.status}`);
   }
@@ -438,10 +439,11 @@ async function loadNemoSummary(agent) {
 
   const policyUrl = runtimeUrlForAgent(agent, "/nemoclaw/policy");
   const approvalsUrl = runtimeUrlForAgent(agent, "/nemoclaw/approvals");
+  const authHeaders = await runtimeAuthHeaders(agent);
   const [statusResult, policyResult, approvalsResult] = await Promise.allSettled([
-    fetchJson(statusUrl),
-    fetchJson(policyUrl),
-    fetchJson(approvalsUrl),
+    fetchJson(statusUrl, authHeaders),
+    fetchJson(policyUrl, authHeaders),
+    fetchJson(approvalsUrl, authHeaders),
   ]);
 
   if (statusResult.status === "fulfilled") {

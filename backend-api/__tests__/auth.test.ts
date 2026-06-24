@@ -128,6 +128,14 @@ function jsonResponse(body, ok = true, status = ok ? 200 : 400) {
   };
 }
 
+let signupIpCounter = 0;
+function signupRequest(ip = null) {
+  signupIpCounter += 1;
+  return request(app)
+    .post("/auth/signup")
+    .set("X-Forwarded-For", ip || `203.0.113.${signupIpCounter}`);
+}
+
 beforeEach(() => {
   mockDb.query.mockReset();
   mockDb.connect.mockReset();
@@ -137,28 +145,30 @@ beforeEach(() => {
   });
   process.env.OAUTH_LOGIN_ENABLED = "false";
   process.env.GOOGLE_CLIENT_ID = "google-client-id";
+  delete process.env.SIGNUP_BOT_PROTECTION_PROVIDER;
+  delete process.env.SIGNUP_TURNSTILE_SECRET;
+  delete process.env.SIGNUP_RECAPTCHA_SECRET;
   global.fetch = jest.fn();
 });
 
 describe("POST /auth/signup", () => {
   it("rejects missing email", async () => {
-    const res = await request(app).post("/auth/signup").send({ password: "testpassword123" });
+    const res = await signupRequest().send({ password: "testpassword123" });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/email/i);
   });
 
   it("rejects invalid email format", async () => {
-    const res = await request(app)
-      .post("/auth/signup")
-      .send({ email: "notanemail", password: "testpassword123" });
+    const res = await signupRequest().send({
+      email: "notanemail",
+      password: "testpassword123",
+    });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/email/i);
   });
 
   it("rejects short password", async () => {
-    const res = await request(app)
-      .post("/auth/signup")
-      .send({ email: "test@example.com", password: "short" });
+    const res = await signupRequest().send({ email: "test@example.com", password: "short" });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/8 characters/i);
   });
@@ -167,15 +177,17 @@ describe("POST /auth/signup", () => {
     mockDb.query
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ has_users: false }] })
       .mockResolvedValueOnce({
         rows: [{ id: "uuid-1", email: "new@example.com", role: "admin" }],
       })
       .mockResolvedValueOnce({ rows: [] });
 
-    const res = await request(app)
-      .post("/auth/signup")
-      .send({ email: "new@example.com", password: "validpassword123" });
+    const res = await signupRequest().send({
+      email: "new@example.com",
+      password: "validpassword123",
+    });
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("id", "uuid-1");
     expect(res.body).toHaveProperty("email", "new@example.com");
@@ -186,35 +198,180 @@ describe("POST /auth/signup", () => {
     mockDb.query
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ has_users: true }] })
       .mockResolvedValueOnce({
         rows: [{ id: "uuid-2", email: "next@example.com", role: "user" }],
       })
       .mockResolvedValueOnce({ rows: [] });
 
-    const res = await request(app)
-      .post("/auth/signup")
-      .send({ email: "next@example.com", password: "validpassword123" });
+    const res = await signupRequest().send({
+      email: "next@example.com",
+      password: "validpassword123",
+    });
 
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("role", "user");
   });
 
-  it("returns 500 on duplicate email (DB unique constraint)", async () => {
+  it("returns 409 for an existing email before hashing", async () => {
+    const hashSpy = jest.spyOn(bcrypt, "hash");
+    mockDb.query.mockResolvedValueOnce({ rows: [{ id: "existing-user" }] });
+
+    const res = await signupRequest().send({
+      email: "dup@example.com",
+      password: "validpassword123",
+    });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/already exists/i);
+    expect(hashSpy).not.toHaveBeenCalled();
+    expect(mockDb.connect).not.toHaveBeenCalled();
+    hashSpy.mockRestore();
+  });
+
+  it("returns 409 on duplicate email races from the DB unique constraint", async () => {
     const err = new Error("duplicate key value violates unique constraint");
     err.code = "23505";
     mockDb.query
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ has_users: true }] })
       .mockRejectedValueOnce(err)
       .mockResolvedValueOnce({ rows: [] });
 
-    const res = await request(app)
-      .post("/auth/signup")
-      .send({ email: "dup@example.com", password: "validpassword123" });
-    expect(res.status).toBe(500);
-    expect(res.body).toHaveProperty("error");
+    const res = await signupRequest().send({
+      email: "dup-race@example.com",
+      password: "validpassword123",
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/already exists/i);
+  });
+
+  it("rate limits signup bursts separately from login", async () => {
+    const ip = "198.51.100.250";
+    for (let i = 0; i < 5; i += 1) {
+      const res = await signupRequest(ip).send({
+        email: "notanemail",
+        password: "testpassword123",
+      });
+      expect(res.status).toBe(400);
+    }
+
+    const res = await signupRequest(ip).send({
+      email: "notanemail",
+      password: "testpassword123",
+    });
+    expect(res.status).toBe(429);
+    expect(res.body.error).toMatch(/too many signup/i);
+  });
+
+  it("rejects signup when Turnstile is configured and the token is missing", async () => {
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "turnstile";
+    process.env.SIGNUP_TURNSTILE_SECRET = "turnstile-secret";
+
+    const res = await signupRequest().send({
+      email: "turnstile@example.com",
+      password: "validpassword123",
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/verification challenge/i);
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
+  it("allows signup when Turnstile verification succeeds", async () => {
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "turnstile";
+    process.env.SIGNUP_TURNSTILE_SECRET = "turnstile-secret";
+    global.fetch.mockResolvedValueOnce(jsonResponse({ success: true }));
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ has_users: true }] })
+      .mockResolvedValueOnce({
+        rows: [{ id: "uuid-turnstile", email: "turnstile@example.com", role: "user" }],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await signupRequest().send({
+      email: "turnstile@example.com",
+      password: "validpassword123",
+      botProtectionToken: "turnstile-token",
+    });
+
+    expect(res.status).toBe(200);
+    expect(global.fetch).toHaveBeenCalledWith(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const verifyBody = global.fetch.mock.calls[0][1].body;
+    expect(verifyBody.get("secret")).toBe("turnstile-secret");
+    expect(verifyBody.get("response")).toBe("turnstile-token");
+  });
+
+  it("rejects signup when reCAPTCHA verification fails", async () => {
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "recaptcha";
+    process.env.SIGNUP_RECAPTCHA_SECRET = "recaptcha-secret";
+    global.fetch.mockResolvedValueOnce(jsonResponse({ success: false }));
+
+    const res = await signupRequest().send({
+      email: "recaptcha@example.com",
+      password: "validpassword123",
+      botProtectionToken: "bad-recaptcha-token",
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/verification challenge/i);
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
+  it("rejects signup when bot verification cannot be reached", async () => {
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "recaptcha";
+    process.env.SIGNUP_RECAPTCHA_SECRET = "recaptcha-secret";
+    global.fetch.mockRejectedValueOnce(new Error("network unavailable"));
+
+    const res = await signupRequest().send({
+      email: "recaptcha-unreachable@example.com",
+      password: "validpassword123",
+      botProtectionToken: "recaptcha-token",
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/verification challenge/i);
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
+  it("allows signup when reCAPTCHA verification succeeds", async () => {
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "recaptcha";
+    process.env.SIGNUP_RECAPTCHA_SECRET = "recaptcha-secret";
+    global.fetch.mockResolvedValueOnce(jsonResponse({ success: true }));
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ has_users: true }] })
+      .mockResolvedValueOnce({
+        rows: [{ id: "uuid-recaptcha", email: "recaptcha@example.com", role: "user" }],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await signupRequest().send({
+      email: "recaptcha@example.com",
+      password: "validpassword123",
+      botProtectionToken: "recaptcha-token",
+    });
+
+    expect(res.status).toBe(200);
+    expect(global.fetch).toHaveBeenCalledWith(
+      "https://www.google.com/recaptcha/api/siteverify",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const verifyBody = global.fetch.mock.calls[0][1].body;
+    expect(verifyBody.get("secret")).toBe("recaptcha-secret");
+    expect(verifyBody.get("response")).toBe("recaptcha-token");
   });
 });
 
@@ -759,5 +916,28 @@ describe("OAuth hardening", () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error).toMatch(/authentication required/i);
+  });
+});
+
+describe("GET /auth/bootstrap-status", () => {
+  it("reports needsFirstAdmin=true when no users exist", async () => {
+    mockDb.query.mockResolvedValueOnce({ rows: [] });
+    const res = await request(app).get("/auth/bootstrap-status");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ needsFirstAdmin: true });
+  });
+
+  it("reports needsFirstAdmin=false once a user is registered", async () => {
+    mockDb.query.mockResolvedValueOnce({ rows: [{ "?column?": 1 }] });
+    const res = await request(app).get("/auth/bootstrap-status");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ needsFirstAdmin: false });
+  });
+
+  it("is publicly reachable without a token and leaks only the boolean", async () => {
+    mockDb.query.mockResolvedValueOnce({ rows: [{ "?column?": 1 }] });
+    const res = await request(app).get("/auth/bootstrap-status");
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body)).toEqual(["needsFirstAdmin"]);
   });
 });

@@ -1,118 +1,79 @@
-# Configure channels to receive agent messages
+# Configure agent channels
 
-> Create and manage communication channels for your agents in Nora, including Slack, Discord, Telegram, email, SMS, webhooks, and more.
+> Link or configure the communication channel an agent uses to reach you.
 
-Channels are the communication endpoints through which your agents send and receive messages. Each channel is attached to a specific agent and backed by an adapter — a typed connector that knows how to deliver messages to that service. When an agent sends a message, Nora routes it through the appropriate adapter. When an external service sends an inbound event, Nora logs it and forwards it to the running agent runtime.
+Channels are the communication endpoints attached to an agent. For current OpenClaw agents, Nora manages channels through the running OpenClaw gateway: the **Channels** tab lists the OpenClaw catalog, opens setup forms for supported channel configs, and starts QR or CLI pairing flows where the runtime supports them.
 
-Sensitive configuration values (tokens, webhook URLs, passwords) are encrypted with AES-256-GCM before storage and shown as `[REDACTED]` in API responses.
+Legacy non-OpenClaw agents use Nora's database-backed channel adapters instead. That older flow still supports create, test-message, message-history, and delete actions.
 
-## Supported channel types
+## OpenClaw channel catalog
 
-| Type       | Label           | Required credentials                                                          |
-| ---------- | --------------- | ----------------------------------------------------------------------------- |
-| `slack`    | Slack           | Webhook URL (required); bot token (optional)                                  |
-| `discord`  | Discord         | Webhook URL (required); bot token (optional)                                  |
-| `email`    | Email (SMTP)    | SMTP host, port, username, password, from address                             |
-| `webhook`  | Webhook         | Target URL (required); HTTP method, custom headers, signing secret (optional) |
-| `teams`    | Microsoft Teams | Incoming webhook URL                                                          |
-| `sms`      | SMS (Twilio)    | Account SID, auth token, from number                                          |
-| `whatsapp` | WhatsApp        | Phone Number ID, access token                                                 |
-| `telegram` | Telegram        | Bot token (required); default chat ID (optional)                              |
-| `line`     | LINE            | Channel access token (required); channel secret, user/group ID (optional)     |
+OpenClaw agents show catalog rows even before they are configured. A row becomes configured after you save setup fields or complete the pairing flow.
 
-## Create a channel
+| Channel kind              | OpenClaw types                                                                                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pairing/link flow         | WhatsApp, Feishu/Lark, Zalo Personal Account                                                                                                                                          |
+| Bot or API setup          | Discord, Google Chat, LINE, Mattermost, Matrix, Microsoft Teams Bot Framework, Nextcloud Talk, Nostr, QQ Bot, Signal, Slack, Synology Chat, Telegram, Tlon, Twitch, Yuanbao, Zalo Bot |
+| Local/self-hosted bridges | BlueBubbles, iMessage, IRC                                                                                                                                                            |
 
-![Channels tab on the agent detail page — existing channels with recent message counts](/images/guides/channels/agent-channels-tab.png)
+<Note>
+  OpenClaw WhatsApp uses the **Link** / QR pairing flow in Nora. Do not paste a Meta Phone Number ID
+  or WhatsApp Cloud API access token into the OpenClaw channel setup. Those fields belonged to the
+  older legacy WhatsApp adapter.
+</Note>
+
+## Connect an OpenClaw channel
+
+![Channels tab on the agent detail page — OpenClaw catalog rows and channel actions](/images/guides/channels/agent-channels-tab.png)
 
 <Steps>
-  <Step title="Open the agent's channels tab">
-    Navigate to the agent's detail page and select the **Channels** tab. Any existing channels for this agent are listed here.
+  <Step title="Open the agent's OpenClaw tab">
+    Navigate to the agent detail page, open **OpenClaw**, then select **Channels**.
   </Step>
 
-  <Step title="Click Add Channel">
-    Click **Add Channel** or the equivalent create button. A form slides in.
+<Step title="Pick one channel">
+  Choose the catalog row you want to use. You only need one channel for agent-to-operator messages.
+</Step>
 
-    ![Add-channel form — type, name, and provider-specific credential fields](/images/guides/channels/agent-channels-add.png)
-  </Step>
+<Step title="Use Link for pairing channels">
+  For WhatsApp, click **Link** and scan or complete the pairing prompt. Feishu/Lark and Zalo
+  Personal Account use OpenClaw's CLI pairing flow when available.
+</Step>
 
-  <Step title="Choose the channel type">
-    Select the type from the dropdown. The form updates to show the configuration fields specific to that adapter.
-  </Step>
-
-  <Step title="Enter a name">
-    Give the channel a descriptive name, such as `Ops Slack` or `Customer SMS`. This name helps you identify the channel in the list.
-  </Step>
-
-  <Step title="Fill in the configuration fields">
-    Enter the required credentials and any optional fields. For example, a Slack channel requires a Webhook URL. A Telegram channel requires a Bot Token. Sensitive fields are encrypted before being stored.
-  </Step>
-
-  <Step title="Save the channel">
-    Click **Save** or **Create**. Nora stores the channel and it becomes available immediately.
+  <Step title="Use Setup for configured channels">
+    For Telegram, Slack, Discord, LINE, Matrix, and similar channels, click **Setup**, fill the fields Nora shows, then save. Nora writes the config through the OpenClaw config API and asks the runtime to reload.
   </Step>
 </Steps>
 
-## Test a channel
+## What actions are available?
 
-After creating a channel you can verify it is working before your agent uses it in production:
+| Action                    | OpenClaw channels                            | Legacy Nora adapters |
+| ------------------------- | -------------------------------------------- | -------------------- |
+| List channels             | Yes, catalog rows                            | Yes, configured rows |
+| Setup or edit config      | Yes                                          | Yes                  |
+| Link / QR login           | WhatsApp, Feishu/Lark, Zalo Personal Account | No                   |
+| Disable / enable          | Yes, after configured                        | Yes                  |
+| Logout                    | WhatsApp, Telegram, QQ Bot where linked      | No                   |
+| Send test message         | Not exposed by Nora for OpenClaw             | Yes                  |
+| View Nora message history | Not exposed by Nora for OpenClaw             | Yes                  |
+| Delete channel row        | No; disable instead                          | Yes                  |
 
-1. Find the channel in the **Channels** tab.
-2. Click **Test**.
+If an OpenClaw channel setup fails, start by checking that the agent is **running** or **warning** and that the OpenClaw gateway is reachable. Setup and link actions are runtime operations, so stopped agents cannot service them.
 
-Nora verifies the configuration (for example, checks that required fields are present) and then sends a test message through the adapter. A success response confirms delivery; an error message explains what failed.
+## Legacy channel adapters
 
-<Tip>
-  Always test a channel after creating it. For Telegram channels, Nora also verifies the bot token by calling `getMe` against the Telegram API during the test.
-</Tip>
+Legacy agents still use Nora's built-in adapters. Sensitive configuration values such as tokens, webhook URLs, and passwords are encrypted with AES-256-GCM before storage and shown as `[REDACTED]` in API responses.
 
-## View channel messages
+| Type       | Label              | Required credentials                                     |
+| ---------- | ------------------ | -------------------------------------------------------- |
+| `slack`    | Slack              | Webhook URL; bot token optional                          |
+| `discord`  | Discord            | Webhook URL; bot token optional                          |
+| `email`    | Email (SMTP)       | SMTP host, port, username, password, from address        |
+| `webhook`  | Webhook            | Target URL; method, headers, and signing secret optional |
+| `teams`    | Microsoft Teams    | Incoming webhook URL                                     |
+| `sms`      | SMS (Twilio)       | Account SID, auth token, from number                     |
+| `whatsapp` | WhatsApp Cloud API | Phone Number ID, access token                            |
+| `telegram` | Telegram           | Bot token; chat ID optional                              |
+| `line`     | LINE               | Channel access token; channel secret optional            |
 
-To inspect messages that have been sent or received through a channel:
-
-1. Open the agent's **Channels** tab.
-2. Click the channel name or a **Messages** link.
-3. Nora loads up to 50 recent messages by default, ordered newest first.
-
-Each message record includes the direction (`inbound` or `outbound`), the content, and any metadata (such as sender ID or chat ID).
-
-## Update a channel
-
-1. Find the channel in the **Channels** tab.
-2. Click **Edit** or the pencil icon.
-3. Update the name, configuration fields, or the enabled/disabled toggle.
-4. Click **Save**.
-
-Updating the configuration re-encrypts any sensitive fields using the new values you provide.
-
-## Delete a channel
-
-1. Find the channel in the **Channels** tab.
-2. Click the trash icon and confirm the deletion.
-
-Deleting a channel removes the record and all associated message history.
-
-## Receive inbound events via webhook
-
-External services can send events to your agent through a public webhook endpoint. The URL format is:
-
-```
-POST /webhooks/:channelId
-```
-
-Where `:channelId` is the ID of the channel you want to receive events on. Nora accepts the payload, logs it as an inbound message, and forwards it to the agent runtime if the agent is currently running.
-
-```http theme={null}
-POST /webhooks/ch_abc123
-Content-Type: application/json
-
-{
-  "text": "Deploy triggered by push to main",
-  "sender": "github-actions"
-}
-```
-
-<Note>
-  This endpoint is public and does not require authentication. Use a signing secret or a verify token in your channel configuration to validate inbound payloads in the agent runtime.
-</Note>
-
-If the agent is not running when the webhook arrives, the message is still logged and will be visible in the channel's message history.
+Legacy channels can be tested from the Channels tab. Nora verifies the configuration and sends a test message through the adapter. OpenClaw-managed channels do not use this legacy Test action.

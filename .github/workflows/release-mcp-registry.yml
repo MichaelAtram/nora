@@ -1,0 +1,133 @@
+name: Publish to MCP Registry
+
+# Lists @noraai/mcp-server in the official MCP Registry
+# (registry.modelcontextprotocol.io) so PulseMCP / Glama / MCP-aware clients can
+# discover it. Runs after a GitHub release is published, alongside the npm
+# release (release-npm.yml) — it polls npm until the released version is visible
+# because the registry validates ownership by fetching the published package's
+# `mcpName` field. Auth is GitHub OIDC (no secret): the io.github.solomon2773/*
+# namespace is authorized by the workflow's OIDC identity, which must match the
+# `name` in mcp-server/server.json and `mcpName` in mcp-server/package.json.
+#
+# Idempotent: a version already in the registry is skipped, and a published npm
+# tarball without `mcpName` is skipped (with a notice) rather than failing the
+# release. The MCP Registry is in preview; pin mcp-publisher below as needed.
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # GitHub OIDC for `mcp-publisher login github-oidc`
+
+env:
+  MCP_PUBLISHER_VERSION: v1.7.9
+  NPM_VISIBILITY_TIMEOUT_SECS: "180"
+
+jobs:
+  publish-mcp-registry:
+    name: Publish server.json to the MCP Registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Read package metadata
+        id: meta
+        working-directory: mcp-server
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          mcp_name="$(node -p "require('./package.json').mcpName || ''")"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "mcp_name=${mcp_name}" >> "$GITHUB_OUTPUT"
+          # Skip prerelease versions (e.g. 0.2.0-rc.1) — they don't belong in the registry.
+          if [[ "${version}" == *-* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping MCP Registry publish for prerelease ${name}@${version}."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for the npm version to be visible (registry validates mcpName from it)
+        if: steps.meta.outputs.skip == 'false'
+        id: npmwait
+        run: |
+          set -euo pipefail
+          name="${{ steps.meta.outputs.name }}"
+          version="${{ steps.meta.outputs.version }}"
+          deadline=$(( SECONDS + ${NPM_VISIBILITY_TIMEOUT_SECS} ))
+          until npm view "${name}@${version}" version >/dev/null 2>&1; do
+            if (( SECONDS >= deadline )); then
+              echo "::warning::${name}@${version} not visible on npm after ${NPM_VISIBILITY_TIMEOUT_SECS}s; skipping registry publish."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Waiting for ${name}@${version} to appear on npm..."
+            sleep 10
+          done
+          # The registry reads the package.json mcpName from the published tarball;
+          # an older tarball without it would fail validation, so guard on it.
+          published_mcp_name="$(npm view "${name}@${version}" mcpName 2>/dev/null || true)"
+          if [[ "${published_mcp_name}" != "${{ steps.meta.outputs.mcp_name }}" ]]; then
+            echo "::warning::Published ${name}@${version} has mcpName='${published_mcp_name}', expected '${{ steps.meta.outputs.mcp_name }}'; skipping registry publish."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Sync the published version into server.json
+        if: steps.meta.outputs.skip == 'false' && steps.npmwait.outputs.ready == 'true'
+        working-directory: mcp-server
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          tmp="$(mktemp)"
+          # Fail loudly if server.json ever loses its packages array rather than
+          # silently syncing only the top-level version.
+          jq --arg v "${version}" '
+            if (.packages | length) == 0 then error("server.json has no packages[] to version")
+            else .version = $v | (.packages[].version) = $v end
+          ' server.json > "${tmp}"
+          mv "${tmp}" server.json
+          echo "server.json now at version ${version}:"
+          jq '{name, version, package: .packages[0].identifier}' server.json
+
+      - name: Install mcp-publisher
+        if: steps.meta.outputs.skip == 'false' && steps.npmwait.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+          url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_${os}_${arch}.tar.gz"
+          echo "Downloading ${url}"
+          curl -fsSL "${url}" | tar xz mcp-publisher
+          ./mcp-publisher --version || true
+
+      - name: Authenticate to the MCP Registry (GitHub OIDC)
+        if: steps.meta.outputs.skip == 'false' && steps.npmwait.outputs.ready == 'true'
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json (tolerate an already-listed version)
+        if: steps.meta.outputs.skip == 'false' && steps.npmwait.outputs.ready == 'true'
+        run: |
+          set -uo pipefail
+          out="$(./mcp-publisher publish mcp-server/server.json 2>&1)" || rc=$?
+          echo "${out}"
+          rc=${rc:-0}
+          if [[ ${rc} -ne 0 ]]; then
+            # Re-publishing the same version is a no-op for us, not a failure.
+            if echo "${out}" | grep -qiE "already exists|already published|duplicate|version .* exists"; then
+              echo "::notice::${{ steps.meta.outputs.mcp_name }}@${{ steps.meta.outputs.version }} already in the registry — skipping."
+              exit 0
+            fi
+            echo "::error::mcp-publisher publish failed (exit ${rc})."
+            exit ${rc}
+          fi
+          echo "::notice::Published ${{ steps.meta.outputs.mcp_name }}@${{ steps.meta.outputs.version }} to the MCP Registry."

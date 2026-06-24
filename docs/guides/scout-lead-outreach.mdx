@@ -2,51 +2,77 @@
 
 > Install the Lead Outreach Drafter template, connect one channel, optionally connect a source/CRM, and teach Scout your offer and voice. Scout judges fit and drafts personalized outreach — you send it.
 
-Scout is an outreach-drafting agent built as an Agent Hub template. It assesses whether a prospect is a real fit, then writes a personalized first-touch message and a short follow-up sequence in *your* voice. **Scout drafts, you send.**
+Scout is an outreach-drafting agent built as an Agent Hub template. It assesses whether a prospect is a real fit, then writes a personalized first-touch message and a short follow-up sequence in _your_ voice. **Scout drafts, you send.**
 
 <Tip>
-  **Scout** is just the default name. On first run the agent asks what you'd like to call it — rename it, or keep "Scout."
+  **Scout** is just the default name. On first run the agent asks what you'd like to call it —
+  rename it, or keep "Scout."
 </Tip>
 
 ## Before you install
+
 - A running Nora instance with dashboard access.
 - Your offer, ideal customer profile, and (ideally) one or two example messages to calibrate voice.
 
 ## Step 1 — Install from Agent Hub
+
 Open **Agent Hub**, find **Lead Outreach Drafter Claw**, and click **Install**. See [Publish and install Agent Hub templates](/guides/agent-hub).
 
+<Frame caption="Agent Hub — Lead Outreach Drafter Claw template detail before installation">
+  ![Scout template detail](/images/guides/agent-templates/scout-lead-outreach.png)
+</Frame>
+
 ## Step 2 — Connect a channel
-Scout needs **one** channel to send you drafts (Channels tab). This is separate from the *outreach* channels (email/LinkedIn/DM) you send prospects through.
+
+Scout needs **one** channel to send you drafts (Channels tab). This is separate from the _outreach_ channels (email/LinkedIn/DM) you send prospects through.
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">At [developers.facebook.com](https://developers.facebook.com), add the **WhatsApp** product.</Step>
-  <Step title="Copy credentials">Copy the **Phone Number ID** and an **Access Token**.</Step>
-  <Step title="Add the channel">Agent → **Channels** tab → add **WhatsApp** → paste the values.</Step>
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
+  </Step>
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
+  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Or use Telegram / Slack / Discord / email — see [Configure channels](/guides/channels).
+Or use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels).
 
 ## Step 3 — (Optional) Connect a source or CRM
+
 Scout drafts fine from pasted prospect info — no integration required. To pull or store directly, connect one in the **Integrations** tab:
 
 <CardGroup cols={2}>
-  <Card title="LinkedIn" href="/guides/integrations/linkedin" icon="linkedin" arrow>Pull prospect context.</Card>
-  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>Send approved drafts from your address.</Card>
-  <Card title="HubSpot" href="/guides/integrations/hubspot" icon="database" arrow>Store outreach against CRM records.</Card>
-  <Card title="Salesforce" href="/guides/integrations/salesforce" icon="cloud" arrow>Store outreach against CRM records.</Card>
+  <Card title="LinkedIn" href="/guides/integrations/linkedin" icon="linkedin" arrow>
+    Pull prospect context.
+  </Card>
+  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>
+    Send approved drafts from your address.
+  </Card>
+  <Card title="HubSpot" href="/guides/integrations/hubspot" icon="database" arrow>
+    Store outreach against CRM records.
+  </Card>
+  <Card title="Salesforce" href="/guides/integrations/salesforce" icon="cloud" arrow>
+    Store outreach against CRM records.
+  </Card>
 </CardGroup>
 
 ## Step 4 — Run the bootstrap
+
 Send any first message. Scout introduces itself, offers to rename, gets your channel connected, then learns your offer, ICP, outreach channels, tone, and voice (paste a sample or two).
 
 ## What Scout will and won't do
+
 - **Draft-only.** Scout never sends on its own.
 - **Rejects weak fits** rather than writing low-signal outreach.
 
 ## Troubleshooting
+
 <AccordionGroup>
   <Accordion title="Scout says a source isn't connected, but I added it">
-    Scout reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the **Integrations** tab.
+    Scout reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the
+    **Integrations** tab.
   </Accordion>
   <Accordion title="Drafts don't sound like me">
     Paste a couple of real outreach messages you've sent — Scout calibrates voice from examples.

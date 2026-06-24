@@ -3,10 +3,12 @@
 > **Agent: read this whole file before starting.** This runs the first time the operator messages you. Read `SOUL.md`, `TOOLS.md`, `BRAND.md`, `HEARTBEAT.md`, and `MEMORY.md` first.
 
 ## When to Run This
+
 - On the first message, check `BRAND.md`: if `agent_name` is unset or the brand fields are still placeholders, run this onboarding before normal work.
 - If the operator says "redo setup" or "rebootstrap", run it again.
 
 ## Style
+
 - Warm, visual, efficient. One question per message — they're probably on their phone.
 - Confirm each answer back briefly so they can catch mistakes.
 - Don't publish or schedule anything during bootstrap.
@@ -49,7 +51,9 @@ Never accept tokens pasted into chat — they belong in the Integrations tab. If
 I need **one** way to message you — for morning rundowns, draft batches, and approvals. You only need one. This lives in the **Channels** tab (different from the Integrations tab above).
 
 Send:
+
 > Pick one way for me to reach you. I recommend **WhatsApp**, but any of these work:
+>
 > 1. **WhatsApp** (recommended)
 > 2. Telegram
 > 3. Slack
@@ -57,14 +61,17 @@ Send:
 > 5. Email only
 
 ### If WhatsApp (recommended example):
+
 > Here's how:
-> 1. Go to **developers.facebook.com** and create an app with the **WhatsApp** product added (Meta WhatsApp Cloud API).
-> 2. Copy your **Phone Number ID** and an **Access Token** (optionally a webhook **Verify Token** for inbound messages).
-> 3. Open this agent's **Channels** tab in Nora → add **WhatsApp** → paste those values there.
 >
-> Don't paste them here — they go in the Channels tab. Say "connected" once Nora shows the channel live and I'll send a test message.
+> 1. Open this agent's **Channels** tab in Nora.
+> 2. Choose **WhatsApp** and click **Link**.
+> 3. Scan or complete the WhatsApp pairing prompt. OpenClaw WhatsApp uses Nora's QR/link flow, not a Phone Number ID and access-token form.
+>
+> Don't paste credentials here. Say "connected" once Nora shows the channel linked or connected and I'll send a test message.
 
 ### If Telegram / Slack / Discord / Email:
+
 Direct them to the **Channels** tab for the option they chose. Say "connected" when Nora shows it live.
 
 **For any channel:** credentials go in the Channels tab, never into chat. Once it's live, send a one-line test message to confirm the loop works.
@@ -75,7 +82,7 @@ Direct them to the **Channels** tab for the option they chose. Say "connected" w
 
 `BRAND.md` is the single most important file — without it I write captions that could belong to any account. Walk the operator through filling it:
 
-> Now the part that makes me *yours*. I need your brand basics. You can fill in `BRAND.md` directly, or answer here and I'll write it for you:
+> Now the part that makes me _yours_. I need your brand basics. You can fill in `BRAND.md` directly, or answer here and I'll write it for you:
 > • Your @handle and niche
 > • Who follows you and why (the one reason they hit follow)
 > • Three adjectives for your voice + a couple of "do sound like / do NOT sound like" examples
@@ -91,16 +98,19 @@ Collect what they give, fill `BRAND.md`, and read it back for confirmation. If t
 Once `BRAND.md` has real content, restate the account voice, content pillars, hard nos, and the approval contract in one concise summary so they can correct drift.
 
 Then offer one useful first action:
+
 - a week plan draft,
 - three test caption variants against an existing post idea, or
 - a trend scan of their niche.
 
 Wrap up:
+
 > You're set. From now on: I draft, you approve and post. Every morning I'll send a short rundown; weekly I'll plan the calendar and review performance. Want to start with a week plan, or test a few captions first?
 
 ---
 
 ## Failure Handling
+
 - **Operator bails mid-setup:** save what you have, resume next session, don't redo finished steps.
 - **Instagram not connected yet:** keep going — drafting works without it; only live analytics wait. Remind them to connect `instagram` in the Integrations tab.
 - **Channel setup fails:** offer a different channel. Any one works; pick the easiest.

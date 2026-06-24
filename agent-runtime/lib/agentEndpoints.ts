@@ -1,8 +1,5 @@
-const {
-  AGENT_RUNTIME_PORT,
-  OPENCLAW_GATEWAY_PORT,
-  HERMES_DASHBOARD_PORT,
-} = require("./contracts");
+const net = require("net");
+const { AGENT_RUNTIME_PORT, OPENCLAW_GATEWAY_PORT, HERMES_DASHBOARD_PORT } = require("./contracts");
 
 function normalizePath(path = "/") {
   if (!path) return "";
@@ -15,9 +12,7 @@ function normalizePort(value, fallback) {
 }
 
 function runtimeExposesGateway(agent) {
-  const runtimeFamily = String(
-    agent?.runtime_family ?? agent?.runtimeFamily ?? ""
-  )
+  const runtimeFamily = String(agent?.runtime_family ?? agent?.runtimeFamily ?? "")
     .trim()
     .toLowerCase();
   if (runtimeFamily) return runtimeFamily !== "hermes";
@@ -26,9 +21,7 @@ function runtimeExposesGateway(agent) {
 }
 
 function runtimeUsesHermesDashboard(agent) {
-  const runtimeFamily = String(
-    agent?.runtime_family ?? agent?.runtimeFamily ?? ""
-  )
+  const runtimeFamily = String(agent?.runtime_family ?? agent?.runtimeFamily ?? "")
     .trim()
     .toLowerCase();
   if (runtimeFamily) return runtimeFamily === "hermes";
@@ -37,7 +30,10 @@ function runtimeUsesHermesDashboard(agent) {
 }
 
 function joinHttpUrl(host, port, path = "/") {
-  return `http://${host}:${port}${normalizePath(path)}`;
+  // Bracket IPv6 literals so the colons in the address don't collide with the
+  // port separator (e.g. ::1 → http://[::1]:9119/…). Hostnames/IPv4 pass through.
+  const hostForUrl = net.isIP(host) === 6 ? `[${host}]` : host;
+  return `http://${hostForUrl}:${port}${normalizePath(path)}`;
 }
 
 function resolveRuntimeAddress(agent) {
@@ -54,7 +50,7 @@ function resolveRuntimeAddress(agent) {
 
 function resolveGatewayAddress(
   agent,
-  { publishedHost = process.env.GATEWAY_HOST || "host.docker.internal" } = {}
+  { publishedHost = process.env.GATEWAY_HOST || "host.docker.internal" } = {},
 ) {
   if (!agent) return null;
   if (!runtimeExposesGateway(agent)) return null;
@@ -138,7 +134,16 @@ function hasHermesDashboardEndpoint(agent) {
   return Boolean(resolveHermesDashboardAddress(agent));
 }
 
+// Bearer headers for calling the runtime sidecar (:9090). The sidecar
+// authenticates every route except /health with the per-agent gateway token
+// (injected as OPENCLAW_GATEWAY_TOKEN). Returns an empty object when no token
+// is known, so a caller against a tokenless/legacy runtime still works.
+function buildRuntimeAuthHeaders(token) {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 module.exports = {
+  joinHttpUrl,
   resolveRuntimeAddress,
   resolveGatewayAddress,
   resolveHermesDashboardAddress,
@@ -148,4 +153,5 @@ module.exports = {
   hasRuntimeEndpoint,
   hasGatewayEndpoint,
   hasHermesDashboardEndpoint,
+  buildRuntimeAuthHeaders,
 };

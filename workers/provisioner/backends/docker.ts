@@ -5,6 +5,7 @@ const path = require("path");
 const {
   buildOpenClawInstallCommand,
   buildOpenClawConfigMergeScript,
+  buildMcpServersConfig,
   buildOpenClawCustomProviders,
   buildIntegrationToolWrapperScript,
   buildRuntimeBootstrapFiles,
@@ -20,6 +21,7 @@ const {
   getStandardDockerAgentImage,
   getStandardDockerPackageSpec,
 } = require("../../../agent-runtime/lib/agentImages");
+const { NEMOCLAW_DEFAULT_MODEL } = require("../../../agent-runtime/lib/nemoclawDefaults");
 const {
   buildDockerTelemetry,
   buildUnavailableTelemetry,
@@ -331,7 +333,10 @@ class DockerBackend extends ProvisionerBackend {
       env,
       container_name,
       templatePayload,
+      mcpServers: mcpServerEntries,
       abortSignal,
+      gatewayHostPort: allocatedGatewayPort,
+      runtimeHostPort: allocatedRuntimePort,
     } = config;
     const containerName = container_name || safeContainerName("nora-oclaw", name, id);
     let container = null;
@@ -473,6 +478,9 @@ class DockerBackend extends ProvisionerBackend {
       CEREBRAS_API_KEY: "cerebras",
       NVIDIA_API_KEY: "nvidia",
       MICROSOFT_FOUNDRY_API_KEY: "microsoft-foundry",
+      // Zero-key demo stub (custom provider nora-demo). Deliberately LAST so a
+      // real provider key wins the first-configured default-model heuristic.
+      NORA_DEMO_LLM_TOKEN: "nora-demo",
     };
     // Build auth-profiles at CREATION TIME to determine the default model for setModelCmd.
     // This is only used for model selection — the actual auth-profiles.json on disk is
@@ -531,7 +539,7 @@ class DockerBackend extends ProvisionerBackend {
       together: "together/moonshotai/Kimi-K2.5",
       cohere: "cohere/command-r-plus",
       xai: "xai/grok-4",
-      nvidia: "nvidia/nvidia/nemotron-3-super-120b-a12b",
+      nvidia: NEMOCLAW_DEFAULT_MODEL,
       moonshot: "moonshot/kimi-k2.5",
       zai: "zai/glm-5",
       minimax: "minimax/MiniMax-M2.7",
@@ -541,9 +549,15 @@ class DockerBackend extends ProvisionerBackend {
       // MICROSOFT_FOUNDRY_DEPLOYMENT (arbitrary per Azure resource), falling
       // back to "gpt-5.5".
       "microsoft-foundry": foundryDefaultModel(env || {}),
+      "nora-demo": "nora-demo/nora-demo-1",
     };
     const firstProvider = configuredProviders[0];
-    const defaultModel = firstProvider ? providerModelDefaults[firstProvider] : undefined;
+    // The worker computes NORA_DEFAULT_OPENCLAW_MODEL from the user's explicit
+    // default provider row; honor that before falling back to the
+    // first-configured-key heuristic (which only reflects env map order).
+    const defaultModel =
+      (env && env.NORA_DEFAULT_OPENCLAW_MODEL) ||
+      (firstProvider ? providerModelDefaults[firstProvider] : undefined);
 
     // Set default model in the config file BEFORE gateway starts (not via background CLI after).
     // Writing it into openclaw.json pre-launch avoids the config-change file watcher triggering
@@ -551,8 +565,21 @@ class DockerBackend extends ProvisionerBackend {
     const safeDefaultModel =
       defaultModel && /^[a-zA-Z0-9_\-/.]+$/.test(defaultModel) ? defaultModel : null;
 
-    // Derive the deterministic host port for this agent to include in allowedOrigins
-    const hostPort = 19000 + ((parseInt(id.replace(/\D/g, "").slice(0, 4)) || 0) % 1000);
+    // Use the port the worker reserved for this agent's host (collision-safe,
+    // BYOC Phase B). Fall back to the legacy deterministic hash only if no
+    // allocation was passed (older callers / safety net).
+    const allocatedPort = Number(allocatedGatewayPort);
+    const hostPort =
+      Number.isInteger(allocatedPort) && allocatedPort >= 1 && allocatedPort <= 65535
+        ? allocatedPort
+        : 19000 + ((parseInt(id.replace(/\D/g, "").slice(0, 4)) || 0) % 1000);
+    const allocatedRuntimePortNumber = Number(allocatedRuntimePort);
+    const runtimeHostPort =
+      Number.isInteger(allocatedRuntimePortNumber) &&
+      allocatedRuntimePortNumber >= 1 &&
+      allocatedRuntimePortNumber <= 65535
+        ? allocatedRuntimePortNumber
+        : null;
 
     const allowedOrigins = new Set([
       "http://localhost:8080",
@@ -608,6 +635,11 @@ class DockerBackend extends ProvisionerBackend {
     const customProviders = buildOpenClawCustomProviders(env || {});
     if (Object.keys(customProviders).length > 0) {
       gatewayConfig.models = { providers: customProviders };
+    }
+    // Per-agent MCP servers (credential-resolved by the worker). OpenClaw spawns
+    // each over stdio; merged into openclaw.json alongside the other config.
+    if (Array.isArray(mcpServerEntries) && mcpServerEntries.length > 0) {
+      gatewayConfig.mcpServers = buildMcpServersConfig(mcpServerEntries);
     }
 
     const bootstrapFiles = this._buildBootstrapFiles({
@@ -672,7 +704,10 @@ class DockerBackend extends ProvisionerBackend {
           RestartPolicy: { Name: "unless-stopped" },
           // Publish gateway port for direct browser access (control UI).
           // Use a deterministic port based on agent ID to survive container restarts.
-          PortBindings: { "18789/tcp": [{ HostPort: String(hostPort) }] },
+          PortBindings: {
+            "18789/tcp": [{ HostPort: String(hostPort) }],
+            ...(runtimeHostPort ? { "9090/tcp": [{ HostPort: String(runtimeHostPort) }] } : {}),
+          },
           // DNS servers for internet access from within the container
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
           Binds: [`${volumeName}:/mnt/nora-agent-state`],
@@ -716,11 +751,20 @@ class DockerBackend extends ProvisionerBackend {
       // Get the published host port for the gateway (for direct browser access to control UI)
       const portBindings = info.NetworkSettings?.Ports?.["18789/tcp"];
       const gatewayHostPort = portBindings?.[0]?.HostPort || null;
+      const runtimePortBindings = info.NetworkSettings?.Ports?.["9090/tcp"];
+      const publishedRuntimeHostPort = runtimePortBindings?.[0]?.HostPort || null;
 
       console.log(
-        `[docker] Container ${containerName} (${container.id}) started at ${host} (gateway port 18789, host port ${gatewayHostPort || "none"})`,
+        `[docker] Container ${containerName} (${container.id}) started at ${host} (gateway port 18789, host port ${gatewayHostPort || "none"}, runtime host port ${publishedRuntimeHostPort || "none"})`,
       );
-      return { containerId: containerName, host, gatewayToken, containerName, gatewayHostPort };
+      return {
+        containerId: containerName,
+        host,
+        gatewayToken,
+        containerName,
+        gatewayHostPort,
+        runtimeHostPort: publishedRuntimeHostPort,
+      };
     } catch (error) {
       if (container) {
         try {

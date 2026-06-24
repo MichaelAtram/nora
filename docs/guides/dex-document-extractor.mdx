@@ -5,49 +5,74 @@
 Dex is a data-extraction agent built as an Agent Hub template. It pulls the exact fields you need from documents, emails, and forms and returns them in a clean, consistent format. Missing or ambiguous fields are **flagged, not guessed**.
 
 <Tip>
-  **Dex** is just the default name. On first run the agent asks what you'd like to call it — rename it, or keep "Dex."
+  **Dex** is just the default name. On first run the agent asks what you'd like to call it — rename
+  it, or keep "Dex."
 </Tip>
 
 ## Before you install
+
 - A running Nora instance with dashboard access.
 - The document types you process and the fields you need from each.
 
 ## Step 1 — Install from Agent Hub
+
 Open **Agent Hub**, find **Document Data Extractor Claw**, and click **Install**. See [Publish and install Agent Hub templates](/guides/agent-hub).
 
+<Frame caption="Agent Hub — Document Data Extractor Claw template detail before installation">
+  ![Dex template detail](/images/guides/agent-templates/dex-document-extractor.png)
+</Frame>
+
 ## Step 2 — Connect a channel
+
 Dex needs **one** channel to send you extractions and flags (Channels tab).
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">At [developers.facebook.com](https://developers.facebook.com), add the **WhatsApp** product.</Step>
-  <Step title="Copy credentials">Copy the **Phone Number ID** and an **Access Token**.</Step>
-  <Step title="Add the channel">Agent → **Channels** tab → add **WhatsApp** → paste the values.</Step>
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
+  </Step>
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
+  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Or use Telegram / Slack / Discord / email — see [Configure channels](/guides/channels).
+Or use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels).
 
 ## Step 3 — (Optional) Connect an output destination
+
 Dex extracts fine from documents you paste — no integration required. To write results straight out, connect one in the **Integrations** tab:
 
 <CardGroup cols={3}>
-  <Card title="Airtable" href="/guides/integrations/airtable" icon="table" arrow>Append extracted rows.</Card>
-  <Card title="Google Sheets" href="/guides/integrations/google-sheets" icon="table-cells" arrow>Append extracted rows.</Card>
-  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>Read documents from attachments.</Card>
+  <Card title="Airtable" href="/guides/integrations/airtable" icon="table" arrow>
+    Append extracted rows.
+  </Card>
+  <Card title="Google Sheets" href="/guides/integrations/google-sheets" icon="table-cells" arrow>
+    Append extracted rows.
+  </Card>
+  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>
+    Read documents from attachments.
+  </Card>
 </CardGroup>
 
 ## Step 4 — Run the bootstrap
+
 Send any first message. Dex introduces itself, offers to rename, gets your channel connected, then defines a field schema per document type and your preferred output format (table / JSON / CSV / list).
 
 ## What Dex will and won't do
+
 - **Never fabricates** — ambiguous fields come back raw and flagged.
 - **Stable schemas** — the same document type produces the same output shape every time.
 
 ## Troubleshooting
+
 <AccordionGroup>
   <Accordion title="Dex says a destination isn't connected, but I added it">
-    Dex reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the **Integrations** tab.
+    Dex reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the
+    **Integrations** tab.
   </Accordion>
   <Accordion title="Extraction missed or misread a field">
-    Tighten the schema for that document type, or check the flag — Dex returns the raw value when a field is ambiguous rather than guessing.
+    Tighten the schema for that document type, or check the flag — Dex returns the raw value when a
+    field is ambiguous rather than guessing.
   </Accordion>
 </AccordionGroup>

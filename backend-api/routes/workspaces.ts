@@ -61,7 +61,7 @@ function logWorkspaceEvent(req, eventType, message, context) {
 
 // ── Workspace collection ────────────────────────────────────────────────────
 
-router.get("/", async (req, res) => {
+router.get("/", async (req, res, next) => {
   try {
     const all = await workspaces.listWorkspaces(req.user.id);
     // API keys are bound to a single workspace — even when the issuing user
@@ -69,11 +69,11 @@ router.get("/", async (req, res) => {
     const bound = apiKeyWorkspaceId(req);
     res.json(bound ? all.filter((w) => w.id === bound) : all);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.post("/", async (req, res) => {
+router.post("/", async (req, res, next) => {
   try {
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: "Name required" });
@@ -86,7 +86,7 @@ router.post("/", async (req, res) => {
     });
     res.json(workspace);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
@@ -110,23 +110,23 @@ router.post("/invitations/accept", async (req, res) => {
 
 // ── Per-workspace agent routes ──────────────────────────────────────────────
 
-router.get("/:id/agents", requireWorkspaceRole("viewer"), async (req, res) => {
+router.get("/:id/agents", requireWorkspaceRole("viewer"), async (req, res, next) => {
   try {
     res.json(await workspaces.getWorkspaceAgents(req.params.id, req.user.id));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.get("/:id/agent-candidates", requireWorkspaceRole("editor"), async (req, res) => {
+router.get("/:id/agent-candidates", requireWorkspaceRole("editor"), async (req, res, next) => {
   try {
     res.json(await workspaces.listAgentCandidates(req.params.id, req.user.id));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.post("/:id/agents", requireWorkspaceRole("editor"), async (req, res) => {
+router.post("/:id/agents", requireWorkspaceRole("editor"), async (req, res, next) => {
   try {
     const { agentId, role } = req.body;
     if (!agentId) return res.status(400).json({ error: "agentId required" });
@@ -141,11 +141,11 @@ router.post("/:id/agents", requireWorkspaceRole("editor"), async (req, res) => {
     );
     res.json(assignment);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.delete("/:id/agents/:agentId", requireWorkspaceRole("admin"), async (req, res) => {
+router.delete("/:id/agents/:agentId", requireWorkspaceRole("admin"), async (req, res, next) => {
   try {
     const removed = await workspaces.removeAgent(req.params.id, req.params.agentId);
     if (!removed) return res.status(404).json({ error: "Workspace agent assignment not found" });
@@ -157,11 +157,11 @@ router.delete("/:id/agents/:agentId", requireWorkspaceRole("admin"), async (req,
     );
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.delete("/:id", requireWorkspaceRole("owner"), async (req, res) => {
+router.delete("/:id", requireWorkspaceRole("owner"), async (req, res, next) => {
   try {
     await db.query("DELETE FROM workspace_agents WHERE workspace_id = $1", [req.params.id]);
     await db.query("DELETE FROM workspaces WHERE id = $1", [req.params.id]);
@@ -171,17 +171,17 @@ router.delete("/:id", requireWorkspaceRole("owner"), async (req, res) => {
     });
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
 // ── Member management ──────────────────────────────────────────────────────
 
-router.get("/:id/members", requireWorkspaceRole("viewer"), async (req, res) => {
+router.get("/:id/members", requireWorkspaceRole("viewer"), async (req, res, next) => {
   try {
     res.json(await workspaceMembers.listMembers(req.params.id));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
@@ -221,12 +221,12 @@ router.delete("/:id/members/:userId", requireWorkspaceRole("admin"), async (req,
 
 // ── Invitation management ──────────────────────────────────────────────────
 
-router.get("/:id/invitations", requireWorkspaceRole("admin"), async (req, res) => {
+router.get("/:id/invitations", requireWorkspaceRole("admin"), async (req, res, next) => {
   try {
     const includeRevoked = req.query.includeRevoked === "true";
     res.json(await workspaceMembers.listInvitations(req.params.id, { includeRevoked }));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 

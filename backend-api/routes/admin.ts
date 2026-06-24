@@ -10,6 +10,8 @@ const snapshots = require("../snapshots");
 const containerManager = require("../containerManager");
 const releaseUpgrade = require("../releaseUpgrade");
 const kubernetesClusters = require("../kubernetesClusters");
+const remoteHosts = require("../remoteHosts");
+const doctor = require("../doctor");
 const { repairHermesAgentConfig } = require("../hermesUi");
 const {
   addBackupJob,
@@ -75,6 +77,17 @@ const router = express.Router();
 router.use(requireAdmin);
 router.use(createMutationFailureAuditMiddleware("admin"));
 
+// Control-plane self-check (DB, queue, Kubernetes targets, secret posture,
+// fleet health, gateway exposure). Backs `nora doctor` and the admin Health
+// panel. Cached briefly; pass ?fresh=1 to force a recompute.
+router.get(
+  "/admin/doctor",
+  asyncHandler(async (req, res) => {
+    const fresh = req.query.fresh === "1" || req.query.fresh === "true";
+    res.json(await doctor.getDoctorReport({ fresh }));
+  }),
+);
+
 function parseInterval(pg) {
   const match = String(pg || "").match(/(\d+)\s*(day|minute|hour|second)/);
   if (!match) return 15 * 60 * 1000;
@@ -124,6 +137,9 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
 async function assertRuntimeTargetAvailable(runtimeFields) {
   const status = assertRuntimeSelectionAvailable(runtimeFields);
   await kubernetesClusters.assertKubernetesExecutionTargetAvailable(runtimeFields);
+  // Admin re-deploys an existing agent, so this validates host availability
+  // (enabled/configured/connected) without owner-scoping the trusted admin.
+  await remoteHosts.assertRemoteHostExecutionTargetAvailable(runtimeFields);
   return status;
 }
 
@@ -742,6 +758,16 @@ router.delete(
       }),
     );
     res.json({ success: true, cluster });
+  }),
+);
+
+// Fleet-wide read-only view of every operator's registered remote hosts (BYOC).
+// Hosts are owned per-user; this is the admin oversight surface. Secrets are
+// masked by the registry's list path.
+router.get(
+  "/remote-hosts",
+  asyncHandler(async (_req, res) => {
+    res.json(await remoteHosts.listRemoteHosts({ includeDisabled: true }));
   }),
 );
 

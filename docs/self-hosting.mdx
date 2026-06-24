@@ -17,12 +17,13 @@ Before you install, make sure your host meets the following requirements.
 | **OpenSSL**          | OpenSSL (used to generate secrets; the installer can install it if missing)        |
 
 <Note>
-  The setup script checks for Docker, Docker Compose, Git, and OpenSSL and installs any that are missing before proceeding.
+  The setup script checks for Docker, Docker Compose, Git, and OpenSSL and installs any that are
+  missing before proceeding.
 </Note>
 
 ## Recommended install
 
-The installer script is the fastest path to a running Nora instance. It handles dependency checks, secret generation, access mode configuration, optional admin account creation, and stack startup in one interactive pass.
+The installer script is the fastest path to a running Nora instance. It handles dependency checks, secret generation, access mode configuration, optional admin account creation, local port selection, and stack startup in one interactive pass.
 
 <Steps>
   <Step title="Run the installer">
@@ -37,6 +38,7 @@ The installer script is the fastest path to a running Nora instance. It handles 
       iwr -useb https://raw.githubusercontent.com/solomon2773/nora/master/setup.ps1 | iex
       ```
     </CodeGroup>
+
   </Step>
 
   <Step title="Follow the interactive prompts">
@@ -44,26 +46,49 @@ The installer script is the fastest path to a running Nora instance. It handles 
 
     1. Verify or install Docker, Docker Compose, Git, and OpenSSL
     2. Clone the repository (if running via the curl pipe)
-    3. Generate `JWT_SECRET`, `ENCRYPTION_KEY`, and `NEXTAUTH_SECRET`
+    3. Generate or preserve secrets for JWTs, AES encryption, managed backups, Agent Hub keys, and the database
     4. Choose platform mode: **self-hosted** (operator-defined resource limits) or **PaaS** (Stripe billing)
-    5. Choose a provisioner backend: **Docker** (default), **Proxmox**, or **Kubernetes**
+    5. Choose whether to keep the GA **Docker** backend enabled. Kubernetes clusters are registered after setup in **Admin -> Kubernetes**. Proxmox is planned but release-blocked in the current release, so setup does not enable it.
     6. Choose access mode: **local only** (`http://localhost:8080`), **public domain behind a proxy**, or **public domain with TLS at Nginx**
     7. Optionally create a bootstrap admin account
-    8. Optionally add an LLM provider key and name your first agent
+    8. Start the stack; after login, add your LLM provider key in **Settings**
 
     When the installer finishes, it writes `.env` and starts the stack with `docker compose up -d`.
+
+    <Note>
+      In local mode, setup checks host ports before startup. If `8080` is busy, it offers a free web port such as `8081` and updates `NEXTAUTH_URL`. If `127.0.0.1:4100` is busy, it offers a free backend API port and writes `BACKEND_API_PORT`.
+    </Note>
+
   </Step>
 
   <Step title="Open the dashboard">
-    The installer prints the base URL it configured. For local mode, open your browser to:
+    The installer prints the base URL it configured. For local mode, the default is:
 
     ```
     http://localhost:8080
     ```
 
-    If you skipped the bootstrap admin account, go to `http://localhost:8080/signup` to create your operator account.
+    If setup selected a different port, use the printed URL instead. If you skipped the bootstrap admin account, go to `/signup` on that origin. On a fresh instance the signup page runs in "claim this server" mode and the first account you create becomes the platform admin (see [Security architecture](/concepts/security)).
+
   </Step>
 </Steps>
+
+## Reconfigure vs clean reinstall
+
+If you run setup again from an existing checkout, it asks which maintenance mode you want:
+
+| Mode                    | What it preserves                                                          | When to use it                                                                  |
+| ----------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **Update code only**    | `.env`, Docker volumes, and provisioned agents                             | Pull the latest Nora code without changing local configuration                  |
+| **Reconfigure install** | Docker volumes and provisioned agents                                      | Change limits, access mode, enabled runtimes, or ports while keeping local data |
+| **Clean reinstall**     | Nothing local; compose volumes and local Nora agent containers are removed | Start over with a brand-new local database                                      |
+
+<Warning>
+  Reconfigure mode intentionally preserves the existing `DB_PASSWORD` from `.env` because the
+  Postgres Docker volume is already initialized with that password. If you manually replace `.env`
+  with a different `DB_PASSWORD` while keeping volumes, the backend cannot sign up or log in users
+  until the password is restored or the volume is recreated.
+</Warning>
 
 ## Manual setup
 
@@ -89,6 +114,7 @@ Use manual setup when you want full control over every configuration value befor
     ```bash theme={null}
     cp .env.example .env
     ```
+
   </Step>
 
   <Step title="Start the stack">
@@ -103,12 +129,37 @@ Use manual setup when you want full control over every configuration value befor
     <Warning>
       Do not start the stack with placeholder values for `JWT_SECRET` or `ENCRYPTION_KEY`. Generate each with `openssl rand -hex 32` before running `docker compose up -d`.
     </Warning>
+
   </Step>
 
   <Step title="Open the dashboard">
-    Once the stack is up, open your browser to `http://localhost:8080`. Create your operator account at `/signup` if you did not pre-seed a bootstrap admin.
+    Once the stack is up, open your browser to `http://localhost:8080`. Open `/signup` to create your operator account if you did not pre-seed a bootstrap admin. On a fresh database this runs as first-run claim, and the first account created becomes the platform admin.
   </Step>
 </Steps>
+
+## Kubernetes (Helm)
+
+Run Nora itself on a Kubernetes cluster with the official chart in [`infra/helm/nora`](https://github.com/solomon2773/nora/tree/master/infra/helm/nora). The chart deploys the full control plane (nginx edge, the three frontends, backend API, provisioner and backup workers) with in-chart PostgreSQL and Redis by default, or external data stores via values.
+
+```bash
+git clone https://github.com/solomon2773/nora.git && cd nora
+helm install nora ./infra/helm/nora \
+  --namespace nora --create-namespace \
+  --set secrets.jwtSecret="$(openssl rand -hex 32)" \
+  --set secrets.encryptionKey="$(openssl rand -hex 32)" \
+  --set secrets.backupEncryptionKey="$(openssl rand -hex 32)" \
+  --set secrets.apiKeyHashSecret="$(openssl rand -hex 32)" \
+  --set secrets.dbPassword="$(openssl rand -hex 24)"
+kubectl -n nora port-forward svc/nora-nginx 8080:80
+```
+
+The chart refuses to install without real secrets — there are no insecure defaults. For a public deployment set `publicUrl`, enable `ingress.*`, and terminate TLS at your Ingress controller.
+
+<Warning>
+  A cluster-hosted control plane deploys agents to **Kubernetes targets only** (`ENABLED_BACKENDS=k8s`): pods have no Docker socket, so the Docker deploy target is unavailable. Register agent clusters under Admin → Kubernetes and mount their kubeconfigs with `kubeconfigs.existingSecret`. In-place release upgrades from the Admin UI are a Docker Compose feature — upgrade with `helm upgrade` instead.
+</Warning>
+
+See the [chart README](https://github.com/solomon2773/nora/blob/master/infra/helm/nora/README.md) for all values, design notes, and the local Kind smoke test.
 
 ## Accessing the dashboard
 
@@ -123,7 +174,8 @@ After installation, the following URLs are available in local mode. Public-domai
 | `http://localhost:8080/app/deploy`    | Deploy your first agent runtime  |
 
 <Tip>
-  If you configured a public domain (for example `https://app.example.com`), replace `http://localhost:8080` with your domain in all of the paths above.
+  If you configured a public domain (for example `https://app.example.com`), replace
+  `http://localhost:8080` with your domain in all of the paths above.
 </Tip>
 
 ![Nora dashboard immediately after the stack comes up](/images/operator/dashboard.png)

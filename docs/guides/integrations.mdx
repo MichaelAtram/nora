@@ -134,6 +134,16 @@ Nora calls the provider's API using the stored credentials and reports success o
 
 Removing an integration deletes the stored credentials. It does not restart the agent — the environment variables will no longer be injected on the next deployment or sync.
 
+## Expose an integration as an MCP server
+
+Some connected integrations can also run as a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server inside the agent's OpenClaw runtime, giving the agent that provider's MCP tools directly. The **MCP Servers** panel on the agent's **Integrations** tab lists every supported provider; toggle one on once its integration is connected.
+
+Nora launches each enabled server over stdio with the integration's own credentials — you don't paste anything twice. Supported today: **GitLab, Notion, Stripe, and Supabase**. The set of enabled servers is applied to the runtime on the agent's next **redeploy**, so the panel shows a reminder after a change.
+
+<Note>
+  Providers whose MCP server needs file-based credentials (Google Drive, Kubernetes) or a connection string (PostgreSQL) are not yet available in the panel.
+</Note>
+
 ## Per-provider guides
 
 Every supported integration has a dedicated page that documents where to apply for the credential, which scopes/permissions to grant, and how to connect it to Nora. The same `credentialsUrl` and `setupGuide` content surfaces inline in the dashboard's integration modal, so docs and dashboard stay in sync.

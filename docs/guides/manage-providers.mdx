@@ -8,33 +8,39 @@ Nora stores your LLM provider API keys centrally and injects them into agent con
 
 Nora supports the following LLM providers:
 
-<AccordionGroup>
-  <Accordion title="All supported providers">
-    | Provider       | Environment variable   |
-    | -------------- | ---------------------- |
-    | Anthropic      | `ANTHROPIC_API_KEY`    |
-    | OpenAI         | `OPENAI_API_KEY`       |
-    | Google AI      | `GEMINI_API_KEY`       |
-    | Groq           | `GROQ_API_KEY`         |
-    | Mistral AI     | `MISTRAL_API_KEY`      |
-    | DeepSeek       | `DEEPSEEK_API_KEY`     |
-    | OpenRouter     | `OPENROUTER_API_KEY`   |
-    | Together AI    | `TOGETHER_API_KEY`     |
-    | Cohere         | `COHERE_API_KEY`       |
-    | xAI            | `XAI_API_KEY`          |
-    | Moonshot AI    | `MOONSHOT_API_KEY`     |
-    | Z.AI           | `ZAI_API_KEY`          |
-    | Ollama         | `OLLAMA_API_KEY`       |
-    | MiniMax        | `MINIMAX_API_KEY`      |
-    | GitHub Copilot | `COPILOT_GITHUB_TOKEN` |
-    | Hugging Face   | `HF_TOKEN`             |
-    | Cerebras       | `CEREBRAS_API_KEY`     |
-    | NVIDIA         | `NVIDIA_API_KEY`       |
-  </Accordion>
-</AccordionGroup>
+| Provider          | Environment variable        |
+| ----------------- | --------------------------- |
+| Anthropic         | `ANTHROPIC_API_KEY`         |
+| OpenAI            | `OPENAI_API_KEY`            |
+| Google AI         | `GEMINI_API_KEY`            |
+| Groq              | `GROQ_API_KEY`              |
+| Mistral AI        | `MISTRAL_API_KEY`           |
+| DeepSeek          | `DEEPSEEK_API_KEY`          |
+| OpenRouter        | `OPENROUTER_API_KEY`        |
+| Together AI       | `TOGETHER_API_KEY`          |
+| Cohere            | `COHERE_API_KEY`            |
+| xAI               | `XAI_API_KEY`               |
+| Moonshot AI       | `MOONSHOT_API_KEY`          |
+| Z.AI              | `ZAI_API_KEY`               |
+| Ollama            | `OLLAMA_API_KEY`            |
+| MiniMax           | `MINIMAX_API_KEY`           |
+| GitHub Copilot    | `COPILOT_GITHUB_TOKEN`      |
+| Hugging Face      | `HF_TOKEN`                  |
+| Cerebras          | `CEREBRAS_API_KEY`          |
+| NVIDIA            | `NVIDIA_API_KEY`            |
+| Microsoft Foundry | `MICROSOFT_FOUNDRY_API_KEY` |
 
 <Note>
-  NVIDIA is required for NemoClaw agents. See [Run secure agents with NemoClaw sandboxes](/guides/nemoclaw) for details.
+  NVIDIA is required for NemoClaw agents. See [Run secure agents with NemoClaw
+  sandboxes](/guides/nemoclaw) for details.
+</Note>
+
+<Note>
+  Microsoft Foundry requires more than an API key. Enter your Foundry resource base URL, for example `https://<resource>.services.ai.azure.com/openai/v1/`, and set the model field to the exact Azure deployment name, such as `gpt-5.5-1`. Deployment names are created in your Foundry resource, so do not trim `-1` or replace the value with the base model id.
+</Note>
+
+<Note>
+  Nora also ships a built-in **Demo** provider (`Demo (built-in, no key required)`) that needs no API key. It runs a deterministic stub served by the control plane itself (model `nora-demo-1`), so a fresh install can deploy a working agent and see a chat round-trip before any real provider key is added. Add it with `POST /api/llm-providers` and a body of `{"provider":"demo"}` (no key), or use the **Try the demo agent — no API key** button in the first-run flow. Replace it with a real provider key when you are ready to run production agents.
 </Note>
 
 ## Add a provider key
@@ -50,19 +56,22 @@ Nora supports the following LLM providers:
     Click **Add Provider** (or the equivalent button in your dashboard). A form appears with three fields.
 
     ![Add-provider form — dropdown, API key field, and optional model pin](/images/guides/providers/provider-keys-add.png)
+
   </Step>
 
-  <Step title="Select the provider">
-    Choose a provider from the dropdown. The list contains all 18 supported providers. The correct environment variable for that provider is shown for reference.
-  </Step>
+<Step title="Select the provider">
+  Choose a provider from the dropdown. The list contains all supported providers. The correct
+  environment variable for that provider is shown for reference.
+</Step>
 
-  <Step title="Enter the API key">
-    Paste your API key into the **API Key** field. This value is required.
-  </Step>
+<Step title="Enter the API key">
+  Paste your API key into the **API Key** field. This value is required.
+</Step>
 
-  <Step title="Optionally pin a model">
-    If you want agents using this provider to default to a specific model, enter the model ID in the **Model** field. You can leave this blank to let the agent runtime select the model.
-  </Step>
+<Step title="Optionally pin a model">
+  If you want agents using this provider to default to a specific model, enter the model ID in the
+  **Model** field. You can leave this blank to let the agent runtime select the model.
+</Step>
 
   <Step title="Save the key">
     Click **Save**. Nora encrypts the key with AES-256-GCM before storing it. The dashboard shows a masked preview such as `sk-a••••••••1234`.
@@ -70,7 +79,8 @@ Nora supports the following LLM providers:
 </Steps>
 
 <Tip>
-  If this is the first key you add, Nora automatically marks it as your default provider. You can change the default at any time.
+  If this is the first key you add, Nora automatically marks it as your default provider. You can
+  change the default at any time.
 </Tip>
 
 ## Set a default provider
@@ -92,7 +102,8 @@ Adding or updating a key in Settings does not automatically update running agent
 Nora decrypts all keys for your account and injects them into the running container as environment variables. The agent runtime picks up the updated keys without needing to restart.
 
 <Note>
-  Keys are synced encrypted in transit and injected directly into the container environment. They are not written to disk on the host.
+  Keys are synced encrypted in transit and injected directly into the container environment. They
+  are not written to disk on the host.
 </Note>
 
 ## Update a provider key

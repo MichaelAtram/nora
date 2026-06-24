@@ -1,0 +1,81 @@
+# Security architecture
+
+> How Nora protects credentials, sessions, runtime access, and operator data across the control plane, the provisioning workers, and the agent runtimes it manages.
+
+Nora is built to be trustworthy in real operator environments: you run it on your own infrastructure, the secrets stay in your database encrypted with your key, and every layer between a browser and a runtime enforces access control. This page collects the security posture in one place.
+
+## Secrets and credentials
+
+- **LLM provider keys, integration credentials, remote-host SSH credentials, and per-agent runtime gateway tokens are encrypted at rest** with AES-256-GCM before they are stored in PostgreSQL. The encryption key is the operator-owned `ENCRYPTION_KEY` generated during setup — Nora never stores plaintext credentials. Gateway tokens (the bearer that authenticates the control plane to each runtime sidecar) are encrypted on write and decrypted only at the point of use; they are never returned in API responses.
+- **Key sync to runtimes is explicit.** Provider keys are pushed to a runtime on demand as part of provisioning or an operator-triggered sync, not broadcast.
+- **Setup generates strong secrets.** The installer creates `JWT_SECRET` and `ENCRYPTION_KEY` with OpenSSL and preserves existing secrets on re-runs.
+- **Production refuses weak secrets.** In production the backend will not boot when `JWT_SECRET` is missing, too short, or a placeholder, or when `ENCRYPTION_KEY` is missing or malformed — so a copy-pasted `.env.example` can never reach the internet. The only way around the encryption requirement is the explicit `NORA_ALLOW_PLAINTEXT_SECRETS=true` override.
+- **First-run claim flow.** Until the first user registers, the signup page runs in "claim this server" mode; the first account becomes the platform admin (`GET /api/auth/bootstrap-status` exposes only that boolean).
+
+## Authentication and authorization
+
+- **JWT-based sessions** authenticate dashboard and API requests; OAuth sign-in flows hand off to backend-issued HttpOnly session cookies.
+- **Role-based access control** separates operators from platform admins — admin routes are guarded by explicit role checks, and the admin dashboard is a separate application surface.
+- **Scoped Agent Hub API keys** can be issued, rotated, and revoked per tenant, with dedicated middleware guarding the public `/api/agent-hub/*` surface.
+- **Signup abuse controls**: signup-specific burst and daily rate limits, duplicate-email short-circuiting, and optional Cloudflare Turnstile or Google reCAPTCHA with server-side challenge verification.
+
+## API and edge hardening
+
+- **helmet** security headers and **CORS** restricted to the configured `CORS_ORIGINS` allowlist.
+- **Layered rate limiting**: a global limiter plus a stricter limiter on mutating requests in the API, and nginx-level rate-limit zones for auth and API paths at the public edge.
+- **No raw error leakage**: unexpected failures route through a central error handler with correlation IDs, so 5xx responses never expose exception internals.
+- **TLS setup is scripted** (`infra/setup-tls.sh`) for public deployments, with Cloudflare real-IP guidance for proxied edges.
+
+## Runtime access control
+
+- **The gateway proxy is the only path to a runtime's API**, and it restricts which upstream addresses can be proxied to an allowlist of ranges.
+- **Live exec, log, and metrics WebSocket streams enforce access control** — runtime terminal and log streaming are authenticated, not open sockets.
+- **Proxied agent assets are token-validated** before they are served.
+
+## Runtime isolation
+
+Isolation strength is a property of the **deploy target + sandbox profile**, not a single global setting. Pick the tier that matches how much you trust the agent's code.
+
+### Standard profile — Docker and Kubernetes (GA)
+
+- **Each agent runs in its own container** with its own namespaces (PID, mount, network, IPC, UTS) and **operator-set CPU, RAM, and disk limits** (Docker `NanoCpus`/`Memory`; Kubernetes `resources.limits`). The host kernel's default container protections apply (Docker's default seccomp profile, dropped ambient capabilities).
+- This is **shared-kernel** isolation: appropriate for first-party or trusted agent code, the same trust boundary you'd give any container you deploy. It is **not** intended as a hard boundary for arbitrary untrusted code — for that, use the NemoClaw profile or a VM-grade target.
+
+### NemoClaw profile — hardened sandbox (experimental, OpenClaw only)
+
+The `nemoclaw` profile is the hardened tier for running less-trusted agent code. On top of the standard limits it adds, verifiably in the provisioner:
+
+- **Non-root execution** as a dedicated unprivileged user (UID 998) under **Landlock** filesystem restrictions and a **seccomp** syscall filter (baked into the runtime image).
+- **All Linux capabilities dropped** (`CapDrop: ["ALL"]`), adding back only `NET_BIND_SERVICE`, with **`no-new-privileges`** set so a child process can never regain privilege.
+- **`noexec,nosuid` tmpfs** for the sandbox's writable directories, so dropped payloads can't be executed from scratch space.
+- **Default-deny egress**: the sandbox runs with no general bridge network; outbound access is mediated by the OpenShell network policy (deny by default), not open to the internet.
+
+### VM-grade target — Proxmox (planned, release-blocked)
+
+Proxmox VM placement is the planned **hardware-boundary** isolation tier (a separate kernel per agent), tracked but currently release-blocked. It is the future home for workloads that need a stronger boundary than a shared-kernel container.
+
+### Roadmap
+
+- **gVisor / Kata via Kubernetes `RuntimeClass`** — syscall-interception and microVM isolation for the standard Kubernetes target, selectable per agent. Not wired today; on the roadmap.
+- **Default-deny egress `NetworkPolicy` templates** for the standard Kubernetes target.
+
+### Control-plane / worker separation
+
+**The control plane and workers are separate services**: the API coordinates state in PostgreSQL while provisioning runs in a dedicated worker over a Redis/BullMQ queue, so runtime credentials and Docker/Kubernetes access stay inside the worker boundary.
+
+## Standards and protocols
+
+- **MCP is first-class and shipped** — Nora publishes a control-plane MCP server (`@noraai/mcp-server`, in the official MCP Registry) and supports per-agent MCP server management. See [Operating Nora over MCP](https://github.com/solomon2773/nora/tree/master/mcp-server).
+- **OpenTelemetry GenAI (`gen_ai.*` / OTLP + Prometheus export)** — available: export runtime telemetry under the OTel GenAI semantic conventions so per-exchange chat spans and per-agent token/cost/resource metrics flow into your existing observability backend. Disabled by default and fail-open. See the [OpenTelemetry export guide](/guides/opentelemetry). (Per-tool-call sub-spans depend on runtime event streams and remain on the roadmap.)
+- **A2A (Agent-to-Agent)** — on the roadmap: serve Agent Cards / A2A discovery for managed OpenClaw and Hermes agents.
+
+## Backups and audit
+
+- **Scheduled backups are encrypted** with AES-256-GCM in a versioned archive format; restores verify the format header before decrypting.
+- **Audit logging** records operator actions in PostgreSQL for review.
+
+## Your data stays yours
+
+Nora is self-hosted: the database, secrets, runtime workloads, and logs all live on infrastructure you control. There is no required external control plane and no phone-home dependency in the product. The full source is open under Apache 2.0 — every claim on this page can be verified in the [repository](https://github.com/solomon2773/nora).
+
+Found a vulnerability? Please report it responsibly — see the [security policy](https://github.com/solomon2773/nora/security/policy) and [contact](/support/contact) page.

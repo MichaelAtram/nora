@@ -18,8 +18,8 @@ Nora operates in one of two platform modes, controlled by the `PLATFORM_MODE` en
 | **Resource limits**          | Set by operator via env vars            | Locked to Stripe subscription plan tier                      |
 | **Billing**                  | None                                    | Stripe (when `BILLING_ENABLED=true`)                         |
 | **Agent limit source**       | `MAX_AGENTS` env var                    | Subscription plan                                            |
-| **vCPU / RAM / disk source** | `MAX_VCPU`, `MAX_RAM_MB`, `MAX_DISK_GB` | Subscription plan tier                                       |
-| **Free tier**                | All users share operator limits         | Automatic free plan (3 agents, 2 vCPU, 2 GB RAM, 20 GB disk) |
+| **vCPU / RAM / disk source** | `MAX_VCPU`, `MAX_RAM_MB`, `MAX_DISK_GB` | Platform-wide deployment defaults (Admin Settings), shared across all plan tiers |
+| **Free tier**                | All users share operator limits         | Automatic free plan (3 agents; compute comes from the platform deployment defaults, not a per-plan value) |
 
 ## Self-hosted mode
 
@@ -70,11 +70,15 @@ BILLING_ENABLED=true
 
 Three tiers are defined in the billing module:
 
-| Plan         | Agents | vCPU | RAM   | Disk   |
-| ------------ | ------ | ---- | ----- | ------ |
-| `free`       | 3      | 2    | 2 GB  | 20 GB  |
-| `pro`        | 10     | 8    | 16 GB | 200 GB |
-| `enterprise` | 100    | 16   | 32 GB | 500 GB |
+| Plan         | Agents |
+| ------------ | ------ |
+| `free`       | 3      |
+| `pro`        | 10     |
+| `enterprise` | 100    |
+
+<Note>
+  vCPU, RAM, and disk are not differentiated by plan tier. Every PaaS subscription receives the platform-wide deployment defaults (`default_vcpu` / `default_ram_mb` / `default_disk_gb`) configured in Admin Settings — only the per-tier agent limit (and managed-backup limits) differ. The shipped fallback defaults are 1 vCPU / 1024 MB / 10 GB.
+</Note>
 
 New users are automatically placed on the `free` plan when they first deploy an agent.
 

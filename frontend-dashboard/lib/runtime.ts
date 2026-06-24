@@ -39,7 +39,10 @@ export function normalizeDeployTarget(value) {
     .toLowerCase();
   if (normalized.startsWith("k8s:") || normalized.startsWith("kubernetes:")) return "k8s";
   if (normalized === "kubernetes" || normalized === "k3s") return "k8s";
-  if (["docker", "k8s", "proxmox"].includes(normalized)) return normalized;
+  if (normalized.startsWith("remote:")) return "remote-docker";
+  if (["docker", "k8s", "remote-docker", "proxmox", "external"].includes(normalized)) {
+    return normalized;
+  }
   return null;
 }
 
@@ -59,6 +62,14 @@ export function normalizeExecutionTargetId(value) {
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "");
     return clusterId ? `k8s:${clusterId}` : "k8s";
+  }
+  if (normalized.startsWith("remote:")) {
+    const hostId = normalized
+      .slice("remote:".length)
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    return hostId ? `remote:${hostId}` : "remote-docker";
   }
   return normalizeDeployTarget(normalized);
 }
@@ -249,6 +260,102 @@ export function pickSandboxProfileSelection(
   return nextProfile?.id || "";
 }
 
+function remoteHostTargetLabel(host: any = {}) {
+  const user = host.sshUser ? `${host.sshUser}@` : "";
+  const port = host.sshPort && host.sshPort !== 22 ? `:${host.sshPort}` : "";
+  return `${user}${host.sshHost || host.gatewayHost || "remote"}${port}`;
+}
+
+// Clone a generic execution-target template into a concrete per-host entry that
+// the deploy picker can render and select. Remote Docker now supports both the
+// standard OpenClaw path and NemoClaw through a dedicated remote sandbox backend.
+function buildRemoteHostTarget(template: any = {}, host: any = {}) {
+  const sandboxProfiles = (template.sandboxProfiles || []).map((profile: any) => {
+    const enabled = profile.enabled !== false;
+    return {
+      ...profile,
+      executionTargetId: host.executionTargetId,
+      deployTargetLabel: host.label,
+      enabled,
+      configured: enabled,
+      available: enabled,
+      availableForOnboarding: enabled && profile.onboardingVisible !== false,
+      isDefault: profile.id === "standard",
+      issue: enabled ? null : profile.issue || null,
+      // remote-docker is experimental in this phase regardless of which template
+      // was cloned (don't inherit a fallback docker template's "ga").
+      maturityTier: "experimental",
+      maturityLabel: "Experimental",
+    };
+  });
+  return {
+    ...template,
+    id: host.executionTargetId,
+    executionTargetId: host.executionTargetId,
+    deployTarget: "remote-docker",
+    label: host.label || host.executionTargetId,
+    shortLabel: host.label || host.executionTargetId,
+    summary: `Your remote Docker host · ${remoteHostTargetLabel(host)}`,
+    enabled: true,
+    configured: true,
+    available: true,
+    availableForOnboarding: true,
+    isDefault: false,
+    issue: null,
+    defaultSandboxProfile: "standard",
+    sandboxProfiles,
+    // remote-docker is experimental in this phase — set explicitly so a docker
+    // fallback template can't make a remote host report "ga".
+    maturityTier: "experimental",
+    maturityLabel: "Experimental",
+    // k8s-only display fields must not leak onto a remote host card
+    clusterName: undefined,
+    namespace: undefined,
+    exposureMode: undefined,
+  };
+}
+
+// Merge the operator's own connected remote hosts into the (public, global)
+// backend catalog so they appear as selectable deploy targets — the per-user
+// equivalent of how registered Kubernetes clusters surface. Only connected
+// (available) hosts are injected, replacing the generic experimental
+// "remote-docker" placeholder. Pure + immutable; returns the original config
+// untouched when there are no usable hosts.
+export function mergeRemoteHostsIntoConfig(
+  backendConfig: BackendConfig = {},
+  remoteHosts: any[] = [],
+) {
+  // Only connected hosts the caller may actually deploy to. Owned hosts always
+  // carry canDeploy=true; hosts shared into a workspace are deployable for
+  // editor+ members and read-only (canDeploy=false) for viewers — those must
+  // not appear as selectable targets even though the operator can see them.
+  const hosts = Array.isArray(remoteHosts)
+    ? remoteHosts.filter((host) => host && host.available && host.canDeploy !== false)
+    : [];
+  if (!hosts.length) return backendConfig;
+  const runtimeFamilies = Array.isArray(backendConfig?.runtimeFamilies)
+    ? backendConfig.runtimeFamilies
+    : [];
+  if (!runtimeFamilies.length) return backendConfig;
+
+  const nextRuntimeFamilies = runtimeFamilies.map((family: any) => {
+    if (family.id !== "openclaw") return family;
+    const targets = Array.isArray(family.executionTargets) ? family.executionTargets : [];
+    const template =
+      targets.find((target: any) => target.id === "remote-docker") ||
+      targets.find((target: any) => target.deployTarget === "remote-docker") ||
+      targets.find((target: any) => target.id === "docker");
+    if (!template) return family;
+    const hostTargets = hosts.map((host) => buildRemoteHostTarget(template, host));
+    const withoutPlaceholder = targets.filter(
+      (target: any) => target.deployTarget !== "remote-docker",
+    );
+    return { ...family, executionTargets: [...withoutPlaceholder, ...hostTargets] };
+  });
+
+  return { ...backendConfig, runtimeFamilies: nextRuntimeFamilies };
+}
+
 export function resolveAgentRuntimeFamily(agent: AgentRuntimeMeta = {}) {
   const explicitRuntimeFamily = normalizeRuntimeFamily(agent.runtime_family);
   if (explicitRuntimeFamily) return explicitRuntimeFamily;
@@ -310,8 +417,12 @@ export function formatExecutionTargetLabel(
   switch (normalizeDeployTarget(value)) {
     case "k8s":
       return "Kubernetes";
+    case "remote-docker":
+      return "Remote Docker host";
     case "proxmox":
       return "Proxmox";
+    case "external":
+      return "External runtime";
     default:
       return "Docker";
   }

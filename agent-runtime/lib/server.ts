@@ -9,6 +9,7 @@ const http = require("http");
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { execSync, execFileSync, spawn } = require("child_process");
 const { AGENT_RUNTIME_PORT, OPENCLAW_GATEWAY_PORT } = require("./contracts");
 const {
@@ -51,6 +52,28 @@ function parseBody(req) {
 function json(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
+}
+
+// Every route except /health requires `Authorization: Bearer <gateway token>`.
+// The token (OPENCLAW_GATEWAY_TOKEN) is the per-agent secret the control plane
+// already holds. Constant-time compared. If no token is provisioned we cannot
+// enforce, so we fail OPEN (and warn loudly at boot) rather than brick a
+// runtime that was never given one — the historical behavior was fully open.
+const RUNTIME_AUTH_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || "";
+const RUNTIME_PUBLIC_PATHS = new Set(["/health"]);
+
+function isRuntimeRequestAuthorized(req) {
+  if (!RUNTIME_AUTH_TOKEN) return true; // unenforceable; warned at startup
+  const header = req.headers["authorization"] || "";
+  // Parse "Bearer <token>" with plain string ops — a `\s+(.+)` regex here is a
+  // ReDoS footgun (the two quantifiers both match spaces, so a header of
+  // "Bearer " + many spaces backtracks catastrophically).
+  if (header.slice(0, 7).toLowerCase() !== "bearer ") return false;
+  const presentedToken = header.slice(7).trim();
+  if (!presentedToken) return false;
+  const presented = Buffer.from(presentedToken);
+  const expected = Buffer.from(RUNTIME_AUTH_TOKEN);
+  return presented.length === expected.length && crypto.timingSafeEqual(presented, expected);
 }
 
 const startTime = Date.now();
@@ -150,7 +173,10 @@ function stripGeneratedIntegrationPromptBlock(content) {
     `\\n?${NORA_INTEGRATIONS_PROMPT_BEGIN}[\\s\\S]*?${NORA_INTEGRATIONS_PROMPT_END}\\n?`,
     "g",
   );
-  return raw.replace(pattern, "\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+  return raw
+    .replace(pattern, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
 }
 
 function buildIntegrationPromptPointerMarkdown() {
@@ -214,9 +240,7 @@ function buildIntegrationContextMarkdown(integrations = []) {
         ? integration.credentialEnv
         : {};
     const configEnv =
-      credentialEnv.config && typeof credentialEnv.config === "object"
-        ? credentialEnv.config
-        : {};
+      credentialEnv.config && typeof credentialEnv.config === "object" ? credentialEnv.config : {};
     const visibleConfigEntries = Object.entries(redactedConfig).filter(
       ([, value]) => value != null && value !== "" && value !== "[REDACTED]",
     );
@@ -474,6 +498,11 @@ async function forwardToGatewayAndReply(body) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const path = url.pathname;
+
+  // Auth gate: everything but /health requires the gateway bearer token.
+  if (!RUNTIME_PUBLIC_PATHS.has(path) && !isRuntimeRequestAuthorized(req)) {
+    return json(res, 401, { error: "unauthorized" });
+  }
 
   // ── GET /health ───────────────────────────────────────
   if (req.method === "GET" && path === "/health") {
@@ -801,6 +830,11 @@ const server = http.createServer(async (req, res) => {
 function startServer() {
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`[openclaw-runtime] HTTP server listening on port ${PORT}`);
+    if (!RUNTIME_AUTH_TOKEN) {
+      console.warn(
+        "[openclaw-runtime] SECURITY WARNING: OPENCLAW_GATEWAY_TOKEN is not set — the runtime API (including /exec) is UNAUTHENTICATED. Ensure this port is never network-reachable.",
+      );
+    }
   });
 }
 

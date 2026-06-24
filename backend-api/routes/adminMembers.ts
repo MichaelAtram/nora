@@ -21,7 +21,7 @@ const router = express.Router();
 router.use(requireSession);
 router.use(requireAdmin);
 
-router.get("/workspaces", async (_req, res) => {
+router.get("/workspaces", async (_req, res, next) => {
   try {
     const result = await db.query(
       `SELECT w.id, w.name, w.user_id, w.created_at,
@@ -63,32 +63,34 @@ router.get("/workspaces", async (_req, res) => {
       })),
     );
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.get("/members", async (req, res) => {
+router.get("/members", async (req, res, next) => {
   try {
     const { workspaceId, userId, role, q } = req.query;
     const conditions = [];
     const params = [];
-    let next = 1;
+    let paramIdx = 1;
     if (typeof workspaceId === "string" && workspaceId) {
-      conditions.push(`m.workspace_id = $${next++}`);
+      conditions.push(`m.workspace_id = $${paramIdx++}`);
       params.push(workspaceId);
     }
     if (typeof userId === "string" && userId) {
-      conditions.push(`m.user_id = $${next++}`);
+      conditions.push(`m.user_id = $${paramIdx++}`);
       params.push(userId);
     }
     if (typeof role === "string" && ["owner", "admin", "editor", "viewer"].includes(role)) {
-      conditions.push(`m.role = $${next++}`);
+      conditions.push(`m.role = $${paramIdx++}`);
       params.push(role);
     }
     if (typeof q === "string" && q.trim()) {
-      conditions.push(`(u.email ILIKE $${next} OR u.name ILIKE $${next} OR w.name ILIKE $${next})`);
+      conditions.push(
+        `(u.email ILIKE $${paramIdx} OR u.name ILIKE $${paramIdx} OR w.name ILIKE $${paramIdx})`,
+      );
       params.push(`%${q.trim()}%`);
-      next += 1;
+      paramIdx += 1;
     }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -128,11 +130,11 @@ router.get("/members", async (req, res) => {
       })),
     );
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.get("/members/summary", async (_req, res) => {
+router.get("/members/summary", async (_req, res, next) => {
   try {
     // User-centric rollup: one row per user, with the count of workspaces they
     // belong to and the highest role they hold across all workspaces.
@@ -163,7 +165,7 @@ router.get("/members/summary", async (_req, res) => {
       })),
     );
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 

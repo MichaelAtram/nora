@@ -8,7 +8,7 @@
 ## Monitored Sources
 > What I watch — distinct from the channel I use to reach the operator.
 
-- **live_sources:** <Slack / Teams / email connected in the Integrations tab, if any>
+- **live_sources:** <Slack / email connected in the Integrations tab, if any>
 - **imported_logs:** <WhatsApp / WeChat / group-chat exports the operator pastes>
 
 ## Trigger Rules

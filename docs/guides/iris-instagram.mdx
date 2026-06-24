@@ -5,20 +5,24 @@
 Iris is a single-account Instagram operator built as an Agent Hub template. She plans a weekly content calendar, drafts captions and hashtag sets, prepares DM and comment replies for approval, watches trends in your niche, and compiles weekly performance reviews. **Publishing stays manual by design** — Iris drafts, you post, reply, and follow.
 
 <Tip>
-  **Iris** is just the default name. On first run she asks what you'd like to call the agent — rename it to anything, or keep "Iris." This guide calls her Iris throughout.
+  **Iris** is just the default name. On first run she asks what you'd like to call the agent —
+  rename it to anything, or keep "Iris." This guide calls her Iris throughout.
 </Tip>
 
 ## Before you install
 
 <Steps>
   <Step title="A running Nora instance with dashboard access">
-    You connect the integration and channel from the agent's detail page, so you need `editor` access to the destination workspace.
+    You connect the integration and channel from the agent's detail page, so you need `editor`
+    access to the destination workspace.
   </Step>
   <Step title="An Instagram Creator or Business account">
-    Connected to a Facebook Page. Personal accounts can't use the Instagram Graph API. You'll need an Access Token and the Business Account ID.
+    Connected to a Facebook Page. Personal accounts can't use the Instagram Graph API. You'll need
+    an Access Token and the Business Account ID.
   </Step>
   <Step title="Your brand basics ready">
-    Handle, niche, audience, three voice adjectives with a couple of examples, content pillars, and hard nos. Iris turns these into `BRAND.md` — her single most important file.
+    Handle, niche, audience, three voice adjectives with a couple of examples, content pillars, and
+    hard nos. Iris turns these into `BRAND.md` — her single most important file.
   </Step>
 </Steps>
 
@@ -28,16 +32,25 @@ From the dashboard, open **Agent Hub**, find the **Iris Instagram Manager** list
 
 See [Publish and install Agent Hub templates](/guides/agent-hub) for the general install flow.
 
+<Frame caption="Agent Hub — Iris Instagram Manager template detail before installation">
+  ![Iris template detail](/images/guides/agent-templates/iris-instagram.png)
+</Frame>
+
 ## Step 2 — Connect Instagram
 
 Open the agent → **Integrations** tab and connect **Instagram Graph**.
 
 <Card title="Instagram Graph" href="/guides/integrations/instagram" icon="instagram" arrow>
-  Form-based connect: paste a long-lived <b>Access Token</b> and your <b>Business Account ID</b> (Facebook Page ID optional). Requires a Creator or Business account with the <code>instagram_basic</code>, <code>instagram_content_publish</code>, and <code>pages_show_list</code> scopes.
+  Form-based connect: paste a long-lived <b>Access Token</b> and your <b>Business Account ID</b>{" "}
+  (Facebook Page ID optional). Requires a Creator or Business account with the{" "}
+  <code>instagram_basic</code>, <code>instagram_content_publish</code>, and{" "}
+  <code>pages_show_list</code> scopes.
 </Card>
 
 <Note>
-  Iris reads insights, comments, and media through this integration. Without it she can still plan and draft from your brand file — she just can't pull live analytics. The API is read-oriented; most operators do the final publish step in the Instagram app or Meta Business Suite.
+  Iris reads insights, comments, and media through this integration. Without it she can still plan
+  and draft from your brand file — she just can't pull live analytics. The API is read-oriented;
+  most operators do the final publish step in the Instagram app or Meta Business Suite.
 </Note>
 
 When you connect the provider, Nora automatically writes `integrations/NORA_INTEGRATIONS.md` into the agent's workspace and updates `TOOLS.md`. Iris reads that file to know what's connected — you never edit it by hand.
@@ -49,18 +62,17 @@ Iris needs **one** communication channel to reach you with rundowns, draft batch
 WhatsApp is the recommended example:
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">
-    At [developers.facebook.com](https://developers.facebook.com), create an app and add the **WhatsApp** product (Meta's WhatsApp Cloud API).
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
   </Step>
-  <Step title="Copy your credentials">
-    Copy the **Phone Number ID** and an **Access Token**. Optionally set a webhook **Verify Token** for inbound messages.
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
   </Step>
-  <Step title="Add the channel in Nora">
-    Open the agent → **Channels** tab → add **WhatsApp** → paste the Phone Number ID and Access Token. Credentials are encrypted at rest.
-  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Prefer something else? Telegram, Slack, Discord, and email all work — see [Configure channels](/guides/channels). You only need one.
+Prefer something else? Use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels). You only need one.
 
 ## Step 4 — Teach Iris your brand
 
@@ -90,12 +102,16 @@ You can answer in chat and let Iris write the file, or fill `BRAND.md` directly.
 
 <AccordionGroup>
   <Accordion title="Iris says Instagram isn't connected, but I added it">
-    Iris reads `integrations/NORA_INTEGRATIONS.md`, regenerated when integrations sync. Re-open the **Integrations** tab to confirm **Instagram Graph** shows connected, then ask Iris to re-check.
+    Iris reads `integrations/NORA_INTEGRATIONS.md`, regenerated when integrations sync. Re-open the
+    **Integrations** tab to confirm **Instagram Graph** shows connected, then ask Iris to re-check.
   </Accordion>
   <Accordion title="Instagram Graph rejects my token">
-    Confirm the account is a Creator or Business account linked to a Facebook Page, the token is long-lived, and it carries the `instagram_basic`, `instagram_content_publish`, and `pages_show_list` scopes. See the [Instagram integration guide](/guides/integrations/instagram).
+    Confirm the account is a Creator or Business account linked to a Facebook Page, the token is
+    long-lived, and it carries the `instagram_basic`, `instagram_content_publish`, and
+    `pages_show_list` scopes. See the [Instagram integration guide](/guides/integrations/instagram).
   </Accordion>
   <Accordion title="Captions feel generic / off-voice">
-    `BRAND.md` needs more signal — add "do sound like / do NOT sound like" examples and tighten the hard nos. Iris reads it every session.
+    `BRAND.md` needs more signal — add "do sound like / do NOT sound like" examples and tighten the
+    hard nos. Iris reads it every session.
   </Accordion>
 </AccordionGroup>

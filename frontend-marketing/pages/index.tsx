@@ -27,7 +27,7 @@ const QUICKSTART_URL = `${OSS_REPO_URL}#quick-start`;
 const RAW_REPO_BASE_URL = "https://raw.githubusercontent.com/solomon2773/nora/master";
 const SETUP_SH_URL = `${RAW_REPO_BASE_URL}/setup.sh`;
 const SETUP_PS1_URL = `${RAW_REPO_BASE_URL}/setup.ps1`;
-const LATEST_VERSION = "v1.6.1";
+const LATEST_VERSION = "v1.13.0";
 
 const TRUST_ITEMS = [
   {
@@ -36,7 +36,7 @@ const TRUST_ITEMS = [
   },
   {
     label: "Self-hosted control",
-    text: "Deploy the control plane on infrastructure you operate, from Docker to Kubernetes or Proxmox.",
+    text: "Deploy the control plane on infrastructure you operate, with GA agent placement on Docker and Kubernetes.",
   },
   {
     label: "Runtime operations",
@@ -52,7 +52,8 @@ const CONTROL_LANES = [
   {
     label: "Deploy",
     title: "Launch agent runtimes without stitching together the stack by hand.",
-    detail: "OpenClaw and Hermes across Docker, Kubernetes, Proxmox, and NemoClaw profiles.",
+    detail:
+      "OpenClaw and Hermes on Docker or Kubernetes, with experimental NemoClaw sandbox profiles.",
   },
   {
     label: "Observe",
@@ -70,7 +71,7 @@ const PLATFORM_ROWS = [
   {
     icon: Server,
     title: "Provision real runtime targets",
-    copy: "Place agents on Docker, Kubernetes, Proxmox, or NemoClaw-backed targets without changing the operator workflow.",
+    copy: "Place agents on Docker or Admin-registered Kubernetes today, enable NemoClaw experimentally, and track Proxmox as a planned target.",
   },
   {
     icon: Lock,
@@ -98,7 +99,7 @@ const WORKFLOW = [
   {
     step: "02",
     title: "Connect providers and choose a target",
-    body: "Add an LLM provider, pick OpenClaw or Hermes, then choose Docker, Kubernetes, Proxmox, or NemoClaw where available.",
+    body: "Add an LLM provider, pick OpenClaw or Hermes, then choose Docker or Kubernetes. Enable the experimental NemoClaw profile when that sandbox is needed.",
   },
   {
     step: "03",
@@ -255,8 +256,8 @@ export default function Home() {
               <p className="mt-6 max-w-xl text-base leading-7 text-slate-700 sm:text-lg">
                 Nora is a self-hosted control plane for AI agents. Deploy OpenClaw and Hermes
                 runtimes, manage provider keys, watch logs and metrics, open terminals, and operate
-                workspaces from one dashboard across Docker, Kubernetes, Proxmox, and NemoClaw
-                profiles.
+                workspaces from one dashboard across GA Docker and Kubernetes targets, with
+                experimental NemoClaw sandbox profiles.
               </p>
 
               <div className="mt-10 flex flex-col gap-3 sm:flex-row sm:flex-wrap">

@@ -5,47 +5,71 @@
 Atlas is a chief-of-staff agent built as an Agent Hub template. It turns meeting notes, messages, and updates into owned tasks, follow-ups, and decisions, tracks owners and blockers, and replaces vague check-ins with a clear status picture.
 
 <Tip>
-  **Atlas** is just the default name. On first run the agent asks what you'd like to call it — rename it, or keep "Atlas."
+  **Atlas** is just the default name. On first run the agent asks what you'd like to call it —
+  rename it, or keep "Atlas."
 </Tip>
 
 ## Before you install
+
 - A running Nora instance with dashboard access.
 - Who the owners are and how you want work tracked.
 
 ## Step 1 — Install from Agent Hub
+
 Open **Agent Hub**, find **Chief-of-Staff Claw**, and click **Install**. See [Publish and install Agent Hub templates](/guides/agent-hub).
 
+<Frame caption="Agent Hub — Chief-of-Staff Claw template detail before installation">
+  ![Atlas template detail](/images/guides/agent-templates/atlas-chief-of-staff.png)
+</Frame>
+
 ## Step 2 — Connect a channel
+
 Atlas needs **one** channel to send you status pictures and flag blockers (Channels tab).
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">At [developers.facebook.com](https://developers.facebook.com), add the **WhatsApp** product.</Step>
-  <Step title="Copy credentials">Copy the **Phone Number ID** and an **Access Token**.</Step>
-  <Step title="Add the channel">Agent → **Channels** tab → add **WhatsApp** → paste the values.</Step>
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
+  </Step>
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
+  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Or use Telegram / Slack / Discord / email — see [Configure channels](/guides/channels).
+Or use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels).
 
 ## Step 3 — (Optional) Connect sources & trackers
+
 Atlas works fine from notes you paste — no integration required. To pull work in or store the backlog, connect one in the **Integrations** tab:
 
 <CardGroup cols={3}>
-  <Card title="Slack" href="/guides/integrations/slack" icon="slack" arrow>Capture work from a channel.</Card>
-  <Card title="Notion" href="/guides/integrations/notion" icon="book" arrow>Store the backlog.</Card>
-  <Card title="Airtable" href="/guides/integrations/airtable" icon="table" arrow>Store the backlog.</Card>
+  <Card title="Slack" href="/guides/integrations/slack" icon="slack" arrow>
+    Capture work from a channel.
+  </Card>
+  <Card title="Notion" href="/guides/integrations/notion" icon="book" arrow>
+    Store the backlog.
+  </Card>
+  <Card title="Airtable" href="/guides/integrations/airtable" icon="table" arrow>
+    Store the backlog.
+  </Card>
 </CardGroup>
 
 ## Step 4 — Run the bootstrap
+
 Send any first message. Atlas introduces itself, offers to rename, gets your channel connected, then sets your owners, status states, and what counts as a task vs a decision.
 
 ## What Atlas will and won't do
+
 - **Internal execution only** — keeps client-facing sales work separate.
 - **No process theater** — surfaces blockers and unowned work rather than burying them.
 
 ## Troubleshooting
+
 <AccordionGroup>
   <Accordion title="Atlas says a source isn't connected, but I added it">
-    Atlas reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the **Integrations** tab.
+    Atlas reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the
+    **Integrations** tab.
   </Accordion>
   <Accordion title="Work is landing without an owner">
     Atlas flags unowned work and asks who owns it — assign an owner and it tracks the next step.

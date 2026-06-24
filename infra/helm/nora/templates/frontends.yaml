@@ -1,0 +1,70 @@
+{{- $frontends := list
+      (dict "name" "frontend-marketing" "image" "nora-frontend-marketing" "values" .Values.frontendMarketing "probePath" "/")
+      (dict "name" "frontend-dashboard" "image" "nora-frontend-dashboard" "values" .Values.frontendDashboard "probePath" "/app")
+      (dict "name" "admin-dashboard" "image" "nora-admin-dashboard" "values" .Values.adminDashboard "probePath" "/admin")
+}}
+{{- range $frontend := $frontends }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nora-{{ $frontend.name }}
+  labels:
+    {{- include "nora.labels" (dict "root" $ "component" $frontend.name) | nindent 4 }}
+spec:
+  replicas: {{ $frontend.values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "nora.selectorLabels" (dict "root" $ "component" $frontend.name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nora.selectorLabels" (dict "root" $ "component" $frontend.name) | nindent 8 }}
+    spec:
+      {{- include "nora.imagePullSecrets" $ | nindent 6 }}
+      containers:
+        - name: {{ $frontend.name }}
+          image: {{ include "nora.image" (dict "root" $ "name" $frontend.image) }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: NODE_ENV
+              value: production
+            {{- if eq $frontend.name "frontend-marketing" }}
+            - name: PLATFORM_MODE
+              value: {{ $.Values.platformMode | quote }}
+            {{- end }}
+            {{- include "nora.extraEnv" (dict "root" $ "extra" $.Values.commonEnv) | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: {{ $frontend.probePath }}
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: {{ $frontend.probePath }}
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            {{- toYaml $frontend.values.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $frontend.name }}
+  labels:
+    {{- include "nora.labels" (dict "root" $ "component" $frontend.name) | nindent 4 }}
+spec:
+  selector:
+    {{- include "nora.selectorLabels" (dict "root" $ "component" $frontend.name) | nindent 4 }}
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+{{- end }}

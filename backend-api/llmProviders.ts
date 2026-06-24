@@ -3,6 +3,8 @@
 
 const db = require("./db");
 const { encrypt, decrypt, ensureEncryptionConfigured } = require("./crypto");
+const { DEMO_PROVIDER_ID, DEMO_MODEL_ID, deriveDemoToken, demoLlmBaseUrl } = require("./demoLlm");
+const { NEMOCLAW_DEFAULT_MODEL } = require("../agent-runtime/lib/nemoclawDefaults");
 
 // Approved LLM providers and their env var names
 // Models updated per https://docs.openclaw.ai/providers (April 2026)
@@ -61,7 +63,7 @@ const PROVIDERS = [
     envVar: "NVIDIA_API_KEY",
     endpoint: "https://integrate.api.nvidia.com/v1",
     models: [
-      "nvidia/nvidia/nemotron-3-super-120b-a12b",
+      NEMOCLAW_DEFAULT_MODEL,
       "nvidia/moonshotai/kimi-k2.5",
       "nvidia/minimaxai/minimax-m2.5",
       "nvidia/z-ai/glm5",
@@ -84,6 +86,8 @@ const PROVIDERS = [
     supportsApiVersion: true,
     apiVersionPlaceholder: "2024-10-21",
     models: [
+      "gpt-5.5-1",
+      "gpt5.5-1",
       "gpt-5.5",
       "gpt-5.5-mini",
       "o3",
@@ -99,6 +103,16 @@ const PROVIDERS = [
       "AI21-Jamba-1.5-Large",
     ],
   },
+  {
+    // Zero-key demo: a deterministic stub served by this control plane. No
+    // user key — addProvider derives the token + in-network base URL itself.
+    // Deliberately LAST so key-based providers stay first in pickers.
+    id: DEMO_PROVIDER_ID,
+    name: "Demo (built-in, no key required)",
+    envVar: "NORA_DEMO_LLM_TOKEN",
+    requiresApiKey: false,
+    models: [DEMO_MODEL_ID],
+  },
 ];
 
 function getAvailableProviders() {
@@ -107,6 +121,7 @@ function getAvailableProviders() {
       id,
       name,
       models,
+      requiresApiKey,
       requiresBaseUrl,
       baseUrlPlaceholder,
       supportsApiVersion,
@@ -115,6 +130,7 @@ function getAvailableProviders() {
       id,
       name,
       models,
+      ...(requiresApiKey === false ? { requiresApiKey: false } : {}),
       ...(requiresBaseUrl ? { requiresBaseUrl: true } : {}),
       ...(baseUrlPlaceholder ? { baseUrlPlaceholder } : {}),
       ...(supportsApiVersion ? { supportsApiVersion: true } : {}),
@@ -163,9 +179,18 @@ async function addProvider(userId, provider, apiKey, model, config = {}) {
   if (!PROVIDERS.find((p) => p.id === provider)) {
     throw new Error(`Unknown LLM provider: ${provider}`);
   }
-  if (!apiKey) throw new Error("API key is required");
-
-  ensureEncryptionConfigured("LLM provider credential storage");
+  if (provider === DEMO_PROVIDER_ID) {
+    // Zero-key path: the token is derived (not user secret material) and the
+    // base URL points at this control plane's stub as reachable from agent
+    // containers. Deliberately no ensureEncryptionConfigured — the demo must
+    // work on a fresh install before any secrets are set up.
+    apiKey = deriveDemoToken();
+    model = model || DEMO_MODEL_ID;
+    config = { ...config, baseUrl: demoLlmBaseUrl() };
+  } else {
+    if (!apiKey) throw new Error("API key is required");
+    ensureEncryptionConfigured("LLM provider credential storage");
+  }
   const encryptedKey = encrypt(apiKey);
 
   // If no other providers exist for this user, make it default

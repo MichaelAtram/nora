@@ -5,50 +5,76 @@
 Penny is an invoice follow-up agent built as an Agent Hub template. It classifies where an invoice sits in the collection timeline and drafts the right reminder — a gentle nudge, a firm notice, or a final demand — tuned to the client relationship. **Penny drafts, you send**, and never decides write-offs or legal action.
 
 <Tip>
-  **Penny** is just the default name. On first run the agent asks what you'd like to call it — rename it, or keep "Penny."
+  **Penny** is just the default name. On first run the agent asks what you'd like to call it —
+  rename it, or keep "Penny."
 </Tip>
 
 ## Before you install
+
 - A running Nora instance with dashboard access.
 - Your payment terms, accepted methods, and an escalation threshold.
 
 ## Step 1 — Install from Agent Hub
+
 Open **Agent Hub**, find **Invoice Follow-Up Claw**, and click **Install**. See [Publish and install Agent Hub templates](/guides/agent-hub).
 
+<Frame caption="Agent Hub — Invoice Follow-Up Claw template detail before installation">
+  ![Penny template detail](/images/guides/agent-templates/penny-invoice-followup.png)
+</Frame>
+
 ## Step 2 — Connect a channel
+
 Penny needs **one** channel to send you drafts (Channels tab).
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">At [developers.facebook.com](https://developers.facebook.com), add the **WhatsApp** product.</Step>
-  <Step title="Copy credentials">Copy the **Phone Number ID** and an **Access Token**.</Step>
-  <Step title="Add the channel">Agent → **Channels** tab → add **WhatsApp** → paste the values.</Step>
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
+  </Step>
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
+  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Or use Telegram / Slack / Discord / email — see [Configure channels](/guides/channels).
+Or use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels).
 
 ## Step 3 — (Optional) Connect billing
+
 Penny drafts fine from invoice details you paste — no integration required. To pull invoice/payment status directly, connect one in the **Integrations** tab:
 
 <CardGroup cols={2}>
-  <Card title="Stripe" href="/guides/integrations/stripe" icon="stripe" arrow>Read invoices and payment status.</Card>
-  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>Send approved reminders from your address.</Card>
+  <Card title="Stripe" href="/guides/integrations/stripe" icon="stripe" arrow>
+    Read invoices and payment status.
+  </Card>
+  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>
+    Send approved reminders from your address.
+  </Card>
 </CardGroup>
 
-<Note>QuickBooks and Xero aren't available as Nora integrations yet — paste those invoice details in and Penny works from them.</Note>
+<Note>
+  QuickBooks and Xero aren't available as Nora integrations yet — paste those invoice details in and
+  Penny works from them.
+</Note>
 
 ## Step 4 — Run the bootstrap
+
 Send any first message. Penny introduces itself, offers to rename, gets your channel connected, then captures your business name, payment terms, accepted methods, default tone, and escalation threshold.
 
 ## What Penny will and won't do
+
 - **Draft-only**, and never decides write-offs or legal action.
 - **No aggressive or shaming messages** — disputes and edge cases escalate to you.
 
 ## Troubleshooting
+
 <AccordionGroup>
   <Accordion title="Penny says billing isn't connected, but I added it">
-    Penny reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the **Integrations** tab.
+    Penny reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the
+    **Integrations** tab.
   </Accordion>
   <Accordion title="An invoice looks disputed">
-    Penny flags dispute signals and recommends a conversation-first approach instead of a standard reminder.
+    Penny flags dispute signals and recommends a conversation-first approach instead of a standard
+    reminder.
   </Accordion>
 </AccordionGroup>

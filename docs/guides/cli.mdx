@@ -1,0 +1,72 @@
+# Install and use the Nora CLI
+
+> Install `@noraai/cli`, authenticate against your Nora instance with a workspace API key, and manage agents, monitoring, and control-plane health from the terminal.
+
+The Nora CLI (`nora`) is a thin client for the [public REST API](/api/overview). It covers the day-to-day operator loop — list and manage agents, read monitoring events, run the control-plane health check — and doubles as the launcher for the [MCP server](/guides/mcp-server) via `nora mcp`.
+
+## Install
+
+```bash
+npm install -g @noraai/cli
+nora --help
+```
+
+Or run it without installing:
+
+```bash
+npx @noraai/cli --help
+```
+
+Requires Node 24+.
+
+## Authenticate
+
+Create a workspace API key in the dashboard (**Workspace → API Keys**) with the scopes you need, then save your host and key:
+
+```bash
+nora login --host https://nora.example.com --token nora_xxxxxxxx
+```
+
+Credentials are stored in `~/.nora/config.json`. Environment variables override the stored config per invocation:
+
+| Variable | Purpose |
+| --- | --- |
+| `NORA_HOST` | Nora origin, e.g. `https://nora.example.com` |
+| `NORA_TOKEN` | API key (`nora_…`) |
+| `NORA_WORKSPACE_ID` | Override the active workspace |
+
+## Commands
+
+```text
+nora agents        List and manage agents (list, get, start, stop, ...)
+nora workspaces    Inspect workspaces
+nora monitoring    Metrics, recent events, and a live event tail
+nora doctor        Control-plane health check (admin; --json, --fresh)
+nora mcp           Launch the Nora MCP server over stdio
+nora login         Save host + API token
+```
+
+Each command prints its subcommands with `--help`, e.g. `nora agents --help`.
+
+### Examples
+
+```bash
+# Fleet at a glance
+nora agents list
+
+# Stream platform events
+nora monitoring tail --interval 5000
+
+# Gate a deploy script on control-plane health (admin key required)
+nora doctor || echo "control plane unhealthy"
+```
+
+## Scopes
+
+API keys carry scopes; the CLI surfaces the backend's `missing_scope` errors directly. Typical setups: `agents:read, monitoring:read` for read-only dashboards, plus `agents:write` for lifecycle control. `nora doctor` requires a key whose issuing user is a platform admin.
+
+## See also
+
+- [Run a control-plane health check](/guides/doctor)
+- [Operate Nora from MCP clients](/guides/mcp-server)
+- [REST API overview](/api/overview)

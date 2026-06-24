@@ -9,13 +9,18 @@ const crypto = require("crypto");
 const dns = require("node:dns").promises;
 const net = require("node:net");
 const db = require("./db");
+const { decrypt } = require("./crypto");
 const integrations = require("./integrations");
 const { resolveAgentRuntimeFamily } = require("./agentRuntimeFields");
+const remoteHosts = require("./remoteHosts");
+const { normalizeDeployTargetName } = require("../agent-runtime/lib/backendCatalog");
 
 const metrics = require("./metrics");
-const { OPENCLAW_GATEWAY_PORT } = require("../agent-runtime/lib/contracts");
+const agentBudgets = require("./agentBudgets");
+const { OPENCLAW_GATEWAY_PORT, HERMES_DASHBOARD_PORT } = require("../agent-runtime/lib/contracts");
 const {
   resolveGatewayAddress,
+  resolveHermesDashboardAddress,
   hasGatewayEndpoint,
 } = require("../agent-runtime/lib/agentEndpoints");
 const GATEWAY_PORT = OPENCLAW_GATEWAY_PORT;
@@ -113,20 +118,86 @@ function isBlockedGatewayIP(address) {
   );
 }
 
-function isAllowedGatewayIP(address, hostname) {
+const EMPTY_ALLOWED_HOSTS = new Set();
+
+// A registered remote host's advertised address is operator-trusted, so allow
+// it even though it is not RFC1918/loopback. Scoped to the agent's OWN host
+// (looked up by execution target) AND to a user who may use it — the agent's
+// owner, OR (C3) a workspace the host is shared into where the owner is editor+.
+// A cross-tenant execution_target_id reference still can't reach a host that was
+// never shared to the agent owner. Blocked addresses (0.0.0.0, link-local, …) still apply.
+async function allowedRemoteHostsForAgent(agent) {
+  if (normalizeDeployTargetName(agent?.deploy_target) !== "remote-docker") {
+    return EMPTY_ALLOWED_HOSTS;
+  }
+  try {
+    const host = await remoteHosts.getRemoteHostByExecutionTarget(agent.execution_target_id);
+    if (!host) return EMPTY_ALLOWED_HOSTS;
+    // Trust the host only if the agent's owner may use it: direct owner, or an
+    // editor+ grant via a workspace the host is shared into (positive check). Fail
+    // closed on a null/foreign owner — never let the owner check short-circuit on a
+    // null owner into trusting the host.
+    if (agent.user_id && host.ownerUserId !== agent.user_id) {
+      const allowed = await remoteHosts.userCanUseRemoteHost(agent.user_id, host.id);
+      if (!allowed) return EMPTY_ALLOWED_HOSTS;
+    }
+    const allowed = new Set();
+    if (host.gatewayHost) allowed.add(String(host.gatewayHost).toLowerCase());
+    if (host.sshHost) allowed.add(String(host.sshHost).toLowerCase());
+    return allowed;
+  } catch {
+    return EMPTY_ALLOWED_HOSTS;
+  }
+}
+
+// The host allowance for an agent's gateway, used identically by the HTTP,
+// RPC-pool, and WS-relay paths so all three enforce the same SSRF policy:
+//  - remote-docker: the agent's OWN registered host address (owner-scoped).
+//  - k8s: the operator-provisioned cluster exposure address (LoadBalancer /
+//    NodePort / ClusterIP host the k8s adapter recorded). Trusting it matches
+//    the prior RPC/WS behavior (they did no host check), so k8s chat — incl.
+//    public LoadBalancer IPs — does not regress.
+//  - external: the operator-declared endpoint of an adopted runtime (BYOC C),
+//    trusted from the agent's OWN row. Owner-scoped inherently (the agent row is
+//    loaded user-scoped, so you can only reach YOUR external agent's endpoint),
+//    and the hard isBlockedGatewayIP floor + port allowlist still apply. In PaaS
+//    mode the endpoint is forced to a public IP at registration (no RFC1918
+//    pivot); selfhosted may adopt RFC1918 runtimes on the operator's own network.
+//  - docker / other: none — falls through to the RFC1918/loopback floor.
+async function allowedGatewayHostsForAgent(agent) {
+  const target = normalizeDeployTargetName(agent?.deploy_target);
+  if (target === "remote-docker") return allowedRemoteHostsForAgent(agent);
+  if (target === "external" || target === "k8s") {
+    const allowed = new Set();
+    if (agent?.gateway_host) allowed.add(String(agent.gateway_host).toLowerCase());
+    if (agent?.runtime_host) allowed.add(String(agent.runtime_host).toLowerCase());
+    return allowed.size ? allowed : EMPTY_ALLOWED_HOSTS;
+  }
+  // docker / other: trust the operator-configured published host — the address
+  // the control plane uses to reach the docker host's published port (GATEWAY_HOST
+  // or host.docker.internal). It is GLOBAL config, not a per-agent value, so this
+  // is not a per-agent SSRF vector; a docker agent's own gateway_host is NOT
+  // trusted here, so a public docker gateway_host still hits the RFC1918 floor.
+  const publishedHost = String(process.env.GATEWAY_HOST || "host.docker.internal").toLowerCase();
+  return new Set([publishedHost]);
+}
+
+function isAllowedGatewayIP(address, hostname, extraAllowedHosts) {
   if (isBlockedGatewayIP(address)) return false;
+  const normalizedHostname = String(hostname || "").toLowerCase();
   const allowedHosts = parseCsvSet(process.env.NORA_GATEWAY_PROXY_ALLOWED_HOSTS);
-  if (allowedHosts.has(String(hostname || "").toLowerCase())) return true;
+  if (allowedHosts.has(normalizedHostname)) return true;
+  if (extraAllowedHosts && extraAllowedHosts.has(normalizedHostname)) return true;
   const ipVersion = net.isIP(address);
   if (ipVersion === 4) return isAllowedGatewayIPv4(address);
   if (ipVersion === 6) return isAllowedGatewayIPv6(address);
   return false;
 }
 
-async function resolveGatewayHostForProxy(host, label = "agent gateway") {
+async function resolveGatewayHostForProxy(host, label = "agent gateway", extraAllowedHosts) {
   const normalizedHost = String(host || "").trim();
   if (net.isIP(normalizedHost)) {
-    if (!isAllowedGatewayIP(normalizedHost, normalizedHost)) {
+    if (!isAllowedGatewayIP(normalizedHost, normalizedHost, extraAllowedHosts)) {
       throw new Error(`${label} host is not an allowed gateway address`);
     }
     return normalizedHost;
@@ -139,7 +210,9 @@ async function resolveGatewayHostForProxy(host, label = "agent gateway") {
     throw new Error(`${label} host could not be resolved (${error.code || error.message})`);
   }
 
-  const firstAllowed = addresses.find((entry) => isAllowedGatewayIP(entry.address, normalizedHost));
+  const firstAllowed = addresses.find((entry) =>
+    isAllowedGatewayIP(entry.address, normalizedHost, extraAllowedHosts),
+  );
   if (!firstAllowed) {
     throw new Error(`${label} host does not resolve to an allowed gateway network`);
   }
@@ -180,7 +253,19 @@ async function resolveSafeGatewayHttpTarget(agent, gatewayPath = "", search = ""
   if (!isAllowedGatewayPort(addr.port)) {
     throw new Error("agent gateway port is not allowed for proxying");
   }
-  const resolvedHost = await resolveGatewayHostForProxy(addr.host);
+  const extraAllowedHosts = await allowedGatewayHostsForAgent(agent);
+  const resolvedHost = await resolveGatewayHostForProxy(
+    addr.host,
+    "agent gateway",
+    extraAllowedHosts,
+  );
+  // The connection is pinned to the validated, resolved IP (no re-resolution at
+  // fetch time, so no DNS-rebinding window). The Host header intentionally keeps
+  // the operator-configured hostname, not the resolved IP: a gateway reached
+  // through a vhost/ingress that routes by Host needs the hostname to land on the
+  // right backend. addr.host is already syntactically validated by
+  // assertSafeAgentAddress, and it cannot redirect the connection (the URL holds
+  // the IP), so this is not an SSRF vector.
   const targetUrl = new URL(`http://${hostForUrl(resolvedHost)}:${addr.port}/`);
   const cleanPath = normalizeProxyPath(gatewayPath);
   targetUrl.pathname = cleanPath ? `/${cleanPath}` : "/";
@@ -189,6 +274,66 @@ async function resolveSafeGatewayHttpTarget(agent, gatewayPath = "", search = ""
     url: targetUrl.toString(),
     hostHeader: hostHeaderForGateway(addr.host, addr.port),
   };
+}
+
+// Validate + resolve a Hermes agent's dashboard address before the embed proxy
+// connects to it — the Hermes equivalent of resolveSafeGatewayHttpTarget, which
+// closes the SSRF gap where the embed proxy reached runtime_host unchecked.
+// Returns the resolved (allowlisted) host + port; throws if disallowed.
+async function resolveSafeHermesDashboardTarget(agent) {
+  const address = resolveHermesDashboardAddress(agent);
+  if (!address) {
+    throw new Error("hermes dashboard is not available for this agent");
+  }
+  const addr = assertSafeAgentAddress(address, "hermes dashboard");
+  // Allow either the default dashboard port (HERMES_DASHBOARD_PORT = 9119, the
+  // local container) OR a published host port (Docker published port / k8s
+  // NodePort) in the gateway port range — those are the two ways the dashboard
+  // is exposed. 9119 is outside the gateway port range, hence the explicit OR.
+  if (addr.port !== HERMES_DASHBOARD_PORT && !isAllowedGatewayPort(addr.port)) {
+    throw new Error("hermes dashboard port is not allowed for proxying");
+  }
+  const extraAllowedHosts = await allowedGatewayHostsForAgent(agent);
+  const resolvedHost = await resolveGatewayHostForProxy(
+    addr.host,
+    "hermes dashboard",
+    extraAllowedHosts,
+  );
+  return { host: resolvedHost, port: addr.port };
+}
+
+// Registration-time gate for adopting an EXTERNAL runtime (BYOC Phase C). Applied
+// when an operator registers an already-running OpenClaw/Hermes endpoint by URL,
+// so the stored endpoint can never be one the proxy would later refuse — and so a
+// PaaS tenant can't register a private-network pivot. Enforces the same hard floor
+// (isBlockedGatewayIP, via resolveGatewayHostForProxy) + port allowlist the proxy
+// uses; and in hosted (PaaS) mode additionally requires the endpoint to resolve to
+// a PUBLIC IP (selfhosted may adopt RFC1918 runtimes on the operator's own network).
+//
+// Returns the RESOLVED IP (not the hostname): the caller pins this IP on the agent
+// row so the proxy connects to the exact validated address at reach time. Storing
+// the hostname instead would reopen a DNS-rebinding/TOCTOU hole — the proxy would
+// re-resolve it later and trust whatever it then points at (incl. loopback/RFC1918)
+// because the hostname sits in the allowlist. Pinning the IP closes that window
+// (re-adopt if a runtime's address legitimately changes). Throws if disallowed.
+async function assertExternalEndpointReachable(address, { paas = false } = {}) {
+  const addr = assertSafeAgentAddress(address, "external runtime");
+  if (addr.port !== HERMES_DASHBOARD_PORT && !isAllowedGatewayPort(addr.port)) {
+    throw new Error(
+      "external runtime port is not allowed — use the gateway port, the Hermes dashboard port, or a published port",
+    );
+  }
+  const resolved = await resolveGatewayHostForProxy(
+    addr.host,
+    "external runtime",
+    new Set([addr.host.toLowerCase()]),
+  );
+  if (paas && (isAllowedGatewayIPv4(resolved) || isAllowedGatewayIPv6(resolved))) {
+    throw new Error(
+      "external runtime endpoint must be a public address in hosted mode (private/RFC1918 addresses are not allowed)",
+    );
+  }
+  return { host: resolved, port: addr.port };
 }
 
 // ─── Device Identity (Ed25519 keypair for Gateway auth) ──────────
@@ -523,7 +668,18 @@ async function getConnection(agent) {
     pool.delete(key);
   }
 
-  conn = new GatewayConnection(addr.host, agent.gateway_token, addr.port);
+  // Validate + resolve the gateway host before opening a NEW connection (the
+  // alive-cache hit above already passed this when it was created). Closes the
+  // gap where the RPC pool checked only the port, not the host.
+  const extraAllowedHosts = await allowedGatewayHostsForAgent(agent);
+  const connectHost = await resolveGatewayHostForProxy(
+    addr.host,
+    "agent gateway",
+    extraAllowedHosts,
+  );
+  // gateway_token is encrypted at rest; decrypt() is transparent to legacy
+  // plaintext, so it is safe regardless of the token's storage form.
+  conn = new GatewayConnection(connectHost, decrypt(agent.gateway_token), addr.port);
   pool.set(key, conn);
   try {
     await conn.connect();
@@ -700,6 +856,8 @@ function createGatewayRouter() {
       const conn = await getConnection(req.agent);
       const { message, messages, session_id, stream } = req.body;
       const idempotencyKey = crypto.randomUUID();
+      // Wall-clock start for the OpenTelemetry chat span duration.
+      const chatStartedAtMs = Date.now();
 
       // Build the text payload: accept either a single `message` string
       // or an array of `messages` (OpenAI-style) and extract the last user turn.
@@ -803,7 +961,9 @@ function createGatewayRouter() {
             source: "openclaw.gateway",
             sessionId: session_id || "main",
             requestId: idempotencyKey,
+            startedAtMs: chatStartedAtMs,
           })
+          .then(() => agentBudgets.checkAndEnforce(req.agent))
           .catch(() => {});
 
         res.write(`data: ${JSON.stringify({ type: "done", runId })}\n\n`);
@@ -819,7 +979,9 @@ function createGatewayRouter() {
             source: "openclaw.gateway",
             sessionId: session_id || "main",
             requestId: idempotencyKey,
+            startedAtMs: chatStartedAtMs,
           })
+          .then(() => agentBudgets.checkAndEnforce(req.agent))
           .catch(() => {});
         res.json(result);
       }
@@ -1215,7 +1377,9 @@ function attachGatewayWS(server) {
         return;
       }
 
-      const identity = deriveDeviceIdentity(agent.gateway_token);
+      // Decrypt once; reused for the device identity and the relay connect auth.
+      const gatewayToken = decrypt(agent.gateway_token);
+      const identity = deriveDeviceIdentity(gatewayToken);
       let handshakeComplete = false;
       let connectPayload = null; // stored relay handshake payload
       let pendingClientConnect = null; // client's connect msg awaiting relay handshake
@@ -1228,7 +1392,15 @@ function attachGatewayWS(server) {
       if (!isAllowedGatewayPort(addr.port)) {
         throw new Error("Agent gateway port is not allowed");
       }
-      const gwWs = new WebSocket(`ws://${addr.host}:${addr.port}`);
+      // Validate + resolve the gateway host (the WS relay previously checked
+      // only the port). Throws here are caught below → client gets an error.
+      const relayExtraAllowedHosts = await allowedGatewayHostsForAgent(agent);
+      const relayHost = await resolveGatewayHostForProxy(
+        addr.host,
+        "agent gateway",
+        relayExtraAllowedHosts,
+      );
+      const gwWs = new WebSocket(`ws://${relayHost}:${addr.port}`);
       const role = "operator";
       const scopes = [
         "operator.admin",
@@ -1268,7 +1440,7 @@ function attachGatewayWS(server) {
               scopes,
               caps: ["thinking-events"],
               commands: [],
-              auth: agent.gateway_token ? { password: agent.gateway_token } : {},
+              auth: gatewayToken ? { password: gatewayToken } : {},
               device,
             },
           }),
@@ -1441,4 +1613,8 @@ module.exports = {
   resolveAgent,
   evictConnection,
   resolveSafeGatewayHttpTarget,
+  resolveSafeHermesDashboardTarget,
+  assertExternalEndpointReachable,
+  resolveGatewayHostForProxy,
+  allowedGatewayHostsForAgent,
 };

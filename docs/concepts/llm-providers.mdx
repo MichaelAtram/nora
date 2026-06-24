@@ -10,36 +10,42 @@ Nora centralizes your LLM provider API keys so you do not have to configure them
 
 Nora supports the following LLM providers. You can save a key for any of them from **Settings → Providers**.
 
-| Provider       | ID               |
-| -------------- | ---------------- |
-| Anthropic      | `anthropic`      |
-| OpenAI         | `openai`         |
-| Google AI      | `google`         |
-| Groq           | `groq`           |
-| Mistral AI     | `mistral`        |
-| DeepSeek       | `deepseek`       |
-| OpenRouter     | `openrouter`     |
-| Together AI    | `together`       |
-| Cohere         | `cohere`         |
-| xAI            | `xai`            |
-| Moonshot AI    | `moonshot`       |
-| Z.AI           | `zai`            |
-| Ollama         | `ollama`         |
-| MiniMax        | `minimax`        |
-| GitHub Copilot | `github-copilot` |
-| Hugging Face   | `huggingface`    |
-| Cerebras       | `cerebras`       |
-| NVIDIA         | `nvidia`         |
+| Provider          | ID                  |
+| ----------------- | ------------------- |
+| Anthropic         | `anthropic`         |
+| OpenAI            | `openai`            |
+| Google AI         | `google`            |
+| Groq              | `groq`              |
+| Mistral AI        | `mistral`           |
+| DeepSeek          | `deepseek`          |
+| OpenRouter        | `openrouter`        |
+| Together AI       | `together`          |
+| Cohere            | `cohere`            |
+| xAI               | `xai`               |
+| Moonshot AI       | `moonshot`          |
+| Z.AI              | `zai`               |
+| Ollama            | `ollama`            |
+| MiniMax           | `minimax`           |
+| GitHub Copilot    | `github-copilot`    |
+| Hugging Face      | `huggingface`       |
+| Cerebras          | `cerebras`          |
+| NVIDIA            | `nvidia`            |
 | Microsoft Foundry | `microsoft-foundry` |
+| Demo (built-in, no key required) | `demo` |
 
 <Note>
-  **Microsoft Foundry** is a model gateway, not a single-vendor provider. One Foundry deployment gives you access to a multi-vendor catalog — OpenAI (`gpt-5.5`, `o3`), Microsoft (`Phi-4`), Meta (`Meta-Llama-3.1-405B-Instruct`), Mistral (`Mistral-Large-2411`, `Codestral-2501`), DeepSeek (`DeepSeek-V3`, `DeepSeek-R1`), Cohere, AI21, and more. The model id you save in Nora is your **Foundry deployment name** — operator-defined when you create the deployment, not a fixed vendor model id.
+  The **`demo`** provider is a zero-key, deterministic built-in stub served by your own control plane (model `nora-demo-1`, `requiresApiKey: false`). Unlike every other provider it needs no API key — Nora derives its token server-side — and it is listed last in the picker so key-based providers appear first. It exists so a fresh install can deploy a working agent and see a chat round-trip before adding a real provider key. Enable it via **Try the demo agent** on the Getting Started page (see the [quickstart](/quickstart)) rather than the Settings key-entry flow.
+</Note>
 
-  Foundry endpoints are **per-resource**, so Nora requires you to provide a Base URL alongside the API key. The wizard's URL field accepts both shapes:
-  - `https://<resource>.openai.azure.com/openai/v1/` — OpenAI v1 GA path (recommended; no `api-version` needed)
-  - `https://<resource>.services.ai.azure.com/openai/v1/` — also accepted
+<Note>
+  **Microsoft Foundry** is a model gateway, not a single-vendor provider. One Foundry deployment gives you access to a multi-vendor catalog — OpenAI (`gpt-5.5`, `o3`), Microsoft (`Phi-4`), Meta (`Meta-Llama-3.1-405B-Instruct`), Mistral (`Mistral-Large-2411`, `Codestral-2501`), DeepSeek (`DeepSeek-V3`, `DeepSeek-R1`), Cohere, AI21, and more. The model id you save in Nora is your **Foundry deployment name** — operator-defined when you create the deployment, not a fixed vendor model id. For example, if the Azure deployment is named `gpt-5.5-1`, save `gpt-5.5-1`; Nora carries that exact deployment name into OpenClaw and Hermes runtime config.
 
-  Auth supports two modes — **API key** (sent via `api-key:` header on classic paths or `Authorization: Bearer` on v1 GA) and **Microsoft Entra ID** (keyless bearer token with scope `https://ai.azure.com/.default`). Nora currently supports the API-key path; Entra ID keyless auth is on the roadmap. See [Microsoft Foundry endpoints](https://learn.microsoft.com/en-us/azure/ai-foundry/foundry-models/concepts/endpoints) for the full reference.
+Foundry endpoints are **per-resource**, so Nora requires you to provide a Base URL alongside the API key. The wizard's URL field accepts both shapes:
+
+- `https://<resource>.openai.azure.com/openai/v1/` — OpenAI v1 GA path (recommended; no `api-version` needed)
+- `https://<resource>.services.ai.azure.com/openai/v1/` — also accepted
+
+Auth supports two modes — **API key** (sent via `api-key:` header on classic paths or `Authorization: Bearer` on v1 GA) and **Microsoft Entra ID** (keyless bearer token with scope `https://ai.azure.com/.default`). Nora currently supports the API-key path; Entra ID keyless auth is on the roadmap. See [Microsoft Foundry endpoints](https://learn.microsoft.com/en-us/azure/ai-foundry/foundry-models/concepts/endpoints) for the full reference.
 
   <Warning>
     `https://models.inference.ai.azure.com` is the **GitHub Models** dev endpoint (free tier, GitHub PAT auth) — not a generic shared Foundry URL. For production, use your per-resource endpoint.
@@ -51,7 +57,8 @@ Nora supports the following LLM providers. You can save a key for any of them fr
 When you save an API key, Nora encrypts it immediately using AES-256-GCM before writing it to the database. The raw key is never stored in plaintext and is never returned to the UI. When you view your saved providers in Settings, Nora shows a masked version of each key — the first four and last four characters only.
 
 <Note>
-  Your `ENCRYPTION_KEY` environment variable is required for key storage to work. If it is not set, Nora will refuse to save provider credentials. Generate one with `openssl rand -hex 32`.
+  Your `ENCRYPTION_KEY` environment variable is required for key storage to work. If it is not set,
+  Nora will refuse to save provider credentials. Generate one with `openssl rand -hex 32`.
 </Note>
 
 ## Syncing keys to agents
@@ -63,9 +70,10 @@ Saving a key in Nora does not automatically push it to your running agents. You 
     Go to **Settings → Providers**, choose a provider, and paste your API key. Nora encrypts and saves it.
   </Step>
 
-  <Step title="Deploy or open an agent">
-    Navigate to the agent you want to configure. The agent must be in `running` status for a sync to succeed.
-  </Step>
+<Step title="Deploy or open an agent">
+  Navigate to the agent you want to configure. The agent must be in `running` status for a sync to
+  succeed.
+</Step>
 
   <Step title="Sync provider keys">
     Click **Sync keys** on the agent detail page. Nora decrypts your stored keys and pushes them to the agent's runtime environment.
@@ -77,18 +85,20 @@ Saving a key in Nora does not automatically push it to your running agents. You 
 The first provider key you save is automatically marked as your default provider. When you have multiple providers configured, you can change the default from **Settings → Providers** — only one provider can be the default at a time. The default provider is used by agents that do not have a specific provider configured.
 
 <Tip>
-  If you are just getting started, save one key from Anthropic, OpenAI, or Google AI and deploy your first agent. You can add more providers at any time without redeploying your agents.
+  If you are just getting started, save one key from Anthropic, OpenAI, or Google AI and deploy your
+  first agent. You can add more providers at any time without redeploying your agents.
 </Tip>
 
 ## Provider key safety
 
-* Keys are stored encrypted at rest (AES-256-GCM).
-* Keys are masked in the UI — you will never see a raw key after saving it.
-* Keys are scoped to your account and are never shared across users.
-* Deleting a provider removes the encrypted key record from the database.
+- Keys are stored encrypted at rest (AES-256-GCM).
+- Keys are masked in the UI — you will never see a raw key after saving it.
+- Keys are scoped to your account and are never shared across users.
+- Deleting a provider removes the encrypted key record from the database.
 
 <Warning>
-  Treat your provider API keys with the same care as passwords. If a key is compromised, revoke it with the provider directly and save a new key in Nora.
+  Treat your provider API keys with the same care as passwords. If a key is compromised, revoke it
+  with the provider directly and save a new key in Nora.
 </Warning>
 
 ## Related concepts

@@ -12,11 +12,11 @@ A pattern matches an event type using one of three forms:
 
 | Pattern             | Example matches                                           | Notes                                                               |
 | ------------------- | --------------------------------------------------------- | ------------------------------------------------------------------- |
-| Literal             | `agent.error` matches only `agent.error`                  | Exact string match.                                                 |
-| Suffix glob         | `agent.*` matches `agent.error`, `agent.warning`, `agent` | The trailing `.*` matches one segment or none.                      |
+| Literal             | `agent.budget_paused` matches only `agent.budget_paused`                  | Exact string match.                                                 |
+| Suffix glob         | `agent.*` matches `agent.budget_paused`, `agent.budget_updated`, `agent` | The trailing `.*` matches one segment or none.                      |
 | Wildcard            | `*` matches every event type                              | Useful for catch-all monitoring rules.                              |
 
-Common event types include `agent.error`, `agent.warning`, `backup_agent_completed`, `backup_agent_failed`, `agent_hub_listing_published`, and `workspace.invitation_accepted`. The full list grows over time — point a `*` rule at a webhook in a staging workspace to discover what's emitted.
+Common event types include `agent_deployed`, `agent_stopped`, `backup_agent_queued`, `agent_hub_published`, `workspace_invitation_accepted`, and `agent.budget_paused`. Most event types use underscores (e.g. `agent_deployed`, `workspace_invitation_accepted`); the dot-delimited form is reserved for budget events (`agent.budget_*`). The full list grows over time — point a `*` rule at a webhook in a staging workspace to discover what's emitted.
 
 ## Channels
 
@@ -40,8 +40,8 @@ The body posted to your endpoint:
 
 ```json theme={null}
 {
-  "eventType": "agent.error",
-  "message": "Container exited unexpectedly",
+  "eventType": "agent_stopped",
+  "message": "Agent stopped unexpectedly",
   "metadata": { "agent": { "id": "..." }, "workspace": { "id": "..." } },
   "firedAt": "2026-05-07T00:00:00Z",
   "ruleId": "...",

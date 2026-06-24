@@ -1,0 +1,67 @@
+# Check control-plane health with `nora doctor`
+
+> Run a one-shot self-check of the Nora control plane — database, provisioning queue, Kubernetes targets, secret posture, fleet health, and gateway exposure — from the CLI or the admin Health panel.
+
+`nora doctor` aggregates the checks an operator runs by hand after an install or before a launch into a single report. It reads only state the control plane already owns, so it is safe to run any time. The same report backs the admin **Health** panel.
+
+## Run it from the CLI
+
+Install the CLI first if you have not (`npm install -g @noraai/cli` — see [the CLI guide](/guides/cli)).
+
+```bash
+nora doctor
+```
+
+```text
+Nora doctor — overall: ✔ ok
+(2026-06-12T12:00:00.000Z)
+
+  ✔ Database             Reachable
+  ✔ Provisioning queue   waiting 0, active 0
+  ✔ Kubernetes targets   No Kubernetes execution targets registered
+  ✔ Secret posture       All required secrets present and non-placeholder
+  ✔ Fleet health         4 agent(s), none need attention
+  ✔ Gateway exposure     No agent gateways are published to a host port
+```
+
+Flags:
+
+- `--json` — emit the raw report (for scripting or piping to `jq`).
+- `--fresh` — bypass the short server-side cache and recompute now.
+
+The command exits non-zero when the overall status is `fail`, so you can gate a deploy script on it:
+
+```bash
+nora doctor || echo "control plane is unhealthy — not deploying"
+```
+
+<Note>
+  `nora doctor` requires an API key whose issuing user is a platform admin. A non-admin key receives a clear 403 message.
+</Note>
+
+## Read it in the admin dashboard
+
+The admin **Health** panel renders the same report with a re-run button and auto-refreshes every 30 seconds.
+
+## What it checks
+
+| Check | Healthy when | Source |
+| --- | --- | --- |
+| Database | A `SELECT 1` succeeds | PostgreSQL |
+| Provisioning queue | The queue responds and the dead-letter queue is empty | Redis / BullMQ |
+| Kubernetes targets | Every registered target has passed a connection test | Admin → Kubernetes |
+| Secret posture | `JWT_SECRET` and `ENCRYPTION_KEY` are set, non-placeholder, and long enough (`ENCRYPTION_KEY` must be a 64-char hex string); a missing/weak `NORA_API_KEY_HASH_SECRET` is a warning, not a failure | Process environment |
+| Fleet health | No agent needs attention (see the [needs-attention roll-up](/api/monitoring)) | Agents table |
+| Gateway exposure | Surfaces how many agent gateways are published to a host port so you can confirm they are firewalled | Agents table |
+
+The overall status is the worst of the individual checks: `ok`, `warn`, or `fail`. A single failing check (for example, an unreachable Redis) is reported on its own line and does not suppress the others.
+
+## API
+
+The report is also available directly:
+
+```
+GET /api/admin/doctor
+```
+
+Requires an admin session or an admin user's API key. Pass `?fresh=1` to bypass the cache. See the response shape in the report above (`--json`).

@@ -22,6 +22,7 @@ const {
 } = require("../../../agent-runtime/lib/contracts");
 const { shellSingleQuote } = require("../../../agent-runtime/lib/containerCommand");
 const { isProxmoxApiTokenId } = require("../../../agent-runtime/lib/backendCatalog");
+const { getNemoClawDefaultModel } = require("../../../agent-runtime/lib/nemoclawDefaults");
 const {
   buildTelemetry,
   buildUnavailableTelemetry,
@@ -444,10 +445,7 @@ class ProxmoxBackend extends ProvisionerBackend {
       ...(isNemoClaw
         ? {
             HOME: "/sandbox",
-            NEMOCLAW_MODEL:
-              env.NEMOCLAW_MODEL ||
-              process.env.NEMOCLAW_DEFAULT_MODEL ||
-              "nvidia/nemotron-3-super-120b-a12b",
+            NEMOCLAW_MODEL: env.NEMOCLAW_MODEL || getNemoClawDefaultModel(process.env),
             ...(process.env.NVIDIA_API_KEY && !env.NVIDIA_API_KEY
               ? { NVIDIA_API_KEY: process.env.NVIDIA_API_KEY }
               : {}),

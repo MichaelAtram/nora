@@ -1,6 +1,7 @@
 // @ts-nocheck
 const express = require("express");
 const db = require("../db");
+const { encrypt, decrypt } = require("../crypto");
 const { addDeploymentJob } = require("../redisQueue");
 const billing = require("../billing");
 const {
@@ -10,6 +11,8 @@ const {
 } = require("../platformSettings");
 const scheduler = require("../scheduler");
 const containerManager = require("../containerManager");
+const agentBudgets = require("../agentBudgets");
+const agentSchedules = require("../agentSchedules");
 const monitoring = require("../monitoring");
 const metrics = require("../metrics");
 const workspaces = require("../workspaces");
@@ -29,6 +32,7 @@ const {
   materializeManagedMigrationState,
 } = require("../agentMigrations");
 const { isGatewayAvailableStatus, reconcileAgentStatus } = require("../agentStatus");
+const { assertExternalEndpointReachable } = require("../gatewayProxy");
 const {
   HERMES_DASHBOARD_PORT,
   OPENCLAW_GATEWAY_PORT,
@@ -73,6 +77,8 @@ const { findAccessibleAgent } = require("../middleware/ownership");
 const { scopeByMethod } = require("../middleware/auth");
 const agentVersions = require("../agentVersions");
 const { assertKubernetesExecutionTargetAvailable } = require("../kubernetesClusters");
+const { assertRemoteHostExecutionTargetAvailable } = require("../remoteHosts");
+const { releaseGatewayPort } = require("../portAllocations");
 
 const router = express.Router();
 router.use(createMutationFailureAuditMiddleware("agent"));
@@ -139,9 +145,10 @@ function isIgnorableStopError(error) {
   return message.includes("already stopped") || message.includes("not running");
 }
 
-async function assertRuntimeTargetAvailable(runtimeFields) {
+async function assertRuntimeTargetAvailable(runtimeFields, ownerUserId) {
   const status = assertRuntimeSelectionAvailable(runtimeFields);
   await assertKubernetesExecutionTargetAvailable(runtimeFields);
+  await assertRemoteHostExecutionTargetAvailable(runtimeFields, { ownerUserId });
   return status;
 }
 
@@ -175,25 +182,19 @@ function resolvePublishedGatewayHost(req) {
 }
 
 function resolvePublishedGatewayProtocol(req) {
-  const nextAuthUrl = String(process.env.NEXTAUTH_URL || "").trim();
-  if (nextAuthUrl) {
-    try {
-      const parsed = new URL(nextAuthUrl);
-      return parsed.protocol === "https:" ? "https" : "http";
-    } catch {
-      // Fall through to request headers.
-    }
-  }
+  const configuredProtocol = String(
+    process.env.GATEWAY_PROTOCOL || process.env.GATEWAY_SCHEME || "",
+  )
+    .trim()
+    .replace(/:$/, "")
+    .toLowerCase();
+  if (configuredProtocol === "https") return "https";
+  if (configuredProtocol === "http") return "http";
 
-  const forwardedProtoHeader = req.headers["x-forwarded-proto"];
-  const forwardedProto = Array.isArray(forwardedProtoHeader)
-    ? forwardedProtoHeader[0]
-    : String(forwardedProtoHeader || "").split(",")[0];
-  if (forwardedProto && forwardedProto.trim()) {
-    return forwardedProto.trim() === "https" ? "https" : "http";
-  }
-
-  return req.protocol === "https" ? "https" : "http";
+  // The OpenClaw gateway's published Docker/Kubernetes ports serve plain HTTP.
+  // The control plane itself may be behind HTTPS, but inheriting that scheme
+  // produces browser TLS errors on direct gateway ports like :19618.
+  return "http";
 }
 
 function normalizeClawhubSkillEntry(entry) {
@@ -627,7 +628,23 @@ function resolveHermesChannelConfig(body = {}) {
 }
 
 async function resolveHermesApiToken(agent) {
-  const storedToken = String(agent?.gateway_token || "").trim();
+  // gateway_token is encrypted at rest; decrypt() is transparent to legacy
+  // plaintext. A rotated/corrupted key would throw — fall through to the
+  // container-env inspection below rather than failing the whole call.
+  let storedToken = "";
+  if (agent?.gateway_token) {
+    try {
+      storedToken = String(decrypt(agent.gateway_token) || "").trim();
+    } catch (err) {
+      // Surface the root cause (e.g. ENCRYPTION_KEY rotation) before falling
+      // back to container inspection, so a "token unavailable" downstream error
+      // is traceable. err.message carries no secret material.
+      console.warn(
+        `[hermes-token] Could not decrypt stored gateway_token for agent ${agent.id} — falling back to runtime inspection: ${err.message}`,
+      );
+      storedToken = "";
+    }
+  }
   if (storedToken) return storedToken;
   if (!agent?.container_id) return null;
 
@@ -647,7 +664,7 @@ async function resolveHermesApiToken(agent) {
     try {
       await db.query("UPDATE agents SET gateway_token = $2 WHERE id = $1", [
         agent.id,
-        resolvedToken,
+        encrypt(resolvedToken),
       ]);
     } catch {
       // Best-effort cache only.
@@ -987,6 +1004,8 @@ router.post(
     const sessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
 
     let chatResponse;
+    // Wall-clock start for the OpenTelemetry chat span duration.
+    const chatStartedAtMs = Date.now();
     try {
       chatResponse = await fetchHermesApi(agent, "/v1/chat/completions", {
         method: "POST",
@@ -1038,6 +1057,7 @@ router.post(
         source: "hermes-ui",
         model: chatResponse.data?.model || requestedModel || null,
         sessionId: responseSessionId,
+        startedAtMs: chatStartedAtMs,
       }),
     ).catch(() => {});
 
@@ -1344,7 +1364,7 @@ router.post("/deploy", async (req, res) => {
       agentName: name,
       runtimeSelection: runtimeFields,
     });
-    const runtimeSelectionStatus = await assertRuntimeTargetAvailable(runtimeFields);
+    const runtimeSelectionStatus = await assertRuntimeTargetAvailable(runtimeFields, req.user.id);
     if (migrationDraft && runtimeFields.runtime_family !== migrationDraft.manifest.runtimeFamily) {
       return res.status(400).json({
         error: `Migration draft targets the ${migrationDraft.manifest.runtimeFamily} runtime family and cannot be deployed as ${runtimeFields.runtime_family}.`,
@@ -1500,6 +1520,111 @@ router.post("/deploy", async (req, res) => {
   }
 });
 
+// Adopt an already-running OpenClaw/Hermes runtime that Nora did NOT provision,
+// by its reachable URL + gateway token (BYOC Phase C). Creates an agent row with
+// deploy_target='external' and status='running' — NO provisioning job, no
+// container. Nora monitors + proxies access; lifecycle mutations are blocked (no
+// container_id ⇒ canMutate() is false) and delete is effectively a deregister.
+router.post("/adopt", async (req, res) => {
+  try {
+    const body = req.body || {};
+    // An adopted runtime still occupies an agent slot, so it counts against the
+    // operator's quota even though Nora doesn't provision its compute.
+    const limits = await billing.enforceLimits(req.user.id);
+    if (!limits.allowed) {
+      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
+    }
+    const runtimeFamily = normalizeRequestedRuntimeFamily(body.runtime_family);
+    if (runtimeFamily == null) {
+      return res.status(400).json({
+        error: `Unsupported runtime_family. Nora currently supports: ${KNOWN_RUNTIME_FAMILIES.map((v) => `"${v}"`).join(", ")}.`,
+      });
+    }
+    const name = sanitizeAgentName(
+      body.name,
+      runtimeFamily === "hermes" ? "Hermes-Agent" : "OpenClaw-Agent",
+    );
+    if (name.length > 100) {
+      return res.status(400).json({ error: "Agent name must be 100 characters or less" });
+    }
+
+    const token = String(body.gateway_token || body.token || "").trim();
+    if (!token) {
+      return res
+        .status(400)
+        .json({ error: "gateway_token is required to adopt an external runtime" });
+    }
+
+    // Accept either a full URL or an explicit host (+ optional port). Default the
+    // port to the runtime family's contract port (OpenClaw gateway / Hermes dashboard).
+    const defaultPort = runtimeFamily === "hermes" ? HERMES_DASHBOARD_PORT : OPENCLAW_GATEWAY_PORT;
+    let host;
+    let port;
+    const rawUrl = typeof body.url === "string" ? body.url.trim() : "";
+    if (rawUrl) {
+      let parsed;
+      try {
+        parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+      } catch {
+        return res.status(400).json({ error: "Invalid runtime URL" });
+      }
+      host = parsed.hostname;
+      port = parsed.port ? Number(parsed.port) : defaultPort;
+    } else if (body.host) {
+      host = String(body.host).trim();
+      port = body.port != null && body.port !== "" ? Number(body.port) : defaultPort;
+    } else {
+      return res.status(400).json({ error: "Provide the runtime URL (or host) to adopt" });
+    }
+    if (!host || !Number.isInteger(port)) {
+      return res.status(400).json({ error: "Provide a valid runtime host and port to adopt" });
+    }
+
+    // Registration-time SSRF gate — the same hard floor + port allowlist the proxy
+    // enforces at reach time, plus public-only in hosted (PaaS) mode.
+    let endpoint;
+    try {
+      endpoint = await assertExternalEndpointReachable({ host, port }, { paas: billing.IS_PAAS });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+
+    // gateway_host/gateway_port are the first fields read by BOTH
+    // resolveGatewayAddress (OpenClaw) and resolveHermesDashboardAddress (Hermes),
+    // so one mapping covers chat + dashboard reach for either family. status starts
+    // 'running' (optimistic); the external health-poll (Phase C2) reconciles it.
+    // dashboard_port mirrors the published port so resolveHermesDashboardAddress is
+    // correct even via its runtime_host fallback (not just the gateway_host branch).
+    const result = await db.query(
+      `INSERT INTO agents(
+         user_id, name, status, runtime_family, deploy_target, execution_target_id,
+         sandbox_profile, sandbox_type, backend_type, gateway_host, gateway_port,
+         runtime_host, dashboard_port, gateway_token
+       ) VALUES($1, $2, 'running', $3, 'external', 'external', 'standard', 'standard',
+                'external', $4, $5, $4, $5, $6) RETURNING *`,
+      // gateway_token is encrypted at rest (no-op when ENCRYPTION_KEY is unset).
+      [req.user.id, name, runtimeFamily, endpoint.host, endpoint.port, encrypt(token)],
+    );
+    const agent = result.rows[0];
+
+    await monitoring.logEvent(
+      "agent_adopted",
+      `Adopted external ${runtimeFamily} runtime "${name}" at ${endpoint.host}:${endpoint.port}`,
+      agentAuditMetadata(req, agent, {
+        adopt: {
+          runtimeFamily,
+          deployTarget: "external",
+          endpoint: `${endpoint.host}:${endpoint.port}`,
+        },
+      }),
+    );
+
+    res.status(201).json(serializeAgent(agent));
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
 router.patch(
   "/:id",
   asyncHandler(async (req, res) => {
@@ -1569,7 +1694,7 @@ router.post(
       },
       fallback: sourceRuntime,
     });
-    await assertRuntimeTargetAvailable(runtimeFields);
+    await assertRuntimeTargetAvailable(runtimeFields, req.user.id);
     const node = await scheduler.selectNode({
       fallback: runtimeFields.deploy_target,
     });
@@ -1665,7 +1790,7 @@ router.post(
   }),
 );
 
-router.post("/:id/start", async (req, res) => {
+router.post("/:id/start", async (req, res, next) => {
   try {
     const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
@@ -1677,8 +1802,10 @@ router.post("/:id/start", async (req, res) => {
 
     await containerManager.start(agent);
 
+    // Manual start is an explicit operator override of a budget pause; the
+    // budget sweep re-pauses on its next cycle if the agent is still over cap.
     const updated = await db.query(
-      "UPDATE agents SET status = 'running' WHERE id = $1 RETURNING *",
+      "UPDATE agents SET status = 'running', paused_reason = NULL WHERE id = $1 RETURNING *",
       [agent.id],
     );
     try {
@@ -1704,11 +1831,11 @@ router.post("/:id/start", async (req, res) => {
     );
     res.json(serializeAgent(updated.rows[0]));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.post("/:id/stop", async (req, res) => {
+router.post("/:id/stop", async (req, res, next) => {
   try {
     const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
@@ -1742,7 +1869,7 @@ router.post("/:id/stop", async (req, res) => {
     );
     res.json(serializeAgent(updated.rows[0]));
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
@@ -1774,6 +1901,10 @@ async function destroyAgent(agentId, userId, req, res) {
     }
   }
 
+  // Free the agent's reserved gateway port. The FK is ON DELETE CASCADE so the
+  // hard delete below already releases it, but release explicitly so the
+  // allocation can't leak if agent deletion ever becomes a soft-delete.
+  await releaseGatewayPort(agent.id).catch(() => {});
   await db.query("DELETE FROM agents WHERE id = $1", [agent.id]);
   await monitoring.logEvent(
     "agent_deleted",
@@ -1785,23 +1916,23 @@ async function destroyAgent(agentId, userId, req, res) {
   res.json({ success: true });
 }
 
-router.post("/:id/delete", async (req, res) => {
+router.post("/:id/delete", async (req, res, next) => {
   try {
     await destroyAgent(req.params.id, req.user.id, req, res);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", async (req, res, next) => {
   try {
     await destroyAgent(req.params.id, req.user.id, req, res);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.post("/:id/restart", async (req, res) => {
+router.post("/:id/restart", async (req, res, next) => {
   try {
     const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
@@ -1823,7 +1954,7 @@ router.post("/:id/restart", async (req, res) => {
     );
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
@@ -1856,7 +1987,7 @@ router.post("/:id/redeploy", async (req, res) => {
       },
       fallback: currentRuntimeFields,
     });
-    await assertRuntimeTargetAvailable(runtimeFields);
+    await assertRuntimeTargetAvailable(runtimeFields, req.user.id);
     const containerName = resolveContainerName({
       requestedName: requestBody.container_name,
       currentName: agent.container_name,
@@ -1946,6 +2077,167 @@ router.post("/:id/redeploy", async (req, res) => {
   }
 });
 
+// ── Per-agent budget caps ────────────────────────────────────────────────────
+// Budgets pause the runtime when spend crosses 100% of a period's limit; the
+// list endpoint attaches current spend so the UI renders cap-vs-spend directly.
+
+router.get(
+  "/:id/budget",
+  asyncHandler(async (req, res) => {
+    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    res.json({
+      budgets: await agentBudgets.listBudgetsWithSpend(agent.id),
+      pausedReason: agent.paused_reason || null,
+    });
+  }),
+);
+
+router.put(
+  "/:id/budget",
+  asyncHandler(async (req, res) => {
+    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    res.locals.auditContext = buildAgentContext(agent, {
+      ownerEmail: req.user.email || null,
+    });
+    const budget = await agentBudgets.upsertBudget(agent.id, req.body || {});
+    await monitoring.logEvent(
+      "agent.budget_updated",
+      `Budget set on agent "${agent.name}": $${budget.limitUsd.toFixed(2)}/${budget.period} (warn at ${budget.softThresholdPct}%)`,
+      agentAuditMetadata(req, agent, {
+        result: {
+          budgetId: budget.id,
+          period: budget.period,
+          limitUsd: budget.limitUsd,
+          softThresholdPct: budget.softThresholdPct,
+        },
+      }),
+    );
+    res.json(budget);
+  }),
+);
+
+router.delete(
+  "/:id/budget/:budgetId",
+  asyncHandler(async (req, res) => {
+    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    res.locals.auditContext = buildAgentContext(agent, {
+      ownerEmail: req.user.email || null,
+    });
+    const deleted = await agentBudgets.deleteBudget(req.params.budgetId, agent.id);
+    if (!deleted) return res.status(404).json({ error: "Budget not found" });
+    await monitoring.logEvent(
+      "agent.budget_removed",
+      `Budget removed from agent "${agent.name}"`,
+      agentAuditMetadata(req, agent, { result: { budgetId: req.params.budgetId } }),
+    );
+    res.json({ success: true });
+  }),
+);
+
+// ── Scheduled runs (recurring cron triggers) ─────────────────────────────────
+
+router.get(
+  "/:id/schedules",
+  asyncHandler(async (req, res) => {
+    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    res.json(await agentSchedules.listSchedules(agent.id));
+  }),
+);
+
+router.post(
+  "/:id/schedules",
+  asyncHandler(async (req, res) => {
+    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
+    let schedule;
+    try {
+      schedule = await agentSchedules.createSchedule(agent.id, req.user.id, req.body || {});
+    } catch (err) {
+      if (err.statusCode === 400) return res.status(400).json({ error: err.message });
+      throw err;
+    }
+    await monitoring.logEvent(
+      "agent.schedule_created",
+      `Schedule "${schedule.name}" (${schedule.action_type}, ${schedule.cron} ${schedule.timezone}) created on agent "${agent.name}"`,
+      agentAuditMetadata(req, agent, {
+        result: { scheduleId: schedule.id, actionType: schedule.action_type, cron: schedule.cron },
+      }),
+    );
+    res.status(201).json(schedule);
+  }),
+);
+
+router.put(
+  "/:id/schedules/:scheduleId",
+  asyncHandler(async (req, res) => {
+    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
+    let schedule;
+    try {
+      schedule = await agentSchedules.updateSchedule(
+        agent.id,
+        req.params.scheduleId,
+        req.body || {},
+      );
+    } catch (err) {
+      if (err.statusCode === 400) return res.status(400).json({ error: err.message });
+      throw err;
+    }
+    if (!schedule) return res.status(404).json({ error: "Schedule not found" });
+    await monitoring.logEvent(
+      "agent.schedule_updated",
+      `Schedule "${schedule.name}" updated on agent "${agent.name}"`,
+      agentAuditMetadata(req, agent, {
+        result: { scheduleId: schedule.id, enabled: schedule.enabled },
+      }),
+    );
+    res.json(schedule);
+  }),
+);
+
+router.delete(
+  "/:id/schedules/:scheduleId",
+  asyncHandler(async (req, res) => {
+    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
+    const deleted = await agentSchedules.deleteSchedule(agent.id, req.params.scheduleId);
+    if (!deleted) return res.status(404).json({ error: "Schedule not found" });
+    await monitoring.logEvent(
+      "agent.schedule_removed",
+      `Schedule removed from agent "${agent.name}"`,
+      agentAuditMetadata(req, agent, { result: { scheduleId: req.params.scheduleId } }),
+    );
+    res.json({ success: true });
+  }),
+);
+
+router.get(
+  "/:id/schedules/:scheduleId/runs",
+  asyncHandler(async (req, res) => {
+    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 25));
+    // Runs are recorded as agent.schedule.run events (audit-integrated).
+    const result = await db.query(
+      `SELECT type, message, metadata, created_at
+         FROM events
+        WHERE type = 'agent.schedule.run'
+          AND metadata #>> '{result,scheduleId}' = $1
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [req.params.scheduleId, limit],
+    );
+    res.json(result.rows);
+  }),
+);
+
 // ── Agent versions + rollback ────────────────────────────────────────────────
 
 router.get(
@@ -2016,6 +2308,15 @@ router.post(
       console.warn(`[agents.rollback] wiring materialize failed: ${err.message}`);
     }
     if (agent.container_id) {
+      // Validate the agent's execution target is still deployable before
+      // queuing the redeploy — a remote host / k8s cluster may have been
+      // removed or disconnected since the original deploy. Owner-scoped to the
+      // agent's owner (an editor may trigger the rollback). Fail before we
+      // clear container_id so a rejected rollback leaves the agent intact.
+      await assertRuntimeTargetAvailable(
+        buildAgentRuntimeFields(agent),
+        agent.user_id || req.user.id,
+      );
       await db.query(
         `UPDATE agents
             SET status = 'queued',

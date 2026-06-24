@@ -9,10 +9,15 @@ Runs on `/admin/*` behind nginx. Provides platform-wide visibility into users, a
 ## Features
 
 - **Ops Overview** — platform-wide metrics, queue health, recent audit activity, and DLQ awareness
+- **Control-plane Health** — admin view of the `nora doctor` self-check (database, queue, Kubernetes targets, secret posture, fleet health, gateway exposure) with auto-refresh and forced re-run
 - **Fleet Management** — global agent list, lifecycle actions, runtime metadata, telemetry samples, and live logs
 - **Queue Recovery** — dead-letter inspection and retry flows for failed deployment jobs
 - **User Management** — role changes, agent counts, and account deletion with agent cleanup
+- **Members & Workspaces** — workspace roster, member roles, and membership administration
+- **Kubernetes Registry** — register and manage Kubernetes clusters as deploy targets
 - **Agent Hub Moderation** — review and remove published Agent Hub listings
+- **Managed Backups** — backup storage, tier limits, schedule, inventory, and guarded restore/delete
+- **Platform Settings & Upgrades** — system banner, default language, deployment defaults, Agent Hub source-catalog key, SMTP notifications, and release status with one-click/manual upgrade guidance
 
 ## Development
 

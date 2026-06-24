@@ -19,21 +19,22 @@ const {
   AGENT_RUNTIME_PORT,
 } = require("../../../agent-runtime/lib/contracts");
 const {
+  getNemoClawDefaultModel,
+  getNemoClawSandboxImage,
+} = require("../../../agent-runtime/lib/nemoclawDefaults");
+const {
   buildDockerTelemetry,
   buildUnavailableTelemetry,
   DOCKER_CAPABILITIES,
   uptimeFromContainerInfo,
 } = require("./telemetry");
 
-// Default to the Nora-built NemoClaw image (OpenShell sandbox base +
-// tsx prebaked so the bootstrap's install fast-path check passes under
-// the non-root UID-998 + Landlock restrictions). Build it with
-// `docker build -f agent-runtime/Dockerfile.nemoclaw-agent -t nora-nemoclaw-agent:local agent-runtime/`
-// or set NEMOCLAW_SANDBOX_IMAGE to pin a different tag.
-const SANDBOX_IMAGE = process.env.NEMOCLAW_SANDBOX_IMAGE || "nora-nemoclaw-agent:local";
+// Default to the Nora-built GHCR image (OpenShell sandbox base + tsx prebaked).
+// Set NEMOCLAW_SANDBOX_IMAGE=nora-nemoclaw-agent:local to use a preloaded local
+// image on offline Docker/k3s nodes.
+const SANDBOX_IMAGE = getNemoClawSandboxImage(process.env);
 
-const DEFAULT_MODEL =
-  process.env.NEMOCLAW_DEFAULT_MODEL || "nvidia/nvidia/nemotron-3-super-120b-a12b";
+const DEFAULT_MODEL = getNemoClawDefaultModel(process.env);
 
 // Baseline network policy — only these endpoints are allowed.
 // Matches NemoClaw's openclaw-sandbox.yaml spec.
@@ -247,7 +248,18 @@ class NemoClawBackend extends ProvisionerBackend {
   }
 
   async create(config) {
-    const { id, name, vcpu, ram_mb, disk_gb, env, container_name, templatePayload } = config;
+    const {
+      id,
+      name,
+      vcpu,
+      ram_mb,
+      disk_gb,
+      env,
+      container_name,
+      templatePayload,
+      gatewayHostPort: allocatedGatewayPort,
+      runtimeHostPort: allocatedRuntimePort,
+    } = config;
     const containerName = container_name || safeContainerName("nora-oclaw", name, id);
     const model = (env && env.NEMOCLAW_MODEL) || DEFAULT_MODEL;
     let container = null;
@@ -434,6 +446,22 @@ class NemoClawBackend extends ProvisionerBackend {
     if (composeNetwork) {
       networkingConfig[composeNetwork] = {};
     }
+    const requestedHostPort = Number(allocatedGatewayPort);
+    const gatewayPortBinding =
+      !composeNetwork &&
+      Number.isInteger(requestedHostPort) &&
+      requestedHostPort >= 1 &&
+      requestedHostPort <= 65535
+        ? { "18789/tcp": [{ HostPort: String(requestedHostPort) }] }
+        : undefined;
+    const requestedRuntimeHostPort = Number(allocatedRuntimePort);
+    const runtimePortBinding =
+      !composeNetwork &&
+      Number.isInteger(requestedRuntimeHostPort) &&
+      requestedRuntimeHostPort >= 1 &&
+      requestedRuntimeHostPort <= 65535
+        ? { "9090/tcp": [{ HostPort: String(requestedRuntimeHostPort) }] }
+        : undefined;
 
     // DNS-safe hostname from agent name (avoids Bonjour conflicts across containers)
     const safeHostname =
@@ -457,6 +485,9 @@ class NemoClawBackend extends ProvisionerBackend {
           NanoCpus: (vcpu || 2) * 1e9,
           Memory: (ram_mb || 2048) * 1024 * 1024,
           RestartPolicy: { Name: "unless-stopped" },
+          ...(gatewayPortBinding || runtimePortBinding
+            ? { PortBindings: { ...(gatewayPortBinding || {}), ...(runtimePortBinding || {}) } }
+            : {}),
           // DNS only for allowed endpoints — OpenShell controls egress
           Dns: ["8.8.8.8", "8.8.4.4"],
           // Security hardening: drop all capabilities, add back only what's needed
@@ -500,11 +531,22 @@ class NemoClawBackend extends ProvisionerBackend {
       } else {
         host = info.NetworkSettings?.IPAddress || "localhost";
       }
+      const portBindings = info.NetworkSettings?.Ports?.["18789/tcp"];
+      const gatewayHostPort = portBindings?.[0]?.HostPort || null;
+      const runtimePortBindings = info.NetworkSettings?.Ports?.["9090/tcp"];
+      const runtimeHostPort = runtimePortBindings?.[0]?.HostPort || null;
 
       console.log(
-        `[nemoclaw] Container ${containerName} (${container.id}) started at ${host} (gateway port 18789, model: ${model})`,
+        `[nemoclaw] Container ${containerName} (${container.id}) started at ${host} (gateway port 18789, host port ${gatewayHostPort || "none"}, runtime host port ${runtimeHostPort || "none"}, model: ${model})`,
       );
-      return { containerId: containerName, host, gatewayToken, containerName };
+      return {
+        containerId: containerName,
+        host,
+        gatewayToken,
+        containerName,
+        gatewayHostPort,
+        runtimeHostPort,
+      };
     } catch (error) {
       if (container) {
         try {

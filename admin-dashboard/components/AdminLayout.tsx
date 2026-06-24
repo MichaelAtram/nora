@@ -3,6 +3,7 @@ import { useRouter } from "next/router";
 import { useEffect, useState } from "react";
 import {
   ArrowUpRight,
+  Activity,
   FileText,
   Archive,
   Boxes,
@@ -22,11 +23,13 @@ import { useI18n } from "../lib/i18n";
 
 const NAV_ITEMS = [
   { name: "Overview", icon: LayoutDashboard, href: "/" },
+  { name: "Health", icon: Activity, href: "/health" },
   { name: "Fleet", icon: Server, href: "/fleet" },
   { name: "Queue", icon: TriangleAlert, href: "/queue" },
   { name: "Users", icon: Users, href: "/users" },
   { name: "Members", icon: ShieldCheck, href: "/members" },
   { name: "Kubernetes", icon: Boxes, href: "/kubernetes" },
+  { name: "Remote Hosts", icon: Server, href: "/remote-hosts" },
   { name: "Agent Hub", icon: ShoppingBag, href: "/agent-hub" },
   { name: "Backups", icon: Archive, href: "/backups" },
   { name: "Audit", icon: FileText, href: "/audit" },

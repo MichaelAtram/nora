@@ -12,8 +12,10 @@ const { HERMES_DASHBOARD_PORT } = require("../../../agent-runtime/lib/contracts"
 const {
   buildContainerBootstrap,
   shellSingleQuote,
-  toDockerLaunch,
 } = require("../../../agent-runtime/lib/containerCommand");
+const {
+  buildHermesRuntimeConfigBootstrapCommand,
+} = require("../../../agent-runtime/lib/hermesRuntimeBootstrap");
 
 const HERMES_RUNTIME_PORT = 8642;
 const HERMES_HOME = "/opt/data";
@@ -36,6 +38,7 @@ function isMutableImageReference(imgName) {
 function buildHermesStartCommand() {
   const hermesRuntimeCommand = [
     "set -eu",
+    buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
     `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
@@ -136,6 +139,13 @@ class HermesBackend extends DockerBackend {
     await this._pullImage(imgName);
   }
 
+  // Host port mapping for the Hermes container. Local Hermes publishes nothing
+  // (reached via the container IP on the shared compose network); the remote
+  // variant overrides this to publish the dashboard port on the remote host.
+  _hermesPortBindings() {
+    return undefined;
+  }
+
   async create(config) {
     const { id, name, image, vcpu, ram_mb, env, container_name, abortSignal } = config;
     const containerName = container_name || safeContainerName("nora-hermes", name, id);
@@ -188,15 +198,9 @@ class HermesBackend extends DockerBackend {
         name: containerName,
         Hostname: hostname,
         Env: envArray,
-        // Hermes needs a login bash so its image's /etc/profile (nvm / python
-        // venv / CUDA env) is sourced; everything else here is identical to
-        // the shared contract in agent-runtime/lib/containerCommand.ts.
-        ...toDockerLaunch(
-          buildContainerBootstrap(buildHermesStartCommand(), {
-            shell: "/bin/bash",
-            login: true,
-          }),
-        ),
+        // Keep the image ENTRYPOINT intact so s6 init runs on current Hermes
+        // images; main-wrapper then executes this bash command after bootstrap.
+        Cmd: ["bash", "-lc", buildHermesStartCommand()],
         WorkingDir: HERMES_HOME,
         ExposedPorts: {
           [`${HERMES_RUNTIME_PORT}/tcp`]: {},
@@ -207,6 +211,10 @@ class HermesBackend extends DockerBackend {
           Memory: (ram_mb || 2048) * 1024 * 1024,
           RestartPolicy: { Name: "unless-stopped" },
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
+          // Local Hermes is reached via the container IP on the shared compose
+          // network (no host publish). The remote variant overrides this to
+          // publish the dashboard port on the remote host.
+          PortBindings: this._hermesPortBindings(config),
         },
         NetworkingConfig: composeNetwork
           ? {

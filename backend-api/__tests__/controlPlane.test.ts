@@ -87,6 +87,16 @@ function kubernetesClusterRow(overrides = {}) {
 }
 
 jest.mock("../db", () => mockDb);
+// Marked, transparent crypto: enc(...) on write, passthrough on read for any
+// non-enc value. gateway_token is encrypted at rest, so the embed/gateway read
+// paths must decrypt before use; plaintext rows in existing tests are unaffected.
+jest.mock("../crypto", () => ({
+  encrypt: (v) => (v == null || v === "" ? v : `enc(${v})`),
+  decrypt: (v) => (typeof v === "string" && v.startsWith("enc(") ? v.slice(4, -1) : v),
+  isEncryptionConfigured: () => true,
+  ensureEncryptionConfigured: () => {},
+  DecryptionError: class DecryptionError extends Error {},
+}));
 jest.mock("../redisQueue", () => ({
   addDeploymentJob: jest.fn(),
   getDLQJobs: jest.fn(),
@@ -394,7 +404,7 @@ describe("public platform config", () => {
       expect.objectContaining({
         enabled: true,
         available: false,
-        maturityTier: "beta",
+        maturityTier: "blocked",
         availableForOnboarding: false,
       }),
     );
@@ -436,12 +446,20 @@ describe("public platform config", () => {
         expect.objectContaining({
           id: "proxmox",
           runtimeFamily: "hermes",
-          maturityTier: "beta",
+          maturityTier: "blocked",
         }),
       ]),
     );
-    expect(res.body.executionTargets.map((target) => target.maturityTier)).not.toContain(
-      "experimental",
+    // Hermes can now target a remote Docker host (BYOC Phase B2), surfaced as
+    // an experimental execution target.
+    expect(res.body.executionTargets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "remote-docker",
+          runtimeFamily: "hermes",
+          maturityTier: "experimental",
+        }),
+      ]),
     );
     expect(res.body.backends).toEqual(
       expect.arrayContaining([
@@ -697,10 +715,17 @@ describe("gateway control-plane embed", () => {
       .set("Accept", "text/html");
 
     expect(res.status).toBe(200);
+    // The embed proxy now routes through the SSRF allowlist: it connects to the
+    // validated host and sets the upstream Host header (10.0.0.10 is RFC1918, so
+    // the resolved address is the IP itself). Root path normalizes to a trailing /.
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://10.0.0.10:18789",
+      "http://10.0.0.10:18789/",
       expect.objectContaining({
-        headers: expect.objectContaining({ Accept: "text/html", "Accept-Encoding": "identity" }),
+        headers: expect.objectContaining({
+          Accept: "text/html",
+          "Accept-Encoding": "identity",
+          Host: "10.0.0.10:18789",
+        }),
       }),
     );
     expect(res.text).toContain('<base href="/api/agents/agent-1/gateway/embed/">');
@@ -751,43 +776,42 @@ describe("gateway control-plane embed", () => {
     expect(res.text).not.toContain("localStorage.setItem('oc-gateway-url',R)");
   });
 
-  it("uses the published gateway host port when one is recorded", async () => {
-    process.env.GATEWAY_HOST = "gateway.internal";
+  it("decrypts an encrypted gateway_token before inlining it into the bootstrap script", async () => {
+    // gateway_token is stored encrypted; the embed bootstrap must inline the
+    // DECRYPTED value (the browser uses it as the gateway WS password), never
+    // the ciphertext.
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
           host: "10.0.0.10",
-          gateway_token: "gateway-password",
-          gateway_host_port: 19123,
+          gateway_token: "enc(gateway-password)",
+          gateway_host_port: null,
           status: "running",
         },
       ],
     });
-    global.fetch.mockResolvedValue({
-      ok: true,
-      status: 200,
-      headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
-      text: async () => "<html><head></head><body>ok</body></html>",
-    });
 
     const res = await request(app)
-      .get(`/agents/agent-1/gateway/embed?token=${encodeURIComponent(token)}`)
+      .get(`/agents/agent-1/gateway/embed/bootstrap.js?token=${encodeURIComponent(token)}`)
       .set("Host", "nora.test")
-      .set("Accept", "text/html");
+      .set("X-Forwarded-Proto", "https");
 
     expect(res.status).toBe(200);
-    expect(global.fetch).toHaveBeenCalledWith("http://gateway.internal:19123", expect.any(Object));
+    // P is the inlined password; it must be the plaintext, not the stored enc(...).
+    expect(res.text).toContain('var P="gateway-password"');
+    expect(res.text).not.toContain("enc(gateway-password)");
   });
 
-  it("prefers explicit gateway host and port when the backend provides them", async () => {
+  it("uses the published gateway host port when one is recorded", async () => {
+    // GATEWAY_HOST is the operator-configured published host; it must be on the
+    // allowlist (RFC1918 here) for the embed proxy to reach it.
+    process.env.GATEWAY_HOST = "10.10.0.5";
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: 19123,
-          gateway_host: "gateway.service.internal",
-          gateway_port: 28789,
           status: "running",
         },
       ],
@@ -806,8 +830,45 @@ describe("gateway control-plane embed", () => {
 
     expect(res.status).toBe(200);
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://gateway.service.internal:28789",
-      expect.any(Object),
+      "http://10.10.0.5:19123/",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Host: "10.10.0.5:19123" }),
+      }),
+    );
+  });
+
+  it("prefers explicit gateway host and port when the backend provides them", async () => {
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          host: "10.0.0.10",
+          gateway_token: "gateway-password",
+          gateway_host_port: 19123,
+          gateway_host: "10.0.0.20",
+          gateway_port: 19500,
+          status: "running",
+        },
+      ],
+    });
+    global.fetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+      text: async () => "<html><head></head><body>ok</body></html>",
+    });
+
+    const res = await request(app)
+      .get(`/agents/agent-1/gateway/embed?token=${encodeURIComponent(token)}`)
+      .set("Host", "nora.test")
+      .set("Accept", "text/html");
+
+    expect(res.status).toBe(200);
+    // Explicit gateway_host + gateway_port win over host/published port.
+    expect(global.fetch).toHaveBeenCalledWith(
+      "http://10.0.0.20:19500/",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Host: "10.0.0.20:19500" }),
+      }),
     );
   });
 
@@ -818,7 +879,7 @@ describe("gateway control-plane embed", () => {
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: 19123,
-          gateway_host: "nora-kind-control-plane",
+          gateway_host: "10.0.0.30",
           status: "running",
         },
       ],
@@ -836,13 +897,17 @@ describe("gateway control-plane embed", () => {
       .set("Accept", "text/html");
 
     expect(res.status).toBe(200);
+    // Explicit gateway_host wins; it is paired with the published host port.
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://nora-kind-control-plane:19123",
-      expect.any(Object),
+      "http://10.0.0.30:19123/",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Host: "10.0.0.30:19123" }),
+      }),
     );
   });
 
   it("allows embed for warning agents so degraded control-plane recovery still works", async () => {
+    process.env.GATEWAY_HOST = "10.10.0.5";
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
@@ -867,8 +932,10 @@ describe("gateway control-plane embed", () => {
 
     expect(res.status).toBe(200);
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://host.docker.internal:19123",
-      expect.any(Object),
+      "http://10.10.0.5:19123/",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Host: "10.10.0.5:19123" }),
+      }),
     );
   });
 
@@ -912,7 +979,59 @@ describe("gateway control-plane embed", () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
+  it("rejects embed proxy access to a public (non-allowlisted) gateway host (SSRF guard)", async () => {
+    // A docker agent's own gateway host that is not RFC1918/loopback/publishedHost
+    // must not be reachable — the embed proxy enforces the same allowlist as the
+    // HTTP gateway proxy.
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          host: "203.0.113.5",
+          gateway_token: "gateway-password",
+          gateway_host: "203.0.113.5",
+          gateway_port: 18789,
+          status: "running",
+          deploy_target: "docker",
+          execution_target_id: "docker",
+          user_id: "user-1",
+        },
+      ],
+    });
+
+    const res = await request(app)
+      .get(`/agents/agent-1/gateway/embed?token=${encodeURIComponent(token)}`)
+      .set("Host", "nora.test")
+      .set("Accept", "text/html");
+
+    expect(res.status).toBe(502);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects asset proxy access to a public (non-allowlisted) gateway host (SSRF guard)", async () => {
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          host: "203.0.113.5",
+          gateway_host: "203.0.113.5",
+          gateway_port: 18789,
+          status: "running",
+          deploy_target: "docker",
+          execution_target_id: "docker",
+          user_id: "user-1",
+        },
+      ],
+    });
+
+    const res = await request(app)
+      .get(`/agents/agent-1/gateway/assets/app.js?token=${encodeURIComponent(token)}`)
+      .set("Host", "nora.test");
+
+    expect(res.status).toBe(502);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
   it("allows asset proxy access for warning agents so degraded control-plane recovery still works", async () => {
+    process.env.GATEWAY_HOST = "10.10.0.5";
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
@@ -935,13 +1054,15 @@ describe("gateway control-plane embed", () => {
 
     expect(res.status).toBe(200);
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://host.docker.internal:19123/assets/app.js",
-      expect.any(Object),
+      "http://10.10.0.5:19123/assets/app.js",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Host: "10.10.0.5:19123" }),
+      }),
     );
   });
 
   it("uses GATEWAY_HOST for asset proxy access when a published gateway port is recorded", async () => {
-    process.env.GATEWAY_HOST = "gateway.external";
+    process.env.GATEWAY_HOST = "10.10.0.5";
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
@@ -964,8 +1085,10 @@ describe("gateway control-plane embed", () => {
 
     expect(res.status).toBe(200);
     expect(global.fetch).toHaveBeenCalledWith(
-      "http://gateway.external:19123/assets/app.js",
-      expect.any(Object),
+      "http://10.10.0.5:19123/assets/app.js",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Host: "10.10.0.5:19123" }),
+      }),
     );
   });
 

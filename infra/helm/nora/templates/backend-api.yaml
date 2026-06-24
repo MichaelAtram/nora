@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nora-backend-api
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "backend-api") | nindent 4 }}
+spec:
+  replicas: {{ .Values.backendApi.replicas }}
+  selector:
+    matchLabels:
+      {{- include "nora.selectorLabels" (dict "root" . "component" "backend-api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nora.selectorLabels" (dict "root" . "component" "backend-api") | nindent 8 }}
+    spec:
+      {{- include "nora.imagePullSecrets" . | nindent 6 }}
+      {{- include "nora.waitForDbInit" . | nindent 6 }}
+      containers:
+        - name: backend-api
+          image: {{ include "nora.image" (dict "root" . "name" "nora-backend-api") }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: 4000
+          {{- include "nora.controlPlaneEnvFrom" . | nindent 10 }}
+          env:
+            {{- include "nora.extraEnv" (dict "root" . "extra" .Values.commonEnv) | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.backupsVolume.enabled }}
+            - name: nora-backups
+              mountPath: /var/lib/nora-backups
+            {{- end }}
+            {{- if .Values.kubeconfigs.existingSecret }}
+            - name: kubeconfigs
+              mountPath: /kubeconfigs
+              readOnly: true
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.backendApi.resources | nindent 12 }}
+      volumes:
+        {{- if .Values.backupsVolume.enabled }}
+        - name: nora-backups
+          persistentVolumeClaim:
+            claimName: nora-backups
+        {{- end }}
+        {{- if .Values.kubeconfigs.existingSecret }}
+        - name: kubeconfigs
+          secret:
+            secretName: {{ .Values.kubeconfigs.existingSecret }}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-api
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "backend-api") | nindent 4 }}
+spec:
+  selector:
+    {{- include "nora.selectorLabels" (dict "root" . "component" "backend-api") | nindent 4 }}
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http

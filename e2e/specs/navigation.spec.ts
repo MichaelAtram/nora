@@ -43,7 +43,11 @@ test.describe("Public marketing pages", () => {
     ).toBeVisible();
 
     await page.goto("/signup");
-    await expect(page.getByRole("heading", { name: /create operator account/i })).toBeVisible();
+    // A zero-user instance renders first-run claim mode instead of the generic
+    // signup heading — both are legitimate states for this route.
+    await expect(
+      page.getByRole("heading", { name: /create operator account|claim this server/i }),
+    ).toBeVisible();
   });
 
   test("Spanish and French public routes render localized copy", async ({ page }) => {
@@ -71,7 +75,9 @@ test.describe("Public marketing pages", () => {
     ).toBeVisible();
 
     await page.goto("/fr/signup");
-    await expect(page.getByRole("heading", { name: /creer un compte operateur/i })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: /creer un compte operateur|claim this server/i }),
+    ).toBeVisible();
   });
 
   test("Simplified and Traditional Chinese routes render localized copy", async ({ page }) => {

@@ -1,6 +1,6 @@
 # Agent runtimes and sandbox types
 
-> Understand the runtimes Nora supports, including OpenClaw, and how to choose between the standard Docker sandbox and the NemoClaw secure sandbox.
+> Understand the runtimes Nora supports, including OpenClaw, and how to choose between the GA standard sandbox and the experimental NemoClaw secure sandbox.
 
 When you deploy an agent in Nora, you choose both a runtime and a sandbox type. The runtime is the agent framework that runs inside the container — OpenClaw is the primary supported runtime today. The sandbox type controls how that container is provisioned and what security policies are applied to it. Understanding the difference helps you pick the right deployment option for your workload.
 
@@ -9,7 +9,8 @@ When you deploy an agent in Nora, you choose both a runtime and a sandbox type. 
 A runtime is the agent framework Nora deploys and manages on your behalf. Nora acts as a control plane: it provisions the container, manages the lifecycle, syncs your provider keys, and gives you access to chat, logs, terminal, and monitoring — regardless of which runtime is running inside.
 
 <Note>
-  OpenClaw is the most mature and best-supported runtime in Nora today. Nora is designed to support additional runtimes over time, but OpenClaw is the recommended path for first deployments.
+  OpenClaw is the most mature and best-supported runtime in Nora today. Nora is designed to support
+  additional runtimes over time, but OpenClaw is the recommended path for first deployments.
 </Note>
 
 ## OpenClaw
@@ -21,13 +22,13 @@ OpenClaw is an open-source agent runtime and the default deployment target in No
     Use OpenClaw's chat workflow directly from the Nora dashboard with streaming responses.
   </Card>
 
-  <Card title="Terminal" icon="terminal">
-    Open an interactive shell into the running OpenClaw container from the agent detail page.
-  </Card>
+<Card title="Terminal" icon="terminal">
+  Open an interactive shell into the running OpenClaw container from the agent detail page.
+</Card>
 
-  <Card title="Logs" icon="file-text">
-    Inspect runtime output and activity logs without leaving the dashboard.
-  </Card>
+<Card title="Logs" icon="file-text">
+  Inspect runtime output and activity logs without leaving the dashboard.
+</Card>
 
   <Card title="Gateway" icon="globe">
     Access the full OpenClaw control UI through the published gateway URL.
@@ -48,35 +49,38 @@ The sandbox type determines how OpenClaw's container is provisioned. You choose 
 
 The standard sandbox (`standard`) runs OpenClaw inside a Docker container with the resource limits you specify. This is the default option and the right choice for most workloads.
 
-* No additional configuration required
-* Supports all agent lifecycle actions (start, stop, restart, redeploy)
-* Available in all Nora deployments
+- No additional configuration required
+- Supports all agent lifecycle actions (start, stop, restart, redeploy)
+- Available in all Nora deployments
 
 ### NemoClaw sandbox
 
-The NemoClaw sandbox (`nemoclaw`) runs OpenClaw inside a secure, NVIDIA-powered sandbox environment with policy controls. It is built on [NVIDIA Nemotron](https://build.nvidia.com) models and uses OpenShell policy enforcement to restrict what the agent runtime can do inside the container.
+The NemoClaw sandbox (`nemoclaw`) is experimental. It runs OpenClaw inside a secure, NVIDIA-powered sandbox environment with policy controls. It is built on [NVIDIA Nemotron](https://build.nvidia.com) models and uses OpenShell policy enforcement to restrict what the agent runtime can do inside the container.
 
 Use NemoClaw when you need:
 
-* Stronger runtime isolation for sensitive workloads
-* Policy-controlled execution environments
-* NVIDIA Nemotron model access integrated at the sandbox level
+- Stronger runtime isolation for sensitive workloads
+- Policy-controlled execution environments
+- NVIDIA Nemotron model access integrated at the sandbox level
 
 <Warning>
-  NemoClaw must be enabled by your Nora operator before it is available as a sandbox option. If you select NemoClaw and it has not been enabled, deployment will fail with an error. Contact your operator to enable it.
+  NemoClaw must be enabled by your Nora operator before it is available as a sandbox option. If you
+  select NemoClaw and it has not been enabled, deployment will fail with an error. Contact your
+  operator to enable it.
 </Warning>
 
 ## Choosing a sandbox
 
-|                   | Standard              | NemoClaw                                           |
-| ----------------- | --------------------- | -------------------------------------------------- |
-| **Availability**  | Always available      | Requires `NEMOCLAW_ENABLED=true`                   |
-| **Isolation**     | Container-level       | Container + policy controls                        |
-| **NVIDIA models** | Via LLM provider keys | Integrated at sandbox level                        |
-| **Best for**      | Most workloads        | Security-sensitive or NVIDIA-accelerated workloads |
+|                   | Standard              | NemoClaw                                                        |
+| ----------------- | --------------------- | --------------------------------------------------------------- |
+| **Availability**  | GA / always available | Experimental; requires `nemoclaw` in `ENABLED_SANDBOX_PROFILES` |
+| **Isolation**     | Container-level       | Container + policy controls                                     |
+| **NVIDIA models** | Via LLM provider keys | Integrated at sandbox level                                     |
+| **Best for**      | Most workloads        | Security-sensitive or NVIDIA-accelerated workloads              |
 
 <Tip>
-  If you are evaluating Nora for the first time, start with the standard sandbox. It requires no additional configuration and gives you the full OpenClaw experience through the Nora dashboard.
+  If you are evaluating Nora for the first time, start with the standard sandbox. It requires no
+  additional configuration and gives you the full OpenClaw experience through the Nora dashboard.
 </Tip>
 
 ## Related concepts

@@ -2,58 +2,77 @@
 
 > Install the Customer Support & FAQ template, connect one channel, optionally connect a help desk, and load your knowledge base. Remy drafts accurate replies from your docs and flags what needs a human — you send everything.
 
-Remy is a first-line support agent built as an Agent Hub template. It classifies each inquiry, drafts an accurate reply from *your* knowledge base with a confidence level, and escalates anything the docs don't cover. **Nothing is sent without you.**
+Remy is a first-line support agent built as an Agent Hub template. It classifies each inquiry, drafts an accurate reply from _your_ knowledge base with a confidence level, and escalates anything the docs don't cover. **Nothing is sent without you.**
 
 <Tip>
-  **Remy** is just the default name. On first run the agent asks what you'd like to call it — rename it to anything, or keep "Remy."
+  **Remy** is just the default name. On first run the agent asks what you'd like to call it — rename
+  it to anything, or keep "Remy."
 </Tip>
 
 ## Before you install
+
 - A running Nora instance with dashboard access (`editor` on the destination workspace).
 - Your support knowledge: FAQ/help docs, refund & return policy, escalation routing.
 
 ## Step 1 — Install from Agent Hub
+
 Open **Agent Hub**, find **Customer Support & FAQ Claw** (Built-in filter), and click **Install**. See [Publish and install Agent Hub templates](/guides/agent-hub).
 
+<Frame caption="Agent Hub — Customer Support & FAQ Claw template detail before installation">
+  ![Remy template detail](/images/guides/agent-templates/remy-customer-support.png)
+</Frame>
+
 ## Step 2 — Connect a channel
+
 Remy needs **one** channel to reach you with drafts and escalations (Channels tab, separate from Integrations).
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">
-    At [developers.facebook.com](https://developers.facebook.com), create an app and add the **WhatsApp** product.
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
   </Step>
-  <Step title="Copy credentials">
-    Copy the **Phone Number ID** and an **Access Token** (optional webhook **Verify Token**).
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
   </Step>
-  <Step title="Add the channel">
-    Agent → **Channels** tab → add **WhatsApp** → paste the values.
-  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Prefer something else? Telegram, Slack, Discord, and email all work — see [Configure channels](/guides/channels).
+Prefer something else? Use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels).
 
 ## Step 3 — (Optional) Connect a help desk
+
 Remy works fine from inquiries you paste — no integration required. To pull tickets directly, connect one in the **Integrations** tab:
 
 <CardGroup cols={3}>
-  <Card title="Zendesk" href="/guides/integrations/zendesk" icon="headset" arrow>Read/draft on tickets.</Card>
-  <Card title="Slack" href="/guides/integrations/slack" icon="slack" arrow>Support threads from a channel.</Card>
-  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>Email-based inquiries.</Card>
+  <Card title="Zendesk" href="/guides/integrations/zendesk" icon="headset" arrow>
+    Read/draft on tickets.
+  </Card>
+  <Card title="Slack" href="/guides/integrations/slack" icon="slack" arrow>
+    Support threads from a channel.
+  </Card>
+  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>
+    Email-based inquiries.
+  </Card>
 </CardGroup>
 
 ## Step 4 — Run the bootstrap
+
 Send any first message. Remy introduces itself, offers to rename, gets your channel connected, then loads your knowledge base, policies, escalation rules, and tone — read back for confirmation.
 
 ## What Remy will and won't do
+
 - **Draft-only.** Remy never sends on its own.
 - **No fabrication.** If the knowledge base is silent, Remy escalates instead of guessing.
 
 ## Troubleshooting
+
 <AccordionGroup>
   <Accordion title="Remy says a help desk isn't connected, but I added it">
-    Remy reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the **Integrations** tab, then ask Remy to re-read.
+    Remy reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the
+    **Integrations** tab, then ask Remy to re-read.
   </Accordion>
   <Accordion title="Answers feel generic or wrong">
-    Load more knowledge-base content and tighten the out-of-scope list. Remy answers only from what you give it.
+    Load more knowledge-base content and tighten the out-of-scope list. Remy answers only from what
+    you give it.
   </Accordion>
 </AccordionGroup>

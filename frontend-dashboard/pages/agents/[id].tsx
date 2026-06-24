@@ -13,6 +13,7 @@ import SettingsTab from "../../components/agents/SettingsTab";
 import NemoClawTab from "../../components/agents/NemoClawTab";
 import AgentFilesTab from "../../components/agents/AgentFilesTab";
 import BackupsTab from "../../components/agents/BackupsTab";
+import SchedulesTab from "../../components/agents/SchedulesTab";
 import StatusBadge from "../../components/agents/StatusBadge";
 import { useToast } from "../../components/Toast";
 import { fetchWithAuth } from "../../lib/api";
@@ -613,6 +614,11 @@ export default function AgentDetail() {
                 <span className="text-[10px] text-slate-500 font-bold uppercase px-2 py-0.5 bg-slate-100 rounded">
                   {executionTargetLabel}
                 </span>
+                {agent.deploy_target === "external" ? (
+                  <span className="text-[10px] text-blue-700 font-bold uppercase px-2 py-0.5 bg-blue-50 border border-blue-200 rounded">
+                    External
+                  </span>
+                ) : null}
                 {sandboxProfile !== "standard" ? (
                   <span className="text-[10px] text-emerald-700 font-bold uppercase px-2 py-0.5 bg-emerald-50 rounded">
                     {sandboxLabel}
@@ -752,6 +758,8 @@ export default function AgentDetail() {
               agentContainerId={agent.container_id}
             />
           )}
+
+          {activeTab === "schedules" && <SchedulesTab agentId={id} />}
 
           {activeTab === "backups" && <BackupsTab agentId={id} />}
 

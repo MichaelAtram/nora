@@ -53,10 +53,16 @@ No MCP server — SMTP isn't a query API.
 
 ## Environment variables Nora injects
 
-| Variable            | Source             |
-| ------------------- | ------------------ |
-| `SMTP_PASS`         | Password field     |
-| `SMTP_HOST`         | SMTP Host field    |
-| `SMTP_PORT`         | SMTP Port field    |
-| `SMTP_USER`         | Username field     |
-| `SMTP_FROM_ADDRESS` | From Address field |
+| Variable                | Source                     |
+| ----------------------- | -------------------------- |
+| `EMAIL_PASSWORD`        | Password field (primary secret) |
+| `EMAIL_USERNAME`        | Username field             |
+| `EMAIL_SMTP_HOST`       | SMTP Host field            |
+| `EMAIL_SMTP_PORT`       | SMTP Port field            |
+| `EMAIL_SMTP_SECURE`     | SMTP secure flag           |
+| `EMAIL_IMAP_HOST`       | IMAP Host field            |
+| `EMAIL_IMAP_PORT`       | IMAP Port field            |
+| `EMAIL_IMAP_SECURE`     | IMAP secure flag           |
+| `EMAIL_FROM_ADDRESS`    | From Address field         |
+| `EMAIL_FROM_NAME`       | From Name field            |
+| `EMAIL_PROVIDER_PRESET` | Provider preset            |

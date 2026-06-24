@@ -10,14 +10,12 @@ const BASE_URL = process.env.NORA_SCREENSHOT_BASE_URL || "https://127.0.0.1";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SCREENSHOT_DIR =
-  process.env.NORA_SCREENSHOT_DIR ||
-  path.resolve(__dirname, "../../.github/readme-assets");
+  process.env.NORA_SCREENSHOT_DIR || path.resolve(__dirname, "../../.github/readme-assets");
 const K8S_DOCS_SCREENSHOT_DIR =
   process.env.NORA_K8S_SCREENSHOT_DIR ||
   path.resolve(__dirname, "../../docs/images/provisioner-backends/k8s/_nora");
 const DOCS_IMAGES_ROOT =
-  process.env.NORA_DOCS_IMAGES_ROOT ||
-  path.resolve(__dirname, "../../docs/images");
+  process.env.NORA_DOCS_IMAGES_ROOT || path.resolve(__dirname, "../../docs/images");
 const DOCS_DIRS = {
   operator: path.join(DOCS_IMAGES_ROOT, "operator"),
   admin: path.join(DOCS_IMAGES_ROOT, "admin"),
@@ -30,21 +28,17 @@ const DOCS_DIRS = {
   alerts: path.join(DOCS_IMAGES_ROOT, "guides/alert-rules"),
   monitoring: path.join(DOCS_IMAGES_ROOT, "guides/monitoring"),
   agentHub: path.join(DOCS_IMAGES_ROOT, "guides/agent-hub"),
+  agentTemplates: path.join(DOCS_IMAGES_ROOT, "guides/agent-templates"),
   backups: path.join(DOCS_IMAGES_ROOT, "guides/backups"),
   nemoclaw: path.join(DOCS_IMAGES_ROOT, "guides/nemoclaw"),
   support: path.join(DOCS_IMAGES_ROOT, "support"),
 };
-const DB_CONTAINER =
-  process.env.NORA_SCREENSHOT_DB_CONTAINER || "nora-postgres-1";
+const DB_CONTAINER = process.env.NORA_SCREENSHOT_DB_CONTAINER || "nora-postgres-1";
 const DB_USER = process.env.NORA_SCREENSHOT_DB_USER || process.env.DB_USER || "nora";
 const DB_NAME = process.env.NORA_SCREENSHOT_DB_NAME || process.env.DB_NAME || "nora";
-const REAL_HERMES_AGENT_ID =
-  process.env.NORA_SCREENSHOT_REAL_HERMES_AGENT_ID || "";
-const REAL_HERMES_TOKEN =
-  process.env.NORA_SCREENSHOT_REAL_HERMES_TOKEN || "";
-const ALLOW_LOCAL_HTTPS_ERRORS = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(
-  BASE_URL
-);
+const REAL_HERMES_AGENT_ID = process.env.NORA_SCREENSHOT_REAL_HERMES_AGENT_ID || "";
+const REAL_HERMES_TOKEN = process.env.NORA_SCREENSHOT_REAL_HERMES_TOKEN || "";
+const ALLOW_LOCAL_HTTPS_ERRORS = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(BASE_URL);
 
 if (ALLOW_LOCAL_HTTPS_ERRORS) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -53,28 +47,20 @@ if (ALLOW_LOCAL_HTTPS_ERRORS) {
 const ACCOUNTS = {
   operator: {
     email: process.env.NORA_SCREENSHOT_EMAIL || "readme.operator@example.com",
-    password:
-      process.env.NORA_SCREENSHOT_PASSWORD || "ReadmeOperatorPass123!",
+    password: process.env.NORA_SCREENSHOT_PASSWORD || "ReadmeOperatorPass123!",
     name: process.env.NORA_SCREENSHOT_NAME || "README Operator",
     role: "user",
   },
   admin: {
-    email:
-      process.env.NORA_SCREENSHOT_ADMIN_EMAIL || "readme.admin@example.com",
-    password:
-      process.env.NORA_SCREENSHOT_ADMIN_PASSWORD || "ReadmeAdminPass123!",
+    email: process.env.NORA_SCREENSHOT_ADMIN_EMAIL || "readme.admin@example.com",
+    password: process.env.NORA_SCREENSHOT_ADMIN_PASSWORD || "ReadmeAdminPass123!",
     name: process.env.NORA_SCREENSHOT_ADMIN_NAME || "README Admin",
     role: "admin",
   },
   community: {
-    email:
-      process.env.NORA_SCREENSHOT_COMMUNITY_EMAIL ||
-      "readme.community@example.com",
-    password:
-      process.env.NORA_SCREENSHOT_COMMUNITY_PASSWORD ||
-      "ReadmeCommunityPass123!",
-    name:
-      process.env.NORA_SCREENSHOT_COMMUNITY_NAME || "Community Publisher",
+    email: process.env.NORA_SCREENSHOT_COMMUNITY_EMAIL || "readme.community@example.com",
+    password: process.env.NORA_SCREENSHOT_COMMUNITY_PASSWORD || "ReadmeCommunityPass123!",
+    name: process.env.NORA_SCREENSHOT_COMMUNITY_NAME || "Community Publisher",
     role: "user",
   },
 };
@@ -137,6 +123,64 @@ const IDS = {
 const AGENT_IMAGE = "nora-openclaw-agent:local";
 const HERMES_IMAGE = "nousresearch/hermes-agent:latest";
 
+const AGENT_TEMPLATE_DOCS = [
+  {
+    imageSlug: "echo-personal-branding",
+    listingSlug: "personal-branding",
+    heading: "Echo Personal Branding",
+  },
+  {
+    imageSlug: "iris-instagram",
+    listingSlug: "iris-instagram",
+    heading: "Iris Instagram Manager",
+  },
+  {
+    imageSlug: "remy-customer-support",
+    listingSlug: "customer-support-faq-claw",
+    heading: "Customer Support & FAQ Claw",
+  },
+  {
+    imageSlug: "scout-lead-outreach",
+    listingSlug: "lead-outreach-drafter-claw",
+    heading: "Lead Outreach Drafter Claw",
+  },
+  {
+    imageSlug: "penny-invoice-followup",
+    listingSlug: "invoice-followup-claw",
+    heading: "Invoice Follow-Up Claw",
+  },
+  {
+    imageSlug: "cadence-email-nurture",
+    listingSlug: "email-nurture-builder-claw",
+    heading: "Email Nurture Builder Claw",
+  },
+  {
+    imageSlug: "dex-document-extractor",
+    listingSlug: "document-data-extractor-claw",
+    heading: "Document Data Extractor Claw",
+  },
+  {
+    imageSlug: "mercer-client-intelligence",
+    listingSlug: "client-intelligence-sales-momentum-claw",
+    heading: "Client Intelligence & Sales Momentum Claw",
+  },
+  {
+    imageSlug: "signal-market-signal",
+    listingSlug: "social-media-market-signal-claw",
+    heading: "Social Media & Market Signal Claw",
+  },
+  {
+    imageSlug: "atlas-chief-of-staff",
+    listingSlug: "chief-of-staff-claw",
+    heading: "Chief-of-Staff Claw",
+  },
+  {
+    imageSlug: "sentry-communication-intelligence",
+    listingSlug: "communication-intelligence-claw",
+    heading: "Communication Intelligence Claw",
+  },
+];
+
 const HERMES_README_AGENT = {
   id: IDS.agents.hermes,
   user_id: "readme-hermes-operator",
@@ -171,10 +215,7 @@ const HERMES_README_RUNTIME = {
     status: "ok",
     platform: "hermes-agent",
   },
-  models: [
-    { id: "hermes-agent" },
-    { id: "hermes-agent-fast" },
-  ],
+  models: [{ id: "hermes-agent" }, { id: "hermes-agent-fast" }],
   defaultModel: "anthropic/claude-sonnet-4-5",
   dashboard: {
     ready: true,
@@ -981,8 +1022,7 @@ function buildTemplatePayload({
   bootstrapLines,
   extraFiles = [],
 }) {
-  const sourceLabel =
-    sourceType === "platform" ? "Platform preset" : "Community template";
+  const sourceLabel = sourceType === "platform" ? "Platform preset" : "Community template";
   const files = [
     textFile(
       "AGENTS.md",
@@ -992,19 +1032,19 @@ ${description}
 
 ## Mission
 
-${missionLines.map((line) => `- ${line}`).join("\n")}`
+${missionLines.map((line) => `- ${line}`).join("\n")}`,
     ),
     textFile(
       "SOUL.md",
       `## Soul
 
-${soulLines.map((line) => `- ${line}`).join("\n")}`
+${soulLines.map((line) => `- ${line}`).join("\n")}`,
     ),
     textFile(
       "TOOLS.md",
       `## Tools
 
-${toolsLines.map((line) => `- ${line}`).join("\n")}`
+${toolsLines.map((line) => `- ${line}`).join("\n")}`,
     ),
     textFile(
       "IDENTITY.md",
@@ -1014,19 +1054,19 @@ ${toolsLines.map((line) => `- ${line}`).join("\n")}`
 - Category: ${category}
 - Source: ${sourceLabel}
 - Publisher: ${ownerName}
-- Primary role: ${description}`
+- Primary role: ${description}`,
     ),
     textFile(
       "USER.md",
       `## User
 
-${userLines.map((line) => `- ${line}`).join("\n")}`
+${userLines.map((line) => `- ${line}`).join("\n")}`,
     ),
     textFile(
       "HEARTBEAT.md",
       `## Heartbeat
 
-${heartbeatLines.map((line) => `- ${line}`).join("\n")}`
+${heartbeatLines.map((line) => `- ${line}`).join("\n")}`,
     ),
     textFile(
       "MEMORY.md",
@@ -1036,13 +1076,13 @@ ${heartbeatLines.map((line) => `- ${line}`).join("\n")}`
 - Category: ${category}
 - Publisher: ${ownerName}
 
-${memoryLines.map((line) => `- ${line}`).join("\n")}`
+${memoryLines.map((line) => `- ${line}`).join("\n")}`,
     ),
     textFile(
       "BOOTSTRAP.md",
       `## Bootstrap
 
-${bootstrapLines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`
+${bootstrapLines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`,
     ),
     ...extraFiles.map((file) => textFile(file.path, file.content)),
   ];
@@ -1062,13 +1102,7 @@ ${bootstrapLines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`
   };
 }
 
-function buildSnapshotConfig({
-  templateKey,
-  builtIn,
-  payload,
-  defaults = {},
-  kind,
-}) {
+function buildSnapshotConfig({ templateKey, builtIn, payload, defaults = {}, kind }) {
   return {
     kind,
     templateKey,
@@ -1112,7 +1146,7 @@ async function requestJson(url, init = {}) {
     throw new Error(
       `${res.status} ${res.statusText} :: ${
         typeof data === "string" ? data : JSON.stringify(data)
-      }`
+      }`,
     );
   }
 
@@ -1283,9 +1317,7 @@ function buildSeedTemplates({ operatorUserId, adminUserId, communityUserId }) {
       "Surface missing context early.",
       "Close with the next decision or action.",
     ],
-    memoryLines: [
-      "Track recurring topics, preferred source types, and unresolved questions.",
-    ],
+    memoryLines: ["Track recurring topics, preferred source types, and unresolved questions."],
     bootstrapLines: [
       "Read the core files.",
       "Confirm the briefing audience and deadline.",
@@ -1325,17 +1357,9 @@ function buildSeedTemplates({ operatorUserId, adminUserId, communityUserId }) {
       "Use CRM exports, handoff notes, and pipeline review inputs.",
       "Call out risk, owner, and next step on every important item.",
     ],
-    userLines: [
-      "Assume the operator wants clear deal risk and explicit owners.",
-    ],
-    heartbeatLines: [
-      "Scan the data.",
-      "Sort by risk level.",
-      "Publish a concise review.",
-    ],
-    memoryLines: [
-      "Remember recurring pipeline blockers and handoff patterns.",
-    ],
+    userLines: ["Assume the operator wants clear deal risk and explicit owners."],
+    heartbeatLines: ["Scan the data.", "Sort by risk level.", "Publish a concise review."],
+    memoryLines: ["Remember recurring pipeline blockers and handoff patterns."],
     bootstrapLines: [
       "Read the core files before touching the weekly review.",
       "Confirm the pipeline window for this run.",
@@ -1375,17 +1399,13 @@ function buildSeedTemplates({ operatorUserId, adminUserId, communityUserId }) {
       "Group work by urgency, owner, and response deadline.",
       "Publish a short summary with next actions.",
     ],
-    userLines: [
-      "Assume the user wants fewer interruptions and clearer next steps.",
-    ],
+    userLines: ["Assume the user wants fewer interruptions and clearer next steps."],
     heartbeatLines: [
       "Collect new inputs.",
       "Sort by urgency and response owner.",
       "Send a concise daily digest.",
     ],
-    memoryLines: [
-      "Track recurring senders, open loops, and escalation preferences.",
-    ],
+    memoryLines: ["Track recurring senders, open loops, and escalation preferences."],
     bootstrapLines: [
       "Read the core files and restate the daily digest goal.",
       "Confirm the inbox sources included in this run.",
@@ -1539,8 +1559,7 @@ function buildSeedTemplates({ operatorUserId, adminUserId, communityUserId }) {
       status: "pending_review",
       slug: "founder-inbox-curator",
       currentVersion: 2,
-      reviewNotes:
-        "Review category naming, then verify the summary cadence copy before publish.",
+      reviewNotes: "Review category naming, then verify the summary cadence copy before publish.",
       reviewedBy: null,
       publishedAtSql: "NULL",
       updatedAtSql: "NOW() - INTERVAL '8 minutes'",
@@ -1559,10 +1578,7 @@ function buildSeedTemplates({ operatorUserId, adminUserId, communityUserId }) {
 
   const snapshots = templates.map((template) => ({
     id: template.snapshotId,
-    agentId:
-      template.listingId === IDS.listings.communityPending
-        ? IDS.agents.primary
-        : null,
+    agentId: template.listingId === IDS.listings.communityPending ? IDS.agents.primary : null,
     name: template.snapshotName,
     description: template.snapshotDescription,
     kind: template.snapshotKind,
@@ -1581,11 +1597,7 @@ function buildSeedTemplates({ operatorUserId, adminUserId, communityUserId }) {
   return { templates, snapshots };
 }
 
-function buildEventMetadata({
-  operatorUserId,
-  communityUserId,
-  type,
-}) {
+function buildEventMetadata({ operatorUserId, communityUserId, type }) {
   const source = {
     kind: "account",
     service: "backend-api",
@@ -1756,8 +1768,7 @@ function buildSeedSql({ operatorUser, adminUser, communityUser }) {
     {
       id: IDS.events.started,
       type: "agent_started",
-      message:
-        'OpenClaw Research Operator restarted cleanly after the latest template sync.',
+      message: "OpenClaw Research Operator restarted cleanly after the latest template sync.",
       metadata: buildEventMetadata({
         operatorUserId: operatorId,
         communityUserId: communityId,
@@ -1768,8 +1779,7 @@ function buildSeedSql({ operatorUser, adminUser, communityUser }) {
     {
       id: IDS.events.redeployed,
       type: "agent_redeployed",
-      message:
-        'Support Inbox Agent finished a clean redeploy with the updated core files.',
+      message: "Support Inbox Agent finished a clean redeploy with the updated core files.",
       metadata: buildEventMetadata({
         operatorUserId: operatorId,
         communityUserId: communityId,
@@ -1780,8 +1790,7 @@ function buildSeedSql({ operatorUser, adminUser, communityUser }) {
     {
       id: IDS.events.installed,
       type: "agent_hub_install",
-      message:
-        'Installed platform preset "Signal Desk Starter" as a new queued agent.',
+      message: 'Installed platform preset "Signal Desk Starter" as a new queued agent.',
       metadata: buildEventMetadata({
         operatorUserId: operatorId,
         communityUserId: communityId,
@@ -1792,8 +1801,7 @@ function buildSeedSql({ operatorUser, adminUser, communityUser }) {
     {
       id: IDS.events.submitted,
       type: "agent_hub_shared",
-      message:
-        'Shared "Founder Inbox Curator" to Agent Hub.',
+      message: 'Shared "Founder Inbox Curator" to Agent Hub.',
       metadata: buildEventMetadata({
         operatorUserId: operatorId,
         communityUserId: communityId,
@@ -1804,8 +1812,7 @@ function buildSeedSql({ operatorUser, adminUser, communityUser }) {
     {
       id: IDS.events.reported,
       type: "agent_hub_reported",
-      message:
-        'Reported community listing "Revenue Ops Coach" for misleading onboarding copy.',
+      message: 'Reported community listing "Revenue Ops Coach" for misleading onboarding copy.',
       metadata: buildEventMetadata({
         operatorUserId: operatorId,
         communityUserId: communityId,
@@ -1816,7 +1823,7 @@ function buildSeedSql({ operatorUser, adminUser, communityUser }) {
     {
       id: IDS.events.stopped,
       type: "agent_stopped",
-      message: 'Retention Analyst was stopped after the weekly review cycle.',
+      message: "Retention Analyst was stopped after the weekly review cycle.",
       metadata: buildEventMetadata({
         operatorUserId: operatorId,
         communityUserId: communityId,
@@ -2019,7 +2026,7 @@ ${snapshots
   ${snapshot.builtIn ? "TRUE" : "FALSE"},
   ${sqlJson(snapshot.config)},
   ${snapshot.createdAtSql}
-);`
+);`,
   )
   .join("\n\n")}
 
@@ -2065,15 +2072,11 @@ ${templates
   ${template.currentVersion},
   ${template.publishedAtSql},
   ${template.updatedAtSql},
-  ${
-    template.status === "published"
-      ? template.updatedAtSql
-      : "NULL"
-  },
+  ${template.status === "published" ? template.updatedAtSql : "NULL"},
   ${template.reviewedBy ? sqlLiteral(template.reviewedBy) : "NULL"},
   ${sqlLiteral(template.reviewNotes)},
   ${template.createdAtSql}
-);`
+);`,
   )
   .join("\n\n")}
 
@@ -2091,7 +2094,7 @@ ${templates
   ${template.currentVersion},
   'files_only',
   ${template.updatedAtSql}
-);`
+);`,
   )
   .join("\n\n")}
 
@@ -2127,7 +2130,7 @@ ${eventRows
   ${sqlLiteral(event.message)},
   ${sqlJson(event.metadata)},
   ${event.createdAtSql}
-);`
+);`,
   )
   .join("\n\n")}
 
@@ -2257,8 +2260,15 @@ FROM
   generate_series(0, 5) AS hours;
 
 -- Backups + schedule for the primary agent.
-DELETE FROM backup_schedules WHERE agent_id IN (${sqlLiteral(IDS.agents.primary)});
-DELETE FROM backups WHERE agent_id IN (${sqlLiteral(IDS.agents.primary)});
+DELETE FROM backup_schedules
+ WHERE agent_id IN (${sqlLiteral(IDS.agents.primary)})
+    OR id = ${sqlLiteral(IDS.backups.schedule)}
+    OR schedule_key = 'agent:${IDS.agents.primary}:daily';
+DELETE FROM backups
+ WHERE agent_id IN (${sqlLiteral(IDS.agents.primary)})
+    OR id IN (${[IDS.backups.daily, IDS.backups.weekly, IDS.backups.onDemand]
+      .map(sqlLiteral)
+      .join(", ")});
 
 INSERT INTO backups (
   id, user_id, agent_id, kind, status, name, storage_backend, storage_key,
@@ -2352,26 +2362,21 @@ ON CONFLICT (schedule_key) DO UPDATE SET
 function runSeedSql(sql) {
   if (!DB_CONTAINER || DB_CONTAINER.toLowerCase() === "none") return;
 
-  const sqlFile = path.join(
-    os.tmpdir(),
-    `nora-readme-screenshots-${Date.now()}.sql`
-  );
+  const sqlFile = path.join(os.tmpdir(), `nora-readme-screenshots-${Date.now()}.sql`);
   fs.writeFileSync(sqlFile, sql);
 
   try {
     execSync(
       `docker cp ${shellQuote(sqlFile)} ${shellQuote(
-        DB_CONTAINER
+        DB_CONTAINER,
       )}:/tmp/nora-readme-screenshots.sql`,
-      { stdio: "inherit" }
+      { stdio: "inherit" },
     );
     execSync(
-      `docker exec ${shellQuote(
-        DB_CONTAINER
-      )} psql -U ${shellQuote(DB_USER)} -d ${shellQuote(
-        DB_NAME
+      `docker exec ${shellQuote(DB_CONTAINER)} psql -U ${shellQuote(DB_USER)} -d ${shellQuote(
+        DB_NAME,
       )} -f /tmp/nora-readme-screenshots.sql`,
-      { stdio: "inherit" }
+      { stdio: "inherit" },
     );
   } finally {
     try {
@@ -2413,27 +2418,21 @@ async function captureHermesReadmeScreenshot(browser, token) {
   const hermes = await newAuthedPage(browser, hermesToken);
 
   if (!useRealHermes) {
-    await hermes.context.route(
-      `**/api/agents/${hermesAgentId}/hermes-ui/embed*`,
-      async (route) => {
-        await route.fulfill({
-          status: 200,
-          contentType: "text/html; charset=utf-8",
-          body: buildHermesReadmeDashboardHtml(),
-        });
-      }
-    );
+    await hermes.context.route(`**/api/agents/${hermesAgentId}/hermes-ui/embed*`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "text/html; charset=utf-8",
+        body: buildHermesReadmeDashboardHtml(),
+      });
+    });
 
-    await hermes.context.route(
-      `**/api/agents/${hermesAgentId}/hermes-ui`,
-      async (route) => {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify(HERMES_README_RUNTIME),
-        });
-      }
-    );
+    await hermes.context.route(`**/api/agents/${hermesAgentId}/hermes-ui`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(HERMES_README_RUNTIME),
+      });
+    });
 
     await hermes.context.route(`**/api/agents/${hermesAgentId}`, async (route) => {
       await route.fulfill({
@@ -2455,18 +2454,11 @@ async function captureHermesReadmeScreenshot(browser, token) {
         .waitFor({ state: "visible", timeout: 15000 });
       await hermes.page.waitForTimeout(700);
     } else {
-      await gotoHeading(
-        hermes.page,
-        `/app/agents/${hermesAgentId}`,
-        HERMES_README_AGENT.name
-      );
+      await gotoHeading(hermes.page, `/app/agents/${hermesAgentId}`, HERMES_README_AGENT.name);
     }
 
     await hermes.page.getByRole("button", { name: "Hermes WebUI" }).first().click();
-    await hermes.page
-      .getByRole("button", { name: "Official Dashboard" })
-      .first()
-      .click();
+    await hermes.page.getByRole("button", { name: "Official Dashboard" }).first().click();
     const iframeSelector = `iframe[title="Hermes Dashboard ${hermesAgentId}"]`;
     const iframe = hermes.page.locator(iframeSelector);
 
@@ -2479,7 +2471,7 @@ async function captureHermesReadmeScreenshot(browser, token) {
           return Boolean(doc?.body && doc.body.innerText.trim().length > 80);
         },
         iframeSelector,
-        { timeout: 20000 }
+        { timeout: 20000 },
       );
     } else {
       await hermes.page
@@ -2570,11 +2562,7 @@ async function captureK8sDocsScreens(page) {
   // service name, NodePort / LB address) only render when the agent is
   // actually backed by a K8s deployment.
   try {
-    await gotoHeading(
-      page,
-      `/app/agents/${IDS.agents.primary}`,
-      "OpenClaw Research Operator",
-    );
+    await gotoHeading(page, `/app/agents/${IDS.agents.primary}`, "OpenClaw Research Operator");
     await page.waitForTimeout(500);
     await page.screenshot({
       path: path.join(K8S_DOCS_SCREENSHOT_DIR, "nora-agent-running-k8s.png"),
@@ -2682,10 +2670,9 @@ async function captureWorkspacesDocsScreens(page) {
     fullPage: true,
   });
 
-  await page.goto(
-    `${BASE_URL}/app/workspaces/${IDS.workspaces.default}/members`,
-    { waitUntil: "networkidle" },
-  );
+  await page.goto(`${BASE_URL}/app/workspaces/${IDS.workspaces.default}/members`, {
+    waitUntil: "networkidle",
+  });
   await page.waitForTimeout(800);
   await page.screenshot({
     path: path.join(DOCS_DIRS.concepts, "workspaces-members.png"),
@@ -2697,9 +2684,17 @@ async function captureDeployDocsScreens(page) {
   ensureDocsDir(DOCS_DIRS.deploy);
 
   await gotoHeading(page, "/app/deploy", "Deploy New Agent");
-  const inputs = page.locator("input");
-  await inputs.nth(0).fill("research-ops-prod").catch(() => {});
-  await inputs.nth(1).fill("nora-research-ops-prod").catch(() => {});
+  // `:visible` skips the hidden import-template <input type="file"> the deploy
+  // page renders first, so nth(0)/nth(1) map to the name + slug text fields.
+  const inputs = page.locator("input:visible");
+  await inputs
+    .nth(0)
+    .fill("research-ops-prod")
+    .catch(() => {});
+  await inputs
+    .nth(1)
+    .fill("nora-research-ops-prod")
+    .catch(() => {});
   await page.waitForTimeout(300);
   await page.screenshot({
     path: path.join(DOCS_DIRS.deploy, "wizard-start.png"),
@@ -2707,9 +2702,7 @@ async function captureDeployDocsScreens(page) {
   });
 
   // Step into runtime selection if the wizard has a Next/Continue button.
-  const nextBtn = page
-    .getByRole("button", { name: /^(next|continue)$/i })
-    .first();
+  const nextBtn = page.getByRole("button", { name: /^(next|continue)$/i }).first();
   if (await nextBtn.count()) {
     await nextBtn.click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(600);
@@ -2733,10 +2726,7 @@ async function captureProvidersDocsScreens(page) {
   ensureDocsDir(DOCS_DIRS.providers);
 
   await gotoHeading(page, "/app/settings", "Settings");
-  const section = page
-    .locator("section")
-    .filter({ hasText: "LLM Provider Keys" })
-    .first();
+  const section = page.locator("section").filter({ hasText: "LLM Provider Keys" }).first();
   if (await section.count()) {
     await section.scrollIntoViewIfNeeded().catch(() => {});
   }
@@ -2748,9 +2738,7 @@ async function captureProvidersDocsScreens(page) {
 
   // Open the add-provider form. The button label may be "Add Provider" or
   // "+ Add Provider" depending on UI revision; try both.
-  const addBtn = page
-    .getByRole("button", { name: /add provider/i })
-    .first();
+  const addBtn = page.getByRole("button", { name: /add provider/i }).first();
   if (await addBtn.count()) {
     await addBtn.click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(500);
@@ -2765,11 +2753,7 @@ async function captureIntegrationsDocsScreens(page) {
   ensureDocsDir(DOCS_DIRS.integrations);
 
   // The Integrations panel lives under the agent's OpenClaw sub-tab.
-  await gotoHeading(
-    page,
-    `/app/agents/${IDS.agents.primary}`,
-    "OpenClaw Research Operator",
-  );
+  await gotoHeading(page, `/app/agents/${IDS.agents.primary}`, "OpenClaw Research Operator");
   await page.waitForTimeout(400);
 
   const openClawTab = page.getByRole("button", { name: /^OpenClaw$/i }).first();
@@ -2779,9 +2763,7 @@ async function captureIntegrationsDocsScreens(page) {
   }
 
   // Sub-tab inside OpenClaw labeled "Integrations".
-  const integrationsSubTab = page
-    .getByRole("button", { name: /^Integrations$/i })
-    .first();
+  const integrationsSubTab = page.getByRole("button", { name: /^Integrations$/i }).first();
   if (await integrationsSubTab.count()) {
     await integrationsSubTab.click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(700);
@@ -2808,11 +2790,138 @@ async function captureIntegrationsDocsScreens(page) {
 async function captureChannelsDocsScreens(page) {
   ensureDocsDir(DOCS_DIRS.channels);
 
-  await gotoHeading(
-    page,
-    `/app/agents/${IDS.agents.primary}`,
-    "OpenClaw Research Operator",
-  );
+  const openClawCatalog = [
+    { type: "bluebubbles", label: "BlueBubbles" },
+    { type: "discord", label: "Discord" },
+    { type: "feishu", label: "Feishu", loginKind: "cli" },
+    { type: "googlechat", label: "Google Chat" },
+    { type: "imessage", label: "iMessage" },
+    { type: "irc", label: "IRC" },
+    { type: "line", label: "LINE" },
+    { type: "mattermost", label: "Mattermost" },
+    { type: "matrix", label: "Matrix" },
+    { type: "msteams", label: "Microsoft Teams" },
+    { type: "nextcloud-talk", label: "Nextcloud Talk" },
+    { type: "nostr", label: "Nostr" },
+    { type: "qqbot", label: "QQ Bot" },
+    { type: "signal", label: "Signal" },
+    { type: "slack", label: "Slack" },
+    { type: "synology-chat", label: "Synology Chat" },
+    { type: "telegram", label: "Telegram" },
+    { type: "tlon", label: "Tlon" },
+    { type: "twitch", label: "Twitch" },
+    { type: "whatsapp", label: "WhatsApp", loginKind: "web" },
+    { type: "yuanbao", label: "Yuanbao" },
+    { type: "zalo", label: "Zalo Bot" },
+    { type: "zalouser", label: "Zalo Personal", loginKind: "cli" },
+  ];
+  const setupFieldMap = {
+    discord: [
+      { key: "token", label: "Bot Token", type: "password", required: true },
+      { key: "applicationId", label: "Application ID", type: "text", required: false },
+    ],
+    slack: [
+      { key: "mode", label: "Mode", type: "select", required: true, defaultValue: "socket" },
+      { key: "botToken", label: "Bot Token", type: "password", required: true },
+      { key: "appToken", label: "App-Level Token", type: "password", required: false },
+      { key: "signingSecret", label: "Signing Secret", type: "password", required: false },
+      { key: "webhookPath", label: "Webhook Path", type: "text", required: false },
+    ],
+    telegram: [{ key: "botToken", label: "Bot Token", type: "password", required: true }],
+  };
+  const typeDefinitions = openClawCatalog.map((entry) => ({
+    id: entry.type,
+    type: entry.type,
+    label: entry.label,
+    title: entry.label,
+    detailLabel: entry.label,
+    description: entry.loginKind
+      ? "Link this channel through OpenClaw's pairing flow."
+      : "Configure this channel through OpenClaw setup.",
+    icon: null,
+    configFields: setupFieldMap[entry.type] || [],
+    hasComplexFields: false,
+    actions: {
+      canQrLogin: Boolean(entry.loginKind),
+      canLogout: false,
+      loginKind: entry.loginKind || null,
+    },
+  }));
+  const typeById = new Map(typeDefinitions.map((entry) => [entry.type, entry]));
+  const channelStatus = {
+    state: "not_configured",
+    connected: false,
+    running: false,
+    healthState: null,
+    lastError: null,
+    lastConnectedAt: null,
+    lastProbeAt: null,
+  };
+  const channelActionsFor = (entry) => ({
+    canEdit: !entry.loginKind,
+    canToggle: true,
+    canDelete: false,
+    canTest: false,
+    canViewMessages: false,
+    canQrLogin: Boolean(entry.loginKind),
+    canLogout: false,
+    loginKind: entry.loginKind || null,
+  });
+  const payload = {
+    runtime: "openclaw",
+    title: "OpenClaw Channels",
+    description:
+      "Nora lists available OpenClaw channels here. Link or set up a channel to enable it.",
+    capabilities: {
+      supportsTesting: false,
+      supportsMessageHistory: false,
+      supportsArbitraryNames: false,
+      supportsLazyTypeDefinitions: true,
+    },
+    channels: openClawCatalog.map((entry) => ({
+      id: entry.type,
+      type: entry.type,
+      name: entry.label,
+      selectionLabel: entry.label,
+      detailLabel: entry.label,
+      configured: false,
+      enabled: false,
+      readOnly: false,
+      accountCount: 0,
+      defaultAccountId: "default",
+      accounts: [],
+      config: {},
+      status: channelStatus,
+      actions: channelActionsFor(entry),
+    })),
+    availableTypes: typeDefinitions.map((entry) => ({
+      ...entry,
+      configFields: [],
+      detailsLoaded: false,
+    })),
+  };
+
+  await page.route(`**/api/agents/${IDS.agents.primary}/channels`, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(payload),
+    });
+  });
+  await page.route(`**/api/agents/${IDS.agents.primary}/channels/types/*`, async (route) => {
+    const type = route.request().url().split("/").pop();
+    await route.fulfill({
+      status: typeById.has(type) ? 200 : 404,
+      contentType: "application/json",
+      body: JSON.stringify(typeById.get(type) || { error: "Unknown channel type" }),
+    });
+  });
+
+  await gotoHeading(page, `/app/agents/${IDS.agents.primary}`, "OpenClaw Research Operator");
   await page.waitForTimeout(400);
 
   const openClawTab = page.getByRole("button", { name: /^OpenClaw$/i }).first();
@@ -2821,9 +2930,7 @@ async function captureChannelsDocsScreens(page) {
     await page.waitForTimeout(500);
   }
 
-  const channelsSubTab = page
-    .getByRole("button", { name: /^Channels$/i })
-    .first();
+  const channelsSubTab = page.getByRole("button", { name: /^Channels$/i }).first();
   if (await channelsSubTab.count()) {
     await channelsSubTab.click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(700);
@@ -2849,10 +2956,9 @@ async function captureChannelsDocsScreens(page) {
 async function captureAlertRulesDocsScreens(page) {
   ensureDocsDir(DOCS_DIRS.alerts);
 
-  await page.goto(
-    `${BASE_URL}/app/workspaces/${IDS.workspaces.default}/alerts`,
-    { waitUntil: "networkidle" },
-  );
+  await page.goto(`${BASE_URL}/app/workspaces/${IDS.workspaces.default}/alerts`, {
+    waitUntil: "networkidle",
+  });
   await page.waitForTimeout(900);
   await page.screenshot({
     path: path.join(DOCS_DIRS.alerts, "alerts-list.png"),
@@ -2882,10 +2988,9 @@ async function captureMonitoringDocsScreens(page) {
     fullPage: true,
   });
 
-  await page.goto(
-    `${BASE_URL}/app/workspaces/${IDS.workspaces.default}/cost`,
-    { waitUntil: "networkidle" },
-  );
+  await page.goto(`${BASE_URL}/app/workspaces/${IDS.workspaces.default}/cost`, {
+    waitUntil: "networkidle",
+  });
   await page.waitForTimeout(900);
   await page.screenshot({
     path: path.join(DOCS_DIRS.monitoring, "monitoring-cost.png"),
@@ -2897,15 +3002,9 @@ async function captureAgentHubDocsScreens(page) {
   ensureDocsDir(DOCS_DIRS.agentHub);
 
   // Install dialog on a listing detail page.
-  await gotoHeading(
-    page,
-    `/app/agent-hub/${IDS.listings.presetSignalDesk}`,
-    "Signal Desk Starter",
-  );
+  await gotoHeading(page, `/app/agent-hub/${IDS.listings.presetSignalDesk}`, "Signal Desk Starter");
   await page.waitForTimeout(400);
-  const installBtn = page
-    .getByRole("button", { name: /^install$/i })
-    .first();
+  const installBtn = page.getByRole("button", { name: /^install$/i }).first();
   if (await installBtn.count()) {
     await installBtn.click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(700);
@@ -2920,11 +3019,7 @@ async function captureAgentHubDocsScreens(page) {
   await page.waitForTimeout(300);
 
   // Publish dialog initiated from the operator's primary agent.
-  await gotoHeading(
-    page,
-    `/app/agents/${IDS.agents.primary}`,
-    "OpenClaw Research Operator",
-  );
+  await gotoHeading(page, `/app/agents/${IDS.agents.primary}`, "OpenClaw Research Operator");
   await page.waitForTimeout(400);
   const publishBtn = page
     .getByRole("button", { name: /^(publish|share to agent hub|share)$/i })
@@ -2941,14 +3036,46 @@ async function captureAgentHubDocsScreens(page) {
   await page.waitForTimeout(300);
 }
 
+async function captureAgentTemplateGuideScreens(page, token) {
+  ensureDocsDir(DOCS_DIRS.agentTemplates);
+
+  const listings = await requestJson(`${BASE_URL}/api/agent-hub`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const listingBySlug = new Map(
+    (Array.isArray(listings) ? listings : [])
+      .filter((listing) => listing?.id && listing?.slug)
+      .map((listing) => [listing.slug, listing]),
+  );
+
+  for (const template of AGENT_TEMPLATE_DOCS) {
+    const listing = listingBySlug.get(template.listingSlug);
+    if (!listing) {
+      console.warn(`[capture] missing Agent Hub listing: ${template.listingSlug}`);
+      continue;
+    }
+
+    try {
+      await gotoHeading(page, `/app/agent-hub/${listing.id}`, template.heading);
+      await page.waitForTimeout(300);
+      await page.screenshot({
+        path: path.join(DOCS_DIRS.agentTemplates, `${template.imageSlug}.png`),
+        fullPage: true,
+      });
+    } catch (err) {
+      console.warn(
+        `[capture] agent template ${template.imageSlug} failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+}
+
 async function captureBackupsDocsScreens(page) {
   ensureDocsDir(DOCS_DIRS.backups);
 
-  await gotoHeading(
-    page,
-    `/app/agents/${IDS.agents.primary}`,
-    "OpenClaw Research Operator",
-  );
+  await gotoHeading(page, `/app/agents/${IDS.agents.primary}`, "OpenClaw Research Operator");
   await page.waitForTimeout(400);
   const backupsTab = page.getByRole("button", { name: /^Backups$/i }).first();
   if (await backupsTab.count()) {
@@ -2976,10 +3103,7 @@ async function captureBackupsDocsScreens(page) {
 async function captureNemoclawDocsScreens(page) {
   ensureDocsDir(DOCS_DIRS.nemoclaw);
 
-  await page.goto(
-    `${BASE_URL}/app/agents/${IDS.agents.nemoclaw}`,
-    { waitUntil: "networkidle" },
-  );
+  await page.goto(`${BASE_URL}/app/agents/${IDS.agents.nemoclaw}`, { waitUntil: "networkidle" });
   await page.waitForTimeout(900);
   const nemoTab = page.getByRole("button", { name: /^NemoClaw$/i }).first();
   if (await nemoTab.count()) {
@@ -3044,7 +3168,7 @@ async function captureScreens() {
       operatorUser: operatorSeed.user,
       adminUser: adminSeed.user,
       communityUser: communitySeed.user,
-    })
+    }),
   );
 
   const operatorAuth = await ensureAccount(ACCOUNTS.operator);
@@ -3068,9 +3192,17 @@ async function captureScreens() {
     });
 
     await gotoHeading(operator.page, "/app/deploy", "Deploy New Agent");
-    const deployInputs = operator.page.locator("input");
-    await deployInputs.nth(0).fill("customer-success-operator");
-    await deployInputs.nth(1).fill("nora-customer-success-operator");
+    // `:visible` skips the hidden import-template <input type="file"> the deploy
+    // page renders first, so nth(0)/nth(1) map to the name + slug text fields.
+    const deployInputs = operator.page.locator("input:visible");
+    await deployInputs
+      .nth(0)
+      .fill("customer-success-operator")
+      .catch(() => {});
+    await deployInputs
+      .nth(1)
+      .fill("nora-customer-success-operator")
+      .catch(() => {});
     await operator.page.waitForTimeout(250);
     await operator.page.screenshot({
       path: path.join(SCREENSHOT_DIR, "proof-operator-deploy-flow.png"),
@@ -3079,7 +3211,7 @@ async function captureScreens() {
     await gotoHeading(
       operator.page,
       `/app/agents/${IDS.agents.primary}`,
-      "OpenClaw Research Operator"
+      "OpenClaw Research Operator",
     );
     await operator.page.getByText("OpenClaw Gateway Active").waitFor({
       state: "visible",
@@ -3099,13 +3231,14 @@ async function captureScreens() {
     await providerSection.scrollIntoViewIfNeeded();
     await operator.page.waitForTimeout(250);
     await providerSection.screenshot({
-      path: path.join(
-        SCREENSHOT_DIR,
-        "proof-operator-settings-provider-setup.png"
-      ),
+      path: path.join(SCREENSHOT_DIR, "proof-operator-settings-provider-setup.png"),
     });
 
-    await gotoHeading(operator.page, "/app/agent-hub", "Install presets, browse community templates, and track your own shared agents.");
+    await gotoHeading(
+      operator.page,
+      "/app/agent-hub",
+      "Install presets, browse community templates, and track your own shared agents.",
+    );
     await operator.page.waitForTimeout(250);
     await operator.page.screenshot({
       path: path.join(SCREENSHOT_DIR, "proof-operator-agent-hub.png"),
@@ -3114,7 +3247,7 @@ async function captureScreens() {
     await gotoHeading(
       operator.page,
       `/app/agent-hub/${IDS.listings.presetSignalDesk}`,
-      "Signal Desk Starter"
+      "Signal Desk Starter",
     );
     await operator.page
       .getByRole("heading", {
@@ -3124,10 +3257,7 @@ async function captureScreens() {
       .scrollIntoViewIfNeeded();
     await operator.page.waitForTimeout(250);
     await operator.page.screenshot({
-      path: path.join(
-        SCREENSHOT_DIR,
-        "proof-operator-agent-hub-detail.png"
-      ),
+      path: path.join(SCREENSHOT_DIR, "proof-operator-agent-hub-detail.png"),
     });
 
     // K8s docs shots — reuses operator page, best-effort.
@@ -3153,6 +3283,9 @@ async function captureScreens() {
     await captureAlertRulesDocsScreens(operator.page).catch(warn("alert-rules"));
     await captureMonitoringDocsScreens(operator.page).catch(warn("monitoring"));
     await captureAgentHubDocsScreens(operator.page).catch(warn("agent-hub"));
+    await captureAgentTemplateGuideScreens(operator.page, operatorAuth.token).catch(
+      warn("agent-templates"),
+    );
     await captureBackupsDocsScreens(operator.page).catch(warn("backups"));
     await captureNemoclawDocsScreens(operator.page).catch(warn("nemoclaw"));
     await capturePlatformModesDocsScreens(operator.page).catch(warn("platform-modes"));
@@ -3161,10 +3294,7 @@ async function captureScreens() {
     await gotoHeading(operator.page, "/app/logs", "Account event log");
     await operator.page.waitForTimeout(500);
     await operator.page.screenshot({
-      path: path.join(
-        SCREENSHOT_DIR,
-        "proof-operator-account-event-log.png"
-      ),
+      path: path.join(SCREENSHOT_DIR, "proof-operator-account-event-log.png"),
     });
 
     await gotoHeading(admin.page, "/admin/agent-hub", "Agent Hub moderation");
@@ -3176,7 +3306,7 @@ async function captureScreens() {
     await gotoHeading(
       admin.page,
       `/admin/agent-hub/${IDS.listings.communityPending}`,
-      "Founder Inbox Curator"
+      "Founder Inbox Curator",
     );
     await admin.page
       .getByRole("heading", {
@@ -3186,10 +3316,7 @@ async function captureScreens() {
       .scrollIntoViewIfNeeded();
     await admin.page.waitForTimeout(250);
     await admin.page.screenshot({
-      path: path.join(
-        SCREENSHOT_DIR,
-        "proof-admin-agent-hub-detail.png"
-      ),
+      path: path.join(SCREENSHOT_DIR, "proof-admin-agent-hub-detail.png"),
     });
   } finally {
     await operator.context.close();

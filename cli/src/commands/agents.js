@@ -1,18 +1,5 @@
 const api = require("../client");
-
-function table(rows, columns) {
-  if (rows.length === 0) {
-    console.log("(none)");
-    return;
-  }
-  const widths = columns.map((col) =>
-    Math.max(col.header.length, ...rows.map((row) => String(col.value(row) ?? "").length)),
-  );
-  const fmt = (cells) => cells.map((cell, i) => String(cell ?? "").padEnd(widths[i])).join("  ");
-  console.log(fmt(columns.map((c) => c.header)));
-  console.log(fmt(widths.map((w) => "-".repeat(w))));
-  for (const row of rows) console.log(fmt(columns.map((c) => c.value(row))));
-}
+const table = require("../table");
 
 async function list() {
   const rows = await api.get("/api/agents");
@@ -55,8 +42,7 @@ async function versions(args) {
 async function rollback(args) {
   const id = args[0];
   const versionId = args[1];
-  if (!id || !versionId)
-    throw new Error("usage: nora agents rollback <agent-id> <version-id>");
+  if (!id || !versionId) throw new Error("usage: nora agents rollback <agent-id> <version-id>");
   const result = await api.post(`/api/agents/${id}/rollback/${versionId}`);
   console.log(`Rolled back to v${result.restored.versionNumber}.`);
   if (result.redeployed) console.log("Redeploy queued.");

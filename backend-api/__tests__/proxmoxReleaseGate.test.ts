@@ -1,5 +1,6 @@
 // @ts-nocheck
 const {
+  PROXMOX_RELEASE_BLOCKER_ISSUE,
   getBackendCatalog,
   getBackendStatus,
   getDefaultBackend,
@@ -46,16 +47,17 @@ describe("proxmox runtime selection", () => {
     restoreEnv();
   });
 
-  it("marks Proxmox available when API and SSH bootstrap configuration exist", () => {
+  it("keeps Proxmox release-blocked even when API and SSH bootstrap configuration exist", () => {
     const status = getBackendStatus("proxmox");
 
     expect(status.enabled).toBe(true);
-    expect(status.configured).toBe(true);
-    expect(status.available).toBe(true);
-    expect(status.maturityTier).toBe("beta");
+    expect(status.configured).toBe(false);
+    expect(status.available).toBe(false);
+    expect(status.issue).toBe(PROXMOX_RELEASE_BLOCKER_ISSUE);
+    expect(status.maturityTier).toBe("blocked");
   });
 
-  it("rejects Proxmox token ids that are not API token ids", () => {
+  it("uses the release blocker before Proxmox token validation", () => {
     process.env.PROXMOX_TOKEN_ID = "root@pam";
 
     const status = getRuntimeSelectionStatus({
@@ -65,9 +67,7 @@ describe("proxmox runtime selection", () => {
     });
 
     expect(status.available).toBe(false);
-    expect(status.issue).toBe(
-      "Proxmox execution target requires PROXMOX_TOKEN_ID in API token format user@realm!tokenname.",
-    );
+    expect(status.issue).toBe(PROXMOX_RELEASE_BLOCKER_ISSUE);
   });
 
   it("keeps the first available deploy target as the default standard path", () => {
@@ -78,7 +78,7 @@ describe("proxmox runtime selection", () => {
     expect(catalog.find((backend) => backend.id === "proxmox")?.isDefault).toBe(false);
   });
 
-  it("requires ready-made Proxmox templates for Hermes and NemoClaw selections", () => {
+  it("does not unblock Proxmox selections when runtime-specific templates exist", () => {
     process.env.ENABLED_RUNTIME_FAMILIES = "openclaw,hermes";
     process.env.ENABLED_SANDBOX_PROFILES = "standard,nemoclaw";
 
@@ -88,14 +88,26 @@ describe("proxmox runtime selection", () => {
         deploy_target: "proxmox",
         sandbox_profile: "standard",
       }),
-    ).toEqual(expect.objectContaining({ enabled: true, available: false }));
+    ).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        available: false,
+        issue: PROXMOX_RELEASE_BLOCKER_ISSUE,
+      }),
+    );
     expect(
       getRuntimeSelectionStatus({
         runtime_family: "openclaw",
         deploy_target: "proxmox",
         sandbox_profile: "nemoclaw",
       }),
-    ).toEqual(expect.objectContaining({ enabled: true, available: false }));
+    ).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        available: false,
+        issue: PROXMOX_RELEASE_BLOCKER_ISSUE,
+      }),
+    );
 
     process.env.PROXMOX_HERMES_TEMPLATE = "local:vztmpl/nora-hermes.tar.zst";
     process.env.PROXMOX_NEMOCLAW_TEMPLATE = "local:vztmpl/nora-nemoclaw.tar.zst";
@@ -106,13 +118,25 @@ describe("proxmox runtime selection", () => {
         deploy_target: "proxmox",
         sandbox_profile: "standard",
       }),
-    ).toEqual(expect.objectContaining({ enabled: true, available: true }));
+    ).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        available: false,
+        issue: PROXMOX_RELEASE_BLOCKER_ISSUE,
+      }),
+    );
     expect(
       getRuntimeSelectionStatus({
         runtime_family: "openclaw",
         deploy_target: "proxmox",
         sandbox_profile: "nemoclaw",
       }),
-    ).toEqual(expect.objectContaining({ enabled: true, available: true }));
+    ).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        available: false,
+        issue: PROXMOX_RELEASE_BLOCKER_ISSUE,
+      }),
+    );
   });
 });

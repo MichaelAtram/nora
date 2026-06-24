@@ -25,6 +25,10 @@ const RUNTIME_FILES = [
   "containerCommand.ts",
   "contracts.ts",
   "runtimeBootstrap.ts",
+  // Required by runtimeBootstrap's require("./mcpServersConfig") — every module
+  // runtimeBootstrap imports relatively must ship into the container with it,
+  // or the in-container runtime server fails at load.
+  "mcpServersConfig.ts",
   "execEndpoint.ts",
   "integrationTools.ts",
   "integrationToolCli.ts",
@@ -43,10 +47,9 @@ const INTEGRATION_TOOL_WRAPPER_SOURCE = [
   'exec "$TSX_BIN" /opt/openclaw-runtime/lib/integrationToolCli.ts "$@"',
   "",
 ].join("\n");
-const INTEGRATION_TOOL_WRAPPER_B64 = Buffer.from(
-  INTEGRATION_TOOL_WRAPPER_SOURCE,
-  "utf8",
-).toString("base64");
+const INTEGRATION_TOOL_WRAPPER_B64 = Buffer.from(INTEGRATION_TOOL_WRAPPER_SOURCE, "utf8").toString(
+  "base64",
+);
 
 const OPENCLAW_WORKSPACE_ROOT = "/root/.openclaw/workspace";
 const OPENCLAW_LEGACY_AGENT_TEMPLATE_ROOT = "/root/.openclaw/agents/main/agent";
@@ -60,7 +63,10 @@ function stripGeneratedIntegrationPromptBlock(content) {
     `\\n?${NORA_INTEGRATIONS_PROMPT_BEGIN}[\\s\\S]*?${NORA_INTEGRATIONS_PROMPT_END}\\n?`,
     "g",
   );
-  return raw.replace(pattern, "\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+  return raw
+    .replace(pattern, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
 }
 
 function buildIntegrationPromptPointerMarkdown() {
@@ -220,14 +226,20 @@ function withIntegrationBootstrapEntries(entries = []) {
   if (!hasWorkspaceTools) {
     nextEntries.push({
       targetPath: path.posix.join(OPENCLAW_WORKSPACE_ROOT, "TOOLS.md"),
-      contentBuffer: Buffer.from(upsertGeneratedIntegrationPromptBlock(defaultToolsContent), "utf8"),
+      contentBuffer: Buffer.from(
+        upsertGeneratedIntegrationPromptBlock(defaultToolsContent),
+        "utf8",
+      ),
       mode: 0o644,
     });
   }
   if (!hasLegacyTools) {
     nextEntries.push({
       targetPath: path.posix.join(OPENCLAW_LEGACY_AGENT_TEMPLATE_ROOT, "TOOLS.md"),
-      contentBuffer: Buffer.from(upsertGeneratedIntegrationPromptBlock(defaultToolsContent), "utf8"),
+      contentBuffer: Buffer.from(
+        upsertGeneratedIntegrationPromptBlock(defaultToolsContent),
+        "utf8",
+      ),
       mode: 0o644,
     });
   }
@@ -296,11 +308,41 @@ const FOUNDRY_OPENCLAW_PROVIDER_ID = "azure-openai-responses";
 // compat flag is `supportsStore: false` — Azure rejects `store: true`, which
 // is OpenClaw's default for Responses API.
 const FOUNDRY_DEFAULT_MODELS = [
-  { id: "gpt-5.5", name: "GPT-5.5 (Azure)", reasoning: true, contextWindow: 400000, maxTokens: 16384 },
-  { id: "gpt-5.5-mini", name: "GPT-5.5 Mini (Azure)", reasoning: true, contextWindow: 400000, maxTokens: 16384 },
-  { id: "gpt-5.5-pro", name: "GPT-5.5 Pro (Azure)", reasoning: true, contextWindow: 200000, maxTokens: 128000 },
-  { id: "gpt-5.5", name: "GPT-5.5 (Azure)", reasoning: true, contextWindow: 200000, maxTokens: 128000 },
-  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex (Azure)", reasoning: true, contextWindow: 400000, maxTokens: 16384 },
+  {
+    id: "gpt-5.5",
+    name: "GPT-5.5 (Azure)",
+    reasoning: true,
+    contextWindow: 400000,
+    maxTokens: 16384,
+  },
+  {
+    id: "gpt-5.5-mini",
+    name: "GPT-5.5 Mini (Azure)",
+    reasoning: true,
+    contextWindow: 400000,
+    maxTokens: 16384,
+  },
+  {
+    id: "gpt-5.5-pro",
+    name: "GPT-5.5 Pro (Azure)",
+    reasoning: true,
+    contextWindow: 200000,
+    maxTokens: 128000,
+  },
+  {
+    id: "gpt-5.5",
+    name: "GPT-5.5 (Azure)",
+    reasoning: true,
+    contextWindow: 200000,
+    maxTokens: 128000,
+  },
+  {
+    id: "gpt-5.2-codex",
+    name: "GPT-5.2 Codex (Azure)",
+    reasoning: true,
+    contextWindow: 400000,
+    maxTokens: 16384,
+  },
   { id: "o3", name: "o3 (Azure)", reasoning: true, contextWindow: 200000, maxTokens: 100000 },
 ];
 
@@ -310,8 +352,19 @@ const FOUNDRY_DEFAULT_MODELS = [
 // unset so existing single-deployment setups keep working.
 const FOUNDRY_FALLBACK_DEPLOYMENT = "gpt-5.5";
 
+function normalizeFoundryDeployment(value) {
+  let deployment = String(value || "").trim();
+  const providerPrefix = `${FOUNDRY_OPENCLAW_PROVIDER_ID}/`;
+  if (deployment.startsWith(providerPrefix)) {
+    deployment = deployment.slice(providerPrefix.length).trim();
+  }
+  return deployment && !deployment.includes("/") ? deployment : "";
+}
+
 function resolveFoundryDeployment(env = {}) {
-  const configured = String(env.MICROSOFT_FOUNDRY_DEPLOYMENT || "").trim();
+  const configured = normalizeFoundryDeployment(
+    env.MICROSOFT_FOUNDRY_DEPLOYMENT || env.NORA_DEFAULT_OPENCLAW_MODEL,
+  );
   return configured || FOUNDRY_FALLBACK_DEPLOYMENT;
 }
 
@@ -327,27 +380,36 @@ function buildFoundryModelEntries(env = {}) {
   // for the very deployment we set as default.
   const deployment = resolveFoundryDeployment(env);
   const seen = new Set();
-  const entries = [
-    { id: deployment, name: `${deployment} (Azure)`, reasoning: true, contextWindow: 400000, maxTokens: 16384 },
-    ...FOUNDRY_DEFAULT_MODELS,
+  const models = FOUNDRY_DEFAULT_MODELS.filter((entry) => {
+    if (seen.has(entry.id)) return false;
+    seen.add(entry.id);
+    return true;
+  }).map((entry) => ({
+    id: entry.id,
+    name: entry.name,
+    api: "azure-openai-responses",
+    reasoning: entry.reasoning,
+    input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: entry.contextWindow,
+    maxTokens: entry.maxTokens,
+    compat: { supportsStore: false, supportsReasoningEffort: true },
+  }));
+  if (!deployment || models.some((model) => model.id === deployment)) return models;
+
+  const baseModelId = deployment.replace(/-\d+$/, "");
+  const template =
+    models.find((model) => model.id === baseModelId) ||
+    models.find((model) => model.id === "gpt-5.5") ||
+    models[0];
+  return [
+    {
+      ...template,
+      id: deployment,
+      name: `${deployment} (Azure deployment)`,
+    },
+    ...models,
   ];
-  return entries
-    .filter((entry) => {
-      if (seen.has(entry.id)) return false;
-      seen.add(entry.id);
-      return true;
-    })
-    .map((entry) => ({
-      id: entry.id,
-      name: entry.name,
-      api: "azure-openai-responses",
-      reasoning: entry.reasoning,
-      input: ["text", "image"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: entry.contextWindow,
-      maxTokens: entry.maxTokens,
-      compat: { supportsStore: false, supportsReasoningEffort: true },
-    }));
 }
 
 // Builds the `models.providers.*` map injected into openclaw.json for
@@ -393,14 +455,44 @@ function buildOpenClawCustomProviders(env = {}) {
       models: buildFoundryModelEntries(env),
     };
   }
+  // Nora's zero-key demo provider: an OpenAI-compatible stub served by the
+  // control plane itself. The worker injects the derived token plus the
+  // in-network base URL (sister env var, same mechanism as Foundry's).
+  const demoToken = env.NORA_DEMO_LLM_TOKEN;
+  const demoBaseUrl = env.NORA_DEMO_LLM_BASE_URL;
+  if (demoToken && demoBaseUrl) {
+    providers[DEMO_OPENCLAW_PROVIDER_ID] = {
+      api: "openai-completions",
+      baseUrl: String(demoBaseUrl).replace(/\/+$/, ""),
+      apiKey: demoToken,
+      models: [
+        {
+          id: DEMO_OPENCLAW_MODEL_ID,
+          name: "Nora Demo (deterministic stub)",
+          api: "openai-completions",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 32768,
+          maxTokens: 4096,
+        },
+      ],
+    };
+  }
   return providers;
 }
 
+// OpenClaw-side ids for the zero-key demo provider. Distinct from Nora's
+// internal "demo" id so a future builtin OpenClaw provider can't collide.
+const DEMO_OPENCLAW_PROVIDER_ID = "nora-demo";
+const DEMO_OPENCLAW_MODEL_ID = "nora-demo-1";
+
 // Maps Nora's internal LLM provider id to the OpenClaw provider id that
 // must appear in model strings (e.g. `<provider>/<deployment>`). Only Foundry
-// needs translation today; everything else passes through unchanged.
+// and the demo stub need translation; everything else passes through unchanged.
 const NORA_TO_OPENCLAW_PROVIDER_ID = Object.freeze({
   "microsoft-foundry": FOUNDRY_OPENCLAW_PROVIDER_ID,
+  demo: DEMO_OPENCLAW_PROVIDER_ID,
 });
 
 function mapNoraProviderIdToOpenClaw(noraProviderId) {
@@ -454,6 +546,11 @@ function buildOpenClawConfigMergeScript(gatewayConfig) {
 function buildOpenClawConfigMergeCommand(configDelta) {
   return buildOpenClawConfigMergeScript(configDelta).join("\n");
 }
+
+// buildMcpServersConfig lives in its own dependency-free module so it can be
+// unit-tested without loading the rest of the bootstrap; re-exported here for
+// the worker/adapter consumers that already import from runtimeBootstrap.
+const { buildMcpServersConfig } = require("./mcpServersConfig");
 
 function buildRuntimeBootstrapCommand() {
   return [
@@ -569,9 +666,12 @@ module.exports = {
   buildIntegrationToolWrapperScript,
   buildOpenClawConfigMergeScript,
   buildOpenClawConfigMergeCommand,
+  buildMcpServersConfig,
   buildOpenClawCustomProviders,
   mapNoraProviderIdToOpenClaw,
   FOUNDRY_OPENCLAW_PROVIDER_ID,
+  DEMO_OPENCLAW_PROVIDER_ID,
+  DEMO_OPENCLAW_MODEL_ID,
   resolveFoundryDeployment,
   foundryDefaultModel,
   buildTemplatePayloadBootstrapCommand,

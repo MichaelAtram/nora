@@ -11,7 +11,7 @@ It is designed to keep important client context from getting lost between meetin
 Full walkthrough: **[Mercer setup guide](https://noradocs.solomontsao.com/guides/mercer-client-intelligence)**.
 
 1. **Install from Agent Hub** — install the listing into a workspace.
-2. **Connect one channel** (**Channels** tab) so Mercer can reach you — **WhatsApp** recommended (Phone Number ID + Access Token), or Telegram / Slack / Discord / email. You only need one.
+2. **Connect one channel** (**Channels** tab) so Mercer can reach you — **WhatsApp** recommended (QR/link pairing), or Telegram / Slack / Discord or another OpenClaw catalog channel. You only need one.
 3. **(Optional) Connect a CRM or source** (**Integrations** tab) — Salesforce, HubSpot, Email, or LinkedIn. Mercer works fine from pasted updates without one.
 4. **Say hi** — Mercer introduces itself, offers to rename, gets your channel connected, captures your sales context, and builds your first client brief.
 

@@ -9,18 +9,22 @@ Drafts personalized payment reminders calibrated to where an invoice sits in the
 Full walkthrough: **[Penny setup guide](https://noradocs.solomontsao.com/guides/penny-invoice-followup)**.
 
 ### 1. Install from Agent Hub
+
 Install the **Invoice Follow-Up Claw** listing into a workspace.
 
 ### 2. Connect one channel — Channels tab
+
 Open the agent → **Channels** tab → connect **one** way for Penny to reach you (you only need one):
 
-- **WhatsApp** (recommended) — Meta WhatsApp Cloud API; needs a Phone Number ID + Access Token.
-- Or **Telegram**, **Slack**, **Discord**, or **email**.
+- **WhatsApp** (recommended) - use Nora's **Link** action and scan the QR/pairing prompt.
+- Or **Telegram**, **Slack**, **Discord**, or another OpenClaw catalog channel.
 
 ### 3. (Optional) Connect billing — Integrations tab
+
 Penny drafts fine from invoice details you paste — no integration required. To pull invoice/payment status directly, connect **Stripe** or **Email** in the **Integrations** tab. (QuickBooks/Xero aren't available as Nora integrations yet — paste those details in.)
 
 ### 4. Say hi
+
 Start the runtime and send a first message. Penny introduces itself, offers to rename, gets your channel connected, then captures your payment terms, tone, and escalation threshold.
 
 > **How integrations flow in:** if you connect billing, Nora writes `integrations/NORA_INTEGRATIONS.md` and updates `TOOLS.md` automatically — you never edit those.

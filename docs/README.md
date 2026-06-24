@@ -31,7 +31,7 @@ docs/
 ├── configuration/            # operator config (env vars, platform modes, …)
 ├── guides/                   # task-oriented walkthroughs
 ├── api/                      # REST API reference
-└── support/                  # FAQ, troubleshooting
+└── support/                  # FAQ, troubleshooting, contact
 ```
 
 ## Maintenance rule

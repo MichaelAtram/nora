@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nora-nginx
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "nginx") | nindent 4 }}
+spec:
+  replicas: {{ .Values.nginx.replicas }}
+  selector:
+    matchLabels:
+      {{- include "nora.selectorLabels" (dict "root" . "component" "nginx") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nora.selectorLabels" (dict "root" . "component" "nginx") | nindent 8 }}
+      annotations:
+        checksum/nginx-config: {{ .Files.Get "files/nginx-k8s.conf" | sha256sum }}
+    spec:
+      containers:
+        - name: nginx
+          image: {{ .Values.nginx.image }}
+          ports:
+            - name: http
+              containerPort: 80
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.nginx.resources | nindent 12 }}
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nora-nginx-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nora-nginx
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "nginx") | nindent 4 }}
+spec:
+  type: {{ .Values.nginx.service.type }}
+  selector:
+    {{- include "nora.selectorLabels" (dict "root" . "component" "nginx") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.nginx.service.port }}
+      targetPort: http
+      {{- if and (eq .Values.nginx.service.type "NodePort") .Values.nginx.service.nodePort }}
+      nodePort: {{ .Values.nginx.service.nodePort }}
+      {{- end }}

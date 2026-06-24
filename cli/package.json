@@ -1,9 +1,12 @@
 {
-  "name": "@nora/cli",
+  "name": "@noraai/cli",
   "version": "0.1.0",
   "description": "Nora command-line interface for managing agents, workspaces, and runtimes via the public REST API.",
   "license": "Apache-2.0",
   "type": "commonjs",
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "nora": "./src/index.js"
   },
@@ -13,9 +16,25 @@
   },
   "files": [
     "src/**/*.js",
-    "README.md"
+    "!src/**/*.test.js",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
-    "test": "node --test src/**/*.test.js"
-  }
+    "test": "node --test \"src/**/*.test.js\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/solomon2773/nora.git",
+    "directory": "cli"
+  },
+  "keywords": [
+    "nora",
+    "cli",
+    "agents",
+    "openclaw",
+    "hermes",
+    "ops",
+    "self-hosted"
+  ]
 }

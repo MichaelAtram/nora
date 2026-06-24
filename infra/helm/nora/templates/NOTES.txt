@@ -1,0 +1,41 @@
+Nora {{ .Chart.AppVersion }} is deploying into namespace {{ .Release.Namespace }}.
+
+1. Watch the rollout:
+
+     kubectl -n {{ .Release.Namespace }} get pods -w
+
+2. Reach the UI:
+{{- if .Values.ingress.enabled }}
+
+     Open {{ .Values.publicUrl }} (Ingress host: {{ .Values.ingress.host }})
+{{- else if eq .Values.nginx.service.type "LoadBalancer" }}
+
+     kubectl -n {{ .Release.Namespace }} get svc nora-nginx   # use the EXTERNAL-IP
+{{- else }}
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/nora-nginx 8080:{{ .Values.nginx.service.port }}
+     # then open http://localhost:8080
+{{- end }}
+
+3. First login: sign up at /signup — the first registered user becomes the
+   platform admin.
+
+Notes:
+  * Agent deploy target is Kubernetes (ENABLED_BACKENDS={{ .Values.enabledBackends }}).
+    Register clusters under Admin -> Kubernetes; mount their kubeconfigs via
+    kubeconfigs.existingSecret. The Docker deploy target is unavailable for a
+    cluster-hosted control plane (no Docker socket in pods).
+  * In-place release upgrades from the Admin UI are a Docker Compose feature;
+    on Kubernetes upgrade with: helm upgrade {{ .Release.Name }} <chart> --reuse-values
+  * Local backup storage uses the shared nora-backups PVC ({{ .Values.backupsVolume.accessModes | join "," }});
+    on multi-node clusters prefer S3/SSH backup storage or a ReadWriteMany class.
+{{- if not .Values.secrets.existingSecret }}
+  * IMPORTANT — record your secrets. This release generated JWT/encryption/
+    backup/API-key/DB secrets into the {{ include "nora.secretName" . }} Secret.
+    `helm uninstall` deletes that Secret, but the postgres pgdata PVC and the
+    nora-backups PVC are retained. A fresh reinstall generates NEW secrets that
+    cannot decrypt the retained data or match the kept DB password. Save them
+    now, or pass your own via secrets.existingSecret:
+
+      kubectl -n {{ .Release.Namespace }} get secret {{ include "nora.secretName" . }} -o yaml > nora-secrets-backup.yaml
+{{- end }}

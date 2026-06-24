@@ -2,52 +2,79 @@
 
 > Install the Email Nurture Builder template, connect one channel, optionally connect a send platform, and teach Cadence your audience and voice. Cadence plans and writes whole sequences — you send them.
 
-Cadence is an email-sequence agent built as an Agent Hub template. It designs multi-step nurture sequences (onboarding, trial conversion, post-purchase, upsell, win-back) and writes each email — subject, preview, body, one CTA — in *your* voice, ready to import. **Cadence drafts, you send.**
+Cadence is an email-sequence agent built as an Agent Hub template. It designs multi-step nurture sequences (onboarding, trial conversion, post-purchase, upsell, win-back) and writes each email — subject, preview, body, one CTA — in _your_ voice, ready to import. **Cadence drafts, you send.**
 
 <Tip>
-  **Cadence** is just the default name. On first run the agent asks what you'd like to call it — rename it, or keep "Cadence."
+  **Cadence** is just the default name. On first run the agent asks what you'd like to call it —
+  rename it, or keep "Cadence."
 </Tip>
 
 ## Before you install
+
 - A running Nora instance with dashboard access.
 - Your product, audience segment(s), brand voice, and email platform.
 
 ## Step 1 — Install from Agent Hub
+
 Open **Agent Hub**, find **Email Nurture Builder Claw**, and click **Install**. See [Publish and install Agent Hub templates](/guides/agent-hub).
 
+<Frame caption="Agent Hub — Email Nurture Builder Claw template detail before installation">
+  ![Cadence template detail](/images/guides/agent-templates/cadence-email-nurture.png)
+</Frame>
+
 ## Step 2 — Connect a channel
+
 Cadence needs **one** channel to send you drafts (Channels tab) — separate from the email platform your sequences are sent from.
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">At [developers.facebook.com](https://developers.facebook.com), add the **WhatsApp** product.</Step>
-  <Step title="Copy credentials">Copy the **Phone Number ID** and an **Access Token**.</Step>
-  <Step title="Add the channel">Agent → **Channels** tab → add **WhatsApp** → paste the values.</Step>
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
+  </Step>
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
+  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Or use Telegram / Slack / Discord / email — see [Configure channels](/guides/channels).
+Or use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels).
 
 ## Step 3 — (Optional) Connect a send platform
+
 Cadence produces ready-to-import copy — no integration required. To push drafts directly, connect one in the **Integrations** tab:
 
 <CardGroup cols={3}>
-  <Card title="SendGrid" href="/guides/integrations/sendgrid" icon="paper-plane" arrow>Programmatic delivery.</Card>
-  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>Send from your address.</Card>
-  <Card title="Notion" href="/guides/integrations/notion" icon="book" arrow>Store sequence drafts.</Card>
+  <Card title="SendGrid" href="/guides/integrations/sendgrid" icon="paper-plane" arrow>
+    Programmatic delivery.
+  </Card>
+  <Card title="Email" href="/guides/integrations/email" icon="envelope" arrow>
+    Send from your address.
+  </Card>
+  <Card title="Notion" href="/guides/integrations/notion" icon="book" arrow>
+    Store sequence drafts.
+  </Card>
 </CardGroup>
 
-<Note>Mailchimp/ConvertKit/Klaviyo aren't Nora integrations yet — Cadence formats copy you can paste into any of them.</Note>
+<Note>
+  Mailchimp/ConvertKit/Klaviyo aren't Nora integrations yet — Cadence formats copy you can paste
+  into any of them.
+</Note>
 
 ## Step 4 — Run the bootstrap
+
 Send any first message. Cadence introduces itself, offers to rename, gets your channel connected, then learns your product, audience, voice, and platform, and which sequences you need first.
 
 ## What Cadence will and won't do
+
 - **Draft-only.** Cadence never sends.
 - **Strategy first** — one job per email, no hype or trick subject lines.
 
 ## Troubleshooting
+
 <AccordionGroup>
   <Accordion title="Cadence says a platform isn't connected, but I added it">
-    Cadence reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the **Integrations** tab.
+    Cadence reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the
+    **Integrations** tab.
   </Accordion>
   <Accordion title="Copy doesn't sound like us">
     Paste an email you've sent that sounds right — Cadence calibrates from it.

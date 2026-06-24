@@ -1,0 +1,98 @@
+# Operate Nora over MCP
+
+> Run the Nora MCP server so Claude Code, Claude Desktop, Cursor, or any MCP client can deploy, inspect, and operate your agent fleet — "Claude, why is my agent stopped?" becomes a tool call against your own control plane.
+
+The `@noraai/mcp-server` package exposes Nora's public REST API as [Model Context Protocol](https://modelcontextprotocol.io) tools over stdio. It authenticates with the same workspace API keys the REST API and CLI use, so workspace scoping and scope-based permissions apply unchanged.
+
+## Prerequisites
+
+1. A running Nora control plane reachable over HTTPS.
+2. A workspace API key (Workspace → API Keys, or via the admin API). Scopes determine what the MCP tools can do:
+   - `agents:read` + `monitoring:read` — all read tools
+   - `agents:write` — deploy and lifecycle tools
+3. Node.js 20+ on the machine running the MCP client.
+
+## Connect a client
+
+<CodeGroup>
+
+```bash Claude Code
+claude mcp add nora \
+  --env NORA_API_URL=https://nora.example.com \
+  --env NORA_API_KEY=nora_xxxxxxxx \
+  -- npx -y @noraai/mcp-server
+```
+
+```json Claude Desktop / Cursor
+{
+  "mcpServers": {
+    "nora": {
+      "command": "npx",
+      "args": ["-y", "@noraai/mcp-server"],
+      "env": {
+        "NORA_API_URL": "https://nora.example.com",
+        "NORA_API_KEY": "nora_xxxxxxxx"
+      }
+    }
+  }
+}
+```
+
+```bash Via the Nora CLI
+# Requires @noraai/cli (see the CLI guide); reuses the host + token from `nora login`
+nora login --host https://nora.example.com --token nora_xxxxxxxx
+nora mcp
+```
+
+</CodeGroup>
+
+<Note>The `nora` command comes from [`@noraai/cli`](/guides/cli) (`npm install -g @noraai/cli`).</Note>
+
+## Configuration
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `NORA_API_URL` | yes | Base URL of your Nora deployment (the public origin, e.g. `https://nora.example.com`) |
+| `NORA_API_KEY` | yes | Workspace API key (`nora_…`) |
+| `NORA_MCP_ALLOW_DESTRUCTIVE` | no | Set `true` to register the `delete_agent` tool. Off by default. |
+
+When `NORA_API_URL`/`NORA_API_KEY` are unset, the server falls back to `NORA_HOST`/`NORA_TOKEN` and then to the CLI's `~/.nora/config.json`, so `nora login` is sufficient setup for local use.
+
+## Tools
+
+**Read** (require `agents:read` / `monitoring:read`):
+
+| Tool | What it returns |
+| --- | --- |
+| `list_agents` | All agents in the key's workspace with status, runtime family, deploy target, resources |
+| `get_agent` | One agent with live-reconciled container status |
+| `get_agent_versions` | Configuration version history |
+| `get_platform_metrics` | Fleet counts by status plus provisioning queue depth |
+| `list_monitoring_events` | Recent platform/agent events with type, search, and time filters |
+| `get_agent_metrics` | Time-series CPU/memory/network/disk/token metrics |
+| `get_agent_metrics_summary` | Aggregated metrics for one agent |
+| `get_agent_cost` | Pricing-aware token-cost rollup (default last 30 days) |
+
+**Write** (require `agents:write`):
+
+| Tool | Effect |
+| --- | --- |
+| `deploy_agent` | Provision a new runtime (name, runtime family, deploy target, sandbox profile, vCPU/RAM/disk) |
+| `start_agent` / `stop_agent` / `restart_agent` | Lifecycle control |
+| `redeploy_agent` | Re-provision the container with current config |
+| `delete_agent` | Permanent removal — only registered when `NORA_MCP_ALLOW_DESTRUCTIVE=true` |
+
+Tool output is the raw REST JSON, so anything the [API reference](/api/overview) documents is available to the model.
+
+## Example prompts
+
+- "List my agents and tell me which ones aren't running."
+- "Deploy an OpenClaw agent named research-assistant with 2 vCPU and 4 GB RAM, then watch it until it's running."
+- "What did agent X cost in the last 7 days, and what model was the spend on?"
+- "Show the last 20 events for the fleet and summarize anything unusual."
+
+## Security notes
+
+- The MCP server is a pure client of the REST API — it adds no endpoints and stores nothing. Revoking the API key cuts off access immediately.
+- Use a key with only the scopes you need; a read-only key (`agents:read`, `monitoring:read`) makes every tool safe.
+- `delete_agent` stays unregistered unless explicitly enabled, so a model can't be talked into destroying an agent by default.

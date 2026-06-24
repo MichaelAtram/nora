@@ -15,26 +15,32 @@ Make sure you have at least one LLM provider key saved in **Settings** before de
     Navigate to **Deploy** in the sidebar. This is the starting point for every new agent.
 
     ![Deploy wizard — agent identity step (name, slug, runtime family)](/images/guides/deploy/wizard-start.png)
+
   </Step>
 
-  <Step title="Enter a name">
-    Type a name for your agent. Names are limited to 100 characters. If you leave the field blank, Nora generates a default name such as `OpenClaw-Agent-472`.
-  </Step>
+<Step title="Enter a name">
+  Type a name for your agent. Names are limited to 100 characters. If you leave the field blank,
+  Nora generates a default name such as `OpenClaw-Agent-472`.
+</Step>
 
   <Step title="Choose a sandbox type">
     Select the sandbox that will run your agent. See the [sandbox comparison table](#sandbox-types) below for details on each option.
 
     ![Deploy wizard — runtime + sandbox selection](/images/guides/deploy/wizard-runtime.png)
+
   </Step>
 
-  <Step title="Set resource limits">
-    Specify the vCPU count, RAM (MB), and disk size (GB) for the agent container. In self-hosted mode these values are clamped to the operator-configured limits. In PaaS mode they are fixed to your subscription plan.
-  </Step>
+<Step title="Set resource limits">
+  Specify the vCPU count, RAM (MB), and disk size (GB) for the agent container. In self-hosted mode
+  these values are clamped to the operator-configured limits. In PaaS mode they are fixed to your
+  subscription plan.
+</Step>
 
   <Step title="Confirm and deploy">
     Click **Confirm & Deploy Agent**. Nora creates the agent record with a `queued` status and adds a deployment job to the queue.
 
     ![Deploy wizard — final confirm step before submission](/images/guides/deploy/wizard-confirm.png)
+
   </Step>
 </Steps>
 
@@ -46,7 +52,8 @@ After you click **Confirm & Deploy Agent**, the deployment moves through two sta
 2. **Running** — Nora provisions the container and starts the agent runtime. The status transitions to `running` once the container is live.
 
 <Note>
-  If the container cannot start, the status transitions to `error` or `warning`. From either of those states you can redeploy the agent (see below).
+  If the container cannot start, the status transitions to `error` or `warning`. From either of
+  those states you can redeploy the agent (see below).
 </Note>
 
 ## Lifecycle actions
@@ -71,15 +78,15 @@ Once an agent exists you can manage it from its detail page. The following actio
 
 From an agent's detail page you can:
 
-* **Chat** — Send messages to the agent runtime using the OpenClaw chat interface with streaming responses.
-* **Logs** — View live and historical log output from the agent container.
-* **Terminal** — Open an interactive terminal session connected to the running agent.
+- **Chat** — Send messages to the agent runtime using the OpenClaw chat interface with streaming responses.
+- **Logs** — View live and historical log output from the agent container.
+- **Terminal** — Open an interactive terminal session connected to the running agent.
 
 The chat and terminal tabs are only available while the agent status is `running`. Logs are accessible regardless of status.
 
 ## Sandbox types
 
-Nora supports two sandbox types. Choose the one that fits your security and model requirements.
+Nora supports the GA standard sandbox and the experimental NemoClaw sandbox profile. Choose the one that fits your security and model requirements.
 
 | Feature                  | Standard sandbox            | NemoClaw sandbox                           |
 | ------------------------ | --------------------------- | ------------------------------------------ |
@@ -88,11 +95,12 @@ Nora supports two sandbox types. Choose the one that fits your security and mode
 | **Policy controls**      | None                        | OpenShell allow/deny policies              |
 | **Supported models**     | Any configured LLM provider | NVIDIA Nemotron models only                |
 | **Approval workflow**    | No                          | Yes — operator reviews flagged actions     |
-| **Operator requirement** | None                        | `NEMOCLAW_ENABLED=true` must be set        |
+| **Operator requirement** | None                        | `nemoclaw` in `ENABLED_SANDBOX_PROFILES`   |
 | **Use case**             | General-purpose agents      | Security-sensitive or compliance workflows |
 
 <Tip>
-  If you select the NemoClaw sandbox and `NEMOCLAW_ENABLED` is not set to `true` in your environment, deployment will return an error. Ask your operator to enable it first.
+  If you select the NemoClaw sandbox and `nemoclaw` is not included in `ENABLED_SANDBOX_PROFILES` in
+  your environment, deployment will return an error. Ask your operator to enable it first.
 </Tip>
 
 For a full guide to NemoClaw agents, see [Run secure agents with NemoClaw sandboxes](/guides/nemoclaw).

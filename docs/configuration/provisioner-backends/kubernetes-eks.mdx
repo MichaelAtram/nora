@@ -14,6 +14,9 @@ EKS uses the same Kubernetes adapter as every Kubernetes provider. Nora stores p
 - **AWS Load Balancer Controller** installed in the cluster, OR EKS **Auto Mode** enabled — without one, Service provisioning hangs at `EXTERNAL-IP: <pending>`.
 - `kubectl` installed on the host that runs Nora.
 
+Use the EKS cluster overview page to confirm the cluster name and AWS region before creating
+the kubeconfig.
+
 <Frame caption="AWS Console — EKS cluster overview">
   ![EKS cluster overview](/images/provisioner-backends/k8s/eks/cluster-overview.png)
 </Frame>
@@ -36,8 +39,8 @@ kubectl --kubeconfig ./.secrets/eks-kubeconfig get nodes
 
 Confirm the node group reports `Ready` in the Console's **Compute** tab.
 
-<Frame caption="AWS Console — Cluster → Compute (node group Ready)">
-  ![EKS compute tab](/images/provisioner-backends/k8s/eks/compute-tab.png)
+<Frame caption="AWS Console — EKS dashboard with managed node groups tab">
+  ![EKS managed node groups dashboard](/images/provisioner-backends/k8s/eks/compute-tab.png)
 </Frame>
 
 ### 4. Configure Nora
@@ -54,8 +57,8 @@ For two or more EKS clusters, put each kubeconfig under `NORA_KUBECONFIGS_DIR` a
 
 Confirm the LB-creating add-on is present under **Add-ons** before continuing.
 
-<Frame caption="AWS Console — Cluster → Add-ons (AWS Load Balancer Controller / Auto Mode)">
-  ![EKS add-ons](/images/provisioner-backends/k8s/eks/add-ons.png)
+<Frame caption="AWS Console — Cluster → Add-ons (Amazon VPC CNI active)">
+  ![EKS Amazon VPC CNI add-on](/images/provisioner-backends/k8s/eks/add-ons.png)
 </Frame>
 
 ### 5. Start the stack
@@ -121,7 +124,10 @@ Set the Admin **Load balancer class** field to `eks.amazonaws.com/nlb`.
 For AWS Load Balancer Controller / NLB annotations:
 
 ```json theme={null}
-{"service.beta.kubernetes.io/aws-load-balancer-scheme":"internet-facing","service.beta.kubernetes.io/aws-load-balancer-nlb-target-type":"ip"}
+{
+  "service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing",
+  "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "ip"
+}
 ```
 
 Your cluster must have the AWS load-balancing path you choose installed and configured. If Services stay pending, check the EKS controller events and IAM permissions for load balancer creation.

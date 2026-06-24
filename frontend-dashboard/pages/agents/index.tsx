@@ -327,7 +327,9 @@ function SearchEmptyState({ search, onClear }) {
 function AgentCard({ agent, backendConfig, onAction }) {
   const isActive = agent.status === "running" || agent.status === "warning";
   const powerAction = isActive ? "stop" : "start";
-  const powerDisabled = !isActive && !agent.container_id;
+  // Adopted external runtimes aren't controlled by Nora — no start/stop.
+  const isExternal = String(agent?.deploy_target || "").toLowerCase() === "external";
+  const powerDisabled = isExternal || (!isActive && !agent.container_id);
   const runtimePathLabel = formatRuntimePathLabel(agent, backendConfig);
   const runtimeFamilyLabel = formatRuntimeFamilyLabel(agent.runtime_family);
   const executionTargetLabel = formatExecutionTargetLabel(
@@ -383,6 +385,11 @@ function AgentCard({ agent, backendConfig, onAction }) {
             <span className="inline-flex items-center rounded-full bg-white px-3 py-1 text-[11px] font-bold text-slate-700 border border-blue-100">
               {sandboxLabel}
             </span>
+            {isExternal ? (
+              <span className="inline-flex items-center rounded-full bg-blue-600/10 px-3 py-1 text-[11px] font-bold text-blue-700 border border-blue-200">
+                External
+              </span>
+            ) : null}
           </div>
         </div>
 
@@ -421,11 +428,13 @@ function AgentCard({ agent, backendConfig, onAction }) {
                 : "bg-emerald-50 border-emerald-100 text-emerald-500 hover:bg-emerald-100",
           )}
           title={
-            powerDisabled
-              ? "Start is unavailable until a container has been provisioned"
-              : isActive
-                ? "Stop agent"
-                : "Start agent"
+            isExternal
+              ? "External runtime — lifecycle controls are unavailable"
+              : powerDisabled
+                ? "Start is unavailable until a container has been provisioned"
+                : isActive
+                  ? "Stop agent"
+                  : "Start agent"
           }
         >
           <Power size={18} />

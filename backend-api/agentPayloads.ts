@@ -4,6 +4,7 @@ const db = require("./db");
 const integrations = require("./integrations");
 const channels = require("./channels");
 const { runtimeUrlForAgent } = require("../agent-runtime/lib/agentEndpoints");
+const { runtimeAuthHeaders } = require("./runtimeAuth");
 const { NORA_INTEGRATIONS_CONTEXT_FILE } = require("../agent-runtime/lib/runtimeBootstrap");
 const { NORA_INTEGRATIONS_SKILL_FILE } = require("../agent-runtime/lib/integrationTools");
 const {
@@ -456,7 +457,7 @@ async function fetchTemplateExportViaRuntime(agent, includeMemory) {
 
   const response = await fetch(runtimeUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await runtimeAuthHeaders(agent)) },
     body: JSON.stringify({ includeMemory }),
   });
 
@@ -562,7 +563,7 @@ process.stdout.write(JSON.stringify(result));
   const command = `node -e ${JSON.stringify(exportScript)} ${includeMemory ? "1" : "0"}`;
   const response = await fetch(runtimeUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await runtimeAuthHeaders(agent)) },
     body: JSON.stringify({
       command,
       timeout: 120000,

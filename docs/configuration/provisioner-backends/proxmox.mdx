@@ -1,12 +1,24 @@
 # Proxmox provisioner backend
 
-> Provision Nora agents as Proxmox-managed LXC runtime targets through the Proxmox API and SSH bootstrap.
+> Track the planned Proxmox execution target. Proxmox is not supported for normal Nora deployments in the current release.
 
-Proxmox gives Nora a stronger isolation and infrastructure-control option than local Docker containers while keeping the Nora control plane in Docker Compose.
+Proxmox is a roadmap execution target for Nora agents. The adapter work is present for continued development, but current releases keep Proxmox release-blocked in the runtime catalog. Use Docker or Admin-registered Kubernetes for supported deployments today. NemoClaw is available only as an experimental sandbox profile on supported targets.
 
-![Deploy wizard — Execution Target picker showing Proxmox alongside other enabled backends](/images/configuration/deploy-backend-picker.png)
+![Deploy wizard — Execution Target picker with execution target options](/images/configuration/deploy-backend-picker.png)
 
-## Configuration
+## Current status
+
+Even if `ENABLED_BACKENDS` includes `proxmox`, Nora marks Proxmox as blocked and returns:
+
+```text theme={null}
+Proxmox execution target is not supported in this Nora release.
+```
+
+The blocked target can stay visible for operator awareness, but it is excluded from normal onboarding and should not be used for production agent placement.
+
+## Adapter configuration reference
+
+These settings are retained for adapter development and future validation. They do not make Proxmox a supported execution target in the current release.
 
 ```bash theme={null}
 ENABLED_BACKENDS=proxmox
@@ -25,7 +37,7 @@ PROXMOX_SSH_PRIVATE_KEY_PATH=/run/secrets/proxmox_key
 
 `PROXMOX_TOKEN_ID` must use Proxmox API token format: `user@realm!tokenname`.
 
-## Required access
+## Future required access
 
 The API token and SSH user must be able to:
 
@@ -33,7 +45,7 @@ The API token and SSH user must be able to:
 - Start, stop, restart, and delete the runtime target.
 - Run bootstrap commands through `pct` during first deploy.
 
-## Runtime-specific templates
+## Future runtime-specific templates
 
 OpenClaw uses `PROXMOX_TEMPLATE`. Hermes and NemoClaw need explicit templates when those runtime paths are enabled:
 
@@ -44,11 +56,11 @@ PROXMOX_NEMOCLAW_TEMPLATE=
 
 ## Verification
 
-Confirm the backend reports as available:
+Confirm the backend reports as blocked:
 
 ```bash theme={null}
 docker compose up -d --build backend-api worker-provisioner
 curl -fsS http://localhost:8080/api/config/platform
 ```
 
-If Proxmox appears enabled but unavailable, check `backend-api` startup logs for missing API token, SSH, or template settings.
+The response should show Proxmox as unavailable or blocked, while Docker and any Admin-registered Kubernetes targets remain the supported deployment paths.

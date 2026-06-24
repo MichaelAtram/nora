@@ -11,7 +11,7 @@ It is designed to filter noisy trends, identify signals that matter to a specifi
 Full walkthrough: **[Signal setup guide](https://noradocs.solomontsao.com/guides/signal-market-signal)**.
 
 1. **Install from Agent Hub** — install the listing into a workspace.
-2. **Connect one channel** (**Channels** tab) so Signal can reach you — **WhatsApp** recommended (Phone Number ID + Access Token), or Telegram / Slack / Discord / email. You only need one. (This is separate from the social platforms you publish to.)
+2. **Connect one channel** (**Channels** tab) so Signal can reach you — **WhatsApp** recommended (QR/link pairing), or Telegram / Slack / Discord or another OpenClaw catalog channel. You only need one. (This is separate from the social platforms you publish to.)
 3. **(Optional) Connect social accounts** (**Integrations** tab) — LinkedIn, Twitter (X), Instagram, Facebook, or Notion. Signal researches and drafts fine without them; publishing stays human-approved.
 4. **Say hi** — Signal introduces itself, offers to rename, gets your channel connected, then captures your brand, audience, platforms, and signal rules.
 

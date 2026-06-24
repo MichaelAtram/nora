@@ -2,7 +2,11 @@
 
 > A complete reference for the Nora REST API: base URLs, authentication, rate limiting, content type, health check, and public config endpoints.
 
-The Nora REST API is a JSON-over-HTTP interface that lets you deploy agents, manage LLM providers, configure channels, and observe platform health programmatically. Every request must include a valid Bearer token in the `Authorization` header — except for the public health, config, and webhook endpoints listed below. All request and response bodies use `application/json`.
+The Nora REST API is a JSON-over-HTTP interface that lets you deploy agents, manage LLM providers, configure channels, and observe platform health programmatically. Every request must be authenticated — with either a session JWT or a workspace API key — except for the public health, config, and webhook endpoints listed below. All request and response bodies use `application/json`.
+
+<Tip>
+  Every Nora instance also serves a machine-readable **OpenAPI 3.1 spec** at `GET /api/api.json` and an **interactive API reference** at `/api/api-docs`. The spec covers the tier-1 surface (agents, budgets, monitoring, LLM providers, auth) and is drift-tested in CI against the actual routers, so it cannot silently go stale.
+</Tip>
 
 ## Base URL
 
@@ -24,13 +28,42 @@ https://app.example.com/api
 
 ## Authentication
 
-All protected endpoints require a JWT in the `Authorization` header:
+Protected endpoints accept **either** of two credentials.
+
+**1. A session JWT** — supplied as a Bearer token:
 
 ```
-Authorization: Bearer <token>
+Authorization: Bearer <jwt>
 ```
 
-Obtain a token via `POST /auth/login`. Tokens are valid for **7 days**. See the [Authentication](/api/authentication) page for the full login flow.
+Obtain one via `POST /auth/login`. Tokens are valid for **7 days** and are also accepted as an HttpOnly session cookie. See the [Authentication](/api/authentication) page for the full login flow.
+
+**2. A workspace API key** — supplied as a Bearer token (the key begins with `nora_`) or in the `X-Api-Key` header (alias `X-Nora-Api-Key`):
+
+```
+Authorization: Bearer nora_<key>
+```
+
+```
+X-Api-Key: nora_<key>
+```
+
+API keys carry **scopes** that are enforced per endpoint, drawn from the recognized v1 set:
+
+| Scope                 | Grants                                          |
+| --------------------- | ----------------------------------------------- |
+| `agents:read`         | Read agents in the workspace                    |
+| `agents:write`        | Create, update, and operate agents              |
+| `workspaces:read`     | Read workspace metadata and members             |
+| `monitoring:read`     | Read monitoring metrics and events              |
+| `integrations:read`   | Read integration configurations                 |
+| `integrations:write`  | Create and remove integrations                  |
+
+Session-authenticated requests skip scope checks (role-based guards apply instead). A request whose API key lacks the required scope is rejected with `403` and `{ "code": "missing_scope" }`.
+
+<Note>
+  Some mutating or destructive operations are **session-only** and reject API keys even with a valid scope — for example monitoring writes, workspace writes, and API-key issuance. These return `403` with `{ "code": "session_required" }`.
+</Note>
 
 ## Rate limiting
 

@@ -16,11 +16,25 @@ GET /monitoring/metrics
 
 ### Response
 
-<ResponseField name="agents_total" type="number">Total number of agents owned by the user.</ResponseField>
-<ResponseField name="agents_running" type="number">Agents currently in `running` state.</ResponseField>
-<ResponseField name="agents_stopped" type="number">Agents in `stopped` state.</ResponseField>
-<ResponseField name="agents_error" type="number">Agents in `error` or `warning` state.</ResponseField>
-<ResponseField name="events_today" type="number">Number of activity events recorded in the last 24 hours.</ResponseField>
+<ResponseField name="totalAgents" type="number">Total number of accessible agents.</ResponseField>
+<ResponseField name="activeAgents" type="number">Agents currently in `running` state.</ResponseField>
+<ResponseField name="deployingAgents" type="number">Agents currently in `deploying` state.</ResponseField>
+<ResponseField name="queuedAgents" type="number">Agents in `queued` state.</ResponseField>
+<ResponseField name="stoppedAgents" type="number">Agents in `stopped` state.</ResponseField>
+<ResponseField name="warningAgents" type="number">Agents in `warning` state.</ResponseField>
+<ResponseField name="errorAgents" type="number">Agents in `error` state.</ResponseField>
+<ResponseField name="totalDeployments" type="number">Total number of deployments.</ResponseField>
+
+<ResponseField name="queue" type="object">
+  Deployment queue job counts.
+
+  <Expandable title="properties">
+    <ResponseField name="waiting" type="number">Jobs waiting to run.</ResponseField>
+    <ResponseField name="active" type="number">Jobs currently running.</ResponseField>
+    <ResponseField name="completed" type="number">Jobs completed.</ResponseField>
+    <ResponseField name="failed" type="number">Jobs failed.</ResponseField>
+  </Expandable>
+</ResponseField>
 
 <CodeGroup>
   ```bash curl theme={null}
@@ -31,11 +45,65 @@ GET /monitoring/metrics
 
 ```json theme={null}
 {
-  "agents_total": 4,
-  "agents_running": 2,
-  "agents_stopped": 1,
-  "agents_error": 1,
-  "events_today": 37
+  "totalAgents": 4,
+  "activeAgents": 2,
+  "deployingAgents": 0,
+  "queuedAgents": 0,
+  "stoppedAgents": 1,
+  "warningAgents": 0,
+  "errorAgents": 1,
+  "totalDeployments": 7,
+  "queue": { "waiting": 0, "active": 0, "completed": 0, "failed": 0 }
+}
+```
+
+***
+
+## Fleet needs-attention roll-up
+
+Return only the agents that need an operator's attention right now, with the reasons why. Derived at read time from existing state — no extra configuration. Use it to drive a triage view instead of scanning every agent. Requires the `monitoring:read` scope.
+
+Detected reasons: `error` and `budget_paused` (severity error); `warning`, `stuck_deploying` (queued/deploying over 10 minutes), `budget_warning` (a running agent crossed a budget soft threshold), and `telemetry_stalled` (a running agent reported no container telemetry for over 5 minutes).
+
+```
+GET /monitoring/fleet-status
+```
+
+### Response
+
+<ResponseField name="generatedAt" type="string">ISO timestamp the roll-up was computed.</ResponseField>
+<ResponseField name="total" type="number">Total number of accessible agents evaluated.</ResponseField>
+<ResponseField name="attentionCount" type="number">Number of agents needing attention.</ResponseField>
+<ResponseField name="agents" type="array">Agents needing attention, errors first. Each has `agentId`, `name`, `status`, `severity`, and a `reasons` array of `{ code, severity, label }`.</ResponseField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl http://localhost:8080/api/monitoring/fleet-status \
+    -H "Authorization: Bearer $TOKEN"
+  ```
+</CodeGroup>
+
+```json theme={null}
+{
+  "generatedAt": "2026-06-12T12:00:00.000Z",
+  "total": 4,
+  "attentionCount": 2,
+  "agents": [
+    {
+      "agentId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Billing bot",
+      "status": "stopped",
+      "severity": "error",
+      "reasons": [{ "code": "budget_paused", "severity": "error", "label": "Paused — budget cap reached" }]
+    },
+    {
+      "agentId": "b2c3d4e5-f6a7-8901-bcde-f23456789012",
+      "name": "Scraper",
+      "status": "deploying",
+      "severity": "warning",
+      "reasons": [{ "code": "stuck_deploying", "severity": "warning", "label": "Stuck deploying for 18m" }]
+    }
+  ]
 }
 ```
 
@@ -58,6 +126,30 @@ GET /monitoring/events
 <ParamField query="limit" type="number" default="50">
   Maximum number of events to return, ordered newest first.
 </ParamField>
+
+<ParamField query="type" type="string">
+  Filter events to a specific event type slug.
+</ParamField>
+
+<ParamField query="search" type="string">
+  Full-text filter across event messages.
+</ParamField>
+
+<ParamField query="from" type="string">
+  Inclusive start date (`YYYY-MM-DD`) for the event window.
+</ParamField>
+
+<ParamField query="to" type="string">
+  Inclusive end date (`YYYY-MM-DD`) for the event window.
+</ParamField>
+
+<ParamField query="page" type="number">
+  Page number for paginated results (1-based).
+</ParamField>
+
+<Note>
+  Supplying any of `page`, `search`, `type`, `from`, or `to` switches the response to a pagination envelope (with `limit` clamped to 10–100). Without those filters, a flat array is returned (`limit` 1–100, default 50).
+</Note>
 
 ### Response
 
@@ -108,6 +200,10 @@ Return raw API performance metric records. Useful for building latency dashboard
 ```
 GET /monitoring/performance
 ```
+
+<Note>
+  Unlike the other `/monitoring/*` endpoints, this one requires the platform-admin role. Non-admin callers receive `403 {"error": "Admin access required"}`.
+</Note>
 
 ### Query parameters
 

@@ -14,10 +14,16 @@ const {
   HERMES_DASHBOARD_PORT,
 } = require("../../../agent-runtime/lib/contracts");
 const { getHermesDockerAgentImage } = require("../../../agent-runtime/lib/agentImages");
+const { getNemoClawDefaultModel } = require("../../../agent-runtime/lib/nemoclawDefaults");
 const {
   buildContainerBootstrap,
   shellSingleQuote,
 } = require("../../../agent-runtime/lib/containerCommand");
+const {
+  HERMES_MANAGED_ENV_ENV,
+  HERMES_MODEL_CONFIG_ENV,
+  buildHermesRuntimeConfigBootstrapCommand,
+} = require("../../../agent-runtime/lib/hermesRuntimeBootstrap");
 const {
   buildTelemetry,
   buildUnavailableTelemetry,
@@ -51,6 +57,21 @@ const K8S_UNAVAILABLE_CAPABILITIES = Object.freeze({
   pids: false,
 });
 const OPERATOR_POLICY_FAMILIES = Object.freeze(["openclaw", "hermes"]);
+const SENSITIVE_ENV_PATTERNS = Object.freeze([
+  /API_KEY/i,
+  /TOKEN/i,
+  /PASSWORD/i,
+  /_PASS$/i,
+  /SECRET/i,
+  /PRIVATE_KEY/i,
+  /PASSPHRASE/i,
+  /CREDENTIAL/i,
+  /SERVICE_ACCOUNT/i,
+  /KUBECONFIG/i,
+  /^PGPASSWORD$/i,
+  /^API_SERVER_KEY$/i,
+  /^OPENCLAW_GATEWAY_TOKEN$/i,
+]);
 
 function parseK8sCpuCores(value) {
   if (value == null) return null;
@@ -150,6 +171,33 @@ function safeK8sName(name, fallback) {
   return safeHostname(name, fallback).slice(0, 63) || fallback;
 }
 
+function isSensitiveEnvName(name) {
+  return SENSITIVE_ENV_PATTERNS.some((pattern) => pattern.test(String(name || "")));
+}
+
+function buildEnvEntries(envMap = {}, secretName = "") {
+  const env = [];
+  const stringData = {};
+  for (const [key, value] of Object.entries(envMap || {})) {
+    if (!key || value == null) continue;
+    if (isSensitiveEnvName(key)) {
+      stringData[key] = String(value);
+      env.push({
+        name: key,
+        valueFrom: {
+          secretKeyRef: {
+            name: secretName,
+            key,
+          },
+        },
+      });
+      continue;
+    }
+    env.push({ name: key, value: String(value) });
+  }
+  return { env, stringData };
+}
+
 function defaultDeployNameForRuntime(runtimeFamily, id, name) {
   const prefix = runtimeFamily === "hermes" ? "nora-hermes" : "nora-oclaw";
   return safeK8sName(`${prefix}-${name || "agent"}-${id}`, `${prefix}-${id}`);
@@ -158,6 +206,7 @@ function defaultDeployNameForRuntime(runtimeFamily, id, name) {
 function buildHermesStartCommand() {
   const hermesRuntimeCommand = [
     "set -eu",
+    buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
     `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
@@ -167,6 +216,17 @@ function buildHermesStartCommand() {
   return [
     "set -eu",
     `exec ${HERMES_ENTRYPOINT} bash -lc ${shellSingleQuote(hermesRuntimeCommand)}`,
+  ].join("\n");
+}
+
+function buildHermesPostStartCommand() {
+  return [
+    "set -eu",
+    `if [ -z "\${${HERMES_MANAGED_ENV_ENV}:-}" ] && [ -z "\${${HERMES_MODEL_CONFIG_ENV}:-}" ]; then exit 0; fi`,
+    // The Hermes image migrates/seeds config.yaml in s6 cont-init. Run after
+    // that has had a short window, then use Hermes's own config helpers.
+    'sleep "${NORA_HERMES_BOOTSTRAP_DELAY_SECONDS:-8}"',
+    buildHermesRuntimeConfigBootstrapCommand(),
   ].join("\n");
 }
 
@@ -1110,6 +1170,10 @@ class K8sBackend extends ProvisionerBackend {
     return `${deployName}-bootstrap`;
   }
 
+  _envSecretName(deployName) {
+    return `${deployName}-env`;
+  }
+
   _bootstrapLaunch(bootstrap) {
     const interpreter =
       Array.isArray(bootstrap?.interpreter) && bootstrap.interpreter.length > 0
@@ -1176,6 +1240,51 @@ class K8sBackend extends ProvisionerBackend {
       );
       body.metadata.resourceVersion = current?.metadata?.resourceVersion;
       await this.coreApi.replaceNamespacedConfigMap({
+        name,
+        namespace,
+        body,
+      });
+    }
+
+    return name;
+  }
+
+  async _upsertEnvSecret(deployName, stringData = {}, labels = {}, namespace = this.namespace) {
+    const name = this._envSecretName(deployName);
+    const body = {
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: {
+        name,
+        namespace,
+        labels: {
+          "nora.agent.id": this._agentIdFromDeployName(deployName),
+          "nora.env": "true",
+          "nora.execution.target": this.executionTargetLabelValue,
+          "nora.kubernetes.cluster": this.clusterId,
+          ...labels,
+        },
+      },
+      type: "Opaque",
+      stringData,
+    };
+
+    try {
+      await this.coreApi.createNamespacedSecret({
+        namespace,
+        body,
+      });
+    } catch (error) {
+      if (!this._isAlreadyExistsError(error)) throw error;
+
+      const current = this._serviceObject(
+        await this.coreApi.readNamespacedSecret({
+          name,
+          namespace,
+        }),
+      );
+      body.metadata.resourceVersion = current?.metadata?.resourceVersion;
+      await this.coreApi.replaceNamespacedSecret({
         name,
         namespace,
         body,
@@ -1477,6 +1586,25 @@ class K8sBackend extends ProvisionerBackend {
     return true;
   }
 
+  async _deleteEnvSecretIfExists(deployName, namespace) {
+    const name = this._envSecretName(deployName);
+    try {
+      await this.coreApi.deleteNamespacedSecret({
+        name,
+        namespace,
+        propagationPolicy: "Foreground",
+      });
+    } catch (error) {
+      if (this._isNotFoundError(error)) return false;
+      throw error;
+    }
+
+    await this._waitForDeleted("Secret", name, namespace, () =>
+      this.coreApi.readNamespacedSecret({ name, namespace }),
+    );
+    return true;
+  }
+
   _isNodePortConflictError(error) {
     const text = this._errorBodyText(error);
     const status = this._errorStatus(error);
@@ -1528,9 +1656,9 @@ class K8sBackend extends ProvisionerBackend {
       },
       namespace,
     );
-    const hermesLaunch = this._bootstrapLaunch(hermesBootstrap);
+    const hermesLaunchArgs = ["bash", "-lc", `. ${BOOTSTRAP_SCRIPT_PATH}`];
 
-    const envVars = Object.entries({
+    const hermesEnvMap = {
       ...(env || {}),
       HERMES_HOME,
       HOME: `${HERMES_HOME}/home`,
@@ -1541,7 +1669,24 @@ class K8sBackend extends ProvisionerBackend {
       GATEWAY_HEALTH_URL: `http://127.0.0.1:${HERMES_RUNTIME_PORT}`,
       MESSAGING_CWD: HERMES_WORKSPACE,
       TERMINAL_CWD: HERMES_WORKSPACE,
-    }).map(([key, value]) => ({ name: key, value: String(value) }));
+    };
+    const hermesSecretName = this._envSecretName(deployName);
+    const { env: envVars, stringData: hermesSecretData } = buildEnvEntries(
+      hermesEnvMap,
+      hermesSecretName,
+    );
+    if (Object.keys(hermesSecretData).length > 0) {
+      await this._upsertEnvSecret(
+        deployName,
+        hermesSecretData,
+        {
+          "nora.agent.id": String(id),
+          "nora.deployment.name": deployName,
+          "nora.runtime.family": "hermes",
+        },
+        namespace,
+      );
+    }
 
     const deployment = {
       apiVersion: "apps/v1",
@@ -1580,10 +1725,16 @@ class K8sBackend extends ProvisionerBackend {
               {
                 name: "agent",
                 image: imgName,
-                command: hermesLaunch.command,
-                args: hermesLaunch.args,
+                args: hermesLaunchArgs,
                 workingDir: HERMES_HOME,
                 env: envVars,
+                lifecycle: {
+                  postStart: {
+                    exec: {
+                      command: ["/bin/sh", "-lc", buildHermesPostStartCommand()],
+                    },
+                  },
+                },
                 volumeMounts: [this._bootstrapVolumeMount()],
                 ports: [
                   { name: "runtime", containerPort: HERMES_RUNTIME_PORT },
@@ -1641,10 +1792,7 @@ class K8sBackend extends ProvisionerBackend {
     const namespace = this._namespaceForRuntimeFamily("openclaw");
     const isNemoClaw = sandboxProfile === "nemoclaw";
     const sandboxLabelMap = this._sandboxProfileLabelMap(isNemoClaw);
-    const nemoModel =
-      env?.NEMOCLAW_MODEL ||
-      process.env.NEMOCLAW_DEFAULT_MODEL ||
-      "nvidia/nemotron-3-super-120b-a12b";
+    const nemoModel = env?.NEMOCLAW_MODEL || getNemoClawDefaultModel(process.env);
 
     await this._ensureNamespace(namespace);
     const policyStatus = await this._reconcileNetworkPolicies({
@@ -1708,7 +1856,7 @@ class K8sBackend extends ProvisionerBackend {
       },
     });
 
-    const envVars = Object.entries({
+    const openClawEnvMap = {
       ...(env || {}),
       ...buildRuntimeEnv(),
       ...(isNemoClaw
@@ -1723,7 +1871,25 @@ class K8sBackend extends ProvisionerBackend {
           }
         : {}),
       OPENCLAW_GATEWAY_TOKEN: gatewayToken,
-    }).map(([k, v]) => ({ name: k, value: String(v) }));
+    };
+    const openClawSecretName = this._envSecretName(deployName);
+    const { env: envVars, stringData: openClawSecretData } = buildEnvEntries(
+      openClawEnvMap,
+      openClawSecretName,
+    );
+    if (Object.keys(openClawSecretData).length > 0) {
+      await this._upsertEnvSecret(
+        deployName,
+        openClawSecretData,
+        {
+          "nora.agent.id": String(id),
+          "nora.deployment.name": deployName,
+          "nora.runtime.family": "openclaw",
+          "nora.sandbox.profile": isNemoClaw ? "nemoclaw" : "standard",
+        },
+        namespace,
+      );
+    }
 
     // CMD: install openclaw, configure gateway with pre-paired device, start the
     // runtime sidecar, then launch the gateway.
@@ -1792,6 +1958,7 @@ class K8sBackend extends ProvisionerBackend {
         "nora.runtime.family": "openclaw",
         "nora.execution.target": this.executionTargetLabelValue,
         "nora.kubernetes.cluster": this.clusterId,
+        "nora.sandbox.profile": isNemoClaw ? "nemoclaw" : "standard",
         "openclaw.agent.id": String(id),
         ...sandboxLabelMap,
       },
@@ -1812,6 +1979,7 @@ class K8sBackend extends ProvisionerBackend {
           "nora.runtime.family": "openclaw",
           "nora.execution.target": this.executionTargetLabelValue,
           "nora.kubernetes.cluster": this.clusterId,
+          "nora.sandbox.profile": isNemoClaw ? "nemoclaw" : "standard",
           "openclaw.agent.id": String(id),
           ...sandboxLabelMap,
         },
@@ -1830,6 +1998,7 @@ class K8sBackend extends ProvisionerBackend {
               "nora.runtime.family": "openclaw",
               "nora.execution.target": this.executionTargetLabelValue,
               "nora.kubernetes.cluster": this.clusterId,
+              "nora.sandbox.profile": isNemoClaw ? "nemoclaw" : "standard",
               "openclaw.agent.id": String(id),
               ...sandboxLabelMap,
             },
@@ -1908,7 +2077,9 @@ class K8sBackend extends ProvisionerBackend {
       const deletedDeployment = await this._deleteDeploymentIfExists(deployName, namespace);
       const deletedService = await this._deleteServiceIfExists(deployName, namespace);
       const deletedConfigMap = await this._deleteBootstrapConfigMapIfExists(deployName, namespace);
-      deletedAny = deletedAny || deletedDeployment || deletedService || deletedConfigMap;
+      const deletedSecret = await this._deleteEnvSecretIfExists(deployName, namespace);
+      deletedAny =
+        deletedAny || deletedDeployment || deletedService || deletedConfigMap || deletedSecret;
     }
 
     console.log(
@@ -2228,6 +2399,59 @@ class K8sBackend extends ProvisionerBackend {
         }),
     );
     console.log(`[k8s] Deployment ${deployName} rollout restart triggered in ${namespace}`);
+  }
+
+  async updateEnv(containerId, envVars = {}, options = {}) {
+    const deployName = containerId;
+    const entries = Object.entries(envVars || {}).filter(([key]) => key);
+    if (entries.length === 0) return;
+
+    const { deployment, namespace } = await this._readDeploymentInCandidateNamespace(
+      deployName,
+      options,
+    );
+    const containers = deployment?.spec?.template?.spec?.containers || [];
+    const containerIndex = containers.findIndex((container) => container?.name === "agent");
+    const index = containerIndex >= 0 ? containerIndex : 0;
+    const env = Array.isArray(containers[index]?.env) ? containers[index].env : [];
+    const envIndexByName = new Map(env.map((entry, entryIndex) => [entry.name, entryIndex]));
+    const envPath = `/spec/template/spec/containers/${index}/env`;
+    const patch = [];
+
+    if (options?.runtimeFamily === "hermes") {
+      patch.push({
+        op: containers[index]?.lifecycle ? "replace" : "add",
+        path: `/spec/template/spec/containers/${index}/lifecycle`,
+        value: {
+          postStart: {
+            exec: {
+              command: ["/bin/sh", "-lc", buildHermesPostStartCommand()],
+            },
+          },
+        },
+      });
+    }
+
+    if (!Array.isArray(containers[index]?.env)) {
+      patch.push({ op: "add", path: envPath, value: [] });
+    }
+
+    for (const [name, value] of entries) {
+      const nextEntry = { name: String(name), value: String(value ?? "") };
+      const existingIndex = envIndexByName.get(name);
+      if (Number.isInteger(existingIndex)) {
+        patch.push({ op: "replace", path: `${envPath}/${existingIndex}`, value: nextEntry });
+      } else {
+        patch.push({ op: "add", path: `${envPath}/-`, value: nextEntry });
+      }
+    }
+
+    await this.appsApi.patchNamespacedDeployment({
+      name: deployName,
+      namespace,
+      body: patch,
+    });
+    console.log(`[k8s] Updated ${entries.length} env var(s) on deployment ${deployName}`);
   }
 
   /**

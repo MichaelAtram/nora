@@ -39,6 +39,7 @@ type DeployAgentOptions = {
   name?: string;
   runtimeFamily?: string;
   backend?: string;
+  executionTargetId?: string;
   sandboxProfile?: string;
   vcpu?: number;
   ramMb?: number;
@@ -76,6 +77,12 @@ type IntegrationRecord = {
   [key: string]: unknown;
 };
 
+type ProviderKeyRecord = {
+  id?: string;
+  provider?: string;
+  [key: string]: unknown;
+};
+
 type IntegrationTestResult = {
   success?: boolean;
   error?: string;
@@ -87,6 +94,41 @@ type ChannelRecord = {
   type?: string;
   name?: string;
   [key: string]: unknown;
+};
+
+type ChannelPayload = {
+  runtime?: string;
+  channels?: ChannelRecord[];
+  availableTypes?: Record<string, unknown>[];
+  capabilities?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+type ChannelTypeMetadata = {
+  type?: string;
+  label?: string;
+  configFields?: Record<string, unknown>[];
+  actions?: Record<string, unknown>;
+  hasComplexFields?: boolean;
+  [key: string]: unknown;
+};
+
+type ChannelSetupOptions = {
+  type: string;
+  config?: Record<string, unknown>;
+  enabled?: boolean;
+};
+
+type ChannelSetupResult = {
+  success?: boolean;
+  channel?: string;
+  restart?: unknown;
+  [key: string]: unknown;
+};
+
+type ChannelActionResult = {
+  status: number;
+  body: Record<string, unknown>;
 };
 
 type ChannelTestResult = {
@@ -155,12 +197,15 @@ async function getPlatformConfig(request: APIRequestContext, token: string) {
   return normalizePlatformConfig(body);
 }
 
-function backendSupported(platform: PlatformConfig, backendId: string) {
+function backendSupported(platform: PlatformConfig, backendId: string, executionTargetId?: string) {
   if (Array.isArray(platform.executionTargets)) {
-    const target = platform.executionTargets.find((entry) => entry?.id === backendId);
+    const target = platform.executionTargets.find(
+      (entry) => entry?.id === (executionTargetId || backendId),
+    );
     if (target) {
       return target.available !== false && target.configured !== false;
     }
+    if (executionTargetId) return false;
   }
 
   const enabled = platform.enabledBackends || platform.enabledDeployTargets || [];
@@ -184,6 +229,7 @@ async function deployAgent(
     name,
     runtimeFamily = "openclaw",
     backend = "docker",
+    executionTargetId,
     sandboxProfile = "standard",
     vcpu = 1,
     ramMb = 1024,
@@ -192,6 +238,7 @@ async function deployAgent(
     model,
   }: DeployAgentOptions = {},
 ) {
+  const target = executionTargetId || backend;
   const { body } = await apiJson<AgentRecord>(request, "/api/agents/deploy", {
     method: "POST",
     token,
@@ -199,7 +246,8 @@ async function deployAgent(
       name,
       runtime_family: runtimeFamily,
       backend_type: backend,
-      deploy_target: backend,
+      deploy_target: target,
+      execution_target_id: executionTargetId,
       sandbox_profile: sandboxProfile,
       vcpu,
       ram_mb: ramMb,
@@ -353,12 +401,21 @@ async function saveProviderKey(
   token: string,
   { provider, apiKey, model }: SaveProviderKeyOptions,
 ) {
-  const { body } = await apiJson(request, "/api/llm-providers", {
+  const { body } = await apiJson<ProviderKeyRecord>(request, "/api/llm-providers", {
     method: "POST",
     token,
     data: { provider, apiKey, model },
   });
-  return body;
+  return assertJsonRecord<ProviderKeyRecord>(body, "/api/llm-providers");
+}
+
+async function setProviderDefault(request: APIRequestContext, token: string, providerId: string) {
+  const { body } = await apiJson<ProviderKeyRecord>(request, `/api/llm-providers/${providerId}`, {
+    method: "PUT",
+    token,
+    data: { is_default: true },
+  });
+  return assertJsonRecord<ProviderKeyRecord>(body, `/api/llm-providers/${providerId}`);
 }
 
 async function listProviders(request: APIRequestContext, token: string) {
@@ -421,6 +478,59 @@ async function deleteIntegration(
 }
 
 // ── Channels ──────────────────────────────────────────────
+async function listAgentChannels(
+  request: APIRequestContext,
+  token: string,
+  agentId: string,
+): Promise<ChannelPayload> {
+  const { body } = await apiJson<ChannelPayload>(request, `/api/agents/${agentId}/channels`, {
+    token,
+  });
+  return assertJsonRecord<ChannelPayload>(body, `/api/agents/${agentId}/channels`);
+}
+
+async function getChannelType(
+  request: APIRequestContext,
+  token: string,
+  agentId: string,
+  type: string,
+): Promise<ChannelTypeMetadata> {
+  const { body } = await apiJson<ChannelTypeMetadata>(
+    request,
+    `/api/agents/${agentId}/channels/types/${encodeURIComponent(type)}`,
+    { token },
+  );
+  return assertJsonRecord<ChannelTypeMetadata>(
+    body,
+    `/api/agents/${agentId}/channels/types/${type}`,
+  );
+}
+
+async function saveChannelSetup(
+  request: APIRequestContext,
+  token: string,
+  agentId: string,
+  { type, config = {}, enabled = true }: ChannelSetupOptions,
+): Promise<ChannelSetupResult> {
+  const { body, response } = await apiJson<ChannelSetupResult>(
+    request,
+    `/api/agents/${agentId}/channels`,
+    {
+      method: "POST",
+      token,
+      data: { type, config, enabled },
+      failOnStatus: false,
+    },
+  );
+  if (!response.ok()) {
+    throw Object.assign(
+      new Error(`saveChannelSetup(${type}) failed: ${response.status()} ${JSON.stringify(body)}`),
+      { status: response.status(), body },
+    );
+  }
+  return assertJsonRecord<ChannelSetupResult>(body, `/api/agents/${agentId}/channels`);
+}
+
 async function createChannel(
   request: APIRequestContext,
   token: string,
@@ -463,6 +573,40 @@ async function testChannel(
   );
 }
 
+async function testChannelAction(
+  request: APIRequestContext,
+  token: string,
+  agentId: string,
+  channelId: string,
+): Promise<ChannelActionResult> {
+  const { body, response } = await apiJson<Record<string, unknown>>(
+    request,
+    `/api/agents/${agentId}/channels/${channelId}/test`,
+    { method: "POST", token, failOnStatus: false },
+  );
+  return {
+    status: response.status(),
+    body: assertJsonRecord(body, `/api/agents/${agentId}/channels/${channelId}/test`),
+  };
+}
+
+async function deleteChannelAction(
+  request: APIRequestContext,
+  token: string,
+  agentId: string,
+  channelId: string,
+): Promise<ChannelActionResult> {
+  const { body, response } = await apiJson<Record<string, unknown>>(
+    request,
+    `/api/agents/${agentId}/channels/${channelId}`,
+    { method: "DELETE", token, failOnStatus: false },
+  );
+  return {
+    status: response.status(),
+    body: assertJsonRecord(body, `/api/agents/${agentId}/channels/${channelId}`),
+  };
+}
+
 async function deleteChannel(
   request: APIRequestContext,
   token: string,
@@ -491,12 +635,18 @@ export {
   chatOpenClaw,
   chatHermes,
   saveProviderKey,
+  setProviderDefault,
   listProviders,
   connectIntegration,
   testIntegration,
   listAgentIntegrations,
   deleteIntegration,
+  listAgentChannels,
+  getChannelType,
+  saveChannelSetup,
   createChannel,
   testChannel,
   deleteChannel,
+  testChannelAction,
+  deleteChannelAction,
 };

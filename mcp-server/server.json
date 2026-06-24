@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.solomon2773/nora",
+  "title": "Nora",
+  "description": "Operate your self-hosted Nora agent fleet from MCP clients.",
+  "version": "0.1.1",
+  "websiteUrl": "https://noradocs.solomontsao.com",
+  "repository": {
+    "url": "https://github.com/solomon2773/nora",
+    "source": "github",
+    "subfolder": "mcp-server"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@noraai/mcp-server",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "npx",
+      "environmentVariables": [
+        {
+          "name": "NORA_API_URL",
+          "description": "Base URL of your Nora backend API (e.g. https://nora.example.com). Falls back to NORA_HOST, then the Nora CLI config at ~/.nora/config.json.",
+          "isRequired": true
+        },
+        {
+          "name": "NORA_API_KEY",
+          "description": "Nora workspace API key (nora_…) used to authenticate against the Nora public REST API. Falls back to NORA_TOKEN, then the Nora CLI config.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "NORA_MCP_ALLOW_DESTRUCTIVE",
+          "description": "Set to \"true\" to enable destructive tools (e.g. delete_agent). Disabled by default.",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

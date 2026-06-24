@@ -24,18 +24,74 @@ When digging into a specific failure, scope the log view to errors only — the 
 
     ***
 
-    **Port 8080 already in use**
+    **Port 8080 or 4100 already in use**
 
-    By default, Nora binds nginx to port 8080. If another process is using that port, set `NGINX_HTTP_PORT` to a free port in your `.env` file before starting the stack:
+    In local mode, the installer checks the browser port and backend API port before startup. If `8080` is busy, accept the suggested web port such as `8081`. If `127.0.0.1:4100` is busy, accept the suggested backend API port such as `4101`.
+
+    If you edit `.env` manually, use these variables:
 
     ```bash theme={null}
     NGINX_HTTP_PORT=9090
+    NEXTAUTH_URL=http://localhost:9090
+    CORS_ORIGINS=http://localhost:9090
+    BACKEND_API_PORT=4101
     ```
 
     Restart the stack after saving the change:
 
     ```bash theme={null}
     docker compose down && docker compose up -d
+    ```
+
+    ***
+
+    **First signup fails with `password authentication failed for user "nora"`**
+
+    This means the backend cannot authenticate to Postgres. The usual cause is a local reconfigure where the Docker Postgres volume was preserved but `.env` now contains a different `DB_PASSWORD` than the one used when the volume was initialized.
+
+    If you want a clean local install, remove the compose volumes and rerun setup:
+
+    ```bash theme={null}
+    cd ~/nora
+    docker compose down -v --remove-orphans
+    curl -fsSL https://raw.githubusercontent.com/solomon2773/nora/master/setup.sh | bash
+    ```
+
+    If you want to keep existing local data, restore `DB_PASSWORD` from the newest `.env.backup-*` file:
+
+    ```bash theme={null}
+    cd ~/nora
+
+    python3 - <<'PY'
+    from pathlib import Path
+
+    backups = sorted(Path(".").glob(".env.backup-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not backups:
+        raise SystemExit("No .env.backup-* file found")
+
+    old = None
+    for line in backups[0].read_text().splitlines():
+        if line.startswith("DB_PASSWORD="):
+            old = line.split("=", 1)[1]
+            break
+
+    if not old:
+        raise SystemExit(f"No DB_PASSWORD found in {backups[0]}")
+
+    env = Path(".env")
+    lines = env.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("DB_PASSWORD="):
+            lines[i] = "DB_PASSWORD=" + old
+            break
+    else:
+        lines.append("DB_PASSWORD=" + old)
+
+    env.write_text("\n".join(lines) + "\n")
+    print(f"Restored DB_PASSWORD from {backups[0]}")
+    PY
+
+    docker compose up -d --build
     ```
 
     ***
@@ -55,6 +111,7 @@ When digging into a specific failure, scope the log view to errors only — the 
     ```
 
     Run that command twice — once for `JWT_SECRET` and once for `ENCRYPTION_KEY`.
+
   </Accordion>
 
   <Accordion title="Agent deployment issues">
@@ -80,20 +137,31 @@ When digging into a specific failure, scope the log view to errors only — the 
 
     ***
 
+    **Kubernetes says `deployments.apps "<agent>" not found`**
+
+    This means Nora has an agent record but the Kubernetes Deployment no longer exists in the registered cluster/namespace. It can happen after manual `kubectl delete`, a failed stale start, or a registry namespace mismatch. Use **Redeploy** on the agent detail page to recreate the Deployment, Service, and bootstrap ConfigMap from the saved Nora agent settings.
+
+    If redeploy also fails, open **Admin -> Kubernetes**, run **Test** on the cluster row, and confirm the OpenClaw and Hermes namespaces match where you expect agents to run.
+
+    ***
+
     **NemoClaw sandbox fails to start**
 
-    NemoClaw is disabled by default. To enable it, you must set both variables in your `.env` file:
+    NemoClaw is disabled by default. To enable it, add `nemoclaw` to the enabled sandbox profiles and provide a valid NVIDIA API key either as a user provider key in **Settings** or as a platform fallback in `.env`:
 
     ```bash theme={null}
-    NEMOCLAW_ENABLED=true
+    ENABLED_SANDBOX_PROFILES=standard,nemoclaw
     NVIDIA_API_KEY=your-nvidia-api-key
     ```
 
     Restart the stack after making these changes. If NemoClaw still fails, confirm that your NVIDIA API key is active and has access to the NVIDIA NIM endpoints Nora uses.
 
+    For Kubernetes, also confirm `NEMOCLAW_SANDBOX_IMAGE` points to an image your nodes can pull. The default is Nora's GHCR image; offline clusters must preload `nora-nemoclaw-agent:local` and override the env var.
+
     <Warning>
       Do not paste your NVIDIA API key into GitHub Issues or Discussions. Share only masked or redacted values when asking for help.
     </Warning>
+
   </Accordion>
 
   <Accordion title="LLM provider issues">
@@ -110,6 +178,7 @@ When digging into a specific failure, scope the log view to errors only — the 
     **Invalid API key errors from the agent**
 
     If the agent reports that a key is invalid or unauthorized, verify the key directly with the provider before troubleshooting Nora. Keys are stored using AES-256-GCM encryption and are never returned in API responses, so the value Nora holds is the exact value you entered. If the key itself is correct, confirm that you selected the right provider in Settings.
+
   </Accordion>
 
   <Accordion title="Authentication issues">
@@ -148,6 +217,7 @@ When digging into a specific failure, scope the log view to errors only — the 
     <Note>
       You only need to set credentials for the OAuth providers you want to enable. Leave the others blank.
     </Note>
+
   </Accordion>
 
   <Accordion title="Dashboard not loading">
@@ -172,6 +242,7 @@ When digging into a specific failure, scope the log view to errors only — the 
     ```bash theme={null}
     docker compose logs -f backend-api
     ```
+
   </Accordion>
 </AccordionGroup>
 
@@ -179,8 +250,8 @@ When digging into a specific failure, scope the log view to errors only — the 
 
 If you cannot resolve your issue with the steps above, the following resources are available:
 
-* **Reproducible bugs** — open an issue at [github.com/solomon2773/nora/issues](https://github.com/solomon2773/nora/issues)
-* **Setup and rollout questions** — start a discussion at [github.com/solomon2773/nora/discussions](https://github.com/solomon2773/nora/discussions)
-* **Enterprise and managed paths** — see [nora.solomontsao.com/pricing](https://nora.solomontsao.com/pricing)
+- **Reproducible bugs** — open an issue at [github.com/solomon2773/nora/issues](https://github.com/solomon2773/nora/issues)
+- **Setup and rollout questions** — start a discussion at [github.com/solomon2773/nora/discussions](https://github.com/solomon2773/nora/discussions)
+- **Enterprise and managed paths** — see [nora.solomontsao.com/pricing](https://nora.solomontsao.com/pricing)
 
 When asking for help, include your deployment mode (self-hosted, rollout-help, or hosted), your OS, which setup script you used, and any relevant log output. Do not include secrets, API keys, or `.env` file contents.

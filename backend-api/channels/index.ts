@@ -6,13 +6,14 @@
 const db = require("../db");
 const { encrypt, decrypt, ensureEncryptionConfigured } = require("../crypto");
 const { runtimeUrlForAgent } = require("../../agent-runtime/lib/agentEndpoints");
+const { runtimeAuthHeaders } = require("../runtimeAuth");
 const { getAdapter, listAdapterTypes } = require("./adapters");
 
 const REDACTED_SECRET = "[REDACTED]";
 const SECRET_CONFIG_KEY_RE = /(token|secret|password|webhook_url|smtp_pass|auth_token)/i;
 
 function parseConfig(config) {
-  return typeof config === "string" ? JSON.parse(config) : (config || {});
+  return typeof config === "string" ? JSON.parse(config) : config || {};
 }
 
 function restoreRedactedConfigValue(nextValue, currentValue) {
@@ -22,9 +23,7 @@ function restoreRedactedConfigValue(nextValue, currentValue) {
 
   if (Array.isArray(nextValue)) {
     const currentItems = Array.isArray(currentValue) ? currentValue : [];
-    return nextValue.map((entry, index) =>
-      restoreRedactedConfigValue(entry, currentItems[index]),
-    );
+    return nextValue.map((entry, index) => restoreRedactedConfigValue(entry, currentItems[index]));
   }
 
   if (nextValue && typeof nextValue === "object") {
@@ -48,7 +47,7 @@ function getSensitiveChannelKeys(type) {
   return new Set(
     (adapter.configFields || [])
       .filter((field) => field?.type === "password" || SECRET_CONFIG_KEY_RE.test(field?.key || ""))
-      .map((field) => field.key)
+      .map((field) => field.key),
   );
 }
 
@@ -117,10 +116,7 @@ function stripChannelSecrets(type, config = {}) {
 }
 
 function buildCloneableChannel(channel = {}) {
-  const { config, removedSensitive } = stripChannelSecrets(
-    channel.type,
-    channel.config
-  );
+  const { config, removedSensitive } = stripChannelSecrets(channel.type, channel.config);
 
   return {
     type: channel.type,
@@ -151,7 +147,7 @@ function hydrateChannel(channel) {
 async function listChannels(agentId) {
   const result = await db.query(
     "SELECT * FROM channels WHERE agent_id = $1 ORDER BY created_at DESC",
-    [agentId]
+    [agentId],
   );
   return result.rows.map(sanitizeChannel);
 }
@@ -165,16 +161,16 @@ async function createChannel(agentId, type, name, config = {}) {
   }
   const result = await db.query(
     "INSERT INTO channels(agent_id, type, name, config) VALUES($1, $2, $3, $4) RETURNING *",
-    [agentId, type, name, JSON.stringify(secured)]
+    [agentId, type, name, JSON.stringify(secured)],
   );
   return sanitizeChannel(result.rows[0]);
 }
 
 async function updateChannel(channelId, agentId, updates) {
-  const existingResult = await db.query(
-    "SELECT * FROM channels WHERE id = $1 AND agent_id = $2",
-    [channelId, agentId]
-  );
+  const existingResult = await db.query("SELECT * FROM channels WHERE id = $1 AND agent_id = $2", [
+    channelId,
+    agentId,
+  ]);
   const existing = existingResult.rows[0];
   if (!existing) throw new Error("Channel not found");
 
@@ -208,7 +204,7 @@ async function updateChannel(channelId, agentId, updates) {
   params.push(channelId, agentId);
   const result = await db.query(
     `UPDATE channels SET ${sets.join(", ")} WHERE id = $${idx++} AND agent_id = $${idx} RETURNING *`,
-    params
+    params,
   );
   if (!result.rows[0]) throw new Error("Channel not found");
   return sanitizeChannel(result.rows[0]);
@@ -217,7 +213,7 @@ async function updateChannel(channelId, agentId, updates) {
 async function deleteChannel(channelId, agentId) {
   const result = await db.query(
     "DELETE FROM channels WHERE id = $1 AND agent_id = $2 RETURNING id",
-    [channelId, agentId]
+    [channelId, agentId],
   );
   if (!result.rows[0]) throw new Error("Channel not found");
 }
@@ -236,7 +232,7 @@ async function sendMessage(channelId, content, metadata = {}) {
   // Log the outbound message
   await db.query(
     "INSERT INTO channel_messages(channel_id, direction, content, metadata) VALUES($1, 'outbound', $2, $3)",
-    [channelId, content, JSON.stringify(metadata)]
+    [channelId, content, JSON.stringify(metadata)],
   );
 
   return result;
@@ -250,7 +246,7 @@ async function getMessages(channelId, agentId, limit = 50) {
      WHERE cm.channel_id = $1 AND c.agent_id = $2
      ORDER BY cm.created_at DESC
      LIMIT $3`,
-    [channelId, agentId, limit]
+    [channelId, agentId, limit],
   );
   return result.rows;
 }
@@ -258,10 +254,10 @@ async function getMessages(channelId, agentId, limit = 50) {
 // ── Testing ──────────────────────────────────────────────
 
 async function testChannel(channelId, agentId) {
-  const chResult = await db.query(
-    "SELECT * FROM channels WHERE id = $1 AND agent_id = $2",
-    [channelId, agentId]
-  );
+  const chResult = await db.query("SELECT * FROM channels WHERE id = $1 AND agent_id = $2", [
+    channelId,
+    agentId,
+  ]);
   const channel = hydrateChannel(chResult.rows[0]);
   if (!channel) throw new Error("Channel not found");
 
@@ -294,13 +290,17 @@ async function handleInboundWebhook(channelId, payload, headers) {
   // Log the inbound message
   await db.query(
     "INSERT INTO channel_messages(channel_id, direction, content, metadata) VALUES($1, 'inbound', $2, $3)",
-    [channelId, formatted.content, JSON.stringify({ sender: formatted.sender, ...formatted.metadata })]
+    [
+      channelId,
+      formatted.content,
+      JSON.stringify({ sender: formatted.sender, ...formatted.metadata }),
+    ],
   );
 
   // Forward to agent runtime if agent is running
   const agentResult = await db.query(
-    "SELECT host, runtime_host, runtime_port FROM agents WHERE id = $1",
-    [channel.agent_id]
+    "SELECT id, host, runtime_host, runtime_port, gateway_token FROM agents WHERE id = $1",
+    [channel.agent_id],
   );
   const agent = agentResult.rows[0];
   const runtimeUrl = runtimeUrlForAgent(agent, "/channels/receive");
@@ -308,7 +308,7 @@ async function handleInboundWebhook(channelId, payload, headers) {
     try {
       await fetch(runtimeUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(await runtimeAuthHeaders(agent)) },
         body: JSON.stringify({
           channelId,
           channelType: channel.type,

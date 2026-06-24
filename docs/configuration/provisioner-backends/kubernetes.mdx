@@ -10,7 +10,19 @@ Stopping an agent scales its Deployment to `0` replicas. Cloud consoles such as 
 
 The agent Overview tab shows the live Kubernetes pod replica snapshot in the Details block: desired, current, ready, available, and updated counts from the Deployment.
 
+<Frame caption="Agent detail — Kubernetes runtime status, replica counts, and Service address">
+  ![Kubernetes agent detail](/images/provisioner-backends/k8s/_nora/nora-agent-running-k8s.png)
+</Frame>
+
 ## Configuration
+
+<Note>
+  Two Kubernetes install models are supported. (1) Nora runs in Docker Compose and provisions agents
+  into one or more registered clusters via mounted kubeconfigs (this page). (2) Run the Nora control
+  plane itself inside Kubernetes with the official Helm chart at `infra/helm/nora` — see the
+  Kubernetes (Helm) section of [Self-hosting](/self-hosting). Under Helm the chart sets
+  `ENABLED_BACKENDS=k8s` and mounts agent kubeconfigs via `kubeconfigs.existingSecret`.
+</Note>
 
 Register Kubernetes clusters in **Admin -> Kubernetes**. Nora does not create a Kubernetes execution target from `.env`; each enabled Admin row with a passing connection test becomes a concrete execution target such as `k8s:aks-eastus2`.
 
@@ -102,6 +114,10 @@ Use clear labels so the Deploy page can show a named cluster such as **AKS East 
   </Step>
 </Steps>
 
+<Frame caption="Nora deploy wizard — Kubernetes execution target selected from the Admin registry">
+  ![Kubernetes target selected](/images/provisioner-backends/k8s/_nora/nora-deploy-k8s-selected.png)
+</Frame>
+
 <Note>
   For several Kubernetes clusters at once, use one Admin registry row per cluster. Mounted-path mode
   uses files under `NORA_KUBECONFIGS_DIR`, which is mounted at `/kubeconfigs` in both containers.
@@ -144,18 +160,18 @@ NodePort example:
 
 LoadBalancer example:
 
-| Admin field               | Value                                |
-| ------------------------- | ------------------------------------ |
-| Exposure mode             | `LoadBalancer`                       |
-| Source ranges             | `<nora-control-plane-egress-cidr>`   |
-| Load balancer timeout     | `1200000`                            |
+| Admin field           | Value                              |
+| --------------------- | ---------------------------------- |
+| Exposure mode         | `LoadBalancer`                     |
+| Source ranges         | `<nora-control-plane-egress-cidr>` |
+| Load balancer timeout | `1200000`                          |
 
 ## Service customization
 
 Provider-specific Service annotations are saved in the Admin **Service annotations JSON** field:
 
 ```json theme={null}
-{"example.com/annotation":"value"}
+{ "example.com/annotation": "value" }
 ```
 
 The Admin **Source ranges** field accepts comma-separated CIDRs. Use it to restrict cloud load balancers to the Nora control-plane egress IP whenever possible.

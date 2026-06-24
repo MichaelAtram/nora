@@ -28,6 +28,10 @@ const mockCreateNamespacedNetworkPolicy = jest.fn();
 const mockReadNamespacedNetworkPolicy = jest.fn();
 const mockReplaceNamespacedNetworkPolicy = jest.fn();
 const mockDeleteNamespacedNetworkPolicy = jest.fn();
+const mockCreateNamespacedSecret = jest.fn();
+const mockReadNamespacedSecret = jest.fn();
+const mockReplaceNamespacedSecret = jest.fn();
+const mockDeleteNamespacedSecret = jest.fn();
 const mockGetNamespacedCustomObject = jest.fn();
 const mockLoadKubeconfigFromFile = jest.fn();
 
@@ -74,6 +78,10 @@ jest.mock(
             readNamespacedConfigMap: mockReadNamespacedConfigMap,
             replaceNamespacedConfigMap: mockReplaceNamespacedConfigMap,
             deleteNamespacedConfigMap: mockDeleteNamespacedConfigMap,
+            createNamespacedSecret: mockCreateNamespacedSecret,
+            readNamespacedSecret: mockReadNamespacedSecret,
+            replaceNamespacedSecret: mockReplaceNamespacedSecret,
+            deleteNamespacedSecret: mockDeleteNamespacedSecret,
           };
         }
         if (api === AppsV1Api) {
@@ -139,6 +147,12 @@ describe("provisioning runtime/gateway contracts", () => {
     });
     mockReplaceNamespacedNetworkPolicy.mockReset().mockResolvedValue({});
     mockDeleteNamespacedNetworkPolicy.mockReset().mockResolvedValue({});
+    mockCreateNamespacedSecret.mockReset().mockResolvedValue({});
+    mockReadNamespacedSecret.mockReset().mockResolvedValue({
+      body: { metadata: { resourceVersion: "secret-rv" } },
+    });
+    mockReplaceNamespacedSecret.mockReset().mockResolvedValue({});
+    mockDeleteNamespacedSecret.mockReset().mockResolvedValue({});
     mockGetNamespacedCustomObject.mockReset().mockResolvedValue({});
     mockLoadKubeconfigFromFile.mockReset().mockReturnValue(undefined);
     delete process.env.GATEWAY_HOST;
@@ -608,9 +622,15 @@ describe("provisioning runtime/gateway contracts", () => {
 
     const deployment = mockCreateNamespacedDeployment.mock.calls[0][0].body;
     const configMap = mockCreateNamespacedConfigMap.mock.calls[0][0].body;
+    const secret = mockCreateNamespacedSecret.mock.calls[0][0].body;
     const container = deployment.spec.template.spec.containers[0];
     const envVars = Object.fromEntries(container.env.map((entry) => [entry.name, entry.value]));
     const policies = mockCreateNamespacedNetworkPolicy.mock.calls.map((call) => call[0].body);
+    const secretEnvVars = Object.fromEntries(
+      container.env
+        .filter((entry) => entry.valueFrom?.secretKeyRef)
+        .map((entry) => [entry.name, entry.valueFrom.secretKeyRef]),
+    );
 
     expect(container.image).toBe("registry.example.com/nora-nemoclaw-agent:stable");
     expect(container.workingDir).toBe("/sandbox");
@@ -620,9 +640,19 @@ describe("provisioning runtime/gateway contracts", () => {
         OPENCLAW_CLI_PATH: "/usr/bin/openclaw",
         OPENCLAW_TSX_BIN: "/usr/bin/tsx",
         NEMOCLAW_MODEL: "nvidia/test-model",
+      }),
+    );
+    expect(envVars.NVIDIA_API_KEY).toBeUndefined();
+    expect(secret.metadata.name).toBe("nora-oclaw-nemo-loadbalancer-qa-nemo-env");
+    expect(secret.stringData).toEqual(
+      expect.objectContaining({
         NVIDIA_API_KEY: "test-nvidia-key",
       }),
     );
+    expect(secretEnvVars.NVIDIA_API_KEY).toEqual({
+      name: "nora-oclaw-nemo-loadbalancer-qa-nemo-env",
+      key: "NVIDIA_API_KEY",
+    });
     expect(container.args).toEqual([". /opt/nora-bootstrap/bootstrap.sh"]);
     expect(configMap.data["bootstrap.sh"]).toContain("nemoclaw@latest");
     expect(configMap.metadata.labels["nora.sandbox.profile"]).toBe("nemoclaw");
@@ -639,8 +669,8 @@ describe("provisioning runtime/gateway contracts", () => {
       ]),
     );
     expect(
-      policies.find((policy) => policy.metadata.name === "nora-openclaw-allow-trusted-ingress")
-        .spec.ingress[0]._from,
+      policies.find((policy) => policy.metadata.name === "nora-openclaw-allow-trusted-ingress").spec
+        .ingress[0]._from,
     ).toEqual([{ ipBlock: { cidr: "203.0.113.10/32" } }]);
   });
 
@@ -838,9 +868,9 @@ describe("provisioning runtime/gateway contracts", () => {
 
     expect(mockCreateNamespacedNetworkPolicy).toHaveBeenCalledTimes(2);
     expect(mockCreateNamespacedDeployment).toHaveBeenCalledTimes(1);
-    expect(
-      mockCreateNamespacedNetworkPolicy.mock.invocationCallOrder[1],
-    ).toBeLessThan(mockCreateNamespacedDeployment.mock.invocationCallOrder[0]);
+    expect(mockCreateNamespacedNetworkPolicy.mock.invocationCallOrder[1]).toBeLessThan(
+      mockCreateNamespacedDeployment.mock.invocationCallOrder[0],
+    );
     expect(result.policyStatus).toBe("supported");
     expect(result.policyBundleAttempted).toBe(true);
     expect(result.policyBundleApplied).toBe(true);
@@ -883,9 +913,9 @@ describe("provisioning runtime/gateway contracts", () => {
       "nora-hermes-allow-trusted-ingress",
     ]);
     expect(mockCreateNamespacedDeployment).toHaveBeenCalledTimes(1);
-    expect(
-      mockCreateNamespacedNetworkPolicy.mock.invocationCallOrder[1],
-    ).toBeLessThan(mockCreateNamespacedDeployment.mock.invocationCallOrder[0]);
+    expect(mockCreateNamespacedNetworkPolicy.mock.invocationCallOrder[1]).toBeLessThan(
+      mockCreateNamespacedDeployment.mock.invocationCallOrder[0],
+    );
     expect(result.policyStatus).toBe("supported");
   });
 
@@ -1293,9 +1323,11 @@ describe("provisioning runtime/gateway contracts", () => {
     mockDeleteNamespacedDeployment.mockImplementation(deleteIfLegacyNamespace);
     mockDeleteNamespacedService.mockImplementation(deleteIfLegacyNamespace);
     mockDeleteNamespacedConfigMap.mockImplementation(deleteIfLegacyNamespace);
+    mockDeleteNamespacedSecret.mockImplementation(deleteIfLegacyNamespace);
     mockReadNamespacedDeployment.mockRejectedValue(notFound);
     mockReadNamespacedService.mockRejectedValue(notFound);
     mockReadNamespacedConfigMap.mockRejectedValue(notFound);
+    mockReadNamespacedSecret.mockRejectedValue(notFound);
 
     const K8sBackend = require("../../workers/provisioner/backends/k8s");
     const backend = new K8sBackend(
@@ -1327,6 +1359,13 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(mockDeleteNamespacedConfigMap).toHaveBeenCalledWith(
       expect.objectContaining({
         name: "nora-oclaw-legacy-agent-bootstrap",
+        namespace: "openclaw-agents",
+        propagationPolicy: "Foreground",
+      }),
+    );
+    expect(mockDeleteNamespacedSecret).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "nora-oclaw-legacy-agent-env",
         namespace: "openclaw-agents",
         propagationPolicy: "Foreground",
       }),
@@ -1468,18 +1507,21 @@ describe("Hermes dashboard provisioning", () => {
     expect(config.Env).toEqual(
       expect.arrayContaining(["GATEWAY_HEALTH_URL=http://127.0.0.1:8642"]),
     );
-    expect(config.Entrypoint).toEqual(["/bin/bash", "-lc"]);
+    expect(config.Entrypoint).toBeUndefined();
     expect(config.Cmd).toEqual([
+      "bash",
+      "-lc",
       expect.stringContaining('HERMES_BIN="/opt/hermes/.venv/bin/hermes"'),
     ]);
-    expect(config.Cmd[0]).toContain("exec /init bash -lc");
-    expect(config.Cmd[0]).toContain(
+    expect(config.Cmd[2]).toContain("exec /init bash -lc");
+    expect(config.Cmd[2]).toContain(
       'nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open',
     );
-    expect(config.Cmd[0]).toContain(">> /opt/data/hermes-dashboard.log 2>&1");
-    expect(config.Cmd[0]).not.toContain("/proc/1/fd");
-    expect(config.Cmd[0]).toContain('exec "$HERMES_BIN" gateway run');
-    expect(config.Cmd[0].match(/\/init/g)).toHaveLength(1);
+    expect(config.Cmd[2]).toContain(">> /opt/data/hermes-dashboard.log 2>&1");
+    expect(config.Cmd[2]).not.toContain("/proc/1/fd");
+    expect(config.Cmd[2]).toContain('exec "$HERMES_BIN" gateway run');
+    expect(config.Cmd[2].match(/\/init/g)).toHaveLength(1);
+    expect(config.Cmd.join(" ")).not.toContain("/opt/hermes/docker/entrypoint.sh");
     expect(config.ExposedPorts).toEqual({
       "8642/tcp": {},
       "9119/tcp": {},
@@ -1498,5 +1540,52 @@ describe("Hermes dashboard provisioning", () => {
         runtimePort: 8642,
       }),
     );
+  });
+});
+
+describe("docker gateway port allocation (BYOC Phase B)", () => {
+  function mockDockerBackend() {
+    const DockerBackend = require("../../workers/provisioner/backends/docker");
+    const backend = new DockerBackend();
+    backend._findComposeNetwork = jest.fn().mockResolvedValue(null);
+    const createdContainer = {
+      id: "oclaw-port-1",
+      start: jest.fn().mockResolvedValue({}),
+      putArchive: jest.fn().mockResolvedValue({}),
+      remove: jest.fn().mockResolvedValue({}),
+      inspect: jest.fn().mockResolvedValue({
+        NetworkSettings: {
+          IPAddress: "10.0.0.7",
+          Networks: {},
+          Ports: { "18789/tcp": [{ HostPort: "19500" }] },
+        },
+      }),
+    };
+    backend.docker = {
+      getImage: jest.fn().mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) }),
+      getContainer: jest
+        .fn()
+        .mockReturnValue({ inspect: jest.fn().mockRejectedValue(new Error("not found")) }),
+      createVolume: jest.fn().mockResolvedValue({}),
+      createContainer: jest.fn().mockResolvedValue(createdContainer),
+      getNetwork: jest.fn().mockReturnValue({ connect: jest.fn().mockResolvedValue({}) }),
+      getVolume: jest.fn().mockReturnValue({ remove: jest.fn().mockResolvedValue({}) }),
+    };
+    return backend;
+  }
+
+  it("publishes the worker-allocated host port", async () => {
+    const backend = mockDockerBackend();
+    await backend.create({ id: "999", name: "Port QA", gatewayHostPort: 19500, env: {} });
+    const config = backend.docker.createContainer.mock.calls[0][0];
+    expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([{ HostPort: "19500" }]);
+  });
+
+  it("falls back to the deterministic hash when no port is allocated", async () => {
+    const backend = mockDockerBackend();
+    // id "999" -> 19000 + (999 % 1000) = 19999
+    await backend.create({ id: "999", name: "Port QA", env: {} });
+    const config = backend.docker.createContainer.mock.calls[0][0];
+    expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([{ HostPort: "19999" }]);
   });
 });

@@ -133,6 +133,60 @@ GET /agents/:id/integrations
 
 ***
 
+## List per-agent MCP servers
+
+List the Model Context Protocol servers available to an agent. Each supported provider is annotated with whether the agent has the integration connected (`connected`) and whether the server is enabled (`enabled`). Requires the `integrations:read` scope.
+
+```
+GET /agents/:id/mcp-servers
+```
+
+### Response
+
+<ResponseField name="servers" type="array">
+  One entry per supported provider, each with `provider`, `name`, `npmPackage`, `docsUrl`, `notes`, `connected`, and `enabled`.
+</ResponseField>
+
+```json theme={null}
+{
+  "servers": [
+    {
+      "provider": "gitlab",
+      "name": "GitLab",
+      "npmPackage": "@modelcontextprotocol/server-gitlab",
+      "docsUrl": "https://github.com/modelcontextprotocol/servers/tree/main/src/gitlab",
+      "notes": "Reference MCP server.",
+      "connected": true,
+      "enabled": false
+    }
+  ]
+}
+```
+
+## Set enabled MCP servers
+
+Replace the set of enabled MCP servers for an agent. Only providers with a connected integration take effect; unknown providers are ignored. The change is applied to the runtime on the agent's next redeploy. Requires the `integrations:write` scope.
+
+```
+PUT /agents/:id/mcp-servers
+```
+
+### Body
+
+<ParamField body="providers" type="string[]" required>
+  Provider ids to enable, e.g. `["gitlab", "notion"]`.
+</ParamField>
+
+```json theme={null}
+{
+  "enabled": ["gitlab"],
+  "redeployRequired": true,
+  "servers": [{ "provider": "gitlab", "connected": true, "enabled": true }]
+}
+```
+
+***
+
 ## Connect an integration
 
 Attach a third-party integration to an agent. The credentials are encrypted and synced to the agent runtime immediately.

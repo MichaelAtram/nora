@@ -27,6 +27,7 @@ Returns an array of provider descriptors.
 <ResponseField name="id" type="string">Provider identifier, e.g. `openai`, `anthropic`.</ResponseField>
 <ResponseField name="name" type="string">Human-readable provider name.</ResponseField>
 <ResponseField name="models" type="string[]">Supported model identifiers for this provider.</ResponseField>
+<ResponseField name="requiresApiKey" type="boolean">Present only for catalog entries that do not need a key — such as the built-in `demo` provider (`"Demo (built-in, no key required)"`), which carries `requiresApiKey: false`. Omitted for key-requiring providers.</ResponseField>
 
 <CodeGroup>
   ```bash curl theme={null}
@@ -112,8 +113,8 @@ POST /llm-providers
   Provider identifier, e.g. `openai`, `anthropic`. Must match a value from `GET /llm-providers/available`.
 </ParamField>
 
-<ParamField body="apiKey" type="string" required>
-  The API key issued by the provider.
+<ParamField body="apiKey" type="string">
+  The API key issued by the provider. Required for every provider except the built-in `demo` provider, whose token is derived server-side — omit `apiKey` when `provider` is `demo`. The `demo` entry is flagged `requiresApiKey: false` in `GET /llm-providers/available`.
 </ParamField>
 
 <ParamField body="model" type="string">
@@ -126,7 +127,7 @@ POST /llm-providers
 
 ### Response
 
-Returns the saved provider record with the API key masked.
+Returns the saved provider record (`id`, `provider`, `model`, `is_default`, `created_at`). The create response omits the masked key and config — use `GET /llm-providers` to retrieve the masked record.
 
 <CodeGroup>
   ```bash curl theme={null}
@@ -141,17 +142,15 @@ Returns the saved provider record with the API key masked.
 {
   "id": "f1e2d3c4-b5a6-7890-abcd-012345678901",
   "provider": "anthropic",
-  "api_key_masked": "sk-a••••••••ntc",
   "model": "claude-opus-4-6",
-  "config": {},
   "is_default": false,
   "created_at": "2025-03-10T09:00:00.000Z"
 }
 ```
 
-| Status | Condition                                                |
-| ------ | -------------------------------------------------------- |
-| `400`  | Missing `provider` or `apiKey`, or unrecognised provider |
+| Status | Condition                                                                                  |
+| ------ | ------------------------------------------------------------------------------------------ |
+| `400`  | Missing `provider`, missing `apiKey` for a key-requiring provider, or unrecognised provider |
 
 ***
 

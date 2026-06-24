@@ -5,7 +5,9 @@
 This guide takes you from a fresh machine to a running, validated agent runtime. You will install Nora using the one-line installer or Docker Compose, create your operator account, connect an LLM provider, deploy your first agent, and confirm the end-to-end workflow is healthy — all in about 15 minutes.
 
 <Note>
-  The installer can install Docker, Docker Compose, and Git for you if they are not already present on your machine. You need macOS 12+, Linux (Ubuntu 20.04+, Debian 11+, or Fedora 38+), or Windows 10+ with WSL2, plus admin or sudo access.
+  The installer can install Docker, Docker Compose, Git, and OpenSSL for you if they are not already present
+  on your machine. You need macOS 12+, Linux (Ubuntu 20.04+, Debian 11+, or Fedora 38+), or Windows
+  10+ with WSL2, plus admin or sudo access.
 </Note>
 
 <Steps>
@@ -22,7 +24,7 @@ This guide takes you from a fresh machine to a running, validated agent runtime.
       ```
     </CodeGroup>
 
-    The installer clones the repository, verifies Docker and Docker Compose, generates platform secrets, walks you through access mode and platform mode choices, creates the initial admin account, optionally collects an LLM provider key, and then starts the full Nora stack.
+    The installer clones the repository, verifies Docker and Docker Compose, generates platform secrets, walks you through access mode, platform mode, runtime/backend choices, and optional bootstrap admin creation, then starts the full Nora stack.
 
     If you prefer to configure things manually, clone the repo and bring up the stack yourself:
 
@@ -34,11 +36,12 @@ This guide takes you from a fresh machine to a running, validated agent runtime.
     docker compose up -d
     ```
 
-    When the installer or Docker Compose finishes, it prints the base URL it configured. Local mode uses `http://localhost:8080` by default.
+    When the installer or Docker Compose finishes, it prints the base URL it configured. Local mode uses `http://localhost:8080` by default, but the installer automatically offers another free web port such as `8081` if `8080` is already in use.
+
   </Step>
 
   <Step title="Open the dashboard">
-    Navigate to the Nora dashboard in your browser. In local mode, the default URLs are:
+    Navigate to the Nora dashboard in your browser. In local mode, use the URL printed by setup. The default URLs are:
 
     | URL                                   | What it opens              |
     | ------------------------------------- | -------------------------- |
@@ -48,21 +51,29 @@ This guide takes you from a fresh machine to a running, validated agent runtime.
     | `http://localhost:8080/app/dashboard` | System overview            |
     | `http://localhost:8080/app/deploy`    | Deploy your first agent    |
 
-    If you configured a public domain during setup, the same paths apply on your origin — for example, `https://app.example.com/app/dashboard`.
+    If setup selected another port, replace `8080` with that port. If you configured a public domain during setup, the same paths apply on your origin — for example, `https://app.example.com/app/dashboard`.
 
     ![System overview after first login — fleet status, recent events, and provider summary](/images/operator/dashboard.png)
+
   </Step>
 
-  <Step title="Create an account or log in">
-    Go to `http://localhost:8080/signup` and create your operator account. If you set `DEFAULT_ADMIN_EMAIL` and `DEFAULT_ADMIN_PASSWORD` during setup, that account is already created — go to `/login` and use those credentials instead.
-  </Step>
+<Step title="Create an account or log in">
+  Go to the printed `/signup` URL and create your operator account. On a brand-new instance with no
+  users yet, the signup page runs in first-run claim mode — it shows "Claim this Nora server" and the
+  first account you create becomes the platform admin. After you finish, you land on the Getting
+  Started page (`/app/getting-started`).
+
+  If you set `DEFAULT_ADMIN_EMAIL` and `DEFAULT_ADMIN_PASSWORD` during setup, that account is already
+  created — go to `/login` and use those credentials instead.
+</Step>
 
   <Step title="Add an LLM provider key">
     Open **Settings** in the dashboard. Add an API key for a supported provider such as Anthropic, OpenAI, or Google. Nora encrypts provider keys at rest with AES-256-GCM and stores them centrally so you can sync them to any running agent at any time.
 
     <Tip>
-      Start with one key to validate the end-to-end flow. You can add more providers later from the same Settings page.
+      **No API key yet?** Click **Try the demo agent** on the Getting Started page instead. It enables Nora's built-in demo provider — a deterministic stub model served by your own control plane — and deploys a working agent you can chat with immediately, zero keys and zero cost. Swap in a real provider whenever you're ready.
     </Tip>
+
   </Step>
 
   <Step title="Deploy your first agent">
@@ -80,6 +91,7 @@ This guide takes you from a fresh machine to a running, validated agent runtime.
     <Note>
       OpenClaw is the best-supported runtime today and the recommended choice for your first deployment.
     </Note>
+
   </Step>
 
   <Step title="Validate the agent">
@@ -94,6 +106,7 @@ This guide takes you from a fresh machine to a running, validated agent runtime.
     If all five checks pass, Nora has demonstrated its core value — a single surface for deploying, observing, and operating an agent runtime.
 
     ![Agent detail — running status with chat, logs, terminal, and runtime info](/images/operator/agent-detail.png)
+
   </Step>
 </Steps>
 
@@ -104,13 +117,13 @@ This guide takes you from a fresh machine to a running, validated agent runtime.
     Learn how to configure runtimes, resource limits, and deployment options in depth.
   </Card>
 
-  <Card title="Manage LLM providers" icon="key" href="/guides/manage-providers">
-    Add more providers, rotate keys, and control which agents have access to each key.
-  </Card>
+<Card title="Manage LLM providers" icon="key" href="/guides/manage-providers">
+  Add more providers, rotate keys, and control which agents have access to each key.
+</Card>
 
-  <Card title="Connect integrations" icon="plug" href="/guides/integrations">
-    Wire GitHub, Slack, Jira, AWS, and other tools to your running agents.
-  </Card>
+<Card title="Connect integrations" icon="plug" href="/guides/integrations">
+  Wire GitHub, Slack, Jira, AWS, and other tools to your running agents.
+</Card>
 
   <Card title="Monitor operations" icon="chart-line" href="/guides/monitoring">
     Track agent health, LLM usage, costs, and runtime activity in real time.

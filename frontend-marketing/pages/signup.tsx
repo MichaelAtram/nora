@@ -1,6 +1,7 @@
 import Head from "next/head";
 import Link from "next/link";
-import { useState } from "react";
+import Script from "next/script";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, CheckCircle2, Loader2, Lock, Mail, Server, Shield, Zap } from "lucide-react";
 import LanguageSwitcher from "../components/LanguageSwitcher";
 import { normalizeLocale, useI18n } from "../lib/i18n";
@@ -8,8 +9,52 @@ import { trackEvent } from "../lib/analytics";
 
 const OAUTH_LOGIN_ENABLED = process.env.NEXT_PUBLIC_OAUTH_LOGIN_ENABLED === "true";
 const IS_SELF_HOSTED = process.env.NEXT_PUBLIC_PLATFORM_MODE === "selfhosted";
+const TURNSTILE_SITE_KEY = process.env.NEXT_PUBLIC_SIGNUP_TURNSTILE_SITE_KEY || "";
+const RECAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY || "";
 const OSS_REPO_URL = "https://github.com/solomon2773/nora";
 const QUICKSTART_URL = `${OSS_REPO_URL}#quick-start`;
+
+type BotProtectionProvider = "none" | "turnstile" | "recaptcha";
+
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (container: HTMLElement, options: Record<string, unknown>) => string;
+      reset: (widgetId?: string) => void;
+    };
+    grecaptcha?: {
+      render: (container: HTMLElement, options: Record<string, unknown>) => number;
+      reset: (widgetId?: number) => void;
+    };
+  }
+}
+
+function normalizeBotProtectionProvider(value?: string): BotProtectionProvider | "" {
+  const provider = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!provider) return "";
+  if (provider === "none" || provider === "turnstile" || provider === "recaptcha") {
+    return provider;
+  }
+  return "";
+}
+
+function resolveBotProtectionProvider(): BotProtectionProvider {
+  const explicitProvider = normalizeBotProtectionProvider(
+    process.env.NEXT_PUBLIC_SIGNUP_BOT_PROTECTION_PROVIDER,
+  );
+  if (explicitProvider === "none") return "none";
+  if (explicitProvider === "turnstile" && TURNSTILE_SITE_KEY) return "turnstile";
+  if (explicitProvider === "recaptcha" && RECAPTCHA_SITE_KEY) return "recaptcha";
+  if (!explicitProvider && TURNSTILE_SITE_KEY && !RECAPTCHA_SITE_KEY) return "turnstile";
+  if (!explicitProvider && RECAPTCHA_SITE_KEY && !TURNSTILE_SITE_KEY) return "recaptcha";
+  return "none";
+}
+
+const SIGNUP_BOT_PROTECTION_PROVIDER = resolveBotProtectionProvider();
+const SIGNUP_BOT_PROTECTION_SITE_KEY =
+  SIGNUP_BOT_PROTECTION_PROVIDER === "turnstile" ? TURNSTILE_SITE_KEY : RECAPTCHA_SITE_KEY;
 
 const NEXT_STEPS = [
   "Create the first operator account for this Nora instance.",
@@ -25,24 +70,102 @@ export default function Signup() {
   const [loading, setLoading] = useState(false);
   const [oauthLoading, setOauthLoading] = useState("");
   const [error, setError] = useState("");
+  const [botProtectionToken, setBotProtectionToken] = useState("");
+  // First-run claim mode: true while this instance has zero users, so the
+  // first signup is framed as claiming the server (it becomes platform admin).
+  const [needsFirstAdmin, setNeedsFirstAdmin] = useState(false);
+  const botProtectionRef = useRef<HTMLDivElement | null>(null);
+  const botProtectionWidgetId = useRef<string | number | null>(null);
+  const botProtectionEnabled = SIGNUP_BOT_PROTECTION_PROVIDER !== "none";
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/auth/bootstrap-status")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!cancelled && d?.needsFirstAdmin === true) setNeedsFirstAdmin(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const resetBotProtection = useCallback(() => {
+    setBotProtectionToken("");
+    const widgetId = botProtectionWidgetId.current;
+    try {
+      if (SIGNUP_BOT_PROTECTION_PROVIDER === "turnstile" && typeof widgetId === "string") {
+        window.turnstile?.reset(widgetId);
+      }
+      if (SIGNUP_BOT_PROTECTION_PROVIDER === "recaptcha" && typeof widgetId === "number") {
+        window.grecaptcha?.reset(widgetId);
+      }
+    } catch {
+      // Challenge reset is best-effort; a fresh page load will render a new token.
+    }
+  }, []);
+
+  const renderBotProtectionWidget = useCallback(() => {
+    if (
+      !botProtectionEnabled ||
+      !botProtectionRef.current ||
+      botProtectionWidgetId.current != null
+    ) {
+      return;
+    }
+
+    if (SIGNUP_BOT_PROTECTION_PROVIDER === "turnstile" && window.turnstile) {
+      botProtectionWidgetId.current = window.turnstile.render(botProtectionRef.current, {
+        sitekey: SIGNUP_BOT_PROTECTION_SITE_KEY,
+        theme: "light",
+        callback: (token: string) => setBotProtectionToken(token),
+        "expired-callback": () => setBotProtectionToken(""),
+        "error-callback": () => setBotProtectionToken(""),
+      });
+    }
+
+    if (SIGNUP_BOT_PROTECTION_PROVIDER === "recaptcha" && window.grecaptcha) {
+      botProtectionWidgetId.current = window.grecaptcha.render(botProtectionRef.current, {
+        sitekey: SIGNUP_BOT_PROTECTION_SITE_KEY,
+        callback: (token: string) => setBotProtectionToken(token),
+        "expired-callback": () => setBotProtectionToken(""),
+        "error-callback": () => setBotProtectionToken(""),
+      });
+    }
+  }, [botProtectionEnabled]);
+
+  useEffect(() => {
+    renderBotProtectionWidget();
+  }, [renderBotProtectionWidget]);
 
   async function handleSignup(event) {
     event.preventDefault();
     setLoading(true);
     setError("");
 
+    if (botProtectionEnabled && !botProtectionToken) {
+      setError(t("Complete the verification challenge and try again."));
+      setLoading(false);
+      return;
+    }
+
     try {
+      const signupPayload = botProtectionEnabled
+        ? { email, password, botProtectionToken }
+        : { email, password };
       const signupRes = await fetch("/api/auth/signup", {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify(signupPayload),
       });
 
       const signupData = await signupRes.json().catch(() => ({}));
 
       if (!signupRes.ok) {
         setError(signupData.error || t("Could not create the account. Please try again."));
+        resetBotProtection();
         return;
       }
 
@@ -76,6 +199,7 @@ export default function Signup() {
     } catch (signupErr) {
       console.error(signupErr);
       setError(t("Could not create the account. Please try again."));
+      resetBotProtection();
     } finally {
       setLoading(false);
     }
@@ -95,6 +219,20 @@ export default function Signup() {
           content="Create a Nora operator account for deploying OpenClaw and Hermes runtimes. Nora is fully open source, self-hostable, and commercially usable under Apache 2.0."
         />
       </Head>
+      {SIGNUP_BOT_PROTECTION_PROVIDER === "turnstile" && (
+        <Script
+          src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+          strategy="afterInteractive"
+          onLoad={renderBotProtectionWidget}
+        />
+      )}
+      {SIGNUP_BOT_PROTECTION_PROVIDER === "recaptcha" && (
+        <Script
+          src="https://www.google.com/recaptcha/api.js?render=explicit"
+          strategy="afterInteractive"
+          onLoad={renderBotProtectionWidget}
+        />
+      )}
 
       <div className="site-shell min-h-screen px-4 pb-10 pt-4 text-brand-ink sm:px-6">
         <header className="mx-auto flex max-w-6xl items-center justify-between rounded-2xl border border-brand-cyan/25 bg-white/90 px-4 py-3 shadow-xl shadow-brand-ink/10 backdrop-blur-xl sm:px-5">
@@ -134,8 +272,15 @@ export default function Signup() {
               Open-source operator signup
             </div>
             <h1 className="max-w-xl text-4xl font-black leading-tight text-white sm:text-5xl">
-              Create the operator account for this Nora instance.
+              {needsFirstAdmin
+                ? "Claim this Nora server."
+                : "Create the operator account for this Nora instance."}
             </h1>
+            {needsFirstAdmin && (
+              <p className="mt-3 max-w-xl text-sm font-bold uppercase tracking-[0.2em] text-[#f2d7a1]">
+                First-run setup — the account you create here becomes the platform admin.
+              </p>
+            )}
             <p className="mt-5 max-w-xl text-base leading-8 text-slate-300">
               Use this account to enter the Nora dashboard, add provider keys, create workspaces,
               and deploy OpenClaw or Hermes runtimes on infrastructure you control. The source stays
@@ -211,7 +356,7 @@ export default function Signup() {
               Easy account creation
             </div>
             <h2 className="text-3xl font-black leading-tight text-slate-950">
-              Create operator account
+              {needsFirstAdmin ? "Claim this server" : "Create operator account"}
             </h2>
             <p className="mt-3 text-sm leading-7 text-slate-700">
               Use this account to enter the Nora operator surface for OpenClaw and Hermes
@@ -319,6 +464,12 @@ export default function Signup() {
                   />
                 </div>
               </label>
+
+              {botProtectionEnabled && (
+                <div className="flex min-h-[96px] items-center justify-center rounded-[24px] border border-black/10 bg-white/60 px-4 py-4">
+                  <div ref={botProtectionRef} />
+                </div>
+              )}
 
               {error && (
                 <div className="rounded-[22px] border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-semibold text-red-700">

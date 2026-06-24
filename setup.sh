@@ -373,7 +373,7 @@ EOF
 
 clean_reinstall_state() {
   warn "Clean reinstall selected: local compose containers and volumes will be removed."
-  info "External Kubernetes, Proxmox, NemoClaw, and VM resources will not be touched."
+  info "External Kubernetes, planned Proxmox, NemoClaw, and VM resources will not be touched."
   docker compose down -v --remove-orphans 2>/dev/null || true
   remove_local_agent_containers
   ok "Local Nora compose state cleaned"
@@ -602,7 +602,7 @@ resolve_available_host_port() {
     fi
     if [ ! -r /dev/tty ]; then
       error "${purpose} port ${port} is unavailable and no interactive terminal is attached."
-      error "Set NGINX_HTTP_PORT in ${ENV_FILE} or stop the conflicting service, then re-run setup."
+      error "Set the matching port variable in ${ENV_FILE} or stop the conflicting service, then re-run setup."
       exit 1
     fi
     printf "  Enter another host port [%s]: " "$suggested_port" > /dev/tty
@@ -908,6 +908,13 @@ if [ "$SETUP_MODE" = "update" ]; then
 
   header "Updating Nora"
   info "Code update mode keeps $ENV_FILE, Postgres/backup volumes, and provisioned instances."
+  # A leftover public-mode docker-compose.override.yml is auto-loaded by
+  # `docker compose` and would pin a LOCAL stack to prod/TLS wiring (443 + cert
+  # mounts). If .env selects the local nginx.conf, retire the stale override.
+  if [ "$(read_env_value "$ENV_FILE" "NGINX_CONFIG_FILE" "nginx.conf")" = "nginx.conf" ] && [ -f "$COMPOSE_OVERRIDE_FILE" ]; then
+    mv "$COMPOSE_OVERRIDE_FILE" "${COMPOSE_OVERRIDE_FILE}.disabled-$(date -u +%Y%m%d-%H%M%SZ)"
+    warn "Disabled a stale ${COMPOSE_OVERRIDE_FILE} (it did not match local mode in $ENV_FILE)."
+  fi
   update_source_checkout
   refresh_release_tags
   ensure_agent_hub_hash_secret_env "$ENV_FILE"
@@ -945,13 +952,21 @@ fi
 
 header "Generating Secrets"
 
-JWT_SECRET=$(openssl rand -hex 32)
-ENCRYPTION_KEY=$(openssl rand -hex 32)
-NORA_BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)
-NORA_AGENT_HUB_API_KEY_HASH_SECRET=$(openssl rand -hex 32)
+# Preserve existing secrets on reconfigure so live sessions, AES-encrypted
+# provider keys, managed backups, Agent Hub keys, and the initialized Postgres
+# volume remain usable. Only a first install with no value generates new ones.
+JWT_SECRET="$(read_env_value "$ENV_FILE" "JWT_SECRET" "")"
+[[ "$JWT_SECRET" =~ ^[0-9a-fA-F]{64}$ ]] || JWT_SECRET=$(openssl rand -hex 32)
+ENCRYPTION_KEY="$(read_env_value "$ENV_FILE" "ENCRYPTION_KEY" "")"
+[[ "$ENCRYPTION_KEY" =~ ^[0-9a-fA-F]{64}$ ]] || ENCRYPTION_KEY=$(openssl rand -hex 32)
+NORA_BACKUP_ENCRYPTION_KEY="$(read_env_value "$ENV_FILE" "NORA_BACKUP_ENCRYPTION_KEY" "")"
+[[ "$NORA_BACKUP_ENCRYPTION_KEY" =~ ^[0-9a-fA-F]{64}$ ]] || NORA_BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)
+NORA_AGENT_HUB_API_KEY_HASH_SECRET="$(read_env_value "$ENV_FILE" "NORA_AGENT_HUB_API_KEY_HASH_SECRET" "")"
+[[ "$NORA_AGENT_HUB_API_KEY_HASH_SECRET" =~ ^[0-9a-fA-F]{64}$ ]] || NORA_AGENT_HUB_API_KEY_HASH_SECRET=$(openssl rand -hex 32)
 DB_USER="nora"
 DB_NAME="nora"
-DB_PASSWORD=$(openssl rand -hex 24)
+DB_PASSWORD="$(read_env_value "$ENV_FILE" "DB_PASSWORD" "")"
+[ -n "$DB_PASSWORD" ] || DB_PASSWORD=$(openssl rand -hex 24)
 
 ok "JWT_SECRET            (64-char hex)"
 ok "ENCRYPTION_KEY        (64-char hex — AES-256-GCM)"
@@ -996,7 +1011,6 @@ fi
 header "Deploy Backends"
 
 DOCKER_BACKEND_ENABLED="true"
-PROXMOX_BACKEND_ENABLED="false"
 HERMES_RUNTIME_ENABLED="false"
 NEMOCLAW_SANDBOX_ENABLED="false"
 PROXMOX_API_URL=""
@@ -1024,44 +1038,7 @@ else
 fi
 
 info "Kubernetes clusters are registered after setup in Admin -> Kubernetes."
-
-printf "  Enable Proxmox backend? [y/N] "
-read -r proxmox_backend_answer < /dev/tty
-if [[ "$proxmox_backend_answer" =~ ^[Yy]$ ]]; then
-  PROXMOX_BACKEND_ENABLED="true"
-  echo ""
-  printf "  Proxmox API URL (e.g., https://proxmox.local:8006/api2/json): "
-  read -r PROXMOX_API_URL < /dev/tty
-  printf "  Proxmox Token ID (e.g., user@pam!tokenname): "
-  read -r PROXMOX_TOKEN_ID < /dev/tty
-  printf "  Proxmox Token Secret: "
-  read -r PROXMOX_TOKEN_SECRET < /dev/tty
-  printf "  Proxmox Node [pve]: "
-  read -r input < /dev/tty; PROXMOX_NODE="${input:-pve}"
-  printf "  Proxmox OpenClaw template [local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst]: "
-  read -r input < /dev/tty; PROXMOX_TEMPLATE="${input:-local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst}"
-  printf "  Proxmox Hermes template [optional, required for Hermes + Proxmox]: "
-  read -r PROXMOX_HERMES_TEMPLATE < /dev/tty
-  printf "  Proxmox NemoClaw template [optional, required for NemoClaw + Proxmox]: "
-  read -r PROXMOX_NEMOCLAW_TEMPLATE < /dev/tty
-  printf "  Proxmox rootfs storage [local-lvm]: "
-  read -r input < /dev/tty; PROXMOX_ROOTFS_STORAGE="${input:-local-lvm}"
-  printf "  Proxmox network bridge [vmbr0]: "
-  read -r input < /dev/tty; PROXMOX_BRIDGE="${input:-vmbr0}"
-  printf "  Proxmox SSH host for pct bootstrap: "
-  read -r PROXMOX_SSH_HOST < /dev/tty
-  printf "  Proxmox SSH user [root]: "
-  read -r input < /dev/tty; PROXMOX_SSH_USER="${input:-root}"
-  printf "  Proxmox SSH private key path [optional]: "
-  read -r PROXMOX_SSH_PRIVATE_KEY_PATH < /dev/tty
-  if [ -z "$PROXMOX_SSH_PRIVATE_KEY_PATH" ]; then
-    printf "  Proxmox SSH password [optional]: "
-    read -r PROXMOX_SSH_PASSWORD < /dev/tty
-  fi
-  ok "Proxmox backend configured"
-else
-  info "Proxmox backend disabled"
-fi
+info "Proxmox is planned but release-blocked in this Nora release; setup will not enable it."
 
 printf "  Enable Hermes runtime family? [y/N] "
 read -r hermes_runtime_answer < /dev/tty
@@ -1090,7 +1067,6 @@ fi
 
 enabled_backends=()
 [ "$DOCKER_BACKEND_ENABLED" = "true" ] && enabled_backends+=("docker")
-[ "$PROXMOX_BACKEND_ENABLED" = "true" ] && enabled_backends+=("proxmox")
 
 if [ ${#enabled_backends[@]} -eq 0 ]; then
   warn "No deploy backends selected — enabling Docker so Nora can deploy agents."
@@ -1117,7 +1093,7 @@ ok "Enabled sandbox profiles: ${ENABLED_SANDBOX_PROFILES}"
 header "Access Mode"
 
 printf "  How should users reach Nora?\n"
-printf "    1) Local only (default) — http://localhost:8080\n"
+printf "    1) Local only (default) — http://localhost:8080 (auto-picks the next free port if 8080 is busy)\n"
 printf "    2) Public domain behind HTTPS proxy — nginx listens on port 80\n"
 printf "    3) Public domain with TLS at nginx — nginx listens on ports 80 and 443\n"
 printf "  Select [1/2/3]: "
@@ -1130,6 +1106,8 @@ NEXTAUTH_URL="http://localhost:8080"
 CORS_ORIGINS="http://localhost:8080"
 NGINX_CONFIG_FILE="nginx.conf"
 NGINX_HTTP_PORT="8080"
+BACKEND_API_PORT="4100"
+NORA_FORCE_SECURE_COOKIES=""
 CAN_START_NORA=true
 
 case "$access_answer" in
@@ -1171,6 +1149,7 @@ case "$access_answer" in
     ACCESS_MODE=$([ "$access_answer" = "3" ] && printf "public-tls" || printf "public-proxy")
     NEXTAUTH_URL="${PUBLIC_SCHEME}://${PUBLIC_DOMAIN}"
     CORS_ORIGINS="${NEXTAUTH_URL}"
+    [ "$PUBLIC_SCHEME" = "https" ] && NORA_FORCE_SECURE_COOKIES=1
     NGINX_CONFIG_FILE="$PUBLIC_NGINX_CONF"
     NGINX_HTTP_PORT="80"
     ;;
@@ -1180,8 +1159,17 @@ case "$access_answer" in
     NEXTAUTH_URL="http://localhost:${NGINX_HTTP_PORT}"
     CORS_ORIGINS="${NEXTAUTH_URL}"
     ok "Local mode — Nora will be available at ${NEXTAUTH_URL}"
+    if [ "$NGINX_HTTP_PORT" != "8080" ]; then
+      warn "Port 8080 was busy — Nora will run at ${NEXTAUTH_URL}."
+      warn "Open THAT URL (not http://localhost:8080) to sign in."
+    fi
     ;;
 esac
+
+BACKEND_API_PORT="$(resolve_available_host_port "4100" "backend API" "backend-api" "4000" "127.0.0.1")"
+if [ "$BACKEND_API_PORT" != "4100" ]; then
+  warn "Port 4100 was busy — Nora backend API will run at 127.0.0.1:${BACKEND_API_PORT}."
+fi
 
 # ── Bootstrap Admin Account (Optional) ───────────────────────
 
@@ -1314,11 +1302,15 @@ DB_PORT=5432
 REDIS_HOST=redis
 REDIS_PORT=6379
 PORT=4000
-BACKEND_API_PORT=4100
+BACKEND_API_PORT=${BACKEND_API_PORT}
 
 # ── Access / URL ─────────────────────────────────────────────
 NGINX_CONFIG_FILE=${NGINX_CONFIG_FILE}
 NGINX_HTTP_PORT=${NGINX_HTTP_PORT}
+# Forces the Secure flag on the session cookie for always-on-TLS public deploys
+# (set to 1 for https public modes; empty for local http). Guards against an
+# upstream proxy that strips X-Forwarded-Proto.
+NORA_FORCE_SECURE_COOKIES=${NORA_FORCE_SECURE_COOKIES}
 
 # ── OAuth ────────────────────────────────────────────────────
 OAUTH_LOGIN_ENABLED=${OAUTH_LOGIN_ENABLED}
@@ -1410,7 +1402,9 @@ ENABLED_RUNTIME_FAMILIES=${ENABLED_RUNTIME_FAMILIES}
 ENABLED_BACKENDS=${ENABLED_BACKENDS}
 ENABLED_SANDBOX_PROFILES=${ENABLED_SANDBOX_PROFILES}
 
-# ── Proxmox (when ENABLED_BACKENDS includes proxmox) ─────────
+# ── Proxmox (planned; release-blocked in current Nora releases) ─────────
+# These values are retained for adapter development and future validation.
+# Setting them does not make Proxmox a supported deploy target yet.
 PROXMOX_API_URL=${PROXMOX_API_URL}
 PROXMOX_TOKEN_ID=${PROXMOX_TOKEN_ID}
 PROXMOX_TOKEN_SECRET=${PROXMOX_TOKEN_SECRET}
@@ -1428,9 +1422,9 @@ PROXMOX_SSH_PASSWORD=${PROXMOX_SSH_PASSWORD}
 # ── NemoClaw / NVIDIA (when ENABLED_SANDBOX_PROFILES includes nemoclaw) ──
 NVIDIA_API_KEY=${NVIDIA_API_KEY}
 NEMOCLAW_DEFAULT_MODEL=nvidia/nemotron-3-super-120b-a12b
-# For K3s/Kubernetes targets, use a registry image your nodes can pull
-# or preload nora-nemoclaw-agent:local onto the target nodes.
-NEMOCLAW_SANDBOX_IMAGE=nora-nemoclaw-agent:local
+# Defaults to the Nora-published GHCR image. For offline hosts or private
+# clusters, build/preload nora-nemoclaw-agent:local and override this value.
+NEMOCLAW_SANDBOX_IMAGE=ghcr.io/solomon2773/nora-nemoclaw-agent:latest
 
 # ── Security ─────────────────────────────────────────────────
 CORS_ORIGINS=${CORS_ORIGINS}
@@ -1465,7 +1459,7 @@ printf "  Database:     PostgreSQL 15 (Docker Compose)\n"
 printf "  DB Access:    %s / auto-generated / %s (.env)\n" "$DB_USER" "$DB_NAME"
 printf "  Redis:        Redis 7 (Docker Compose)\n"
 if [ "$ACCESS_MODE" = "local" ]; then
-  printf "  Access:       Local only\n"
+  printf "  Access:       %s\n" "$NEXTAUTH_URL"
   printf "  Runtime:      Development services\n"
 else
   printf "  Access:       %s\n" "$NEXTAUTH_URL"
@@ -1530,18 +1524,22 @@ docker build \
   agent-runtime/
 ok "OpenClaw agent image ready"
 
-# Only build the NemoClaw variant when the operator actually enables the
-# sandbox profile — pulling the 2.4GB OpenShell base on every install is wasteful.
+# Only build the NemoClaw fallback image when the operator enables the sandbox
+# and explicitly points NEMOCLAW_SANDBOX_IMAGE at the local tag.
 case ",${ENABLED_SANDBOX_PROFILES:-}," in
   *,nemoclaw,*)
-    echo ""
-    info "Building nora-nemoclaw-agent:local (OpenShell sandbox + tsx)..."
-    echo ""
-    docker build \
-      -f agent-runtime/Dockerfile.nemoclaw-agent \
-      -t nora-nemoclaw-agent:local \
-      agent-runtime/
-    ok "NemoClaw sandbox image ready"
+    if grep -Eq '^NEMOCLAW_SANDBOX_IMAGE=nora-nemoclaw-agent:local$' "$ENV_FILE"; then
+      echo ""
+      info "Building nora-nemoclaw-agent:local (OpenShell sandbox + tsx)..."
+      echo ""
+      docker build \
+        -f agent-runtime/Dockerfile.nemoclaw-agent \
+        -t nora-nemoclaw-agent:local \
+        agent-runtime/
+      ok "NemoClaw sandbox image ready"
+    else
+      info "Using GHCR NemoClaw sandbox image from NEMOCLAW_SANDBOX_IMAGE"
+    fi
     ;;
 esac
 

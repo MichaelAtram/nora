@@ -1,0 +1,23 @@
+{{- if .Values.backupsVolume.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nora-backups
+  labels:
+    {{- include "nora.labels" (dict "root" . "component" "backups") | nindent 4 }}
+  annotations:
+    # Retain the backup archives across `helm uninstall` and across a
+    # `--set backupsVolume.enabled=false` (which the README recommends on
+    # multi-node clusters). Without this, Helm deletes the PVC and every local
+    # backup with it. Delete the PVC by hand if you truly want the data gone.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.backupsVolume.accessModes | nindent 4 }}
+  {{- with .Values.backupsVolume.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backupsVolume.size }}
+{{- end }}

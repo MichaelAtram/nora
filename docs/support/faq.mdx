@@ -9,12 +9,14 @@ If you are evaluating Nora or have just started self-hosting it, the questions b
     Yes. Nora is licensed under the **Apache 2.0** license, which means you can self-host it, modify it, use it commercially inside your company, host it for clients, and build services or integrations on top of it — all at no cost and without a commercial agreement.
 
     The center of the product is the fully open-source repository and self-hosted control-plane workflow. There is no proprietary core or usage-gated tier hidden behind the open-source version.
+
   </Accordion>
 
   <Accordion title="Can I use Nora in production?">
-    Yes. Nora is designed for serious operator use. Individual builders, internal AI platform teams, and larger enterprise environments can all run it. It is built to stay credible from single-host evaluation through Proxmox, private cloud, and AWS/Azure/GCP rollout footprints.
+    Yes. Nora is designed for serious operator use. Individual builders, internal AI platform teams, and larger enterprise environments can all run it. It is built to stay credible from single-host Docker evaluation through Kubernetes, private cloud, and AWS/Azure/GCP rollout footprints. Proxmox placement is planned but not supported in the current release.
 
     If you need rollout help, deployment review, or paid support for a production environment, the [GitHub Discussions](https://github.com/solomon2773/nora/discussions) path and the [deployment and support options](https://nora.solomontsao.com/pricing) page are the right starting points.
+
   </Accordion>
 
   <Accordion title="What LLM providers are supported?">
@@ -38,10 +40,12 @@ If you are evaluating Nora or have just started self-hosting it, the questions b
     * Hugging Face
     * Cerebras
     * NVIDIA
+    * Microsoft Foundry
 
     <Tip>
       After saving or updating a key in Settings, use the **Sync** button on the agent detail page to push the key to any running agents.
     </Tip>
+
   </Accordion>
 
   <Accordion title="Is my API key data safe?">
@@ -52,6 +56,7 @@ If you are evaluating Nora or have just started self-hosting it, the questions b
     <Warning>
       Never post your API keys, `.env` file contents, or `ENCRYPTION_KEY` value in GitHub Issues or Discussions.
     </Warning>
+
   </Accordion>
 
   <Accordion title="Can I run multiple agents at the same time?">
@@ -62,18 +67,21 @@ If you are evaluating Nora or have just started self-hosting it, the questions b
     ```
 
     Restart the stack after changing the value.
+
   </Accordion>
 
   <Accordion title="What is NemoClaw?">
-    NemoClaw is a Docker-hosted sandbox backend with OpenShell policy controls, powered by NVIDIA Nemotron models. It provides a secure, isolated execution environment for agent runtimes that require tighter operational controls.
+    NemoClaw is an experimental sandbox profile with OpenShell policy controls, powered by NVIDIA Nemotron models. It provides a secure, isolated execution environment for agent runtimes that require tighter operational controls.
 
-    NemoClaw is disabled by default. To enable it, set `NEMOCLAW_ENABLED=true` and provide a valid `NVIDIA_API_KEY` in your `.env` file. See the [troubleshooting guide](/support/troubleshooting) if NemoClaw fails to start after enabling it.
+    NemoClaw is disabled by default. To enable it, add `nemoclaw` to `ENABLED_SANDBOX_PROFILES` (e.g. `ENABLED_SANDBOX_PROFILES=standard,nemoclaw`) and save an NVIDIA provider key in **Settings** or provide a platform fallback with `NVIDIA_API_KEY`. It can deploy to local Docker, remote Docker hosts, k3s, and managed Kubernetes targets once those execution targets are connected. See the [troubleshooting guide](/support/troubleshooting) if NemoClaw fails to start after enabling it.
+
   </Accordion>
 
   <Accordion title="What is OpenClaw?">
     OpenClaw is the primary supported agent runtime in Nora today and the fastest path to a working deployment. It is an open-source project maintained separately at [github.com/openclaw/openclaw](https://github.com/openclaw/openclaw).
 
     When you deploy an agent in Nora, the default runtime path uses OpenClaw. Nora's architecture is designed to support additional runtimes over time, so OpenClaw is the best-supported option today but not the only one the platform will support.
+
   </Accordion>
 
   <Accordion title="Can I run Nora on Kubernetes?">
@@ -88,6 +96,7 @@ If you are evaluating Nora or have just started self-hosting it, the questions b
     Then register each cluster in **Admin -> Kubernetes** with a kubeconfig path like
     `/kubeconfigs/aks-eastus2`. K3s clusters usually use NodePort exposure in the Admin row; AKS,
     GKE, and EKS usually use LoadBalancer exposure.
+
   </Accordion>
 
   <Accordion title="How do I get support?">
@@ -98,6 +107,7 @@ If you are evaluating Nora or have just started self-hosting it, the questions b
     * **Paid support, managed PaaS, or enterprise deployments** — see the options at [nora.solomontsao.com/pricing](https://nora.solomontsao.com/pricing)
 
     When asking for help in Issues or Discussions, include your deployment mode, OS, setup method, and any relevant logs. Do not include secrets or private credentials.
+
   </Accordion>
 
   <Accordion title="Can I contribute to Nora?">
@@ -111,5 +121,6 @@ If you are evaluating Nora or have just started self-hosting it, the questions b
     4. Open a pull request
 
     For larger changes, consider opening a [GitHub Discussion](https://github.com/solomon2773/nora/discussions) first to align on direction before investing significant time.
+
   </Accordion>
 </AccordionGroup>

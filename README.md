@@ -1,9 +1,9 @@
 <div align="center">
   <img src=".github/readme-assets/nora-logo.png" alt="Nora" width="112" height="112" />
   <h1>Nora</h1>
-  <p><strong>The self-hosted AI agent ops platform.</strong></p>
+  <p><strong>Deploy &amp; operate AI agent fleets on infrastructure you control.</strong></p>
   <p>
-    Deploy, monitor, and operate OpenClaw and Hermes runtimes from one operator surface — runtime-neutral, Apache 2.0, and on infrastructure you control. Grow from a single Docker host to Kubernetes, Proxmox, or NemoClaw sandboxes without replacing your ops layer.
+    The self-hosted, runtime-neutral control plane for OpenClaw and Hermes agents — deploy, monitor, and operate them from one operator surface, Apache 2.0. Run on Docker or Kubernetes today, use NemoClaw sandboxes experimentally, and track Proxmox as a planned execution target.
   </p>
 </div>
 
@@ -13,6 +13,7 @@
   <img src="https://img.shields.io/badge/docker-compose-2496ED.svg" alt="Docker Compose" />
   <img src="https://img.shields.io/badge/self--hosted-first-0ea5e9.svg" alt="Self-hosted first" />
   <img src="https://img.shields.io/badge/commercial%20use-Apache%202.0%20allowed-6d28d9.svg" alt="Commercial use allowed" />
+  <img src="https://img.shields.io/badge/MCP-server%20%2B%20per--agent-7c3aed.svg" alt="MCP server and per-agent MCP" />
 </p>
 
 <p align="center">
@@ -20,6 +21,8 @@
   <a href="https://noradocs.solomontsao.com/quickstart">Quick Start</a> ·
   <a href="https://noradocs.solomontsao.com/self-hosting">Self-Hosting</a> ·
   <a href="https://noradocs.solomontsao.com/concepts/architecture">Architecture</a> ·
+  <a href="https://noradocs.solomontsao.com/compare">How Nora Compares</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
   <a href="https://nora.solomontsao.com">Public Site</a> ·
   <a href="https://nora.solomontsao.com/signup">Create Account</a>
 </p>
@@ -27,17 +30,20 @@
 ---
 
 <p align="center">
-  <video src="https://github.com/solomon2773/nora/raw/master/.github/readme-assets/walkthrough.mp4" controls muted width="900"></video>
+  <a href="https://github.com/solomon2773/nora/raw/master/.github/readme-assets/walkthrough.mp4">
+    <img src=".github/readme-assets/walkthrough.gif" alt="Watch the Nora walkthrough" width="900" />
+  </a>
+</p>
+<p align="center">
+  <sub>▶ <b><a href="https://github.com/solomon2773/nora/raw/master/.github/readme-assets/walkthrough.mp4">Watch the walkthrough</a></b></sub>
 </p>
 
-<p align="center">
-  <img src=".github/readme-assets/proof-operator-openclaw-ui-tab.png" alt="OpenClaw UI tab in Nora" width="380" />
-  &nbsp;&nbsp;
-  <img src=".github/readme-assets/proof-operator-hermes-webui-tab.png" alt="Hermes official dashboard in Nora" width="380" />
-</p>
-<p align="center">
-  <sub><b>OpenClaw UI tab</b> &nbsp;·&nbsp; <b>Hermes official dashboard</b></sub>
-</p>
+## Standards & isolation
+
+- **MCP — shipped.** A control-plane [MCP](https://modelcontextprotocol.io) server (`@noraai/mcp-server`, published to the official [MCP Registry](https://github.com/modelcontextprotocol/registry)) plus per-agent MCP server management — operate the fleet from Claude Code / Desktop / Cursor, and wire MCP tools into individual agents.
+- **OpenTelemetry GenAI — available.** [OTLP + Prometheus export](https://noradocs.solomontsao.com/guides/opentelemetry) of runtime telemetry under the `gen_ai.*` semantic conventions — per-exchange chat spans plus token/cost/resource metrics flow into the Grafana / Datadog / Langfuse stack you already run. (Per-tool-call sub-spans depend on runtime event streams and remain on the roadmap.)
+- **A2A — on the roadmap.** Agent Cards / Agent-to-Agent discovery for managed OpenClaw and Hermes agents.
+- **Isolation, per deploy target.** Standard Docker and Kubernetes runs use container namespaces plus operator-set CPU / RAM / disk limits; the experimental **NemoClaw** profile hardens untrusted code with a non-root user, all Linux capabilities dropped, `no-new-privileges`, Landlock + seccomp, and default-deny egress; Proxmox VM placement (planned) is the future hardware-isolation tier. See the [isolation model](https://noradocs.solomontsao.com/concepts/security#runtime-isolation).
 
 ## What Is Nora?
 
@@ -63,14 +69,17 @@ curl -fsSL https://raw.githubusercontent.com/solomon2773/nora/master/setup.sh | 
 iwr -useb https://raw.githubusercontent.com/solomon2773/nora/master/setup.ps1 | iex
 ```
 
-The installer verifies prerequisites, generates secrets, optionally creates a bootstrap admin, and starts the stack. Once it finishes, open `http://localhost:8080` and follow the [first-15-minutes walkthrough](https://noradocs.solomontsao.com/quickstart).
+> **Windows requires [PowerShell 7+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows).** The default Windows PowerShell 5.1 is not supported — run the command above from a `pwsh` 7 session.
 
-For manual setup, environment variables, public-domain mode, TLS, and Kubernetes / Proxmox / NemoClaw configuration, see the docs:
+The installer verifies prerequisites, generates or preserves secrets, optionally creates a bootstrap admin, picks free local ports when the defaults are busy, and starts the stack. Once it finishes, open the URL printed by setup. Local mode defaults to `http://localhost:8080`, but setup may select another port such as `8081` on a busy workstation. Then follow the [first-15-minutes walkthrough](https://noradocs.solomontsao.com/quickstart).
+
+For manual setup, environment variables, public-domain mode, TLS, Kubernetes, NemoClaw, and planned Proxmox configuration, see the docs:
 
 - [Self-hosting guide](https://noradocs.solomontsao.com/self-hosting)
 - [Environment variables reference](https://noradocs.solomontsao.com/configuration/environment-variables)
-- [Provisioner backends](https://noradocs.solomontsao.com/configuration/provisioner-backends) (Docker, k3s/Kubernetes, Proxmox, NemoClaw)
+- [Provisioner backends](https://noradocs.solomontsao.com/configuration/provisioner-backends) (Docker and k3s/Kubernetes are GA; NemoClaw is experimental; Proxmox is planned)
 - [TLS and public domains](https://noradocs.solomontsao.com/configuration/tls-domains)
+- [Fronting a launch with Cloudflare](infra/cloudflare-launch.md) — edge caching, rate limiting, and spike absorption for the single-host deploy
 
 ## Documentation
 
@@ -94,29 +103,29 @@ Nginx
 ├── /admin/*    → admin-dashboard     (Next.js)
 └── /api/*      → backend-api         (Express.js)
                        ├── PostgreSQL
-                       ├── Redis + BullMQ  (deployments, clawhub-installs, backups, alert-deliveries)
+                       ├── Redis + BullMQ  (deployments, clawhub-jobs, backups, alert-deliveries)
                        ├── worker-provisioner
                        ├── worker-backup
-                       └── runtime adapters  (Docker · k3s/k8s · Proxmox · NemoClaw)
+                       └── runtime adapters/profiles  (Docker GA · k3s/k8s GA · NemoClaw experimental · Proxmox planned)
 ```
 
 Full architecture write-up — system map, queue/worker boundaries, RBAC, migration contract, deployment topologies — is in [docs/concepts/architecture](https://noradocs.solomontsao.com/concepts/architecture).
 
 ## Tech Stack
 
-| Layer                 | Technology                                             |
-| --------------------- | ------------------------------------------------------ |
-| Reverse proxy         | Nginx                                                  |
-| Frontends             | Next.js 16, React 19, Tailwind CSS                     |
-| Backend API           | Express.js 4, Node.js 24 LTS                           |
-| Auth                  | JWT, HttpOnly cookies, bcryptjs, provider OAuth bridge |
-| Database              | PostgreSQL 15                                          |
-| Queue                 | BullMQ + Redis 7                                       |
-| Runtime families      | OpenClaw, Hermes                                       |
-| Provisioning backends | Docker, k3s/Kubernetes, Proxmox, NemoClaw              |
-| Secrets at rest       | AES-256-GCM (provider keys, integrations, backups)     |
+| Layer                 | Technology                                                                         |
+| --------------------- | ---------------------------------------------------------------------------------- |
+| Reverse proxy         | Nginx                                                                              |
+| Frontends             | Next.js 16, React 19, Tailwind CSS                                                 |
+| Backend API           | Express.js 5, Node.js 24 LTS                                                       |
+| Auth                  | JWT, HttpOnly cookies, bcryptjs, provider OAuth bridge                             |
+| Database              | PostgreSQL 15                                                                      |
+| Queue                 | BullMQ + Redis 7                                                                   |
+| Runtime families      | OpenClaw, Hermes                                                                   |
+| Provisioning backends | Docker and k3s/Kubernetes (GA); NemoClaw (experimental sandbox); Proxmox (planned) |
+| Secrets at rest       | AES-256-GCM (provider keys, integrations, backups)                                 |
 
-## Public REST API and CLI
+## Public REST API, CLI, and MCP
 
 Workspace-scoped API keys (bearer-only, prefixed `nora_`, HMAC-hashed at rest, scope-based) drive a stable subset of the REST surface. Issue keys at `/app/workspaces/<id>/api-keys`.
 
@@ -125,15 +134,25 @@ export NORA_TOKEN="nora_..."
 curl -H "Authorization: Bearer $NORA_TOKEN" https://your-nora.example.com/api/agents
 ```
 
-A small CLI lives in [`cli/`](./cli) (`@nora/cli`) and wraps the same surface for `nora workspaces`, `nora agents`, and `nora monitoring`. See the [API reference](https://noradocs.solomontsao.com/api/overview) for the supported endpoints and scopes.
+A small CLI lives in [`cli/`](./cli) (`@noraai/cli`): run `nora login` once to save your host and API token, then `nora workspaces`, `nora agents`, and `nora monitoring` wrap the same REST surface. `nora doctor` runs an admin-only control-plane health check, and `nora mcp` launches the MCP stdio server. See the [API reference](https://noradocs.solomontsao.com/api/overview) for the supported endpoints and scopes.
+
+**Operate Nora from Claude Code, Claude Desktop, or Cursor:** the [`mcp-server/`](./mcp-server) package (`@noraai/mcp-server`) exposes the same API as [Model Context Protocol](https://modelcontextprotocol.io) tools — deploy agents, control their lifecycle, and read fleet metrics, events, and per-agent cost from any MCP client. Destructive deletion stays disabled unless explicitly opted in.
+
+```bash
+claude mcp add nora \
+  --env NORA_API_URL=https://your-nora.example.com \
+  --env NORA_API_KEY=nora_... \
+  -- npx -y @noraai/mcp-server
+```
+
+See the [MCP guide](https://noradocs.solomontsao.com/guides/mcp-server) for Claude Desktop/Cursor config, the tool list, and security notes.
 
 ## Roadmap
 
 Current roadmap items:
 
-- **High priority - NemoClaw production readiness:** harden secure-sandbox deploys across enablement, NVIDIA key and model configuration, OpenShell policy controls, approvals, gateway health, logs, terminal access, telemetry, and end-to-end validation.
-- **Kubernetes policy controls:** extend NemoClaw/OpenShell policy enforcement, approval workflows, network policy defaults, pod-level telemetry, and smoke coverage to k3s/Kubernetes deploy targets.
-- **Proxmox backend:** continue adapter work for standard, Hermes, and NemoClaw-backed LXC deployments, with stronger API/SSH validation, template handling, lifecycle operations, log streaming, telemetry, and smoke coverage.
+- **High priority - NemoClaw experimental hardening:** mature the experimental secure-sandbox profile across enablement, NVIDIA key and model configuration, OpenShell policy controls, approvals, gateway health, logs, terminal access, telemetry, and end-to-end validation.
+- **Proxmox execution target:** complete the planned LXC deployment path for standard, Hermes, and NemoClaw-backed runtimes, with stronger API/SSH validation, template handling, lifecycle operations, log streaming, telemetry, and smoke coverage.
 - **Hermes/OpenClaw parity:** close runtime gaps across validation, deployment readiness, logs, terminal access, monitoring, integration setup, and failure reporting.
 - **First-run operator UX:** tighten the setup path for workspaces, LLM providers, provisioning backends, the first agent deploy, and recommended smoke checks.
 - **Account-scoped monitoring:** add account-level health views that roll up workspace, agent, runtime, cost, and alert signals with drill-downs where operators need detail.
@@ -155,6 +174,8 @@ cd e2e && npm test
 Detailed contributor guidance, subtree ownership, and development commands live in [`CLAUDE.md`](./CLAUDE.md). For deeper repo work, read [`CONTRIBUTING.md`](./CONTRIBUTING.md), the root [`AGENTS.md`](./AGENTS.md), and the nearest subtree `AGENTS.md`.
 
 ## Contributing
+
+New here? Browse [**good first issues**](https://github.com/solomon2773/nora/labels/good%20first%20issue) for small, self-contained starting points, then skim [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 Strong contribution areas: runtime adapter work · operator and admin UX · provisioning and lifecycle orchestration · integrations and channels · test and CI hardening · self-hosted deployment ergonomics.
 

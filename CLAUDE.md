@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Repo Is
 
-Nora is the self-hosted AI agent ops platform — an operator-facing control plane that manages, deploys, monitors, and operates agent runtimes across multiple backends (Docker, Kubernetes, Proxmox, NemoClaw, Hermes). Node 24 LTS across all services.
+Nora is the self-hosted AI agent ops platform — an operator-facing control plane that manages, deploys, monitors, and operates agent runtimes across Docker and Kubernetes GA deploy targets. Runtime families are OpenClaw and Hermes; NemoClaw is an experimental sandbox profile layered onto supported deploy targets. Proxmox is a known but release-blocked planned target. Node 24 LTS across all services.
 
 ## Development Commands
 
@@ -74,9 +74,7 @@ nginx (8080 local / 80|443 public)
                     └── worker-provisioner (health on 4001)
                           ├── Docker adapter
                           ├── Kubernetes adapter
-                          ├── Proxmox adapter
-                          ├── NemoClaw adapter
-                          └── Hermes adapter
+                          └── Proxmox adapter (release-blocked)
 ```
 
 **Key ports:** nginx 8080 (local), backend-api container 4000 → host 4100, worker-provisioner health 4001, agent runtime contract 9090, OpenClaw gateway 18789, Hermes dashboard 9119.
@@ -88,8 +86,8 @@ nginx (8080 local / 80|443 public)
 Resolved in `agent-runtime/lib/backendCatalog.ts`:
 
 1. **Runtime family** (`ENABLED_RUNTIME_FAMILIES`): `openclaw` (default) or `hermes`
-2. **Deploy target** (`ENABLED_BACKENDS`): `docker`, `k8s`, `proxmox`
-3. **Sandbox profile**: `standard` or `nemoclaw`
+2. **Deploy target** (`ENABLED_BACKENDS`): `docker`, `k8s`, `proxmox` (`proxmox` is release-blocked)
+3. **Sandbox profile**: `standard` or `nemoclaw` (`nemoclaw` is experimental)
 
 ### Shared runtime contracts
 
@@ -102,7 +100,14 @@ Resolved in `agent-runtime/lib/backendCatalog.ts`:
 
 ### Backend adapter code sharing
 
-Compose mounts `./workers/provisioner/backends` into `backend-api` at `/app/backends`. This means adapter code is **physically shared** between the API and the worker. When editing adapters, verify both consumers still work.
+⚠️ **SHARED/MOUNTED — blast radius spans two services.** Compose mounts `./workers/provisioner/backends` into `backend-api` at `/app/backends`. This means adapter code is **physically shared** between the API and the worker. When editing adapters, verify both consumers still work.
+
+Two consequences that routinely confuse agents:
+
+- **The mount shadows the host `backend-api/backends/` directory at runtime.** Inside the backend-api container, `/app/backends/*` resolves to the worker's copy, _not_ the host files under `backend-api/backends/`. A change to a host file that the mount shadows has **no runtime effect** in the container.
+- **`backend-api/backends/hermes.ts` and `nemoclaw.ts` are re-export shims** (`module.exports = require("../../workers/provisioner/backends/<name>")`) — edit the worker source, never the shim. The one genuinely backend-owned file there is `telemetry.ts` (backend telemetry normalization), which is distinct from the worker's `telemetry.ts`.
+
+Treat `workers/provisioner/backends/` and `agent-runtime/` as **shared-blast-radius zones**: an edit there changes both backend-api and the worker. See those folders' `AGENTS.md` for the per-folder warning.
 
 ### Key backend modules
 
@@ -115,21 +120,34 @@ Compose mounts `./workers/provisioner/backends` into `backend-api` at `/app/back
 Each folder has its own `AGENTS.md` that narrows ownership, data-flow rules, and architecture. Read the relevant subtree doc before implementing in that area. Cross-cutting changes should be split across affected subtrees.
 
 - `backend-api/` — primary integration hub: control-plane APIs, persistence, queue, auth, monitoring, Agent Hub, gateway proxy, runtime coordination
+- `cli/` — packaged command-line client for Nora's public REST APIs, workspace config, token auth, and operator automation commands
+- `mcp-server/` — `@noraai/mcp-server`, standalone MCP (Model Context Protocol) stdio server exposing the public REST API as tools for Claude Code/Desktop/Cursor; pure API client authenticated by workspace API keys, no backend coupling
 - `workers/provisioner/` — async provisioning worker; `workers/provisioner/backends/` holds adapter implementations (shared with backend-api via volume mount)
 - `agent-runtime/` — shared runtime contracts (mounted read-only into backend-api and worker)
 - `frontend-dashboard/` — operator UI at `/app`; coordinates with backend-api for API + WebSocket contracts
 - `admin-dashboard/` — platform admin UI at `/admin`
 - `frontend-marketing/` — public site + auth entrypoints at `/`
 - `e2e/` — Playwright smoke coverage and local stack bootstrapping
-- `infra/` — public-domain nginx template (`nginx_public.conf.template`), TLS setup (`setup-tls.sh`), Kind config, backup image, public/prod compose overlays
+- `infra/` — public-domain nginx template (`nginx_public.conf.template`), TLS setup (`setup-tls.sh`), Kind config, backup image, public/prod compose overlays, and the official Helm chart for installing Nora on Kubernetes (`helm/nora`, with `helm/scripts/kind-smoke.sh`)
 - `docs/` — Mintlify source for the public docs site at `noradocs.solomontsao.com`
 - `.github/` — CI and deploy workflows
 
 Note: the **active** nginx configs (`nginx.conf`, `nginx.e2e.conf`, `nginx.public.conf`) live at the **repo root** — that's what compose mounts. `infra/nginx_public.conf.template` is a template used by `setup-tls.sh`.
 
+Root-owned operational files also live at the repo root: `docker-compose*.yml`, `setup.sh`, `setup.ps1`, `package.json`, and `tsconfig.base.json`. Coordinate changes to those through the root owner plus the affected service, `infra/`, `.github/`, or `e2e/` owner.
+
+### Parallel / multi-agent work
+
+When multiple agents work the repo at once:
+
+- **Divide by subtree owner**, using the routing table in the root `AGENTS.md`. Keep each agent's writes inside its owned subtree unless the root doc says otherwise.
+- **Use a git worktree per agent** for any file-mutating task, so concurrent edits can't collide in a single working tree.
+- **Treat `agent-runtime/` and `workers/provisioner/backends/` as shared-blast-radius zones** (see the ⚠️ SHARED/MOUNTED banners in those folders' `AGENTS.md`). An edit there changes two services — coordinate it rather than assuming it is local to one subtree.
+- **Grep `⚠️ SHARED/MOUNTED`** to find every cross-consumer zone before fanning out work.
+
 ## Environment
 
-Copy `.env.example` to `.env`. Required: `JWT_SECRET`, `ENCRYPTION_KEY`, `NEXTAUTH_URL`.
+Copy `.env.example` to `.env`. Required (boot fails closed in production): `JWT_SECRET`, `ENCRYPTION_KEY`. Also required for managed backups: `NORA_BACKUP_ENCRYPTION_KEY`. `NORA_AGENT_HUB_API_KEY_HASH_SECRET` is in the Required block but auto-generates on setup/update when missing. `NEXTAUTH_URL` has a working localhost default and is kept only for deploy-env compatibility (not validated).
 
 Commonly toggled: `PLATFORM_MODE` (`selfhosted` or `paas`), `ENABLED_RUNTIME_FAMILIES`, `ENABLED_BACKENDS`, `NGINX_CONFIG_FILE`, `NGINX_HTTP_PORT`, `BACKEND_API_PORT`, `NORA_KUBECONFIGS_DIR`, `NVIDIA_API_KEY` (required when `nemoclaw` is enabled), `CORS_ORIGINS`.
 

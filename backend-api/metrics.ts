@@ -1,5 +1,18 @@
 // @ts-nocheck
 const db = require("./db");
+// Lazy OTel handle — required after definition to avoid any load-order coupling;
+// otel.ts is fail-open and a no-op when disabled.
+let _otel = null;
+function otel() {
+  if (_otel === null) {
+    try {
+      _otel = require("./otel");
+    } catch {
+      _otel = { recordChatExchange() {}, isEnabled: () => false };
+    }
+  }
+  return _otel;
+}
 
 /**
  * Record a single metric data point.
@@ -95,9 +108,42 @@ async function recordTokenUsage(agentOrId, userId, payload = {}, defaults = {}) 
   if (!agentId || !userId) return null;
   const runtimeFamily =
     defaults.runtimeFamily || (typeof agentOrId === "object" ? agentOrId?.runtime_family : null);
+  const sandboxProfile =
+    defaults.sandboxProfile || (typeof agentOrId === "object" ? agentOrId?.sandbox_profile : null);
   const usage = extractTokenUsage(payload, { ...defaults, runtimeFamily });
   if (!usage) return null;
+  if (sandboxProfile) {
+    usage.metadata.sandbox_profile = String(sandboxProfile);
+  }
   await recordMetric(agentId, userId, "tokens_used", usage.totalTokens, usage.metadata);
+  // Mirror the exchange to the OpenTelemetry GenAI exporter (no-op when
+  // disabled; never throws). Cost is estimated in-process from the same pricing
+  // as the canonical rollup, so no extra DB round-trip.
+  try {
+    const m = usage.metadata || {};
+    otel().recordChatExchange({
+      agentId,
+      model: m.model,
+      provider: m.provider,
+      runtimeFamily,
+      sandboxProfile: m.sandbox_profile,
+      source: m.source,
+      sessionId: m.session_id,
+      inputTokens: m.input_tokens,
+      outputTokens: m.output_tokens,
+      totalTokens: usage.totalTokens,
+      costUsd: estimateCostUsd({
+        model: m.model,
+        provider: m.provider,
+        inputTokens: m.input_tokens,
+        outputTokens: m.output_tokens,
+        totalTokens: usage.totalTokens,
+      }),
+      startedAtMs: defaults.startedAtMs,
+    });
+  } catch {
+    /* telemetry export is best-effort */
+  }
   return usage;
 }
 
@@ -475,6 +521,51 @@ async function getTokenCostBreakdown(agentId, costWindow) {
   };
 }
 
+// Cached model-rate map for the hot per-exchange cost estimate (OTel export).
+// The canonical cost path (getTokenCostBreakdown) re-parses each call; this
+// cache only serves the high-frequency estimate. A COST_MODEL_RATES_JSON change
+// needs a restart, same as any other env change.
+let _cachedModelRates = null;
+function getCachedModelRates() {
+  if (!_cachedModelRates) _cachedModelRates = parseModelRateMap();
+  return _cachedModelRates;
+}
+
+/**
+ * Estimate the USD cost of a single recorded exchange without a DB round-trip,
+ * reusing the same model-aware pricing/branching as the canonical cost rollup
+ * (buildTokenCostModel) but returning the RAW, unrounded cost. The OTel cost
+ * counter sums many sub-cent exchanges, so cent-rounding each one (as the
+ * display rollup does) would zero them out. Returns a number (0 on any bad
+ * input — never throws).
+ */
+function estimateCostUsd({ model, provider, inputTokens, outputTokens, totalTokens } = {}) {
+  try {
+    const fallbackPer1k = normalizePositiveRate(process.env.COST_PER_1K_TOKENS || "0.002");
+    const input = normalizeCostNumber(inputTokens);
+    const output = normalizeCostNumber(outputTokens);
+    const total = normalizeCostNumber(totalTokens) || input + output;
+    if (total <= 0) return 0;
+    const modelKey = String(model || "").trim();
+    const isUnknownModel = !modelKey || modelKey === UNKNOWN_MODEL;
+    const rate = isUnknownModel ? null : resolveModelRate(model, provider, getCachedModelRates());
+    const hasSplit = input > 0 || output > 0;
+    let cost;
+    if (rate && hasSplit && (rate.inputPer1k !== null || rate.outputPer1k !== null)) {
+      const inRate = rate.inputPer1k ?? rate.per1k ?? fallbackPer1k;
+      const outRate = rate.outputPer1k ?? rate.per1k ?? fallbackPer1k;
+      cost = (input / 1000) * inRate + (output / 1000) * outRate;
+    } else if (rate && rate.per1k !== null) {
+      cost = (total / 1000) * rate.per1k;
+    } else {
+      cost = (total / 1000) * fallbackPer1k;
+    }
+    return Number.isFinite(cost) && cost > 0 ? cost : 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function getAgentCost(agentId, options = {}) {
   const costWindow = resolveCostWindow(options);
 
@@ -644,6 +735,7 @@ async function getAccessibleWorkspaceCosts(userId, options = {}) {
 module.exports = {
   recordMetric,
   recordTokenUsage,
+  estimateCostUsd,
   getAgentMetrics,
   getAgentSummary,
   getUserSummary,

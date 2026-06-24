@@ -21,19 +21,39 @@ const { collectAgentTelemetrySample } = require("./agentTelemetry");
 const {
   collectBackgroundTelemetry,
   reconcileBackgroundAgentStatuses,
+  reconcileExternalAgentStatuses,
 } = require("./backgroundTasks");
+const agentBudgets = require("./agentBudgets");
+const agentSchedules = require("./agentSchedules");
+const { addScheduleRunJob } = require("./redisQueue");
+// OpenTelemetry GenAI exporter — self-initializes on require (no-op unless
+// NORA_OTEL_ENABLED=true; fail-open). Wrapped so even a module load/parse error
+// (e.g. a corrupted dependency) disables OTel rather than crashing boot — the
+// init() try/catch only covers runtime errors, not require-time failures.
+let otel;
+try {
+  otel = require("./otel");
+} catch (otelErr) {
+  console.warn(`[otel] module load failed — telemetry disabled: ${otelErr?.message || otelErr}`);
+  otel = { isEnabled: () => false, shutdown: async () => {} };
+}
 const { listKubernetesExecutionTargets } = require("./kubernetesClusters");
 const { STARTER_TEMPLATES } = require("./starterTemplates");
 const { getBootstrapAdminSeedConfig } = require("./bootstrapAdmin");
 const { ensureFirstRegisteredUserIsAdmin } = require("./ensureAdminUser");
 const { authenticateToken } = require("./middleware/auth");
 const { correlationId, errorHandler } = require("./middleware/errorHandler");
-const { createGatewayRouter, attachGatewayWS } = require("./gatewayProxy");
+const {
+  createGatewayRouter,
+  attachGatewayWS,
+  resolveSafeGatewayHttpTarget,
+  resolveSafeHermesDashboardTarget,
+} = require("./gatewayProxy");
 const { isGatewayAvailableStatus } = require("./agentStatus");
 const { repairHermesAgentConfig } = require("./hermesUi");
+const { HERMES_EMBED_AGENT_COLUMNS, GATEWAY_EMBED_AGENT_COLUMNS } = require("./embedAgentColumns");
 const {
-  gatewayUrlForAgent,
-  dashboardUrlForAgent,
+  joinHttpUrl,
   hasGatewayEndpoint,
   hasHermesDashboardEndpoint,
 } = require("../agent-runtime/lib/agentEndpoints");
@@ -53,7 +73,12 @@ const {
 
 // ─── JWT Secret ───────────────────────────────────────────────────
 const IS_TEST_ENV = process.env.NODE_ENV === "test" || !!process.env.JEST_WORKER_ID;
+const { looksLikePlaceholderSecret } = require("./lib/secretValidation");
 const MIN_JWT_SECRET_LENGTH = 32;
+// When a dev boot generated an ephemeral JWT secret, we persist/restore it via
+// platform_settings after the DB is up so sessions survive restarts (dev only;
+// production refuses to boot without an explicit secret).
+let usedEphemeralJwtSecret = false;
 if (!process.env.JWT_SECRET) {
   if (IS_TEST_ENV) {
     process.env.JWT_SECRET = "secret";
@@ -64,9 +89,10 @@ if (!process.env.JWT_SECRET) {
     process.exit(1);
   } else {
     console.warn(
-      "SECURITY WARNING: JWT_SECRET not configured. Using ephemeral secret — all tokens will invalidate on restart. Set JWT_SECRET in .env.",
+      "SECURITY WARNING: JWT_SECRET not configured. Using a generated dev secret (persisted in the database so sessions survive restarts). Set JWT_SECRET in .env for real deployments.",
     );
     process.env.JWT_SECRET = crypto.randomBytes(32).toString("hex");
+    usedEphemeralJwtSecret = true;
   }
 } else if (!IS_TEST_ENV && process.env.JWT_SECRET.length < MIN_JWT_SECRET_LENGTH) {
   // A short JWT_SECRET is brute-forceable offline given any signed token. Fail
@@ -77,6 +103,40 @@ if (!process.env.JWT_SECRET) {
     `FATAL: JWT_SECRET is shorter than the minimum of ${MIN_JWT_SECRET_LENGTH} characters. Generate a stronger one (e.g. node -e "console.log(require('crypto').randomBytes(32).toString('hex'))") and restart.`,
   );
   process.exit(1);
+} else if (!IS_TEST_ENV && looksLikePlaceholderSecret(process.env.JWT_SECRET)) {
+  // Placeholder-looking secrets (your_*, changeme, <REPLACE_...>, "test-...")
+  // mean the operator never edited .env.example. Tokens signed with a guessable
+  // secret are forgeable, so refuse in production; warn loudly in dev.
+  if (process.env.NODE_ENV === "production") {
+    console.error(
+      "FATAL: JWT_SECRET looks like a placeholder value. Generate a real secret and restart.",
+    );
+    process.exit(1);
+  }
+  console.warn("SECURITY WARNING: JWT_SECRET looks like a placeholder value — replace it in .env.");
+}
+
+// ─── Encryption key (credentials at rest) ─────────────────────────
+// crypto.ts already warns when ENCRYPTION_KEY is missing/invalid and blocks new
+// secret writes. In production that soft failure becomes a refusal to boot:
+// running a control plane that cannot encrypt integration credentials is a
+// footgun. NORA_ALLOW_PLAINTEXT_SECRETS=true is the explicit operator override
+// (e.g. air-gapped throwaway demos).
+{
+  const { isEncryptionConfigured } = require("./crypto");
+  if (
+    !IS_TEST_ENV &&
+    process.env.NODE_ENV === "production" &&
+    !isEncryptionConfigured() &&
+    process.env.NORA_ALLOW_PLAINTEXT_SECRETS !== "true"
+  ) {
+    console.error(
+      "FATAL: ENCRYPTION_KEY is not set (or is not a 64-char hex key) in production. " +
+        "Generate one with: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\" " +
+        "and set it in .env. To intentionally run without encryption at rest, set NORA_ALLOW_PLAINTEXT_SECRETS=true.",
+    );
+    process.exit(1);
+  }
 }
 
 // ─── App Setup ────────────────────────────────────────────────────
@@ -378,7 +438,7 @@ function setProxyResponseHeaders(res, resp, { cachePolicy = "asset" } = {}) {
 
 async function lookupEmbedAgent(agentId, userId) {
   const result = await db.query(
-    `SELECT host, gateway_token, gateway_host_port, gateway_host, gateway_port, status
+    `SELECT ${GATEWAY_EMBED_AGENT_COLUMNS.join(", ")}
        FROM agents
       WHERE id = $1 AND user_id = $2`,
     [agentId, userId],
@@ -394,8 +454,12 @@ async function lookupEmbedAgent(agentId, userId) {
 }
 
 async function lookupHermesEmbedAgent(agentId, userId) {
+  // Selects the SSRF-relevant fields (deploy_target / execution_target_id /
+  // user_id / gateway_host) the embed proxy's allowlist authorizes against — see
+  // embedAgentColumns.ts. Omitting them would mis-route a remote-docker/k8s agent
+  // or short-circuit the owner-scoping check.
   const result = await db.query(
-    `SELECT host, runtime_host, runtime_port, status, runtime_family, backend_type
+    `SELECT ${HERMES_EMBED_AGENT_COLUMNS.join(", ")}
        FROM agents
       WHERE id = $1 AND user_id = $2`,
     [agentId, userId],
@@ -552,7 +616,11 @@ const mutationLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests, please slow down" },
-  skip: (req) => req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS",
+  // Skip in tests: the unit suites fire far more than 60 mutations/min from a
+  // single IP, and the global limiter is not what they exercise (the signup
+  // limiter has its own dedicated test). Fully active outside test environments.
+  skip: (req) =>
+    IS_TEST_ENV || req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS",
 });
 app.use(mutationLimiter);
 
@@ -715,6 +783,34 @@ app.post("/webhooks/:channelId", async (req, res) => {
 
 app.use("/auth", require("./routes/auth"));
 
+// Zero-key demo LLM stub (OpenAI-compatible). Pre-auth: agent runtimes call it
+// over the container network with the derived demo bearer token, not a JWT.
+app.use("/demo-llm", require("./routes/demoLlm"));
+
+// ─── OpenAPI spec + interactive reference (pre-auth: the spec documents the
+// public surface and contains no secrets; publicly /api/api.json + /api/api-docs).
+app.get("/api.json", (req, res) => {
+  const { buildOpenApiDocument } = require("./openapi");
+  res.json(buildOpenApiDocument());
+});
+app.get("/api-docs", (req, res) => {
+  // Scalar's standalone bundle renders the reference client-side from the spec
+  // URL; loading it from the CDN keeps the backend dependency-free.
+  res
+    .type("html")
+    .send(
+      [
+        "<!doctype html>",
+        "<html><head><title>Nora API Reference</title>",
+        '<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>',
+        "</head><body>",
+        '<script id="api-reference" data-url="api.json"></script>',
+        '<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>',
+        "</body></html>",
+      ].join("\n"),
+    );
+});
+
 // ─── Gateway UI static assets (before auth wall — JS/CSS/icons contain no user data) ──
 // These are served pre-auth because iframes can't set Authorization headers on sub-resource loads.
 // Only opaque static files (JS bundles, CSS, favicons) are exempted — not HTML or
@@ -750,12 +846,16 @@ gatewayUIAssetProxy.get("/agents/:agentId/gateway/embed/bootstrap.js", async (re
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Vary", "Cookie");
+    // gateway_token is encrypted at rest; decrypt before inlining it into the
+    // embed bootstrap JS that the browser uses for the gateway WS handshake.
+    // decrypt() is transparent to legacy plaintext tokens.
+    const { decrypt } = require("./crypto");
     res.send(
       buildEmbedBootstrapScript({
         agentId: access.agentId,
         requestHost: req.headers.host,
         requestScheme: requestProtocol(req),
-        gatewayToken: access.agent.gateway_token,
+        gatewayToken: decrypt(access.agent.gateway_token),
       }),
     );
   } catch (err) {
@@ -772,10 +872,19 @@ async function proxyEmbeddedGateway(req, res) {
     if (!access) return;
 
     const gatewayPath = getEmbeddedGatewayPath(req);
-    const targetUrl = `${gatewayUrlForAgent(access.agent, gatewayPath)}${buildForwardedSearch(req)}`;
+    // Validate + resolve the gateway host against the SSRF allowlist before
+    // connecting (mirrors the HTTP gateway proxy; closes the embed-proxy SSRF
+    // gap where gatewayUrlForAgent reached the agent host unchecked).
+    const safeTarget = await resolveSafeGatewayHttpTarget(
+      access.agent,
+      gatewayPath,
+      buildForwardedSearch(req),
+    );
+    const targetUrl = safeTarget.url;
     const headers = {
       Accept: req.headers.accept || "*/*",
       "Accept-Encoding": "identity",
+      Host: safeTarget.hostHeader,
     };
 
     const method = req.method.toUpperCase();
@@ -838,7 +947,10 @@ async function proxyEmbeddedHermes(req, res) {
     if (!access) return;
 
     const hermesPath = getEmbeddedHermesPath(req);
-    const targetUrl = `${dashboardUrlForAgent(access.agent, hermesPath)}${buildForwardedSearch(req)}`;
+    // Validate + resolve the dashboard host against the gateway allowlist before
+    // connecting (closes the SSRF gap where runtime_host was reached unchecked).
+    const safeTarget = await resolveSafeHermesDashboardTarget(access.agent);
+    const targetUrl = `${joinHttpUrl(safeTarget.host, safeTarget.port, hermesPath)}${buildForwardedSearch(req)}`;
     const cookies = parseCookieHeader(req.headers.cookie || "");
     const dashboardTokenCookieName = getEmbedSessionCookieName(
       access.agentId,
@@ -969,10 +1081,20 @@ async function proxyGatewayAsset(req, res) {
     if (!access) return;
 
     const gatewayPath = req.path || "/";
-    const targetUrl = `${gatewayUrlForAgent(access.agent, gatewayPath)}${buildForwardedSearch(req)}`;
-    const resp = await fetch(targetUrl, {
+    // Same SSRF allowlist as the embed proxy — gateway asset/favicon fetches must
+    // not reach an unvalidated agent host either.
+    const safeTarget = await resolveSafeGatewayHttpTarget(
+      access.agent,
+      gatewayPath,
+      buildForwardedSearch(req),
+    );
+    const resp = await fetch(safeTarget.url, {
       method: req.method,
-      headers: { Accept: req.headers.accept || "*/*", "Accept-Encoding": "identity" },
+      headers: {
+        Accept: req.headers.accept || "*/*",
+        "Accept-Encoding": "identity",
+        Host: safeTarget.hostHeader,
+      },
       signal: AbortSignal.timeout(10000),
     });
     res.status(resp.status);
@@ -1007,6 +1129,7 @@ app.use("/llm-providers", require("./routes/llmProviders"));
 app.use("/clawhub", require("./routes/clawhub"));
 app.use("/agent-hub", require("./routes/agentHub"));
 app.use("/workspaces", require("./routes/workspaces"));
+app.use("/remote-hosts", require("./routes/remoteHosts"));
 app.use("/billing", require("./routes/billing"));
 // Fleet routes mount before /admin so the explicit prefix wins; both still go
 // through requireAdmin (the fleet router applies it itself, and /admin's own
@@ -1242,6 +1365,44 @@ async function migrateDB() {
     `DO $$ BEGIN ALTER TABLE kubernetes_clusters ADD COLUMN policy_settings_status JSONB NOT NULL DEFAULT '{}'::jsonb; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
     `CREATE INDEX IF NOT EXISTS idx_kubernetes_clusters_enabled
        ON kubernetes_clusters(enabled, is_default, label)`,
+    `CREATE TABLE IF NOT EXISTS remote_hosts (
+       id TEXT PRIMARY KEY,
+       owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       label TEXT NOT NULL,
+       enabled BOOLEAN NOT NULL DEFAULT true,
+       is_default BOOLEAN NOT NULL DEFAULT false,
+       ssh_host TEXT NOT NULL DEFAULT '',
+       ssh_port INTEGER NOT NULL DEFAULT 22,
+       ssh_user TEXT NOT NULL DEFAULT '',
+       ssh_auth_mode TEXT NOT NULL DEFAULT 'key',
+       ssh_private_key_encrypted TEXT,
+       ssh_password_encrypted TEXT,
+       ssh_passphrase_encrypted TEXT,
+       gateway_host TEXT NOT NULL DEFAULT '',
+       docker_host TEXT NOT NULL DEFAULT '',
+       last_test_status TEXT,
+       last_test_message TEXT,
+       last_tested_at TIMESTAMPTZ,
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       updated_at TIMESTAMPTZ DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_remote_hosts_owner
+       ON remote_hosts(owner_user_id, enabled, is_default, label)`,
+    `CREATE TABLE IF NOT EXISTS gateway_port_allocations (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       host_key TEXT NOT NULL,
+       agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+       port INTEGER NOT NULL,
+       purpose TEXT NOT NULL DEFAULT 'gateway',
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       UNIQUE(host_key, port)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_gateway_port_allocations_agent
+       ON gateway_port_allocations(agent_id)`,
+    `DO $$ BEGIN
+       ALTER TABLE gateway_port_allocations ADD COLUMN purpose TEXT NOT NULL DEFAULT 'gateway';
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
     `DO $$ BEGIN ALTER TABLE agents ADD COLUMN vcpu INTEGER DEFAULT 1; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
     `DO $$ BEGIN ALTER TABLE agents ADD COLUMN ram_mb INTEGER DEFAULT 1024; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
     `DO $$ BEGIN ALTER TABLE agents ADD COLUMN disk_gb INTEGER DEFAULT 10; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
@@ -1597,6 +1758,16 @@ async function migrateDB() {
        ON workspace_agents(workspace_id, agent_id)`,
     `CREATE INDEX IF NOT EXISTS idx_workspace_agents_agent
        ON workspace_agents(agent_id)`,
+    `CREATE TABLE IF NOT EXISTS workspace_remote_hosts (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+       remote_host_id TEXT REFERENCES remote_hosts(id) ON DELETE CASCADE,
+       created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+       created_at TIMESTAMP DEFAULT NOW(),
+       UNIQUE(workspace_id, remote_host_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_workspace_remote_hosts_host
+       ON workspace_remote_hosts(remote_host_id)`,
     `CREATE TABLE IF NOT EXISTS workspace_members (
        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -1679,6 +1850,59 @@ async function migrateDB() {
        updated_at TIMESTAMPTZ DEFAULT NOW(),
        UNIQUE(workspace_id, period)
      )`,
+    // ─── Per-agent budgets with hard-cap auto-pause ─────────────────────
+    `CREATE TABLE IF NOT EXISTS agent_budgets (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+       period TEXT NOT NULL DEFAULT 'monthly'
+         CHECK (period IN ('daily', 'weekly', 'monthly')),
+       limit_usd NUMERIC(12, 2) NOT NULL,
+       soft_threshold_pct INTEGER NOT NULL DEFAULT 80
+         CHECK (soft_threshold_pct BETWEEN 0 AND 100),
+       last_alerted_at TIMESTAMPTZ,
+       last_alerted_pct INTEGER,
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       updated_at TIMESTAMPTZ DEFAULT NOW(),
+       UNIQUE(agent_id, period)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_agent_budgets_agent ON agent_budgets(agent_id)`,
+    // ─── Control-plane scheduled agent runs (recurring cron triggers) ───
+    `CREATE TABLE IF NOT EXISTS agent_schedules (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+       created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+       name TEXT NOT NULL,
+       cron TEXT NOT NULL,
+       timezone TEXT NOT NULL DEFAULT 'UTC',
+       action_type TEXT NOT NULL DEFAULT 'prompt'
+         CHECK (action_type IN ('prompt', 'restart', 'stop', 'start', 'redeploy')),
+       prompt TEXT,
+       enabled BOOLEAN NOT NULL DEFAULT TRUE,
+       last_run_at TIMESTAMPTZ,
+       last_status TEXT,
+       next_run_at TIMESTAMPTZ,
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       updated_at TIMESTAMPTZ DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_agent_schedules_due
+       ON agent_schedules(next_run_at) WHERE enabled`,
+    `CREATE INDEX IF NOT EXISTS idx_agent_schedules_agent ON agent_schedules(agent_id)`,
+    `DO $$ BEGIN
+       ALTER TABLE agents ADD COLUMN paused_reason TEXT;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
+    `DO $$ BEGIN
+       ALTER TABLE agents ADD COLUMN mcp_servers JSONB DEFAULT '[]';
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
+    `DO $$ BEGIN
+       ALTER TABLE agents ADD COLUMN dashboard_port INTEGER;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
+    `DO $$ BEGIN
+       ALTER TABLE platform_settings ADD COLUMN dev_jwt_secret TEXT;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
     // ─── Phase 3: agent configuration history ───────────────────────────
     `CREATE TABLE IF NOT EXISTS agent_versions (
        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1820,6 +2044,32 @@ if (require.main === module) {
       console.error("DB migration error:", e.message);
     }
 
+    // Dev-mode only: persist the generated JWT secret in platform_settings so
+    // sessions survive restarts; on later boots restore the stored one. The
+    // restore happens before real traffic in practice, and the worst case of a
+    // racing request is one invalidated token — the prior behavior for ALL
+    // tokens on every restart. Production never reaches this branch (boot
+    // fails without an explicit JWT_SECRET).
+    if (usedEphemeralJwtSecret) {
+      try {
+        const existing = await db.query("SELECT dev_jwt_secret FROM platform_settings LIMIT 1");
+        const stored = existing.rows[0]?.dev_jwt_secret;
+        if (stored && stored.length >= MIN_JWT_SECRET_LENGTH) {
+          process.env.JWT_SECRET = stored;
+          console.log("Restored persisted dev JWT secret — existing sessions remain valid.");
+        } else {
+          await db.query(
+            `INSERT INTO platform_settings(singleton, dev_jwt_secret) VALUES (TRUE, $1)
+             ON CONFLICT (singleton) DO UPDATE SET dev_jwt_secret = EXCLUDED.dev_jwt_secret`,
+            [process.env.JWT_SECRET],
+          );
+          console.log("Persisted generated dev JWT secret — sessions will survive restarts.");
+        }
+      } catch (e) {
+        console.warn("Could not persist/restore dev JWT secret:", e.message);
+      }
+    }
+
     // Seed bootstrap admin account on first boot only when explicit secure credentials are provided.
     try {
       const { rows } = await db.query("SELECT id FROM users LIMIT 1");
@@ -1885,12 +2135,61 @@ if (require.main === module) {
     setInterval(async () => {
       await reconcileBackgroundAgentStatuses({ dbClient: db });
     }, RECONCILE_INTERVAL);
+
+    // ── External runtime reconciler: adopted runtimes have no container, so probe
+    // their endpoint over HTTP (SSRF-safe) and reconcile status every 30s. ──
+    setInterval(async () => {
+      await reconcileExternalAgentStatuses({ dbClient: db });
+    }, RECONCILE_INTERVAL);
+
+    // ── Budget sweep: re-enforce per-agent hard caps every 60s. The status
+    // reconciler above flips stopped->running whenever a container is live,
+    // so re-enforcement is what keeps a budget pause stuck. ──
+    const BUDGET_SWEEP_INTERVAL = 60000;
+    setInterval(async () => {
+      await agentBudgets.sweepAgentBudgets({ dbClient: db });
+    }, BUDGET_SWEEP_INTERVAL);
+
+    // ── Schedule sweep: claim due agent_schedules and enqueue each run for the
+    // worker to execute. Replica-safe (FOR UPDATE SKIP LOCKED in the module).
+    // The re-entrancy guard prevents a slow sweep from overlapping the next
+    // tick (setInterval doesn't await), bounding concurrent enqueue load. ──
+    const SCHEDULE_SWEEP_INTERVAL = 30000;
+    let scheduleSweepRunning = false;
+    setInterval(async () => {
+      if (scheduleSweepRunning) return;
+      scheduleSweepRunning = true;
+      try {
+        await agentSchedules.sweepDueSchedules({
+          dbClient: db,
+          enqueue: addScheduleRunJob,
+        });
+      } catch (err) {
+        console.error("[schedules] sweep failed:", err?.message || err);
+      } finally {
+        scheduleSweepRunning = false;
+      }
+    }, SCHEDULE_SWEEP_INTERVAL);
   });
 
   attachLogStream(server);
   attachExecStream(server);
   attachMetricsStream(server);
   attachGatewayWS(server);
+
+  // Flush batched OpenTelemetry spans/metrics on shutdown — only when OTel is
+  // actually enabled, so the default/disabled path (and tests) keep Node's
+  // stock signal behavior. Bounded so a stuck exporter can't block exit.
+  if (otel.isEnabled()) {
+    for (const sig of ["SIGTERM", "SIGINT"]) {
+      process.once(sig, () => {
+        Promise.race([
+          otel.shutdown(),
+          new Promise((resolve) => setTimeout(resolve, 3000)),
+        ]).finally(() => process.exit(0));
+      });
+    }
+  }
 }
 
 module.exports = app;

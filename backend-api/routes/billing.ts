@@ -5,7 +5,7 @@ const billing = require("../billing");
 
 const router = express.Router();
 
-router.get("/subscription", async (req, res) => {
+router.get("/subscription", async (req, res, next) => {
   try {
     const sub = await billing.getSubscription(req.user.id);
     const [agentCount, backupUsage] = await Promise.all([
@@ -21,11 +21,11 @@ router.get("/subscription", async (req, res) => {
       backup_storage_used_bytes: backupUsage.backup_storage_used_bytes,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.post("/checkout", async (req, res) => {
+router.post("/checkout", async (req, res, next) => {
   if (!billing.BILLING_ENABLED) return res.status(404).json({ error: "Billing is disabled" });
   try {
     const { plan } = req.body;
@@ -34,17 +34,17 @@ router.post("/checkout", async (req, res) => {
     const result = await billing.createCheckoutSession(req.user.id, plan);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 
-router.post("/portal", async (req, res) => {
+router.post("/portal", async (req, res, next) => {
   if (!billing.BILLING_ENABLED) return res.status(404).json({ error: "Billing is disabled" });
   try {
     const result = await billing.createPortalSession(req.user.id);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    next(e);
   }
 });
 

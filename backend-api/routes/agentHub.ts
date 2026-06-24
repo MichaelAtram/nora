@@ -13,6 +13,7 @@ const snapshots = require("../snapshots");
 const scheduler = require("../scheduler");
 const monitoring = require("../monitoring");
 const { assertKubernetesExecutionTargetAvailable } = require("../kubernetesClusters");
+const { assertRemoteHostExecutionTargetAvailable } = require("../remoteHosts");
 const {
   buildTemplatePayloadFromAgent,
   extractTemplateDefaultsFromSnapshot,
@@ -177,9 +178,10 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
   return status;
 }
 
-async function assertRuntimeTargetAvailable(runtimeFields) {
+async function assertRuntimeTargetAvailable(runtimeFields, ownerUserId) {
   const status = assertRuntimeSelectionAvailable(runtimeFields);
   await assertKubernetesExecutionTargetAvailable(runtimeFields);
+  await assertRemoteHostExecutionTargetAvailable(runtimeFields, { ownerUserId });
   return status;
 }
 
@@ -678,7 +680,7 @@ router.post(
       execution_target_id: defaults.executionTargetId || null,
       sandbox_type: defaults.sandbox || "standard",
     });
-    await assertRuntimeTargetAvailable(runtimeFields);
+    await assertRuntimeTargetAvailable(runtimeFields, req.user.id);
 
     const specs = resolveTemplateSpecs(defaults, limits.subscription || {});
     const image = resolveRequestedImage({

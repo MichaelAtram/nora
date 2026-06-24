@@ -5,51 +5,80 @@
 Signal is a research-and-drafting agent built as an Agent Hub template. It scans for trends and conversations in your space, filters out the hype that doesn't fit your audience, and turns the signals that matter into review-ready post packages — angle, hook, draft, hashtags, visual direction. **Nothing is auto-published.**
 
 <Tip>
-  **Signal** is just the default name. On first run the agent asks what you'd like to call it — rename it, or keep "Signal."
+  **Signal** is just the default name. On first run the agent asks what you'd like to call it —
+  rename it, or keep "Signal."
 </Tip>
 
 ## Before you install
+
 - A running Nora instance with dashboard access.
 - Your brand positioning, audience, platforms, content pillars, and what counts as a useful signal.
 
 ## Step 1 — Install from Agent Hub
+
 Open **Agent Hub**, find **Social Media & Market Signal Claw**, and click **Install**. See [Publish and install Agent Hub templates](/guides/agent-hub).
 
+<Frame caption="Agent Hub — Social Media & Market Signal Claw template detail before installation">
+  ![Signal template detail](/images/guides/agent-templates/signal-market-signal.png)
+</Frame>
+
 ## Step 2 — Connect a channel
+
 Signal needs **one** channel to send you briefs and drafts (Channels tab) — separate from the social platforms you publish to.
 
 <Steps>
-  <Step title="Create a WhatsApp Cloud API app">At [developers.facebook.com](https://developers.facebook.com), add the **WhatsApp** product.</Step>
-  <Step title="Copy credentials">Copy the **Phone Number ID** and an **Access Token**.</Step>
-  <Step title="Add the channel">Agent → **Channels** tab → add **WhatsApp** → paste the values.</Step>
+  <Step title="Link WhatsApp in Nora">
+    Open the agent -> **Channels** tab -> **WhatsApp** -> **Link**.
+  </Step>
+  <Step title="Scan the QR code">
+    Complete the pairing prompt from WhatsApp. OpenClaw WhatsApp uses QR/link pairing, not a
+    Phone Number ID and access-token form.
+  </Step>
+  <Step title="Confirm the channel">Return when Nora shows the channel linked or connected.</Step>
 </Steps>
 
-Or use Telegram / Slack / Discord / email — see [Configure channels](/guides/channels).
+Or use Telegram, Slack, Discord, or another OpenClaw channel from the catalog — see [Configure channels](/guides/channels).
 
 ## Step 3 — (Optional) Connect social accounts
+
 Signal researches and drafts on its own — no integration required. To publish the packages you approve (still human-gated), connect one in the **Integrations** tab:
 
 <CardGroup cols={3}>
-  <Card title="LinkedIn" href="/guides/integrations/linkedin" icon="linkedin" arrow>Post approved drafts.</Card>
-  <Card title="Twitter / X" href="/guides/integrations/twitter" icon="twitter" arrow>Post approved drafts.</Card>
-  <Card title="Instagram" href="/guides/integrations/instagram" icon="instagram" arrow>Insights (read-oriented).</Card>
-  <Card title="Facebook" href="/guides/integrations/facebook" icon="facebook" arrow>Page posts.</Card>
-  <Card title="Notion" href="/guides/integrations/notion" icon="book" arrow>Store the content calendar.</Card>
+  <Card title="LinkedIn" href="/guides/integrations/linkedin" icon="linkedin" arrow>
+    Post approved drafts.
+  </Card>
+  <Card title="Twitter / X" href="/guides/integrations/twitter" icon="twitter" arrow>
+    Post approved drafts.
+  </Card>
+  <Card title="Instagram" href="/guides/integrations/instagram" icon="instagram" arrow>
+    Insights (read-oriented).
+  </Card>
+  <Card title="Facebook" href="/guides/integrations/facebook" icon="facebook" arrow>
+    Page posts.
+  </Card>
+  <Card title="Notion" href="/guides/integrations/notion" icon="book" arrow>
+    Store the content calendar.
+  </Card>
 </CardGroup>
 
 ## Step 4 — Run the bootstrap
+
 Send any first message. Signal introduces itself, offers to rename, gets your channel connected, then captures your brand, audience, platforms, voice, and the rules for what counts as a useful signal.
 
 ## What Signal will and won't do
+
 - **Never auto-publishes** — every package stays in review until you approve.
 - **Says no to weak signals** rather than manufacturing content from thin trends.
 
 ## Troubleshooting
+
 <AccordionGroup>
   <Accordion title="Signal says an account isn't connected, but I added it">
-    Signal reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the **Integrations** tab. Publishing still requires your approval even when connected.
+    Signal reads `integrations/NORA_INTEGRATIONS.md`, regenerated on sync. Re-check the
+    **Integrations** tab. Publishing still requires your approval even when connected.
   </Accordion>
   <Accordion title="Too many low-fit ideas">
-    Tighten the signal rules and always-skip list in setup — Signal filters against your audience and brand fit.
+    Tighten the signal rules and always-skip list in setup — Signal filters against your audience
+    and brand fit.
   </Accordion>
 </AccordionGroup>
