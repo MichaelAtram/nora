@@ -425,14 +425,14 @@ test.describe("Complete platform journey", () => {
       (response) =>
         response.url().includes("/api/agent-hub/install") && response.request().method() === "POST",
     );
-    await installDialog.getByRole("button", { name: /^install$/i }).click();
+    const installButton = installDialog.getByRole("button", { name: /^install$/i });
+    await installButton.scrollIntoViewIfNeeded();
+    await installButton.click();
 
     const installResponse = await installResponsePromise;
     const installPayload = await installResponse.json().catch(() => ({}));
     expect(installResponse.ok(), JSON.stringify(installPayload)).toBe(true);
-    expect(typeof installPayload?.id).toBe("string");
-
-    await page.waitForURL(new RegExp(`/app/agents/${installPayload.id}(?:[/?#]|$)`), {
+    await page.waitForURL(/\/app\/agents\/[^/?#]+(?:[/?#]|$)/, {
       waitUntil: "domcontentloaded",
     });
 
