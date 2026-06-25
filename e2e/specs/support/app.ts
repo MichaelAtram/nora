@@ -277,6 +277,21 @@ async function waitForAdminAuditEvent(
 }
 
 async function authenticatePage(page: Page, token: string, path = "/app/dashboard") {
+  // The backend prefers the HttpOnly session cookie over the Bearer token.
+  // When a serial E2E suite switches from one user to another in the same
+  // browser context, keeping the previous user's cookie around can silently
+  // authenticate subsequent page fetches as the wrong person even if
+  // localStorage has the new token. Reset the cookie jar and seed the current
+  // session token as the browser cookie before navigation so page-driven API
+  // calls and explicit Bearer helpers stay aligned.
+  await page.context().clearCookies();
+  await page.context().addCookies([
+    {
+      name: "nora_auth",
+      value: token,
+      url: E2E_BASE_URL,
+    },
+  ]);
   await page.addInitScript((storedToken) => {
     window.localStorage.setItem("token", storedToken);
   }, token);

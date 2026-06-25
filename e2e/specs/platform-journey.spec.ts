@@ -40,6 +40,15 @@ test.describe("Complete platform journey", () => {
   }
 
   test("the first operator can sign up and become the admin", async ({ page, request }) => {
+    const { body: bootstrapBody } = await apiJson<{ needsFirstAdmin?: boolean }>(
+      request,
+      "/api/auth/bootstrap-status",
+    );
+    const needsFirstAdmin =
+      typeof bootstrapBody === "object" &&
+      bootstrapBody !== null &&
+      (bootstrapBody as { needsFirstAdmin?: unknown }).needsFirstAdmin === true;
+
     admin = {
       email: uniqueEmail("nora-admin"),
       password: DEFAULT_PASSWORD,
@@ -84,7 +93,10 @@ test.describe("Complete platform journey", () => {
     admin.profile = await getCurrentUser(request, admin.token);
 
     expect(admin.profile.email).toBe(admin.email);
-    expect(admin.profile.role).toBe("admin");
+    // On the first fresh run this user should claim the server and become the
+    // admin. During Playwright retries the suite reuses the same E2E stack, so
+    // a previous failed attempt may already have created the first admin.
+    expect(admin.profile.role).toBe(needsFirstAdmin ? "admin" : "user");
   });
 
   test("settings can change the password and save a provider key", async ({ page, request }) => {
@@ -409,12 +421,20 @@ test.describe("Complete platform journey", () => {
     await expect(installDialog).toBeVisible();
     await installDialog.getByLabel(/new agent name/i).fill(installName);
 
-    await Promise.all([
-      page.waitForURL(/\/app\/agents\/[^/?#]+$/, {
-        waitUntil: "domcontentloaded",
-      }),
-      installDialog.getByRole("button", { name: /^install$/i }).click(),
-    ]);
+    const installResponsePromise = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/agent-hub/install") && response.request().method() === "POST",
+    );
+    await installDialog.getByRole("button", { name: /^install$/i }).click();
+
+    const installResponse = await installResponsePromise;
+    const installPayload = await installResponse.json().catch(() => ({}));
+    expect(installResponse.ok(), JSON.stringify(installPayload)).toBe(true);
+    expect(typeof installPayload?.id).toBe("string");
+
+    await page.waitForURL(new RegExp(`/app/agents/${installPayload.id}(?:[/?#]|$)`), {
+      waitUntil: "domcontentloaded",
+    });
 
     const installedAgentId = extractIdFromUrl(page.url(), "/app/agents/");
     expect(installedAgentId).toBeTruthy();
