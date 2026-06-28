@@ -157,7 +157,9 @@ function normalizeSkillSummary(item = {}) {
   const source =
     item && typeof item === "object" && item.skill && typeof item.skill === "object"
       ? item.skill
-      : item;
+      : item && typeof item === "object"
+        ? item
+        : {};
 
   const slug = normalizeText(source.slug || source.installSlug || source.pagePath || source.id);
   if (!slug) return null;
