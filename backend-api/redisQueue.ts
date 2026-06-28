@@ -147,9 +147,16 @@ async function addKubernetesPolicyReconcileJob(payload) {
   if (existingJob) {
     const state =
       typeof existingJob.getState === "function" ? await existingJob.getState() : "unknown";
-    if (["waiting", "waiting-children", "delayed", "prioritized", "active"].includes(state)) {
+    if (["waiting", "waiting-children", "delayed", "prioritized"].includes(state)) {
       await existingJob.updateData({ clusterId, desiredHash });
       return existingJob;
+    }
+    if (state === "active") {
+      return policySettingsQueue.add(
+        "reconcile-kubernetes-policy-settings",
+        { clusterId, desiredHash },
+        { jobId: `${jobId}-followup-${randomUUID()}` },
+      );
     }
     if (typeof existingJob.remove === "function") {
       await existingJob.remove();

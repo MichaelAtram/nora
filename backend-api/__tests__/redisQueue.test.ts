@@ -30,7 +30,7 @@ describe("addKubernetesPolicyReconcileJob", () => {
     policySettingsQueue.getJob.mockReset();
   });
 
-  it("updates an in-flight job instead of re-enqueueing", async () => {
+  it("updates a queued job instead of re-enqueueing", async () => {
     const existingJob = {
       getState: jest.fn().mockResolvedValue("waiting"),
       updateData: jest.fn().mockResolvedValue(undefined),
@@ -50,6 +50,31 @@ describe("addKubernetesPolicyReconcileJob", () => {
     expect(existingJob.remove).not.toHaveBeenCalled();
     expect(policySettingsQueue.add).not.toHaveBeenCalled();
     expect(result).toBe(existingJob);
+  });
+
+  it("enqueues a follow-up job when the existing job is already active", async () => {
+    const existingJob = {
+      getState: jest.fn().mockResolvedValue("active"),
+      updateData: jest.fn(),
+      remove: jest.fn(),
+    };
+    const followUpJob = { id: "k8s-policy-aks-eastus2-followup-test" };
+    policySettingsQueue.getJob.mockResolvedValue(existingJob);
+    policySettingsQueue.add.mockResolvedValue(followUpJob);
+
+    const result = await addKubernetesPolicyReconcileJob({
+      clusterId: "aks-eastus2",
+      desiredHash: "hash-2",
+    });
+
+    expect(existingJob.updateData).not.toHaveBeenCalled();
+    expect(existingJob.remove).not.toHaveBeenCalled();
+    expect(policySettingsQueue.add).toHaveBeenCalledWith(
+      "reconcile-kubernetes-policy-settings",
+      { clusterId: "aks-eastus2", desiredHash: "hash-2" },
+      { jobId: expect.stringMatching(/^k8s-policy-aks-eastus2-followup-/) },
+    );
+    expect(result).toBe(followUpJob);
   });
 
   it("re-enqueues a fresh job when the previous job already completed", async () => {

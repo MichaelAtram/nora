@@ -385,14 +385,16 @@ function buildPolicySettingsSummary(policySettings, policySettingsStatus = {}) {
   const openclawCount = normalizedSettings.ingressRules.openclaw.length;
   const hermesCount = normalizedSettings.ingressRules.hermes.length;
   const configured = openclawCount + hermesCount > 0;
+  const currentSettingsHash = buildPolicySettingsHash(normalizedSettings);
   const desiredHash =
-    normalizedStatus.desiredHash ||
-    (configured || normalizedStatus.state ? buildPolicySettingsHash(normalizedSettings) : null);
+    configured || normalizedStatus.state
+      ? currentSettingsHash
+      : normalizedStatus.desiredHash || null;
   const applied =
     configured &&
     normalizedStatus.state === "applied" &&
     Boolean(normalizedStatus.appliedHash) &&
-    normalizedStatus.appliedHash === desiredHash;
+    normalizedStatus.appliedHash === currentSettingsHash;
 
   return {
     customPolicyConfigured: configured,
@@ -757,11 +759,32 @@ async function markKubernetesClusterPolicyStatus(clusterId, statusPayload = {}) 
     policySettings,
     { lenient: true },
   );
-  const nextStatus = normalizePolicySettingsStatus(
+  let nextStatus = normalizePolicySettingsStatus(
     { ...currentStatus, ...(statusPayload || {}) },
     currentStatus,
     policySettings,
   );
+  const currentDesiredHash = buildPolicySettingsHash(policySettings);
+  const staleTerminalUpdate =
+    ["applied", "failed"].includes(nextStatus.state) &&
+    Boolean(nextStatus.desiredHash) &&
+    nextStatus.desiredHash !== currentDesiredHash;
+  if (staleTerminalUpdate) {
+    nextStatus = normalizePolicySettingsStatus(
+      {
+        ...nextStatus,
+        state: ["queued", "applying"].includes(currentStatus.state)
+          ? currentStatus.state
+          : "queued",
+        desiredHash: currentDesiredHash,
+        customPolicyIssue: currentStatus.customPolicyIssue || null,
+        customPolicyAppliedAt: currentStatus.customPolicyAppliedAt || null,
+        updatedAt: new Date().toISOString(),
+      },
+      currentStatus,
+      policySettings,
+    );
+  }
   const result = await db.query(
     `UPDATE kubernetes_clusters
         SET policy_settings_status = $2::jsonb,
