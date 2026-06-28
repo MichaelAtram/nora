@@ -104,6 +104,9 @@ CREATE TABLE IF NOT EXISTS remote_hosts (
   ssh_passphrase_encrypted TEXT,
   gateway_host TEXT NOT NULL DEFAULT '',
   docker_host TEXT NOT NULL DEFAULT '',
+  -- Pinned SSH host public key (base64), captured trust-on-first-use during the
+  -- connection test and verified on every subsequent connect (MITM protection).
+  ssh_host_key TEXT,
   last_test_status TEXT,
   last_test_message TEXT,
   last_tested_at TIMESTAMPTZ,

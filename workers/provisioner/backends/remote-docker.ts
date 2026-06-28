@@ -32,6 +32,16 @@ function buildRemoteDockerOptions(profile = {}) {
     if (profile.sshPrivateKey) sshOptions.privateKey = Buffer.from(profile.sshPrivateKey);
     if (profile.sshPassphrase) sshOptions.passphrase = profile.sshPassphrase;
   }
+  // Host-key pinning (MITM protection): the connection test pins the host key
+  // (TOFU). When a pin exists, reject any connection presenting a different key.
+  // Without a pin (host registered before pinning, or test never run) we accept
+  // trust-on-first-use so existing deployments don't break.
+  const expectedHostKey = typeof profile.sshHostKey === "string" ? profile.sshHostKey.trim() : "";
+  sshOptions.hostVerifier = (key) => {
+    if (!expectedHostKey) return true;
+    const presented = Buffer.isBuffer(key) ? key.toString("base64") : String(key || "");
+    return presented === expectedHostKey;
+  };
   return {
     protocol: "ssh",
     host: profile.sshHost,

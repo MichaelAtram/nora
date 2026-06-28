@@ -1388,6 +1388,10 @@ async function migrateDB() {
      )`,
     `CREATE INDEX IF NOT EXISTS idx_remote_hosts_owner
        ON remote_hosts(owner_user_id, enabled, is_default, label)`,
+    `DO $$ BEGIN
+       ALTER TABLE remote_hosts ADD COLUMN ssh_host_key TEXT;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
     `CREATE TABLE IF NOT EXISTS gateway_port_allocations (
        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
        host_key TEXT NOT NULL,

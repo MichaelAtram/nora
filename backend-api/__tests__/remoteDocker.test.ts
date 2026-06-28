@@ -44,6 +44,25 @@ describe("buildRemoteDockerOptions", () => {
     expect(opts.sshOptions.privateKey).toBeUndefined();
   });
 
+  describe("hostVerifier (host-key pinning)", () => {
+    it("accepts any key when no pin exists yet (trust-on-first-use)", () => {
+      const opts = buildRemoteDockerOptions(keyProfile({ sshHostKey: null }));
+      expect(opts.sshOptions.hostVerifier(Buffer.from("anything"))).toBe(true);
+    });
+
+    it("accepts a matching pinned key", () => {
+      const pin = Buffer.from("GOOD-KEY").toString("base64");
+      const opts = buildRemoteDockerOptions(keyProfile({ sshHostKey: pin }));
+      expect(opts.sshOptions.hostVerifier(Buffer.from("GOOD-KEY"))).toBe(true);
+    });
+
+    it("rejects a key that differs from the pin (MITM)", () => {
+      const pin = Buffer.from("GOOD-KEY").toString("base64");
+      const opts = buildRemoteDockerOptions(keyProfile({ sshHostKey: pin }));
+      expect(opts.sshOptions.hostVerifier(Buffer.from("EVIL-KEY"))).toBe(false);
+    });
+  });
+
   it("defaults the SSH port to 22 when unset", () => {
     expect(buildRemoteDockerOptions(keyProfile({ sshPort: null })).port).toBe(22);
   });
