@@ -401,10 +401,21 @@ function isHttpUrl(value) {
 
 async function fetchRuntimeEmbed(runtimeFamily, agentId, token) {
   const runtime = RUNTIMES[runtimeFamily];
-  const embedResponse = await fetch(`${API_BASE_URL}${runtime.embedPath(agentId, token)}`);
-  if (!embedResponse.ok) {
-    throw new Error(`${runtime.label} embed returned ${embedResponse.status}`);
+  const startedAt = Date.now();
+  let lastError = null;
+
+  while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
+    try {
+      const embedResponse = await fetch(`${API_BASE_URL}${runtime.embedPath(agentId, token)}`);
+      if (embedResponse.ok) return;
+      lastError = `${runtime.label} embed returned ${embedResponse.status}`;
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
+    await sleep(POLL_INTERVAL_MS);
   }
+
+  throw new Error(`${runtime.label} embed did not become reachable: ${lastError || "unknown"}`);
 }
 
 async function cleanupAgent(token, agentId) {
