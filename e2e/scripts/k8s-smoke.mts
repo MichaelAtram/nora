@@ -150,6 +150,24 @@ async function apiWithTimeout(path, { timeoutMs = CLEANUP_TIMEOUT_MS, ...options
   }
 }
 
+async function retryApi(path, options = {}, { timeoutMs = POLL_TIMEOUT_MS } = {}) {
+  const startedAt = Date.now();
+  let lastError = null;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      return await api(path, options);
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  throw new Error(
+    `${options.method || "GET"} ${path} did not succeed: ${lastError || "no response"}`,
+  );
+}
+
 function kubectl(...args) {
   return execFileSync(KUBECTL_BIN, args, {
     encoding: "utf8",
@@ -548,13 +566,13 @@ async function main() {
 
       let surfaceUrl = null;
       if (runtimeFamily === "openclaw") {
-        const gatewayUrl = await api(`/agents/${agentId}/gateway-url`, { token });
+        const gatewayUrl = await retryApi(`/agents/${agentId}/gateway-url`, { token });
         surfaceUrl = gatewayUrl.body.url;
         if (!isHttpUrl(surfaceUrl)) {
           throw new Error(`Unexpected gateway URL payload: ${JSON.stringify(gatewayUrl.body)}`);
         }
       } else {
-        const hermesUi = await api(`/agents/${agentId}/hermes-ui`, { token });
+        const hermesUi = await retryApi(`/agents/${agentId}/hermes-ui`, { token });
         surfaceUrl = hermesUi.body?.dashboard?.url || hermesUi.body?.url;
         if (!isHttpUrl(surfaceUrl)) {
           throw new Error(`Unexpected Hermes UI payload: ${JSON.stringify(hermesUi.body)}`);
@@ -565,14 +583,14 @@ async function main() {
       await fetchRuntimeEmbed(runtimeFamily, agentId, token);
       assertPeerPodBlocked(runtimeFamily, runningAgent);
 
-      await api(`/agents/${agentId}/stop`, { method: "POST", token });
+      await retryApi(`/agents/${agentId}/stop`, { method: "POST", token });
       await waitForAgentStatus(token, agentId, ["stopped"]);
 
-      await api(`/agents/${agentId}/start`, { method: "POST", token });
+      await retryApi(`/agents/${agentId}/start`, { method: "POST", token });
       const restartedAgent = await waitForAgentStatus(token, agentId, ["running", "warning"]);
       await waitForRuntimeSurface(token, restartedAgent);
 
-      await api(`/agents/${agentId}/restart`, { method: "POST", token });
+      await retryApi(`/agents/${agentId}/restart`, { method: "POST", token });
       const restartedAgainAgent = await waitForAgentStatus(token, agentId, ["running", "warning"]);
       await waitForRuntimeSurface(token, restartedAgainAgent);
 
