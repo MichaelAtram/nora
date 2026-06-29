@@ -78,6 +78,13 @@ function isKubernetesAgent(agent = {}) {
   return resolveAgentBackendType(agent) === "k8s";
 }
 
+/**
+ * Resolve the runtime identifier to use for a lifecycle operation.
+ *
+ * @param {Object} agent - Agent row whose runtime should be addressed.
+ * @param {string} operation - Human-readable lifecycle action name used in error messages.
+ * @returns {string} Runtime identifier for the backend, using Kubernetes fallbacks when `container_id` is unavailable.
+ */
 function resolveKubernetesRuntimeId(agent, operation) {
   if (!isKubernetesAgent(agent)) {
     return ensureContainerId(agent, operation);
@@ -102,6 +109,12 @@ function canMutate(agent = {}) {
   return hasText(agent.container_name) || hasText(agent.name) || hasText(agent.id);
 }
 
+/**
+ * Resolve the identifier Nora should use when destroying an agent runtime.
+ *
+ * @param {Object} agent - Agent row being deleted.
+ * @returns {string} Runtime identifier to destroy, including Kubernetes deployment-name fallbacks for drifted rows.
+ */
 function resolveDestroyContainerId(agent) {
   if (!isKubernetesAgent(agent)) {
     return ensureContainerId(agent, "destroy");
@@ -130,6 +143,13 @@ function resolveBackendPath(name) {
   }
 }
 
+/**
+ * Lazily construct and cache the backend adapter used for lifecycle operations.
+ *
+ * @param {string} type - Normalized backend type such as `docker`, `docker:hermes`, `docker:nemoclaw`, `proxmox`, or `k8s`.
+ * @param {Object} [agent={}] - Agent row used to resolve execution-target-scoped backends like Kubernetes.
+ * @returns {Promise<Object>} Backend adapter instance for the requested lifecycle operations.
+ */
 async function getBackendInstance(type, agent = {}) {
   const cacheKey =
     type === "k8s" || type === "k3s" || type === "kubernetes" || type === "remote-docker"
@@ -225,9 +245,10 @@ async function getBackendInstance(type, agent = {}) {
 }
 
 /**
- * Get the provisioner backend for a given agent row.
- * @param {{ backend_type?: string, deploy_target?: string, sandbox_profile?: string }} agent
- * @returns {import('../workers/provisioner/backends/interface')}
+ * Resolve the backend adapter that should handle lifecycle operations for an agent.
+ *
+ * @param {Object} agent - Agent runtime metadata used to choose the backend.
+ * @returns {Promise<Object>} Backend adapter responsible for the agent's lifecycle operations.
  */
 async function backendFor(agent) {
   const type = resolveAgentBackendType(agent);

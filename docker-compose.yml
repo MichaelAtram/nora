@@ -17,7 +17,7 @@ services:
     volumes:
       - ./frontend-marketing:/app
       - ./tsconfig.base.json:/tsconfig.base.json:ro
-    command: sh -c "npm install && npm run dev"
+    command: sh -c "npm install && npm run dev -- --webpack"
     environment:
       - PORT=3000
       - NODE_ENV=development
@@ -33,7 +33,7 @@ services:
     volumes:
       - ./frontend-dashboard:/app
       - ./tsconfig.base.json:/tsconfig.base.json:ro
-    command: sh -c "npm install && npm run dev"
+    command: sh -c "npm install && npm run dev -- --webpack"
     environment:
       - PORT=3000
       - NODE_ENV=development
@@ -46,7 +46,7 @@ services:
     volumes:
       - ./admin-dashboard:/app
       - ./tsconfig.base.json:/tsconfig.base.json:ro
-    command: sh -c "npm install && npm run dev"
+    command: sh -c "npm install && npm run dev -- --webpack"
     environment:
       - PORT=3000
       - NODE_ENV=development
@@ -168,8 +168,8 @@ services:
     ports:
       # Bind to localhost only — exposing Postgres on all interfaces turns every
       # host-network peer into a potential attacker. Host-side tools still reach
-      # it via 127.0.0.1:5433; inter-container traffic uses the compose network.
-      - "127.0.0.1:5433:5432"
+      # it via 127.0.0.1:${POSTGRES_HOST_PORT:-5433}; inter-container traffic uses the compose network.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     environment:
       POSTGRES_USER: ${DB_USER:-nora}
       # DB_PASSWORD is required. setup.sh generates a random 48-char hex secret;
