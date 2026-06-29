@@ -99,7 +99,18 @@ if [[ -z "${NORA_K8S_LOAD_BALANCER_SOURCE_RANGES:-}" ]]; then
     docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' \
       "${COMPOSE_PROJECT_NAME}-backend-api-1"
   )"
-  export NORA_K8S_LOAD_BALANCER_SOURCE_RANGES="${BACKEND_CONTAINER_IP}/32"
+  TRUSTED_INGRESS_CIDRS=()
+  if [[ -n "$BACKEND_CONTAINER_IP" ]]; then
+    TRUSTED_INGRESS_CIDRS+=("${BACKEND_CONTAINER_IP}/32")
+  fi
+  if [[ "$NORA_K8S_RUNTIME_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
+    [[ "$NORA_K8S_RUNTIME_HOST" != "$BACKEND_CONTAINER_IP" ]]; then
+    TRUSTED_INGRESS_CIDRS+=("${NORA_K8S_RUNTIME_HOST}/32")
+  fi
+  export NORA_K8S_LOAD_BALANCER_SOURCE_RANGES="$(
+    IFS=,
+    echo "${TRUSTED_INGRESS_CIDRS[*]}"
+  )"
 fi
 
 for _ in $(seq 1 120); do
