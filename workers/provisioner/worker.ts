@@ -1083,6 +1083,14 @@ function backendInstanceKey(runtimeFields = {}) {
   return backend;
 }
 
+/**
+ * Resolve the provisioner backend instance for the requested runtime path,
+ * rebuilding Kubernetes adapters from the latest saved cluster profile when
+ * needed.
+ *
+ * @param {Object} [runtimeFields={}] - Runtime-selection fields that identify the backend implementation.
+ * @returns {Promise<Object>} Backend adapter instance used for deployment and lifecycle work.
+ */
 async function loadBackend(runtimeFields = {}) {
   const key = backendInstanceKey(runtimeFields);
   // Kubernetes execution targets are Admin-managed records whose exposure mode,
@@ -1259,6 +1267,13 @@ function defaultK8sDeployName(runtimeFamily, id, name) {
   return safeK8sName(`${prefix}-${name || "agent"}-${id}`, `${prefix}-${id}`);
 }
 
+/**
+ * Remove the previous Kubernetes deployment before redeploying an agent whose
+ * runtime path changed or whose old runtime metadata still points at k8s.
+ *
+ * @param {Object} [params={}] - Previous-runtime metadata used to locate the old Kubernetes resource.
+ * @returns {Promise<void>} Resolves after the previous runtime is destroyed or no cleanup is needed.
+ */
 async function cleanupPreviousK8sRuntime({
   agentId,
   jobData = {},
@@ -1437,6 +1452,14 @@ async function readInstalledClawhubSkills(provisioner, containerId) {
   throw new Error(`Failed to parse ClawHub lockfile: ${lastError?.message || "unknown error"}`);
 }
 
+/**
+ * Ensure the `clawhub` CLI is available inside a running OpenClaw container
+ * before Nora attempts install/delete operations.
+ *
+ * @param {Object} provisioner - Backend-specific provisioner client with `exec`.
+ * @param {string} containerId - Runtime container identifier.
+ * @returns {Promise<void>} Resolves when the CLI is already present or installs successfully.
+ */
 async function ensureClawhubCli(provisioner, containerId) {
   try {
     await runProvisionerExecCommand(
@@ -1668,6 +1691,12 @@ async function reconcileClawhubSkills({
   }
 }
 
+/**
+ * Load and validate the agent targeted by a queued ClawHub job.
+ *
+ * @param {string} agentId - Agent whose runtime will be mutated.
+ * @returns {Promise<Object>} Running OpenClaw agent with a usable container id.
+ */
 async function loadClawhubJobAgent(agentId) {
   const result = await db.query(
     `SELECT id, name, status, container_id, backend_type, runtime_family, deploy_target,
