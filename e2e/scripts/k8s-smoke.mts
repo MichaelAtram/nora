@@ -251,33 +251,49 @@ async function testKubernetesCluster(token) {
 
 async function waitForAgentStatus(token, agentId, allowedStatuses) {
   const startedAt = Date.now();
+  let lastError = null;
 
   while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
-    const { body } = await api(`/agents/${agentId}`, { token });
-    if (allowedStatuses.includes(body.status)) {
-      return body;
+    try {
+      const { body } = await api(`/agents/${agentId}`, { token });
+      if (allowedStatuses.includes(body.status)) {
+        return body;
+      }
+      lastError = `last status=${body.status}`;
+    } catch (error) {
+      lastError = error?.message || String(error);
     }
     await sleep(POLL_INTERVAL_MS);
   }
 
   throw new Error(
-    `Timed out waiting for agent ${agentId} to reach one of: ${allowedStatuses.join(", ")}`,
+    `Timed out waiting for agent ${agentId} to reach one of: ${allowedStatuses.join(
+      ", ",
+    )}; ${lastError || "no status response"}`,
   );
 }
 
 async function waitForGateway(token, agentId) {
   const startedAt = Date.now();
+  let lastError = null;
 
   while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
-    const { response } = await api(`/agents/${agentId}/gateway/status`, {
-      token,
-      expectOk: false,
-    });
-    if (response.ok) return;
+    try {
+      const { response, body } = await api(`/agents/${agentId}/gateway/status`, {
+        token,
+        expectOk: false,
+      });
+      if (response.ok) return;
+      lastError = `${response.status}: ${typeof body === "string" ? body : JSON.stringify(body)}`;
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
     await sleep(POLL_INTERVAL_MS);
   }
 
-  throw new Error(`Timed out waiting for gateway readiness on agent ${agentId}`);
+  throw new Error(
+    `Timed out waiting for gateway readiness on agent ${agentId}; ${lastError || "no response"}`,
+  );
 }
 
 async function waitForHermesUi(token, agentId) {
@@ -285,12 +301,16 @@ async function waitForHermesUi(token, agentId) {
   let last = null;
 
   while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
-    const { response, body } = await api(`/agents/${agentId}/hermes-ui`, {
-      token,
-      expectOk: false,
-    });
-    last = body;
-    if (response.ok && body?.health?.ok && body?.dashboard?.ready) return;
+    try {
+      const { response, body } = await api(`/agents/${agentId}/hermes-ui`, {
+        token,
+        expectOk: false,
+      });
+      last = body;
+      if (response.ok && body?.health?.ok && body?.dashboard?.ready) return;
+    } catch (error) {
+      last = error?.message || String(error);
+    }
     await sleep(POLL_INTERVAL_MS);
   }
 
