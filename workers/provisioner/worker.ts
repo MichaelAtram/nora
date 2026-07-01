@@ -25,6 +25,7 @@ const {
   getPersistedHermesState,
 } = require("../../backend-api/hermesUi");
 const {
+  buildPolicySettingsHash,
   getKubernetesClusterProfile,
   markKubernetesClusterPolicyStatus,
 } = require("../../backend-api/kubernetesClusters");
@@ -126,6 +127,26 @@ async function acquireAgentProvisionLock(agentId) {
         await client.query("SELECT pg_advisory_unlock($1)", [lockKey.toString()]);
       } catch (e) {
         console.warn(`[provisioner] advisory unlock failed for agent ${agentId}: ${e.message}`);
+      } finally {
+        client.release();
+      }
+    },
+  };
+}
+
+async function acquireKubernetesPolicyReconcileLock(clusterId) {
+  const client = await db.connect();
+  const lockKey = advisoryLockKeyForAgent(`k8s-policy:${clusterId}`);
+  await client.query("SELECT pg_advisory_lock($1)", [lockKey.toString()]);
+  let released = false;
+  return {
+    release: async () => {
+      if (released) return;
+      released = true;
+      try {
+        await client.query("SELECT pg_advisory_unlock($1)", [lockKey.toString()]);
+      } catch (e) {
+        console.warn(`[k8s-policy-settings] advisory unlock failed for ${clusterId}: ${e.message}`);
       } finally {
         client.release();
       }
@@ -1163,27 +1184,27 @@ async function runKubernetesPolicyReconcileJob({ clusterId }) {
     throw new Error("Kubernetes policy reconcile job is missing clusterId");
   }
 
-  const executionTargetId = `k8s:${normalizedClusterId}`;
-  const profile = await getKubernetesClusterProfile(executionTargetId);
-  if (!profile) {
-    console.warn(
-      `[k8s-policy-settings] Skipping reconcile for missing cluster ${normalizedClusterId}`,
-    );
-    return { skipped: true, clusterId: normalizedClusterId, reason: "cluster_missing" };
-  }
-
-  const desiredHash =
-    profile.policySettingsStatus?.desiredHash || profile.customPolicyDesiredHash || null;
-  const now = new Date().toISOString();
-
-  await markKubernetesClusterPolicyStatus(normalizedClusterId, {
-    state: "applying",
-    desiredHash,
-    customPolicyIssue: null,
-    updatedAt: now,
-  });
-
+  const lock = await acquireKubernetesPolicyReconcileLock(normalizedClusterId);
   try {
+    const executionTargetId = `k8s:${normalizedClusterId}`;
+    const profile = await getKubernetesClusterProfile(executionTargetId);
+    if (!profile) {
+      console.warn(
+        `[k8s-policy-settings] Skipping reconcile for missing cluster ${normalizedClusterId}`,
+      );
+      return { skipped: true, clusterId: normalizedClusterId, reason: "cluster_missing" };
+    }
+
+    const desiredHash = buildPolicySettingsHash(profile.policySettings);
+    const now = new Date().toISOString();
+
+    await markKubernetesClusterPolicyStatus(normalizedClusterId, {
+      state: "applying",
+      desiredHash,
+      customPolicyIssue: null,
+      updatedAt: now,
+    });
+
     const backend = await loadBackend({
       backend_type: "k8s",
       deploy_target: "k8s",
@@ -1218,6 +1239,8 @@ async function runKubernetesPolicyReconcileJob({ clusterId }) {
       updatedAt: new Date().toISOString(),
     });
     throw error;
+  } finally {
+    await lock.release();
   }
 }
 

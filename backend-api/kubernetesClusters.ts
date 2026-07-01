@@ -765,17 +765,19 @@ async function markKubernetesClusterPolicyStatus(clusterId, statusPayload = {}) 
     policySettings,
   );
   const currentDesiredHash = buildPolicySettingsHash(policySettings);
-  const staleTerminalUpdate =
-    ["applied", "failed"].includes(nextStatus.state) &&
+  const staleStatusUpdate =
+    POLICY_STATUS_STATES.has(nextStatus.state) &&
     Boolean(nextStatus.desiredHash) &&
     nextStatus.desiredHash !== currentDesiredHash;
-  if (staleTerminalUpdate) {
+  if (staleStatusUpdate) {
+    const terminalUpdate = ["applied", "failed"].includes(nextStatus.state);
+    const preserveCurrentActiveState =
+      ["queued", "applying"].includes(currentStatus.state) &&
+      currentStatus.desiredHash === currentDesiredHash;
     nextStatus = normalizePolicySettingsStatus(
       {
-        ...nextStatus,
-        state: ["queued", "applying"].includes(currentStatus.state)
-          ? currentStatus.state
-          : "queued",
+        ...(terminalUpdate ? nextStatus : currentStatus),
+        state: preserveCurrentActiveState ? currentStatus.state : "queued",
         desiredHash: currentDesiredHash,
         customPolicyIssue: currentStatus.customPolicyIssue || null,
         customPolicyAppliedAt: currentStatus.customPolicyAppliedAt || null,

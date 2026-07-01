@@ -252,6 +252,116 @@ describe("kubernetes cluster registry", () => {
     expect(cluster.customPolicyDesiredHash).toBe(currentHash);
   });
 
+  it("does not let a stale reconcile job overwrite newer queued status as applying", async () => {
+    const stalePolicySettings = {
+      ingressRules: {
+        openclaw: [{ id: "rule-1", cidr: "203.0.113.10/32", ports: [18789, 9090] }],
+        hermes: [],
+      },
+    };
+    const currentPolicySettings = {
+      ingressRules: {
+        openclaw: [{ id: "rule-2", cidr: "198.51.100.20/32", ports: [18789] }],
+        hermes: [],
+      },
+    };
+    const staleHash = buildPolicySettingsHash(stalePolicySettings);
+    const currentHash = buildPolicySettingsHash(currentPolicySettings);
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          kubernetesClusterRow({
+            policy_settings: currentPolicySettings,
+            policy_settings_status: {
+              state: "queued",
+              desiredHash: currentHash,
+              appliedHash: null,
+              customPolicyIssue: "newer issue",
+            },
+          }),
+        ],
+      })
+      .mockImplementationOnce((_sql, params) => ({
+        rows: [
+          kubernetesClusterRow({
+            policy_settings: currentPolicySettings,
+            policy_settings_status: JSON.parse(params[1]),
+          }),
+        ],
+      }));
+
+    const cluster = await markKubernetesClusterPolicyStatus("aks-eastus2", {
+      state: "applying",
+      desiredHash: staleHash,
+      customPolicyIssue: null,
+      updatedAt: "2026-06-22T12:00:01.000Z",
+    });
+
+    const persistedStatus = JSON.parse(mockDb.query.mock.calls[1][1][1]);
+    expect(persistedStatus.state).toBe("queued");
+    expect(persistedStatus.desiredHash).toBe(currentHash);
+    expect(persistedStatus.customPolicyIssue).toBe("newer issue");
+    expect(cluster.customPolicyState).toBe("queued");
+    expect(cluster.customPolicyDesiredHash).toBe(currentHash);
+  });
+
+  it("repairs an already stale applying status when an old terminal result arrives", async () => {
+    const stalePolicySettings = {
+      ingressRules: {
+        openclaw: [{ id: "rule-1", cidr: "203.0.113.10/32", ports: [18789, 9090] }],
+        hermes: [],
+      },
+    };
+    const currentPolicySettings = {
+      ingressRules: {
+        openclaw: [{ id: "rule-2", cidr: "198.51.100.20/32", ports: [18789] }],
+        hermes: [],
+      },
+    };
+    const staleHash = buildPolicySettingsHash(stalePolicySettings);
+    const currentHash = buildPolicySettingsHash(currentPolicySettings);
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          kubernetesClusterRow({
+            policy_settings: currentPolicySettings,
+            policy_settings_status: {
+              state: "applying",
+              desiredHash: staleHash,
+              appliedHash: null,
+              customPolicyIssue: null,
+            },
+          }),
+        ],
+      })
+      .mockImplementationOnce((_sql, params) => ({
+        rows: [
+          kubernetesClusterRow({
+            policy_settings: currentPolicySettings,
+            policy_settings_status: JSON.parse(params[1]),
+          }),
+        ],
+      }));
+
+    const cluster = await markKubernetesClusterPolicyStatus("aks-eastus2", {
+      state: "applied",
+      desiredHash: staleHash,
+      appliedHash: staleHash,
+      lastAppliedNamespaces: { openclaw: ["nora-openclaw-agents"] },
+      customPolicyAppliedAt: "2026-06-22T12:00:00.000Z",
+      updatedAt: "2026-06-22T12:00:01.000Z",
+    });
+
+    const persistedStatus = JSON.parse(mockDb.query.mock.calls[1][1][1]);
+    expect(persistedStatus.state).toBe("queued");
+    expect(persistedStatus.desiredHash).toBe(currentHash);
+    expect(persistedStatus.appliedHash).toBe(staleHash);
+    expect(persistedStatus.customPolicyAppliedAt).toBeNull();
+    expect(cluster.customPolicyApplied).toBe(false);
+    expect(cluster.customPolicyState).toBe("queued");
+    expect(cluster.customPolicyDesiredHash).toBe(currentHash);
+  });
+
   it("persists normalized policy settings with queued desired-hash status", async () => {
     const updated = kubernetesClusterRow({
       policy_settings: {
