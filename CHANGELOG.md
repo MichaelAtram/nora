@@ -4,6 +4,42 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.14.0](https://github.com/solomon2773/nora/releases/tag/v1.14.0) — 2026-07-02
+
+Kubernetes network isolation, BYOC SSH hardening, new MCP fleet tools, and
+approval-gated Echo social publishing.
+
+### Added
+
+- **Kubernetes NetworkPolicy isolation**: Nora-managed runtimes on Kubernetes now get
+  baseline pod-level ingress isolation at provisioning time, with admin tooling to
+  inspect and manage custom ingress CIDR allow rules on registered clusters. (#240)
+- **SSH host-key pinning for BYOC remote backends**: trust-on-first-use pinning with
+  enforcement on every connect across the remote Docker, Hermes, and NemoClaw paths;
+  a key mismatch surfaces a clear possible-MITM connection-test failure. (#241)
+- **MCP fleet tools**: new read-only `get_fleet_status` and `get_agent_stats` tools
+  expose the fleet needs-attention roll-up and per-agent resource/execution stats to
+  MCP clients. (#242, #236)
+- **Approval-gated Echo social publishing**: the Echo template moves from draft-only
+  to approval-gated publishing for original X/LinkedIn posts, including LinkedIn share
+  posting through the integration tool. (#243)
+
+### Changed
+
+- The supply-chain workflow no longer uploads container CVE reports to GitHub code
+  scanning; Trivy/Syft evidence stays available as workflow artifacts.
+
+### Fixed
+
+- Gateway port reservation no longer fails with an ambiguous `generate_series`
+  overload during Echo deploys; placeholders are cast before the query. (#244)
+- OpenClaw API-key auth profiles now import into the per-agent SQLite auth store (and
+  the legacy JSON file) across live auth sync plus Docker, Kubernetes, NemoClaw, and
+  Proxmox startup paths. (#245)
+- Microsoft Foundry saved model values normalize to OpenClaw's
+  `azure-openai-responses` provider id, including legacy `openai/<deployment>`
+  values, in both auth sync and post-deploy reconciliation. (#246)
+
 ## [v1.13.0](https://github.com/solomon2773/nora/releases/tag/v1.13.0) — 2026-06-23
 
 Scheduled agent operations, production-ready NemoClaw placement, GenAI observability,
