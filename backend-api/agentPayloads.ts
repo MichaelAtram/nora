@@ -440,9 +440,11 @@ function resolveContainerName({
 
 function serializeAgent(agent) {
   if (!agent) return agent;
-  const { template_payload, gateway_token, ...rest } = agent;
+  const { template_payload, gateway_token, network_policy_status, ...rest } = agent;
   return {
     ...rest,
+    networkPolicyStatus:
+      network_policy_status == null ? null : decodeMaybeString(network_policy_status),
     ...buildAgentRuntimeFields(rest),
   };
 }

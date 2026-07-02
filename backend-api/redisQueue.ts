@@ -55,6 +55,16 @@ const clawhubJobsQueue = new Queue("clawhub-jobs", {
   },
 });
 
+const policySettingsQueue = new Queue("k8s-policy-settings", {
+  connection,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: "exponential", delay: 3000 },
+    removeOnComplete: { count: 200 },
+    removeOnFail: false,
+  },
+});
+
 // Note: BullMQ v5 deprecated `timeout` in defaultJobOptions — it's silently
 // ignored. The backup worker enforces BACKUP_JOB_TIMEOUT_MS itself via
 // Promise.race in workers/backup/worker.ts.
@@ -124,6 +134,39 @@ async function addClawhubJob(payload) {
 async function addBackupJob(payload) {
   const jobId = payload?.jobId || payload?.backupId || randomUUID();
   return backupsQueue.add("run-backup", { ...payload, jobId }, { jobId });
+}
+
+async function addKubernetesPolicyReconcileJob(payload) {
+  const clusterId = String(payload?.clusterId || payload?.cluster_id || "").trim();
+  if (!clusterId) {
+    throw new Error("clusterId is required");
+  }
+  const desiredHash = String(payload?.desiredHash || payload?.desired_hash || "").trim() || null;
+  const jobId = `k8s-policy-${clusterId}`;
+  const existingJob = await policySettingsQueue.getJob(jobId);
+  if (existingJob) {
+    const state =
+      typeof existingJob.getState === "function" ? await existingJob.getState() : "unknown";
+    if (["waiting", "waiting-children", "delayed", "prioritized"].includes(state)) {
+      await existingJob.updateData({ clusterId, desiredHash });
+      return existingJob;
+    }
+    if (state === "active") {
+      return policySettingsQueue.add(
+        "reconcile-kubernetes-policy-settings",
+        { clusterId, desiredHash },
+        { jobId: `${jobId}-followup-${randomUUID()}` },
+      );
+    }
+    if (typeof existingJob.remove === "function") {
+      await existingJob.remove();
+    }
+  }
+  return policySettingsQueue.add(
+    "reconcile-kubernetes-policy-settings",
+    { clusterId, desiredHash },
+    { jobId },
+  );
 }
 
 async function findInFlightClawhubJob(agentId, slug, operation) {
@@ -232,6 +275,7 @@ async function retryDLQJob(jobId) {
 module.exports = {
   deployQueue,
   clawhubJobsQueue,
+  policySettingsQueue,
   backupsQueue,
   alertDeliveryQueue,
   agentScheduleQueue,
@@ -240,6 +284,7 @@ module.exports = {
   addClawhubJob,
   addClawhubInstallJob,
   addBackupJob,
+  addKubernetesPolicyReconcileJob,
   addAlertDeliveryJob,
   findInFlightClawhubJob,
   findInFlightClawhubInstallJob,

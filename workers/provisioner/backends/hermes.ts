@@ -9,7 +9,10 @@ const {
 } = require("./telemetry");
 const { getHermesDockerAgentImage } = require("../../../agent-runtime/lib/agentImages");
 const { HERMES_DASHBOARD_PORT } = require("../../../agent-runtime/lib/contracts");
-const { buildContainerBootstrap } = require("../../../agent-runtime/lib/containerCommand");
+const {
+  buildContainerBootstrap,
+  shellSingleQuote,
+} = require("../../../agent-runtime/lib/containerCommand");
 const {
   buildHermesRuntimeConfigBootstrapCommand,
 } = require("../../../agent-runtime/lib/hermesRuntimeBootstrap");
@@ -18,6 +21,7 @@ const HERMES_RUNTIME_PORT = 8642;
 const HERMES_HOME = "/opt/data";
 const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
+const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
 
 function isMutableImageReference(imgName) {
@@ -32,13 +36,20 @@ function isMutableImageReference(imgName) {
 }
 
 function buildHermesStartCommand() {
-  return [
+  const hermesRuntimeCommand = [
     "set -eu",
     buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
     `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
     'exec "$HERMES_BIN" gateway run',
+  ].join("\n");
+
+  return [
+    "set -eu",
+    // Bootstrap the mounted Hermes home once, then fork dashboard and gateway
+    // from that initialized session so first-run file seeding cannot race.
+    `exec ${HERMES_ENTRYPOINT} bash -lc ${shellSingleQuote(hermesRuntimeCommand)}`,
   ].join("\n");
 }
 

@@ -1,6 +1,8 @@
 // @ts-nocheck
+const { createHash, randomUUID } = require("crypto");
 const db = require("./db");
 const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
+const ipaddr = require("ipaddr.js");
 const {
   getExecutionTargetMetadata,
   normalizeDeployTargetName,
@@ -10,6 +12,12 @@ const {
 const PROVIDERS = new Set(["kubernetes", "k3s", "aks", "gke", "eks"]);
 const CREDENTIAL_MODES = new Set(["encrypted_kubeconfig", "mounted_path"]);
 const EXPOSURE_MODES = new Set(["cluster-ip", "node-port", "load-balancer"]);
+const POLICY_STATUS_STATES = new Set(["queued", "applying", "applied", "failed"]);
+const POLICY_INGRESS_PORTS = Object.freeze({
+  openclaw: Object.freeze([18789, 9090]),
+  hermes: Object.freeze([8642, 9119]),
+});
+const POLICY_RULE_DESCRIPTION_MAX_LENGTH = 200;
 let k8sClient = null;
 
 function getK8sClient() {
@@ -115,6 +123,294 @@ function parseJsonObject(value, fallback = {}) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : fallback;
 }
 
+function createPolicyValidationError(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
+}
+
+function buildEmptyPolicySettings() {
+  return {
+    ingressRules: {
+      openclaw: [],
+      hermes: [],
+    },
+  };
+}
+
+function parseStructuredObject(value, fieldName, { lenient = false, fallback = {} } = {}) {
+  if (value == null || value === "") return fallback;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch (error) {
+      if (lenient) return fallback;
+      throw createPolicyValidationError(`${fieldName} must be a JSON object.`);
+    }
+    if (lenient) return fallback;
+    throw createPolicyValidationError(`${fieldName} must be a JSON object.`);
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+  if (lenient) return fallback;
+  throw createPolicyValidationError(`${fieldName} must be an object.`);
+}
+
+function normalizeCidr(value, { lenient = false } = {}) {
+  const raw = normalizeText(value);
+  if (!raw) {
+    if (lenient) return "";
+    throw createPolicyValidationError("Ingress rules require a CIDR block.");
+  }
+
+  try {
+    const [address, prefix] = ipaddr.parseCIDR(raw);
+    const normalizedAddress =
+      address.kind() === "ipv6"
+        ? address.toRFC5952String()
+        : typeof address.toString === "function"
+          ? address.toString()
+          : String(address);
+    return `${normalizedAddress}/${prefix}`;
+  } catch {
+    if (lenient) return "";
+    throw createPolicyValidationError(`Invalid CIDR block: ${raw}`);
+  }
+}
+
+function normalizeIngressPorts(runtimeFamily, ports, { lenient = false } = {}) {
+  if (!Array.isArray(ports) || ports.length === 0) {
+    if (lenient) return [];
+    throw createPolicyValidationError(
+      `${runtimeFamily} ingress rules must include a non-empty ports array.`,
+    );
+  }
+
+  const allowedPorts = new Set(POLICY_INGRESS_PORTS[runtimeFamily] || []);
+  const normalized = [];
+  for (const value of ports) {
+    const parsed = parsePort(value);
+    if (!parsed) {
+      if (lenient) continue;
+      throw createPolicyValidationError(
+        `${runtimeFamily} ingress rules may only contain valid TCP ports.`,
+      );
+    }
+    if (!allowedPorts.has(parsed)) {
+      throw createPolicyValidationError(
+        `${runtimeFamily} ingress rules may only target ports ${POLICY_INGRESS_PORTS[
+          runtimeFamily
+        ].join(" and ")}.`,
+      );
+    }
+    normalized.push(parsed);
+  }
+
+  return Array.from(new Set(normalized)).sort((left, right) => left - right);
+}
+
+function normalizeIngressPolicyRules(runtimeFamily, rules, options = {}) {
+  const { lenient = false } = options;
+  if (!Object.prototype.hasOwnProperty.call(POLICY_INGRESS_PORTS, runtimeFamily)) {
+    throw createPolicyValidationError(`Unsupported runtime family: ${runtimeFamily}`);
+  }
+  if (rules == null) return [];
+  if (!Array.isArray(rules)) {
+    if (lenient) return [];
+    throw createPolicyValidationError(`${runtimeFamily} ingress rules must be an array.`);
+  }
+
+  const deduped = new Map();
+  const seenCidrs = new Set();
+  for (const rawRule of rules) {
+    if (!rawRule || typeof rawRule !== "object" || Array.isArray(rawRule)) {
+      if (lenient) continue;
+      throw createPolicyValidationError(`${runtimeFamily} ingress rules must be objects.`);
+    }
+
+    const cidr = normalizeCidr(rawRule.cidr, { lenient });
+    const normalizedPorts = normalizeIngressPorts(runtimeFamily, rawRule.ports, { lenient });
+    if (!cidr || normalizedPorts.length === 0) continue;
+
+    const descriptionRaw = rawRule.description == null ? "" : String(rawRule.description);
+    const description = normalizeText(descriptionRaw);
+    if (description.length > POLICY_RULE_DESCRIPTION_MAX_LENGTH) {
+      throw createPolicyValidationError(
+        `${runtimeFamily} ingress rule descriptions must be ${POLICY_RULE_DESCRIPTION_MAX_LENGTH} characters or fewer.`,
+      );
+    }
+
+    const dedupeKey = `${runtimeFamily}|${cidr}|${normalizedPorts.join(",")}`;
+    if (seenCidrs.has(cidr)) {
+      if (lenient) continue;
+      throw createPolicyValidationError(
+        `${runtimeFamily} ingress already includes ${cidr}. Edit the existing rule instead of adding a duplicate CIDR.`,
+      );
+    }
+    seenCidrs.add(cidr);
+    if (deduped.has(dedupeKey)) continue;
+
+    deduped.set(dedupeKey, {
+      id: normalizeText(rawRule.id) || randomUUID(),
+      cidr,
+      ports: normalizedPorts,
+      description: description || null,
+    });
+  }
+
+  return Array.from(deduped.values());
+}
+
+function normalizeLastAppliedNamespaces(value, { lenient = false } = {}) {
+  if (value == null || value === "") return null;
+  const input = parseStructuredObject(value, "policySettingsStatus.lastAppliedNamespaces", {
+    lenient,
+    fallback: {},
+  });
+  const normalized = {};
+  for (const runtimeFamily of Object.keys(POLICY_INGRESS_PORTS)) {
+    const rawNamespaces = input[runtimeFamily];
+    const values = Array.isArray(rawNamespaces) ? rawNamespaces : [rawNamespaces];
+    const namespaces = Array.from(
+      new Set(values.map((entry) => normalizeText(entry)).filter(Boolean)),
+    );
+    if (namespaces.length > 0) {
+      normalized[runtimeFamily] = namespaces;
+    }
+  }
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+function normalizeTimestamp(value, fieldName, { lenient = false } = {}) {
+  if (value == null || value === "") return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    if (lenient) return null;
+    throw createPolicyValidationError(`${fieldName} must be a valid timestamp.`);
+  }
+  return parsed.toISOString();
+}
+
+function normalizePolicySettings(input = {}, existing = null, options = {}) {
+  const { lenient = false } = options;
+  const existingInput =
+    existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {};
+  const root = parseStructuredObject(input, "policySettings", {
+    lenient,
+    fallback: existingInput,
+  });
+  const ingressRules = parseStructuredObject(root.ingressRules, "policySettings.ingressRules", {
+    lenient,
+    fallback: {},
+  });
+
+  return {
+    ingressRules: {
+      openclaw: normalizeIngressPolicyRules("openclaw", ingressRules.openclaw ?? [], { lenient }),
+      hermes: normalizeIngressPolicyRules("hermes", ingressRules.hermes ?? [], { lenient }),
+    },
+  };
+}
+
+function buildPolicySettingsHash(policySettings) {
+  const normalized = normalizePolicySettings(policySettings, buildEmptyPolicySettings(), {
+    lenient: true,
+  });
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+function normalizePolicySettingsStatus(
+  input = {},
+  existing = null,
+  policySettings = null,
+  options = {},
+) {
+  const { lenient = false } = options;
+  const fallback =
+    existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {};
+  const root = parseStructuredObject(input, "policySettingsStatus", { lenient, fallback });
+  const desiredHashFallback = policySettings ? buildPolicySettingsHash(policySettings) : null;
+  const state = normalizeText(root.state ?? fallback.state).toLowerCase();
+  if (state && !POLICY_STATUS_STATES.has(state)) {
+    if (!lenient) {
+      throw createPolicyValidationError(
+        `policySettingsStatus.state must be one of ${Array.from(POLICY_STATUS_STATES).join(", ")}.`,
+      );
+    }
+  }
+
+  const normalized = {
+    state: POLICY_STATUS_STATES.has(state) ? state : null,
+    desiredHash:
+      normalizeText(root.desiredHash ?? root.desired_hash ?? fallback.desiredHash) ||
+      desiredHashFallback ||
+      null,
+    appliedHash:
+      normalizeText(root.appliedHash ?? root.applied_hash ?? fallback.appliedHash) || null,
+    lastAppliedNamespaces: normalizeLastAppliedNamespaces(
+      root.lastAppliedNamespaces ?? root.last_applied_namespaces ?? fallback.lastAppliedNamespaces,
+      { lenient },
+    ),
+    customPolicyIssue:
+      normalizeText(
+        root.customPolicyIssue ?? root.custom_policy_issue ?? fallback.customPolicyIssue,
+      ) || null,
+    customPolicyAppliedAt: normalizeTimestamp(
+      root.customPolicyAppliedAt ?? root.custom_policy_applied_at ?? fallback.customPolicyAppliedAt,
+      "policySettingsStatus.customPolicyAppliedAt",
+      { lenient },
+    ),
+    updatedAt: normalizeTimestamp(
+      root.updatedAt ?? root.updated_at ?? fallback.updatedAt,
+      "policySettingsStatus.updatedAt",
+      { lenient },
+    ),
+  };
+
+  return Object.values(normalized).some((value) => value != null) ? normalized : {};
+}
+
+function buildPolicySettingsSummary(policySettings, policySettingsStatus = {}) {
+  const normalizedSettings = normalizePolicySettings(policySettings, buildEmptyPolicySettings(), {
+    lenient: true,
+  });
+  const normalizedStatus = normalizePolicySettingsStatus(
+    policySettingsStatus,
+    null,
+    normalizedSettings,
+    { lenient: true },
+  );
+  const openclawCount = normalizedSettings.ingressRules.openclaw.length;
+  const hermesCount = normalizedSettings.ingressRules.hermes.length;
+  const configured = openclawCount + hermesCount > 0;
+  const currentSettingsHash = buildPolicySettingsHash(normalizedSettings);
+  const desiredHash =
+    configured || normalizedStatus.state
+      ? currentSettingsHash
+      : normalizedStatus.desiredHash || null;
+  const applied =
+    configured &&
+    normalizedStatus.state === "applied" &&
+    Boolean(normalizedStatus.appliedHash) &&
+    normalizedStatus.appliedHash === currentSettingsHash;
+
+  return {
+    customPolicyConfigured: configured,
+    customIngressConfigured: configured,
+    customPolicyApplied: applied,
+    customPolicyIssue: normalizedStatus.customPolicyIssue || null,
+    customPolicyState: normalizedStatus.state || null,
+    customPolicyDesiredHash: desiredHash,
+    customPolicyAppliedAt: normalizedStatus.customPolicyAppliedAt || null,
+    customIngressRuleCounts: {
+      openclaw: openclawCount,
+      hermes: hermesCount,
+    },
+  };
+}
+
 function parseStringArray(value) {
   if (Array.isArray(value)) {
     return value.map((entry) => normalizeText(entry)).filter(Boolean);
@@ -133,6 +429,28 @@ function normalizeBool(value, fallback = false) {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off", ""].includes(normalized)) return false;
   return fallback;
+}
+
+function normalizeNullableBool(value, fallback = null) {
+  if (value === null || value === undefined || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const normalized = normalizeText(value).toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function detectPolicyEngineFromDaemonSets(items = []) {
+  const names = items
+    .map((item) => normalizeText(item?.metadata?.name).toLowerCase())
+    .filter(Boolean);
+  if (names.some((name) => name.includes("cilium"))) return "cilium";
+  if (names.some((name) => name.includes("calico"))) return "calico";
+  if (names.some((name) => name.includes("azure-npm") || name.includes("npm-"))) {
+    return "azure-npm";
+  }
+  return "";
 }
 
 function maskCluster(row) {
@@ -164,6 +482,18 @@ function rowToProfile(row, { includeSecret = false } = {}) {
       ? Boolean(row.kubeconfig_encrypted)
       : Boolean(normalizeText(row.kubeconfig_path));
   const testedOk = row.last_test_status === "ok";
+  const supportsNetworkPolicy = row.supports_network_policy === true;
+  const policyEngine = normalizeText(row.policy_engine);
+  const policySettings = normalizePolicySettings(row.policy_settings, buildEmptyPolicySettings(), {
+    lenient: true,
+  });
+  const policySettingsStatus = normalizePolicySettingsStatus(
+    row.policy_settings_status,
+    {},
+    policySettings,
+    { lenient: true },
+  );
+  const policySettingsSummary = buildPolicySettingsSummary(policySettings, policySettingsStatus);
   const issue = !configured
     ? row.credential_mode === "encrypted_kubeconfig"
       ? "Kubernetes cluster requires encrypted kubeconfig content."
@@ -212,6 +542,14 @@ function rowToProfile(row, { includeSecret = false } = {}) {
     loadBalancerClass: normalizeText(row.load_balancer_class),
     loadBalancerReadyTimeoutMs: parsePositiveInteger(row.load_balancer_ready_timeout_ms, 600000),
     loadBalancerReadyIntervalMs: parsePositiveInteger(row.load_balancer_ready_interval_ms, 5000),
+    supportsNetworkPolicy,
+    policyEngine: policyEngine || null,
+    policySupportStatus: supportsNetworkPolicy ? "supported" : "degraded",
+    policyIssue: supportsNetworkPolicy
+      ? null
+      : "Cluster does not currently advertise Kubernetes NetworkPolicy support. Nora will deploy in degraded mode and skip pod-level policy enforcement.",
+    policySettings,
+    policySettingsStatus,
     configured,
     connected: testedOk,
     available: row.enabled !== false && configured && testedOk,
@@ -234,6 +572,7 @@ function rowToProfile(row, { includeSecret = false } = {}) {
     lastTestedAt: row.last_tested_at || null,
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
+    ...policySettingsSummary,
   };
 }
 
@@ -262,6 +601,20 @@ function normalizeClusterInput(input = {}, existing = null) {
   const serviceAnnotations = parseJsonObject(
     input.serviceAnnotations ?? input.service_annotations,
     existing?.service_annotations || {},
+  );
+  const policySettings = normalizePolicySettings(
+    input.policySettings ?? input.policy_settings ?? existing?.policy_settings,
+    buildEmptyPolicySettings(),
+    { lenient: true },
+  );
+  const policySettingsStatus = normalizePolicySettingsStatus(
+    input.policySettingsStatus ??
+      input.policy_settings_status ??
+      existing?.policy_settings_status ??
+      {},
+    existing?.policy_settings_status,
+    policySettings,
+    { lenient: true },
   );
 
   return {
@@ -321,6 +674,17 @@ function normalizeClusterInput(input = {}, existing = null) {
         existing?.load_balancer_ready_interval_ms,
       5000,
     ),
+    supportsNetworkPolicy: normalizeNullableBool(
+      input.supportsNetworkPolicy ??
+        input.supports_network_policy ??
+        existing?.supports_network_policy,
+      null,
+    ),
+    policyEngine: normalizeText(
+      input.policyEngine ?? input.policy_engine ?? existing?.policy_engine,
+    ),
+    policySettings,
+    policySettingsStatus,
   };
 }
 
@@ -365,6 +729,118 @@ async function getClusterRow(clusterId) {
   return result.rows[0] || null;
 }
 
+async function getKubernetesClusterPolicySettings(clusterId) {
+  const row = await getClusterRow(clusterId);
+  if (!row) {
+    const error = new Error("Kubernetes cluster not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  return maskCluster(row);
+}
+
+async function markKubernetesClusterPolicyStatus(clusterId, statusPayload = {}) {
+  const existing = await getClusterRow(clusterId);
+  if (!existing) {
+    const error = new Error("Kubernetes cluster not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  const policySettings = normalizePolicySettings(
+    existing.policy_settings,
+    buildEmptyPolicySettings(),
+    {
+      lenient: true,
+    },
+  );
+  const currentStatus = normalizePolicySettingsStatus(
+    existing.policy_settings_status,
+    {},
+    policySettings,
+    { lenient: true },
+  );
+  let nextStatus = normalizePolicySettingsStatus(
+    { ...currentStatus, ...(statusPayload || {}) },
+    currentStatus,
+    policySettings,
+  );
+  const currentDesiredHash = buildPolicySettingsHash(policySettings);
+  const staleStatusUpdate =
+    POLICY_STATUS_STATES.has(nextStatus.state) &&
+    Boolean(nextStatus.desiredHash) &&
+    nextStatus.desiredHash !== currentDesiredHash;
+  if (staleStatusUpdate) {
+    const terminalUpdate = ["applied", "failed"].includes(nextStatus.state);
+    const preserveCurrentActiveState =
+      ["queued", "applying"].includes(currentStatus.state) &&
+      currentStatus.desiredHash === currentDesiredHash;
+    nextStatus = normalizePolicySettingsStatus(
+      {
+        ...(terminalUpdate ? nextStatus : currentStatus),
+        state: preserveCurrentActiveState ? currentStatus.state : "queued",
+        desiredHash: currentDesiredHash,
+        customPolicyIssue: currentStatus.customPolicyIssue || null,
+        customPolicyAppliedAt: currentStatus.customPolicyAppliedAt || null,
+        updatedAt: new Date().toISOString(),
+      },
+      currentStatus,
+      policySettings,
+    );
+  }
+  const result = await db.query(
+    `UPDATE kubernetes_clusters
+        SET policy_settings_status = $2::jsonb,
+            updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [existing.id, JSON.stringify(nextStatus)],
+  );
+  return maskCluster(result.rows[0]);
+}
+
+async function updateKubernetesClusterPolicySettings(clusterId, input = {}) {
+  const existing = await getClusterRow(clusterId);
+  if (!existing) {
+    const error = new Error("Kubernetes cluster not found");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const policySettings = normalizePolicySettings(
+    input.policySettings ?? input.policy_settings ?? input,
+    existing.policy_settings,
+  );
+  const desiredHash = buildPolicySettingsHash(policySettings);
+  const currentStatus = normalizePolicySettingsStatus(
+    existing.policy_settings_status,
+    {},
+    policySettings,
+    { lenient: true },
+  );
+  const nextStatus = normalizePolicySettingsStatus(
+    {
+      state: "queued",
+      desiredHash,
+      appliedHash: currentStatus.appliedHash,
+      lastAppliedNamespaces: currentStatus.lastAppliedNamespaces,
+      customPolicyIssue: null,
+      updatedAt: new Date().toISOString(),
+    },
+    currentStatus,
+    policySettings,
+  );
+  const result = await db.query(
+    `UPDATE kubernetes_clusters
+        SET policy_settings = $2::jsonb,
+            policy_settings_status = $3::jsonb,
+            updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [existing.id, JSON.stringify(policySettings), JSON.stringify(nextStatus)],
+  );
+  return maskCluster(result.rows[0]);
+}
+
 async function createKubernetesCluster(input = {}) {
   const cluster = normalizeClusterInput(input);
   const result = await db.query(
@@ -374,14 +850,15 @@ async function createKubernetesCluster(input = {}) {
        openclaw_namespace, hermes_namespace, exposure_mode, runtime_host,
        runtime_node_port, gateway_node_port, service_annotations,
        load_balancer_source_ranges, load_balancer_class,
-       load_balancer_ready_timeout_ms, load_balancer_ready_interval_ms
+       load_balancer_ready_timeout_ms, load_balancer_ready_interval_ms,
+       supports_network_policy, policy_engine, policy_settings, policy_settings_status
      ) VALUES(
        $1, $2, $3, $4, $5, $6, $7,
        $8, $9, $10, $11,
        $12, $13, $14, $15,
        $16, $17, $18::jsonb,
        $19::text[], $20,
-       $21, $22
+       $21, $22, $23, $24, $25::jsonb, $26::jsonb
      )
      RETURNING *`,
     [
@@ -407,6 +884,10 @@ async function createKubernetesCluster(input = {}) {
       cluster.loadBalancerClass,
       cluster.loadBalancerReadyTimeoutMs,
       cluster.loadBalancerReadyIntervalMs,
+      cluster.supportsNetworkPolicy === true,
+      cluster.policyEngine,
+      JSON.stringify(cluster.policySettings),
+      JSON.stringify(cluster.policySettingsStatus),
     ],
   );
   if (cluster.isDefault) {
@@ -449,9 +930,13 @@ async function updateKubernetesCluster(clusterId, input = {}) {
             load_balancer_class = $20,
             load_balancer_ready_timeout_ms = $21,
             load_balancer_ready_interval_ms = $22,
-            last_test_status = CASE WHEN $23 THEN NULL ELSE last_test_status END,
-            last_test_message = CASE WHEN $23 THEN NULL ELSE last_test_message END,
-            last_tested_at = CASE WHEN $23 THEN NULL ELSE last_tested_at END,
+            supports_network_policy = COALESCE($23, supports_network_policy),
+            policy_engine = CASE WHEN $24 = '' THEN policy_engine ELSE $24 END,
+            policy_settings = $25::jsonb,
+            policy_settings_status = $26::jsonb,
+            last_test_status = CASE WHEN $27 THEN NULL ELSE last_test_status END,
+            last_test_message = CASE WHEN $27 THEN NULL ELSE last_test_message END,
+            last_tested_at = CASE WHEN $27 THEN NULL ELSE last_tested_at END,
             updated_at = NOW()
       WHERE id = $1
       RETURNING *`,
@@ -478,6 +963,10 @@ async function updateKubernetesCluster(clusterId, input = {}) {
       cluster.loadBalancerClass,
       cluster.loadBalancerReadyTimeoutMs,
       cluster.loadBalancerReadyIntervalMs,
+      cluster.supportsNetworkPolicy,
+      cluster.policyEngine,
+      JSON.stringify(cluster.policySettings),
+      JSON.stringify(cluster.policySettingsStatus),
       connectionInputChanged,
     ],
   );
@@ -582,6 +1071,86 @@ function buildKubeConfig(profile) {
   return kc;
 }
 
+function unwrapKubernetesClientResponse(response) {
+  if (!response || typeof response !== "object") {
+    return response;
+  }
+  return response.body && typeof response.body === "object" ? response.body : response;
+}
+
+async function probeKubernetesNetworkPolicySupport(profile) {
+  const k8s = getK8sClient();
+  const kc = buildKubeConfig(profile);
+  const result = {
+    supportsNetworkPolicy: false,
+    policyEngine: "",
+    message: "Kubernetes API is reachable, but NetworkPolicy support could not be confirmed.",
+  };
+
+  if (!k8s.NetworkingV1Api || !k8s.AuthorizationV1Api) {
+    return result;
+  }
+
+  try {
+    const appsApi = k8s.AppsV1Api ? kc.makeApiClient(k8s.AppsV1Api) : null;
+    if (appsApi?.listNamespacedDaemonSet) {
+      const daemonSets = await appsApi.listNamespacedDaemonSet({
+        namespace: "kube-system",
+        limit: 100,
+      });
+      const daemonSetList = unwrapKubernetesClientResponse(daemonSets);
+      result.policyEngine = detectPolicyEngineFromDaemonSets(daemonSetList?.items || []);
+    }
+  } catch {
+    // Best-effort signal only.
+  }
+
+  try {
+    const authApi = kc.makeApiClient(k8s.AuthorizationV1Api);
+    const namespaces = Array.from(
+      new Set(
+        [
+          normalizeText(profile.openclawNamespace),
+          normalizeText(profile.hermesNamespace),
+          normalizeText(profile.namespace),
+        ].filter(Boolean),
+      ),
+    );
+    const reviews = await Promise.all(
+      namespaces.map((namespace) =>
+        authApi.createSelfSubjectAccessReview({
+          body: {
+            apiVersion: "authorization.k8s.io/v1",
+            kind: "SelfSubjectAccessReview",
+            spec: {
+              resourceAttributes: {
+                namespace,
+                group: "networking.k8s.io",
+                resource: "networkpolicies",
+                verb: "create",
+              },
+            },
+          },
+        }),
+      ),
+    );
+    const allowed = reviews.every(
+      (review) => unwrapKubernetesClientResponse(review)?.status?.allowed === true,
+    );
+    result.supportsNetworkPolicy = allowed && Boolean(result.policyEngine);
+    result.message = result.supportsNetworkPolicy
+      ? `Kubernetes API is reachable and NetworkPolicy support was detected${result.policyEngine ? ` (${result.policyEngine})` : ""}.`
+      : allowed
+        ? "Kubernetes API is reachable, but NetworkPolicy enforcement could not be confirmed from cluster signals."
+        : `Kubernetes API is reachable, but this kubeconfig cannot create NetworkPolicy resources in all required Nora namespaces (${namespaces.join(", ")}).`;
+  } catch (error) {
+    result.message =
+      error?.message || "Kubernetes API is reachable, but NetworkPolicy probing failed.";
+  }
+
+  return result;
+}
+
 async function testKubernetesCluster(clusterId) {
   const profile = await getKubernetesClusterProfile(`k8s:${clusterId}`);
   if (!profile) {
@@ -591,6 +1160,8 @@ async function testKubernetesCluster(clusterId) {
   }
   let status = "ok";
   let message = "Kubernetes API is reachable.";
+  let supportsNetworkPolicy = normalizeBool(profile.supportsNetworkPolicy, false);
+  let policyEngine = normalizeText(profile.policyEngine);
   if (!profile.configured) {
     status = "failed";
     message = profile.issue || "Kubernetes cluster is not configured.";
@@ -600,6 +1171,10 @@ async function testKubernetesCluster(clusterId) {
       const kc = buildKubeConfig(profile);
       const coreApi = kc.makeApiClient(k8s.CoreV1Api);
       await coreApi.listNamespace({ limit: 1 });
+      const policyProbe = await probeKubernetesNetworkPolicySupport(profile);
+      supportsNetworkPolicy = policyProbe.supportsNetworkPolicy;
+      policyEngine = policyProbe.policyEngine;
+      message = policyProbe.message || message;
     } catch (error) {
       status = "failed";
       message = error?.message || "Kubernetes API test failed.";
@@ -609,23 +1184,33 @@ async function testKubernetesCluster(clusterId) {
     `UPDATE kubernetes_clusters
         SET last_test_status = $2,
             last_test_message = $3,
+            supports_network_policy = $4,
+            policy_engine = $5,
             last_tested_at = NOW(),
             updated_at = NOW()
       WHERE id = $1
       RETURNING *`,
-    [profile.id, status, message],
+    [profile.id, status, message, supportsNetworkPolicy, policyEngine],
   );
   return maskCluster(result.rows[0]);
 }
 
 module.exports = {
   assertKubernetesExecutionTargetAvailable,
+  buildPolicySettingsHash,
+  buildPolicySettingsSummary,
   createKubernetesCluster,
   deleteKubernetesCluster,
   getKubernetesClusterProfile,
+  getKubernetesClusterPolicySettings,
   listKubernetesClusters,
   listKubernetesExecutionTargets,
+  markKubernetesClusterPolicyStatus,
+  normalizeIngressPolicyRules,
+  normalizePolicySettings,
+  normalizePolicySettingsStatus,
   rowToProfile,
   testKubernetesCluster,
   updateKubernetesCluster,
+  updateKubernetesClusterPolicySettings,
 };
