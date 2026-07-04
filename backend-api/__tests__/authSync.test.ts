@@ -5,6 +5,8 @@ const { PassThrough } = require("stream");
 const mockDb = { query: jest.fn() };
 const mockRestart = jest.fn();
 const mockExec = jest.fn();
+const mockIsKubernetesAgent = jest.fn();
+const mockUpdateEnv = jest.fn();
 const mockGetProviderKeys = jest.fn();
 const mockBuildAuthProfiles = jest.fn();
 const mockGetIntegrationEnvVars = jest.fn();
@@ -15,6 +17,8 @@ jest.mock("../db", () => mockDb);
 jest.mock("../containerManager", () => ({
   exec: mockExec,
   restart: mockRestart,
+  isKubernetesAgent: mockIsKubernetesAgent,
+  updateEnv: mockUpdateEnv,
 }));
 jest.mock("../llmProviders", () => ({
   PROVIDERS: [
@@ -78,6 +82,12 @@ describe("auth sync", () => {
     mockDb.query.mockReset();
     mockExec.mockReset().mockResolvedValue(execResult());
     mockRestart.mockReset().mockResolvedValue(undefined);
+    mockIsKubernetesAgent
+      .mockReset()
+      .mockImplementation(
+        (agent) => String(agent?.backend_type || "").toLowerCase() === "k8s",
+      );
+    mockUpdateEnv.mockReset().mockResolvedValue(undefined);
     mockGetProviderKeys.mockReset().mockResolvedValue({
       OPENAI_API_KEY: "sk-live-test",
     });
@@ -117,8 +127,13 @@ describe("auth sync", () => {
       model: "openai/gpt-5.5-1",
     });
 
-    expect(command).toContain('"models" "set" "azure-openai-responses/gpt-5.5-1"');
-    expect(command).not.toContain('"models" "set" "openai/gpt-5.5-1"');
+    // Written via config merge, NOT `openclaw models set`: the CLI
+    // canonicalizes the ref back to `openai/<deployment>`, a provider the
+    // agent has no credentials for.
+    expect(command).toContain("__NORA_MERGE_OPENCLAW_CONFIG__");
+    expect(command).toContain('"primary": "azure-openai-responses/gpt-5.5-1"');
+    expect(command).not.toContain('"openai/gpt-5.5-1"');
+    expect(command).not.toContain('"models" "set"');
   });
 
   it("syncs auth through the runtime endpoint and restarts supported non-docker agents", async () => {
@@ -180,7 +195,16 @@ describe("auth sync", () => {
       }),
     );
     expect(JSON.parse(global.fetch.mock.calls[1][1].body).command).toContain(
-      'models" "set" "openai/gpt-5.5',
+      '"primary": "openai/gpt-5.5"',
+    );
+    // Kubernetes restarts are rollouts: the replacement pod re-seeds auth
+    // from the Deployment env, so the sync must patch it too.
+    expect(mockUpdateEnv).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "agent-k8s-1" }),
+      {
+        OPENAI_API_KEY: "sk-live-test",
+        NORA_DEFAULT_OPENCLAW_MODEL: "openai/gpt-5.5",
+      },
     );
     expect(results).toEqual([{ agentId: "agent-k8s-1", status: "synced" }]);
   });

@@ -54,6 +54,7 @@ const {
   buildOpenClawAuthProfilesWriteCommand,
   buildOpenClawConfigMergeCommand,
   buildOpenClawCustomProviders,
+  buildOpenClawDefaultModelCommand,
   buildOpenClawModelForProvider,
 } = require("../../agent-runtime/lib/runtimeBootstrap");
 const {
@@ -316,14 +317,7 @@ function buildDefaultModelCommand(defaultProvider = null) {
   const fullModel = buildDefaultOpenClawModel(defaultProvider);
   if (!fullModel) return null;
 
-  return (
-    'OPENCLAW_BIN="${OPENCLAW_CLI_PATH:-/usr/local/bin/openclaw}"; ' +
-    'if [ ! -x "$OPENCLAW_BIN" ]; then OPENCLAW_BIN="$(command -v openclaw 2>/dev/null || true)"; fi; ' +
-    '[ -n "$OPENCLAW_BIN" ] && [ -x "$OPENCLAW_BIN" ] || exit 127; ' +
-    `exec "$OPENCLAW_BIN" ${["models", "set", fullModel]
-      .map((arg) => JSON.stringify(String(arg)))
-      .join(" ")}`
-  );
+  return buildOpenClawDefaultModelCommand(fullModel);
 }
 
 function buildDefaultOpenClawModel(defaultProvider = null) {
