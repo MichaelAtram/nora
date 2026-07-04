@@ -4,6 +4,19 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.14.2](https://github.com/solomon2773/nora/releases/tag/v1.14.2) — 2026-07-04
+
+Patch release: OpenClaw ≥2026.6 auth fix for custom providers (Microsoft Foundry).
+
+### Fixed
+
+- OpenClaw ≥2026.6 agents using custom providers (Microsoft Foundry) no longer fail
+  every turn with `missing-provider-auth`: API-key profiles now import into the
+  per-agent SQLite auth store (previously skipped for Foundry), auth sync no longer
+  uses `openclaw models set` (which canonicalized `azure-openai-responses/<deployment>`
+  to an uncredentialed `openai/<deployment>` ref), and auth now survives Kubernetes
+  pod rollouts instead of evaporating with exec-written files. (#260)
+
 ## [v1.14.1](https://github.com/solomon2773/nora/releases/tag/v1.14.1) — 2026-07-04
 
 Docs-only patch: promo-ready README refresh.
