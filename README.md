@@ -8,12 +8,12 @@
 </div>
 
 <p align="center">
+  <a href="https://github.com/solomon2773/nora/releases"><img src="https://img.shields.io/github/v/release/solomon2773/nora?color=6d28d9&label=release" alt="Latest release" /></a>
+  <a href="https://github.com/solomon2773/nora/actions/workflows/ci-quality.yml"><img src="https://img.shields.io/github/actions/workflow/status/solomon2773/nora/ci-quality.yml?branch=master&label=CI" alt="CI status" /></a>
+  <a href="https://www.npmjs.com/package/@noraai/cli"><img src="https://img.shields.io/npm/v/%40noraai%2Fcli?label=%40noraai%2Fcli&color=cb3837" alt="@noraai/cli on npm" /></a>
+  <a href="https://www.npmjs.com/package/@noraai/mcp-server"><img src="https://img.shields.io/npm/v/%40noraai%2Fmcp-server?label=%40noraai%2Fmcp-server&color=cb3837" alt="@noraai/mcp-server on npm" /></a>
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License" />
   <img src="https://img.shields.io/badge/node-%3E%3D24-brightgreen.svg" alt="Node" />
-  <img src="https://img.shields.io/badge/docker-compose-2496ED.svg" alt="Docker Compose" />
-  <img src="https://img.shields.io/badge/self--hosted-first-0ea5e9.svg" alt="Self-hosted first" />
-  <img src="https://img.shields.io/badge/commercial%20use-Apache%202.0%20allowed-6d28d9.svg" alt="Commercial use allowed" />
-  <img src="https://img.shields.io/badge/MCP-server%20%2B%20per--agent-7c3aed.svg" alt="MCP server and per-agent MCP" />
 </p>
 
 <p align="center">
@@ -38,24 +38,56 @@
   <sub>▶ <b><a href="https://github.com/solomon2773/nora/raw/master/.github/readme-assets/walkthrough.mp4">Watch the walkthrough</a></b></sub>
 </p>
 
-## Standards & isolation
-
-- **MCP — shipped.** A control-plane [MCP](https://modelcontextprotocol.io) server (`@noraai/mcp-server`, published to the official [MCP Registry](https://github.com/modelcontextprotocol/registry)) plus per-agent MCP server management — operate the fleet from Claude Code / Desktop / Cursor, and wire MCP tools into individual agents.
-- **OpenTelemetry GenAI — available.** [OTLP + Prometheus export](https://noradocs.solomontsao.com/guides/opentelemetry) of runtime telemetry under the `gen_ai.*` semantic conventions — per-exchange chat spans plus token/cost/resource metrics flow into the Grafana / Datadog / Langfuse stack you already run. (Per-tool-call sub-spans depend on runtime event streams and remain on the roadmap.)
-- **A2A — on the roadmap.** Agent Cards / Agent-to-Agent discovery for managed OpenClaw and Hermes agents.
-- **Isolation, per deploy target.** Standard Docker and Kubernetes runs use container namespaces plus operator-set CPU / RAM / disk limits; the experimental **NemoClaw** profile hardens untrusted code with a non-root user, all Linux capabilities dropped, `no-new-privileges`, Landlock + seccomp, and default-deny egress; Proxmox VM placement (planned) is the future hardware-isolation tier. See the [isolation model](https://noradocs.solomontsao.com/concepts/security#runtime-isolation).
-
 ## What Is Nora?
 
-Nora is the self-hosted AI agent ops platform for running autonomous agent fleets on infrastructure you control, whether you standardize on OpenClaw, Hermes, or keep both available in the same operator surface.
+Nora is the self-hosted AI agent ops platform for running autonomous agent fleets on infrastructure you control — whether you standardize on OpenClaw, Hermes, or keep both available in the same operator surface.
 
-Most teams running agents in production eventually rebuild the same layer around the runtime itself: deploy workflows, secrets, monitoring, logs, terminal, Agent Hub templating, and a separate admin surface. Nora exists so that layer doesn't have to be rewritten every time the runtime conversation changes.
-
-In one place: deploy OpenClaw and Hermes runtimes, migrate existing runtimes via uploaded bundles or live Docker/SSH inspection, manage provider keys with sync to running runtimes, validate agents through runtime-specific surfaces, browse and edit live runtime files, install Agent Hub starter templates, review monitoring and account event history, and connect channels and integrations from the same control plane. Operator workflows live under `/app`; platform-wide admin lives under `/admin`.
+Most teams running agents in production eventually rebuild the same layer around the runtime itself: deploy workflows, secrets, monitoring, logs, terminal, templates, and a separate admin surface. Nora exists so that layer doesn't have to be rewritten every time the runtime conversation changes. Operator workflows live under `/app`; platform-wide admin lives under `/admin`.
 
 → [Why Nora](https://noradocs.solomontsao.com/introduction#why-teams-choose-nora) · [Runtime model](https://noradocs.solomontsao.com/concepts/runtimes) · [Deployment footprint](https://noradocs.solomontsao.com/concepts/architecture#deployment-topologies)
 
+## Features
+
+- **Deploy & operate runtimes** — provision OpenClaw and Hermes agents to Docker or Kubernetes (both GA, official Helm chart) with full lifecycle controls: deploy, start/stop, restart, redeploy, and version history.
+- **Migrate existing runtimes** — adopt agents you already run via uploaded bundles or live Docker/SSH inspection.
+- **Live operator access** — streaming logs, an interactive terminal into running containers, a file browser/editor, and the OpenClaw gateway &amp; Hermes dashboard embedded in the operator UI.
+- **Monitoring & alerting** — per-agent metrics and cost, a fleet needs-attention roll-up (errored, stuck, over-budget, stalled telemetry), and user-defined alert rules delivered to your channels.
+- **Budgets & scheduled runs** — per-agent LLM budget hard caps with auto-pause, plus recurring cron schedules for agent runs with queue retries and sweep guards.
+- **Secrets that fail closed** — provider keys AES-256-GCM encrypted at rest and synced to running runtimes; production refuses to boot without a valid encryption key; SSH host-key pinning protects remote (BYOC) Docker hosts.
+- **Network isolation** — baseline Kubernetes NetworkPolicy ingress isolation with admin-managed CIDR allow rules, and an experimental NemoClaw hardened sandbox for untrusted code.
+- **Agent Hub** — installable, versioned starter templates to go from zero to a working agent fast.
+- **Integrations** — 69 integration providers (source control, chat, cloud, observability, vector DBs, automation) and 17+ LLM providers; expose connected integrations to agents as per-agent MCP servers.
+- **Automate everything** — a public REST API (OpenAPI 3.1), the `@noraai/cli`, and the `@noraai/mcp-server` for Claude Code, Claude Desktop, and Cursor.
+- **Workspaces & RBAC** — multi-tenant workspaces with ranked roles, a platform admin surface, account event history, and encrypted managed backups.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src=".github/readme-assets/proof-operator-dashboard.png" alt="Operator dashboard" /><br />
+      <sub><b>Operator dashboard</b></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src=".github/readme-assets/proof-operator-fleet.png" alt="Fleet monitoring" /><br />
+      <sub><b>Fleet monitoring &amp; needs-attention triage</b></sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src=".github/readme-assets/proof-operator-deploy-flow.png" alt="Agent deploy flow" /><br />
+      <sub><b>Agent deploy flow</b></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src=".github/readme-assets/proof-operator-openclaw-ui-tab.png" alt="Embedded OpenClaw gateway UI" /><br />
+      <sub><b>Embedded OpenClaw gateway UI</b></sub>
+    </td>
+  </tr>
+</table>
+
 ## Quick Start
+
+> **Requirements:** macOS 12+, Linux, or Windows 10+ (WSL2), with Docker Engine + Compose v2. The installer checks for Docker, Git, and OpenSSL and installs anything missing.
 
 **macOS / Linux / WSL2:**
 
@@ -147,17 +179,23 @@ claude mcp add nora \
 
 See the [MCP guide](https://noradocs.solomontsao.com/guides/mcp-server) for Claude Desktop/Cursor config, the tool list, and security notes.
 
+## Standards & isolation
+
+- **MCP — shipped.** A control-plane [MCP](https://modelcontextprotocol.io) server (`@noraai/mcp-server`, published to the official [MCP Registry](https://github.com/modelcontextprotocol/registry)) plus per-agent MCP server management — operate the fleet from Claude Code / Desktop / Cursor, and wire MCP tools into individual agents.
+- **OpenTelemetry GenAI — available.** [OTLP + Prometheus export](https://noradocs.solomontsao.com/guides/opentelemetry) of runtime telemetry under the `gen_ai.*` semantic conventions — per-exchange chat spans plus token/cost/resource metrics flow into the Grafana / Datadog / Langfuse stack you already run. (Per-tool-call sub-spans depend on runtime event streams and remain on the roadmap.)
+- **A2A — on the roadmap.** Agent Cards / Agent-to-Agent discovery for managed OpenClaw and Hermes agents.
+- **Isolation, per deploy target.** Standard Docker and Kubernetes runs use container namespaces plus operator-set CPU / RAM / disk limits; the experimental **NemoClaw** profile hardens untrusted code with a non-root user, all Linux capabilities dropped, `no-new-privileges`, Landlock + seccomp, and default-deny egress; Proxmox VM placement (planned) is the future hardware-isolation tier. See the [isolation model](https://noradocs.solomontsao.com/concepts/security#runtime-isolation).
+
 ## Roadmap
 
-Current roadmap items:
-
-- **High priority - NemoClaw experimental hardening:** mature the experimental secure-sandbox profile across enablement, NVIDIA key and model configuration, OpenShell policy controls, approvals, gateway health, logs, terminal access, telemetry, and end-to-end validation.
-- **Proxmox execution target:** complete the planned LXC deployment path for standard, Hermes, and NemoClaw-backed runtimes, with stronger API/SSH validation, template handling, lifecycle operations, log streaming, telemetry, and smoke coverage.
-- **Hermes/OpenClaw parity:** close runtime gaps across validation, deployment readiness, logs, terminal access, monitoring, integration setup, and failure reporting.
-- **First-run operator UX:** tighten the setup path for workspaces, LLM providers, provisioning backends, the first agent deploy, and recommended smoke checks.
-- **Account-scoped monitoring:** add account-level health views that roll up workspace, agent, runtime, cost, and alert signals with drill-downs where operators need detail.
-- **Auth and key-sync hardening:** strengthen session and API-key boundaries, provider key propagation, audit trails, key rotation, and recovery from partial sync failures.
-- **Agent Hub ergonomics:** improve template discovery, install/configure flows, version metadata, setup guidance, and post-install validation.
+- **NemoClaw hardening** _(high priority)_ — mature the experimental secure-sandbox profile end to end: enablement, policy controls, approvals, telemetry, and validation.
+- **Proxmox execution target** — complete the planned LXC deployment path with lifecycle operations, log streaming, telemetry, and smoke coverage.
+- **Hermes/OpenClaw parity** — close runtime gaps across validation, logs, terminal access, monitoring, and failure reporting.
+- **First-run operator UX** — a tighter path from install to the first deployed, validated agent.
+- **Account-scoped monitoring** — account-level health roll-ups across workspaces, agents, cost, and alerts, with drill-downs.
+- **Auth & key-sync hardening** — key rotation, audit trails, and recovery from partial sync failures.
+- **Agent Hub ergonomics** — better template discovery, install/configure flows, and post-install validation.
+- **A2A support** — Agent Cards / agent-to-agent discovery for managed runtimes.
 
 ## Development
 
@@ -171,7 +209,7 @@ cd backend-api && npx jest --no-watchman
 cd e2e && npm test
 ```
 
-Detailed contributor guidance, subtree ownership, and development commands live in [`CLAUDE.md`](./CLAUDE.md). For deeper repo work, read [`CONTRIBUTING.md`](./CONTRIBUTING.md), the root [`AGENTS.md`](./AGENTS.md), and the nearest subtree `AGENTS.md`.
+Start with [`CONTRIBUTING.md`](./CONTRIBUTING.md) for contributor guidance. [`CLAUDE.md`](./CLAUDE.md) documents the repo layout, development commands, and subtree ownership for humans and AI coding agents alike.
 
 ## Contributing
 
@@ -187,6 +225,8 @@ Typical workflow: fork → branch (`feature/...`) → commit → pull request.
 - [Discussions](https://github.com/solomon2773/nora/discussions)
 - [Hermes Agent](https://github.com/NousResearch/Hermes-Agent)
 - [OpenClaw](https://github.com/openclaw/openclaw)
+
+If Nora is useful to you, a ⭐ on the repo helps other self-hosters find it.
 
 ## License
 
