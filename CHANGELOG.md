@@ -4,6 +4,24 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.14.1](https://github.com/solomon2773/nora/releases/tag/v1.14.1) — 2026-07-04
+
+Docs-only patch: promo-ready README refresh.
+
+### Changed
+
+- README reordered for first-time visitors (What Is Nora → Features → Screenshots →
+  Quick Start, with Standards & isolation moved below the API/CLI/MCP section), a
+  scannable feature list covering scheduled runs, budget auto-pause, the fleet
+  needs-attention roll-up, alert rules, Kubernetes NetworkPolicy isolation, and SSH
+  host-key pinning, a screenshot grid, live release/CI/npm badges, a Quick Start
+  requirements callout, and a tightened roadmap.
+
+### Fixed
+
+- Removed a broken README link to the untracked `AGENTS.md`; `CONTRIBUTING.md` is the
+  contributor entry point.
+
 ## [v1.14.0](https://github.com/solomon2773/nora/releases/tag/v1.14.0) — 2026-07-02
 
 Kubernetes network isolation, BYOC SSH hardening, new MCP fleet tools, and
