@@ -202,12 +202,6 @@ function hasMeaningfulHermesModelConfig(modelConfig = {}) {
   );
 }
 
-/**
- * Build auth-profiles.json content for a specific agent.
- * Merges per-user LLM provider keys with per-agent integration tokens
- * that overlap with LLM auth env vars (e.g., HF_TOKEN, OPENAI_API_KEY).
- * Explicit LLM provider keys always take precedence over integration tokens.
- */
 async function getIntegrationLlmEnvVars(agentId) {
   try {
     const { getIntegrationEnvVars } = require("./integrations");
@@ -224,6 +218,12 @@ async function getIntegrationLlmEnvVars(agentId) {
   }
 }
 
+/**
+ * Build auth-profiles.json content for a specific agent.
+ * Merges per-user LLM provider keys with per-agent integration tokens
+ * that overlap with LLM auth env vars (e.g., HF_TOKEN, OPENAI_API_KEY).
+ * Explicit LLM provider keys always take precedence over integration tokens.
+ */
 async function buildAuthProfilesForAgent(userId, agentId) {
   const llmKeys = await llmProviders.getProviderKeys(userId);
   const overrides =
