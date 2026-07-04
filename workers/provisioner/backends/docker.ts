@@ -681,10 +681,17 @@ class DockerBackend extends ProvisionerBackend {
         .slice(0, 63) || `agent-${id}`;
 
     const volumeName = `nora_agent_state_${id}`;
-    try {
-      await this.docker.createVolume({ Name: volumeName });
-    } catch (e) {
-      if (!String(e.message).includes("already exists")) throw e;
+    // The agent's real state root. Without this, /root/.openclaw lives on the
+    // container writable layer and is lost whenever the container is
+    // recreated (image update, redeploy) — the /mnt volume only covers the
+    // integration-tool state dir.
+    const homeVolumeName = `nora_agent_home_${id}`;
+    for (const volume of [volumeName, homeVolumeName]) {
+      try {
+        await this.docker.createVolume({ Name: volume });
+      } catch (e) {
+        if (!String(e.message).includes("already exists")) throw e;
+      }
     }
 
     try {
@@ -712,7 +719,7 @@ class DockerBackend extends ProvisionerBackend {
           },
           // DNS servers for internet access from within the container
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
-          Binds: [`${volumeName}:/mnt/nora-agent-state`],
+          Binds: [`${volumeName}:/mnt/nora-agent-state`, `${homeVolumeName}:/root/.openclaw`],
         },
         NetworkingConfig: composeNetwork
           ? {
@@ -775,10 +782,12 @@ class DockerBackend extends ProvisionerBackend {
           // Best effort cleanup only.
         }
       }
-      try {
-        await this.docker.getVolume(volumeName).remove({ force: true });
-      } catch {
-        // Best effort cleanup only.
+      for (const volume of [volumeName, homeVolumeName]) {
+        try {
+          await this.docker.getVolume(volume).remove({ force: true });
+        } catch {
+          // Best effort cleanup only.
+        }
       }
       throw error;
     }
@@ -805,11 +814,15 @@ class DockerBackend extends ProvisionerBackend {
     console.log(`[docker] Container ${containerId} removed`);
 
     if (agentId) {
-      try {
-        await this.docker.getVolume(`nora_agent_state_${agentId}`).remove({ force: true });
-        console.log(`[docker] Volume nora_agent_state_${agentId} removed`);
-      } catch (e) {
-        console.warn(`[docker] Could not remove volume for agent ${agentId}: ${e.message}`);
+      for (const volume of [`nora_agent_state_${agentId}`, `nora_agent_home_${agentId}`]) {
+        try {
+          await this.docker.getVolume(volume).remove({ force: true });
+          console.log(`[docker] Volume ${volume} removed`);
+        } catch (e) {
+          console.warn(
+            `[docker] Could not remove volume ${volume} for agent ${agentId}: ${e.message}`,
+          );
+        }
       }
     }
   }

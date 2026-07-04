@@ -229,6 +229,12 @@ async function sendMessage(channelId, content, metadata = {}) {
   const adapter = getAdapter(channel.type);
   const result = await adapter.send(channel, content, metadata);
 
+  // Some adapters (email) report failures via `delivered: false` instead of
+  // throwing — surface those instead of logging a phantom outbound message.
+  if (result && result.delivered === false) {
+    throw new Error(result.error || `Message delivery failed for ${channel.type} channel`);
+  }
+
   // Log the outbound message
   await db.query(
     "INSERT INTO channel_messages(channel_id, direction, content, metadata) VALUES($1, 'outbound', $2, $3)",
@@ -269,7 +275,15 @@ async function testChannel(channelId, agentId) {
 
   // Then try sending a test message
   try {
-    await adapter.send(channel, `🦞 OpenClaw test message — ${new Date().toISOString()}`);
+    const sendResult = await adapter.send(
+      channel,
+      `🦞 OpenClaw test message — ${new Date().toISOString()}`,
+    );
+    // Non-throwing adapters (email) report failure via `delivered: false` —
+    // a test must not show green over a failed delivery.
+    if (sendResult && sendResult.delivered === false) {
+      return { success: false, error: sendResult.error || "Test message delivery failed" };
+    }
     return { success: true, message: "Test message sent successfully" };
   } catch (e) {
     return { success: false, error: e.message };

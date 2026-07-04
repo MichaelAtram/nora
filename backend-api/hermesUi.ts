@@ -1021,7 +1021,51 @@ async function restartHermesRuntime(agent) {
   }
 }
 
+/**
+ * Env vars for every channel persisted in hermes_runtime_state for an agent.
+ * Callers persist DB state first, then project this into the runtime.
+ */
+async function buildHermesChannelEnvForAgent(agentId) {
+  const state = await getPersistedHermesState(agentId);
+  const channels = normalizeHermesChannelStateList(state?.channels || []);
+  const env = {};
+  for (const entry of channels) {
+    const definition = definitionForChannelType(entry.type);
+    if (!definition) continue;
+    const normalized = normalizeHermesChannelInput(definition, entry.config || {}, {});
+    for (const [key, value] of Object.entries(normalized || {})) {
+      const text = value == null ? "" : String(value).trim();
+      if (text) env[key] = text;
+    }
+  }
+  return env;
+}
+
+// Kubernetes: exec-written /opt/data/.env does not survive the rollout the
+// save flow triggers right after, so channel env must be projected onto the
+// Deployment env (the postStart bootstrap rebuilds the managed .env block
+// from it on every pod start). The managed block is replaced wholesale, so
+// the FULL env set (LLM keys + all persisted channels) is recomputed from
+// the DB rather than just the channel being edited.
+async function syncHermesManagedEnvToKubernetes(agent) {
+  const { buildHermesManagedEnvForAgent, writeHermesEnvToContainer } = require("./authSync");
+  const envVars = await buildHermesManagedEnvForAgent(agent.user_id, agent.id);
+  await writeHermesEnvToContainer(agent, envVars);
+}
+
+function isKubernetesHermesAgent(agent) {
+  return (
+    typeof containerManager.isKubernetesAgent === "function" &&
+    containerManager.isKubernetesAgent(agent)
+  );
+}
+
 async function persistHermesChannelConfig(agent, definition, config) {
+  if (isKubernetesHermesAgent(agent)) {
+    await syncHermesManagedEnvToKubernetes(agent);
+    return;
+  }
+
   const payloadJson = JSON.stringify(config || {});
   const script = `
 import json
@@ -1042,6 +1086,13 @@ print(json.dumps({"ok": True}))
 }
 
 async function removeHermesChannelConfig(agent, definition) {
+  if (isKubernetesHermesAgent(agent)) {
+    // DB state was deleted by the caller; rebuilding the managed env from the
+    // DB drops the removed channel's keys from the managed block.
+    await syncHermesManagedEnvToKubernetes(agent);
+    return;
+  }
+
   const script = `
 import json
 
@@ -1218,6 +1269,7 @@ module.exports = {
   HERMES_CHANNEL_DEFINITIONS,
   HERMES_CHANNEL_TYPES,
   applyPersistedHermesState,
+  buildHermesChannelEnvForAgent,
   buildHermesPythonCommand,
   definitionForChannelType,
   getPersistedHermesState,

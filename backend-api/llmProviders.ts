@@ -27,7 +27,8 @@ const PROVIDERS = [
     id: "groq",
     name: "Groq",
     envVar: "GROQ_API_KEY",
-    models: ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
+    // mixtral-8x7b-32768 was decommissioned by Groq — do not resurface it.
+    models: ["llama-3.3-70b-versatile"],
   },
   { id: "mistral", name: "Mistral", envVar: "MISTRAL_API_KEY", models: ["mistral-large-latest"] },
   {
@@ -52,7 +53,16 @@ const PROVIDERS = [
   },
   { id: "moonshot", name: "Moonshot AI", envVar: "MOONSHOT_API_KEY", models: ["kimi-k2.5"] },
   { id: "zai", name: "Z.AI", envVar: "ZAI_API_KEY", models: ["glm-5"] },
-  { id: "ollama", name: "Ollama", envVar: "OLLAMA_API_KEY", models: [] },
+  {
+    // Ollama endpoints are per-host (the operator's own server) — without a
+    // base URL the agent container has nothing to connect to.
+    id: "ollama",
+    name: "Ollama",
+    envVar: "OLLAMA_API_KEY",
+    requiresBaseUrl: true,
+    baseUrlPlaceholder: "http://<ollama-host>:11434/v1",
+    models: [],
+  },
   { id: "minimax", name: "MiniMax", envVar: "MINIMAX_API_KEY", models: ["MiniMax-M2.7"] },
   { id: "github-copilot", name: "GitHub Copilot", envVar: "COPILOT_GITHUB_TOKEN", models: [] },
   { id: "huggingface", name: "Hugging Face (Inference)", envVar: "HF_TOKEN", models: [] },
@@ -87,7 +97,6 @@ const PROVIDERS = [
     apiVersionPlaceholder: "2024-10-21",
     models: [
       "gpt-5.5-1",
-      "gpt5.5-1",
       "gpt-5.5",
       "gpt-5.5-mini",
       "o3",

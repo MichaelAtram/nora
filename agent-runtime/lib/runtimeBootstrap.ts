@@ -331,13 +331,6 @@ const FOUNDRY_DEFAULT_MODELS = [
     maxTokens: 128000,
   },
   {
-    id: "gpt-5.5",
-    name: "GPT-5.5 (Azure)",
-    reasoning: true,
-    contextWindow: 200000,
-    maxTokens: 128000,
-  },
-  {
     id: "gpt-5.2-codex",
     name: "GPT-5.2 Codex (Azure)",
     reasoning: true,

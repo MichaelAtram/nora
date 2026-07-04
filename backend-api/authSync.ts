@@ -300,12 +300,24 @@ async function buildHermesManagedEnvForAgent(userId, agentId) {
       ? llmProviders.buildApiVersionEnvVars(overrides.apiVersionByEnvVar || {})
       : {};
 
+  // The managed .env block is replaced wholesale on every write, so persisted
+  // channel env must ride along or an LLM key save silently drops every
+  // configured Hermes channel.
+  let channelEnvVars = {};
+  try {
+    const { buildHermesChannelEnvForAgent } = require("./hermesUi");
+    channelEnvVars = await buildHermesChannelEnvForAgent(agentId);
+  } catch {
+    channelEnvVars = {};
+  }
+
   try {
     const { getIntegrationEnvVars } = require("./integrations");
     const integrationEnvVars = await getIntegrationEnvVars(agentId);
     return Object.fromEntries(
       Object.entries({
         ...integrationEnvVars,
+        ...channelEnvVars,
         ...llmKeys,
         ...baseUrlEnvVars,
         ...apiVersionEnvVars,
@@ -313,9 +325,12 @@ async function buildHermesManagedEnvForAgent(userId, agentId) {
     );
   } catch {
     return Object.fromEntries(
-      Object.entries({ ...llmKeys, ...baseUrlEnvVars, ...apiVersionEnvVars }).filter(
-        ([key, value]) => key && value != null && String(value) !== "",
-      ),
+      Object.entries({
+        ...channelEnvVars,
+        ...llmKeys,
+        ...baseUrlEnvVars,
+        ...apiVersionEnvVars,
+      }).filter(([key, value]) => key && value != null && String(value) !== ""),
     );
   }
 }
