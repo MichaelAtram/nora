@@ -3,6 +3,7 @@ const k8s = require("@kubernetes/client-node");
 const crypto = require("crypto");
 const ProvisionerBackend = require("./interface");
 const {
+  buildMcpServersConfig,
   buildOpenClawAuthImportFromFileCommand,
   buildOpenClawInstallCommand,
   buildRuntimeBootstrapCommand,
@@ -72,6 +73,9 @@ const SENSITIVE_ENV_PATTERNS = Object.freeze([
   /^PGPASSWORD$/i,
   /^API_SERVER_KEY$/i,
   /^OPENCLAW_GATEWAY_TOKEN$/i,
+  // Hermes bootstrap blobs carry decrypted provider keys / channel tokens.
+  /^NORA_HERMES_MANAGED_ENV_B64$/i,
+  /^NORA_HERMES_MODEL_CONFIG_B64$/i,
 ]);
 
 function parseK8sCpuCores(value) {
@@ -231,7 +235,7 @@ function buildHermesPostStartCommand() {
   ].join("\n");
 }
 
-function buildOpenClawRuntimeAuthBootstrapCommand() {
+function buildOpenClawRuntimeAuthBootstrapCommand({ mcpServers = null } = {}) {
   const providerMap = {
     ANTHROPIC_API_KEY: "anthropic",
     OPENAI_API_KEY: "openai",
@@ -295,16 +299,6 @@ function buildOpenClawRuntimeAuthBootstrapCommand() {
       compat: { supportsStore: false, supportsReasoningEffort: true },
     },
     {
-      id: "gpt-5.5",
-      name: "GPT-5.5 (Azure)",
-      reasoning: true,
-      input: ["text", "image"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 200000,
-      maxTokens: 128000,
-      compat: { supportsStore: false, supportsReasoningEffort: true },
-    },
-    {
       id: "gpt-5.2-codex",
       name: "GPT-5.2 Codex (Azure)",
       reasoning: true,
@@ -334,6 +328,7 @@ function buildOpenClawRuntimeAuthBootstrapCommand() {
     `const staticEndpointMap = ${JSON.stringify(staticEndpointMap)};`,
     `const apiVersionEnvMap = ${JSON.stringify(apiVersionEnvMap)};`,
     `const foundryModels = ${JSON.stringify(foundryModels)};`,
+    `const mcpServers = ${JSON.stringify(mcpServers && typeof mcpServers === "object" ? mcpServers : null)};`,
     "const authPath = '/root/.openclaw/agents/main/agent/auth-profiles.json';",
     "const configPath = '/root/.openclaw/openclaw.json';",
     "const auth = { version: 1, profiles: {}, order: {}, lastGood: {} };",
@@ -389,6 +384,16 @@ function buildOpenClawRuntimeAuthBootstrapCommand() {
     "  config.agents.defaults.model = { primary: defaultModel };",
     "  config.agents.defaults.models = config.agents.defaults.models && typeof config.agents.defaults.models === 'object' ? config.agents.defaults.models : {};",
     "  config.agents.defaults.models[defaultModel] = config.agents.defaults.models[defaultModel] || {};",
+    "}",
+    // Nora owns the mcpServers block: replace it wholesale with the
+    // provision-time value (same semantics as the docker backend, which bakes
+    // it into the create-time openclaw.json; changes flow via redeploy).
+    "if (mcpServers) {",
+    "  if (Object.keys(mcpServers).length > 0) {",
+    "    config.mcpServers = mcpServers;",
+    "  } else {",
+    "    delete config.mcpServers;",
+    "  }",
     "}",
     "fs.mkdirSync('/root/.openclaw', { recursive: true });",
     "fs.writeFileSync(configPath, JSON.stringify(config, null, 2));",
@@ -1205,6 +1210,82 @@ class K8sBackend extends ProvisionerBackend {
     };
   }
 
+  _stateVolumeClaimName(deployName) {
+    return `${deployName}-state`;
+  }
+
+  _stateVolume(claimName) {
+    return {
+      name: "nora-agent-state",
+      persistentVolumeClaim: { claimName },
+    };
+  }
+
+  _stateVolumeMount(mountPath) {
+    return {
+      name: "nora-agent-state",
+      mountPath,
+    };
+  }
+
+  // Agent state (OpenClaw config/auth/sessions/workspace, Hermes /opt/data)
+  // must survive pod replacement — a k8s restart is a rollout and the
+  // container writable layer is reset on every kubelet restart. RWO is
+  // sufficient because agent Deployments run a single replica with
+  // strategy Recreate (old pod terminates before the new one mounts).
+  async _upsertStateVolumeClaim(deployName, { sizeGi, labels = {}, namespace } = {}) {
+    const name = this._stateVolumeClaimName(deployName);
+    const storage = `${Math.max(1, Math.round(Number(sizeGi) || 10))}Gi`;
+    const body = {
+      apiVersion: "v1",
+      kind: "PersistentVolumeClaim",
+      metadata: {
+        name,
+        namespace,
+        labels: {
+          "nora.agent.id": this._agentIdFromDeployName(deployName),
+          "nora.agent.state": "true",
+          "nora.execution.target": this.executionTargetLabelValue,
+          "nora.kubernetes.cluster": this.clusterId,
+          ...labels,
+        },
+      },
+      spec: {
+        accessModes: ["ReadWriteOnce"],
+        resources: { requests: { storage } },
+      },
+    };
+
+    try {
+      await this.coreApi.createNamespacedPersistentVolumeClaim({ namespace, body });
+    } catch (error) {
+      // PVC specs are immutable once bound (apart from expansion); reuse the
+      // existing claim as-is so retried creates don't fail.
+      if (!this._isAlreadyExistsError(error)) throw error;
+    }
+
+    return name;
+  }
+
+  async _deleteStateVolumeClaimIfExists(deployName, namespace) {
+    const name = this._stateVolumeClaimName(deployName);
+    try {
+      await this.coreApi.deleteNamespacedPersistentVolumeClaim({
+        name,
+        namespace,
+        propagationPolicy: "Foreground",
+      });
+    } catch (error) {
+      if (this._isNotFoundError(error)) return false;
+      throw error;
+    }
+
+    await this._waitForDeleted("PersistentVolumeClaim", name, namespace, () =>
+      this.coreApi.readNamespacedPersistentVolumeClaim({ name, namespace }),
+    );
+    return true;
+  }
+
   async _upsertBootstrapConfigMap(deployName, script, labels = {}, namespace = this.namespace) {
     const name = this._bootstrapConfigMapName(deployName);
     const body = {
@@ -1588,6 +1669,35 @@ class K8sBackend extends ProvisionerBackend {
     return true;
   }
 
+  // Merge new keys into the env Secret without dropping existing ones.
+  // Used by updateEnv so rotated sensitive values stay in the Secret instead
+  // of being downgraded to plaintext pod-spec env.
+  async _mergeEnvSecretData(deployName, stringData = {}, namespace = this.namespace) {
+    const name = this._envSecretName(deployName);
+    let current = null;
+    try {
+      current = this._serviceObject(await this.coreApi.readNamespacedSecret({ name, namespace }));
+    } catch (error) {
+      if (!this._isNotFoundError(error)) throw error;
+    }
+
+    if (!current) {
+      return this._upsertEnvSecret(deployName, stringData, {}, namespace);
+    }
+
+    // stringData overlays data on write, so existing keys survive untouched.
+    const body = {
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: current.metadata,
+      type: current.type || "Opaque",
+      data: current.data || {},
+      stringData,
+    };
+    await this.coreApi.replaceNamespacedSecret({ name, namespace, body });
+    return name;
+  }
+
   async _deleteEnvSecretIfExists(deployName, namespace) {
     const name = this._envSecretName(deployName);
     try {
@@ -1631,7 +1741,7 @@ class K8sBackend extends ProvisionerBackend {
   }
 
   async _createHermes(config, deployName) {
-    const { id, name, image, vcpu, ram_mb, env } = config;
+    const { id, name, image, vcpu, ram_mb, disk_gb, env } = config;
     const namespace = this._namespaceForRuntimeFamily("hermes");
     const imgName = image || getHermesDockerAgentImage();
     const apiServerKey = config.gatewayToken || crypto.randomBytes(32).toString("hex");
@@ -1690,6 +1800,16 @@ class K8sBackend extends ProvisionerBackend {
       );
     }
 
+    const stateClaimName = await this._upsertStateVolumeClaim(deployName, {
+      sizeGi: disk_gb,
+      labels: {
+        "nora.agent.id": String(id),
+        "nora.deployment.name": deployName,
+        "nora.runtime.family": "hermes",
+      },
+      namespace,
+    });
+
     const deployment = {
       apiVersion: "apps/v1",
       kind: "Deployment",
@@ -1707,6 +1827,12 @@ class K8sBackend extends ProvisionerBackend {
       },
       spec: {
         replicas: 1,
+        // Recreate is required for the RWO state volume and lets restarts
+        // complete on capacity-constrained clusters: RollingUpdate's surge pod
+        // needs a second full Guaranteed-QoS reservation, which sticks Pending
+        // forever on a full cluster while the old pod keeps serving stale
+        // config.
+        strategy: { type: "Recreate" },
         selector: {
           matchLabels: { "nora.agent.id": String(id) },
         },
@@ -1737,7 +1863,7 @@ class K8sBackend extends ProvisionerBackend {
                     },
                   },
                 },
-                volumeMounts: [this._bootstrapVolumeMount()],
+                volumeMounts: [this._bootstrapVolumeMount(), this._stateVolumeMount(HERMES_HOME)],
                 ports: [
                   { name: "runtime", containerPort: HERMES_RUNTIME_PORT },
                   { name: "dashboard", containerPort: HERMES_DASHBOARD_PORT },
@@ -1754,7 +1880,10 @@ class K8sBackend extends ProvisionerBackend {
                 },
               },
             ],
-            volumes: [this._bootstrapVolume(bootstrapConfigMapName)],
+            volumes: [
+              this._bootstrapVolume(bootstrapConfigMapName),
+              this._stateVolume(stateClaimName),
+            ],
           },
         },
       },
@@ -1780,7 +1909,7 @@ class K8sBackend extends ProvisionerBackend {
   }
 
   async create(config) {
-    const { id, name, image, vcpu, ram_mb, env, templatePayload, sandboxProfile } = config;
+    const { id, name, image, vcpu, ram_mb, disk_gb, env, templatePayload, sandboxProfile } = config;
     const runtimeFamily = String(config.runtimeFamily || "openclaw")
       .trim()
       .toLowerCase();
@@ -1936,15 +2065,23 @@ class K8sBackend extends ProvisionerBackend {
           },
         }).replace(/'/g, "'\\''")}' > /opt/openclaw/policy.yaml && `
       : "";
+    const mcpServersConfig =
+      Array.isArray(config.mcpServers) && config.mcpServers.length > 0
+        ? buildMcpServersConfig(config.mcpServers)
+        : {};
+    // openclaw.json is seeded only when absent: the pod's state volume outlives
+    // pod replacement, and an unconditional write would wipe channel config,
+    // provider registrations, and default-model changes accumulated since
+    // provisioning. The auth bootstrap below MERGES into the existing file.
     const gatewayScript =
       "set -eu\n" +
       ensureOpenClawCmd +
       "mkdir -p ~/.openclaw/devices && " +
-      `echo '{"gateway":{"port":${OPENCLAW_GATEWAY_PORT},"bind":"lan","mode":"local"}}' > ~/.openclaw/openclaw.json && ` +
+      `[ -f ~/.openclaw/openclaw.json ] || echo '{"gateway":{"port":${OPENCLAW_GATEWAY_PORT},"bind":"lan","mode":"local"}}' > ~/.openclaw/openclaw.json && ` +
       `echo '${escapedPaired}' > ~/.openclaw/devices/paired.json && ` +
       `echo '{}' > ~/.openclaw/devices/pending.json && ` +
       nemoPolicyCmd +
-      buildOpenClawRuntimeAuthBootstrapCommand() +
+      buildOpenClawRuntimeAuthBootstrapCommand({ mcpServers: mcpServersConfig }) +
       templateBootstrapCmd +
       runtimeBootstrapCmd +
       '"$OPENCLAW_BIN" gateway --port ' +
@@ -1968,6 +2105,19 @@ class K8sBackend extends ProvisionerBackend {
     );
     const gatewayLaunch = this._bootstrapLaunch(gatewayBootstrap);
 
+    // NemoClaw runs with HOME=/sandbox, so its OpenClaw state root lives there.
+    const stateMountPath = isNemoClaw ? "/sandbox" : "/root/.openclaw";
+    const stateClaimName = await this._upsertStateVolumeClaim(deployName, {
+      sizeGi: disk_gb,
+      labels: {
+        "nora.agent.id": String(id),
+        "nora.deployment.name": deployName,
+        "nora.runtime.family": "openclaw",
+        "nora.sandbox.profile": isNemoClaw ? "nemoclaw" : "standard",
+      },
+      namespace,
+    });
+
     const deployment = {
       apiVersion: "apps/v1",
       kind: "Deployment",
@@ -1988,6 +2138,10 @@ class K8sBackend extends ProvisionerBackend {
       },
       spec: {
         replicas: 1,
+        // See the Hermes deployment above: Recreate is required for the RWO
+        // state volume and prevents stuck RollingUpdate surge pods on full
+        // clusters.
+        strategy: { type: "Recreate" },
         selector: {
           matchLabels: { "openclaw.agent.id": String(id) },
         },
@@ -2022,7 +2176,10 @@ class K8sBackend extends ProvisionerBackend {
                 args: gatewayLaunch.args,
                 workingDir: isNemoClaw ? "/sandbox" : undefined,
                 env: envVars,
-                volumeMounts: [this._bootstrapVolumeMount()],
+                volumeMounts: [
+                  this._bootstrapVolumeMount(),
+                  this._stateVolumeMount(stateMountPath),
+                ],
                 ports: [
                   { name: "gateway", containerPort: OPENCLAW_GATEWAY_PORT },
                   { name: "runtime", containerPort: AGENT_RUNTIME_PORT },
@@ -2039,7 +2196,10 @@ class K8sBackend extends ProvisionerBackend {
                 },
               },
             ],
-            volumes: [this._bootstrapVolume(bootstrapConfigMapName)],
+            volumes: [
+              this._bootstrapVolume(bootstrapConfigMapName),
+              this._stateVolume(stateClaimName),
+            ],
           },
         },
       },
@@ -2080,8 +2240,16 @@ class K8sBackend extends ProvisionerBackend {
       const deletedService = await this._deleteServiceIfExists(deployName, namespace);
       const deletedConfigMap = await this._deleteBootstrapConfigMapIfExists(deployName, namespace);
       const deletedSecret = await this._deleteEnvSecretIfExists(deployName, namespace);
+      // Deployment deletion above is Foreground, so no pod holds the claim by
+      // the time this runs.
+      const deletedStateClaim = await this._deleteStateVolumeClaimIfExists(deployName, namespace);
       deletedAny =
-        deletedAny || deletedDeployment || deletedService || deletedConfigMap || deletedSecret;
+        deletedAny ||
+        deletedDeployment ||
+        deletedService ||
+        deletedConfigMap ||
+        deletedSecret ||
+        deletedStateClaim;
     }
 
     console.log(
@@ -2438,14 +2606,34 @@ class K8sBackend extends ProvisionerBackend {
       patch.push({ op: "add", path: envPath, value: [] });
     }
 
+    // Sensitive values go into the env Secret and are referenced via
+    // secretKeyRef — replacing an existing secretKeyRef entry with a literal
+    // value would put the decrypted key into the pod spec (readable by
+    // anyone with `get deployment`) and let the Secret drift.
+    const secretName = this._envSecretName(deployName);
+    const sensitiveData = {};
     for (const [name, value] of entries) {
-      const nextEntry = { name: String(name), value: String(value ?? "") };
-      const existingIndex = envIndexByName.get(name);
+      const key = String(name);
+      const stringValue = String(value ?? "");
+      let nextEntry;
+      if (isSensitiveEnvName(key)) {
+        sensitiveData[key] = stringValue;
+        nextEntry = { name: key, valueFrom: { secretKeyRef: { name: secretName, key } } };
+      } else {
+        nextEntry = { name: key, value: stringValue };
+      }
+      const existingIndex = envIndexByName.get(key);
       if (Number.isInteger(existingIndex)) {
         patch.push({ op: "replace", path: `${envPath}/${existingIndex}`, value: nextEntry });
       } else {
         patch.push({ op: "add", path: `${envPath}/-`, value: nextEntry });
       }
+    }
+
+    // Update the Secret before the Deployment so secretKeyRef entries resolve
+    // as soon as the rollout (or the caller's explicit restart) starts pods.
+    if (Object.keys(sensitiveData).length > 0) {
+      await this._mergeEnvSecretData(deployName, sensitiveData, namespace);
     }
 
     await this.appsApi.patchNamespacedDeployment({

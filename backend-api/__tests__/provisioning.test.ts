@@ -32,6 +32,9 @@ const mockCreateNamespacedSecret = jest.fn();
 const mockReadNamespacedSecret = jest.fn();
 const mockReplaceNamespacedSecret = jest.fn();
 const mockDeleteNamespacedSecret = jest.fn();
+const mockCreateNamespacedPersistentVolumeClaim = jest.fn();
+const mockReadNamespacedPersistentVolumeClaim = jest.fn();
+const mockDeleteNamespacedPersistentVolumeClaim = jest.fn();
 const mockGetNamespacedCustomObject = jest.fn();
 const mockLoadKubeconfigFromFile = jest.fn();
 
@@ -82,6 +85,9 @@ jest.mock(
             readNamespacedSecret: mockReadNamespacedSecret,
             replaceNamespacedSecret: mockReplaceNamespacedSecret,
             deleteNamespacedSecret: mockDeleteNamespacedSecret,
+            createNamespacedPersistentVolumeClaim: mockCreateNamespacedPersistentVolumeClaim,
+            readNamespacedPersistentVolumeClaim: mockReadNamespacedPersistentVolumeClaim,
+            deleteNamespacedPersistentVolumeClaim: mockDeleteNamespacedPersistentVolumeClaim,
           };
         }
         if (api === AppsV1Api) {
@@ -153,6 +159,13 @@ describe("provisioning runtime/gateway contracts", () => {
     });
     mockReplaceNamespacedSecret.mockReset().mockResolvedValue({});
     mockDeleteNamespacedSecret.mockReset().mockResolvedValue({});
+    mockCreateNamespacedPersistentVolumeClaim.mockReset().mockResolvedValue({});
+    // Reads only happen in _waitForDeleted; defaulting to 404 means "already
+    // deleted" so destroy paths terminate immediately.
+    mockReadNamespacedPersistentVolumeClaim
+      .mockReset()
+      .mockRejectedValue(Object.assign(new Error("not found"), { statusCode: 404 }));
+    mockDeleteNamespacedPersistentVolumeClaim.mockReset().mockResolvedValue({});
     mockGetNamespacedCustomObject.mockReset().mockResolvedValue({});
     mockLoadKubeconfigFromFile.mockReset().mockReturnValue(undefined);
     delete process.env.GATEWAY_HOST;
@@ -346,9 +359,21 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(deployment.metadata.labels["nora.sandbox.profile"]).toBe("standard");
     expect(deployment.spec.template.metadata.labels["nora.sandbox.profile"]).toBe("standard");
     expect(deployment.spec.selector.matchLabels).toEqual({ "openclaw.agent.id": "123" });
+    // Recreate: required for the RWO state volume and prevents RollingUpdate
+    // surge pods sticking Pending on full clusters.
+    expect(deployment.spec.strategy).toEqual({ type: "Recreate" });
+    // Agent state must survive pod replacement — a k8s restart is a rollout.
+    expect(mockCreateNamespacedPersistentVolumeClaim).toHaveBeenCalledTimes(1);
+    const pvc = mockCreateNamespacedPersistentVolumeClaim.mock.calls[0][0].body;
+    expect(pvc.metadata.name).toBe("nora-oclaw-nora-qa-123-state");
+    expect(pvc.spec.accessModes).toEqual(["ReadWriteOnce"]);
+    // Boot must not clobber persisted state: openclaw.json is seeded only
+    // when absent.
+    expect(configMap.data["bootstrap.sh"]).toContain("[ -f ~/.openclaw/openclaw.json ] ||");
     expect(container.volumeMounts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "nora-bootstrap", mountPath: "/opt/nora-bootstrap" }),
+        expect.objectContaining({ name: "nora-agent-state", mountPath: "/root/.openclaw" }),
       ]),
     );
     expect(deployment.spec.template.spec.volumes).toEqual(
@@ -356,6 +381,12 @@ describe("provisioning runtime/gateway contracts", () => {
         expect.objectContaining({
           name: "nora-bootstrap",
           configMap: expect.objectContaining({ name: "nora-oclaw-nora-qa-123-bootstrap" }),
+        }),
+        expect.objectContaining({
+          name: "nora-agent-state",
+          persistentVolumeClaim: expect.objectContaining({
+            claimName: "nora-oclaw-nora-qa-123-state",
+          }),
         }),
       ]),
     );
@@ -388,6 +419,70 @@ describe("provisioning runtime/gateway contracts", () => {
         gatewayPort: OPENCLAW_GATEWAY_PORT,
       }),
     );
+  });
+
+  it("bakes MCP servers into the kubernetes bootstrap like the docker backend", async () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(k8sProfile());
+
+    await backend.create({
+      id: "321",
+      name: "MCP QA",
+      vcpu: 2,
+      ram_mb: 2048,
+      env: {},
+      mcpServers: [
+        { name: "notion", npmPackage: "@notionhq/notion-mcp-server", env: { NOTION_TOKEN: "t" } },
+      ],
+    });
+
+    const configMap = mockCreateNamespacedConfigMap.mock.calls[0][0].body;
+    const script = configMap.data["bootstrap.sh"];
+    expect(script).toContain('"notion"');
+    expect(script).toContain("@notionhq/notion-mcp-server");
+    expect(script).toContain("config.mcpServers = mcpServers");
+  });
+
+  it("routes sensitive updateEnv values into the env Secret instead of plaintext pod spec", async () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(k8sProfile());
+
+    mockReadNamespacedDeployment.mockResolvedValue({
+      metadata: { name: "nora-oclaw-nora-qa-123" },
+      spec: {
+        template: {
+          spec: {
+            containers: [{ name: "agent", env: [{ name: "OPENAI_API_KEY", value: "old" }] }],
+          },
+        },
+      },
+    });
+    mockReadNamespacedSecret.mockResolvedValue({
+      metadata: { name: "nora-oclaw-nora-qa-123-env", resourceVersion: "secret-rv" },
+      type: "Opaque",
+      data: { EXISTING_TOKEN: "b2xk" },
+    });
+
+    await backend.updateEnv("nora-oclaw-nora-qa-123", {
+      OPENAI_API_KEY: "sk-new",
+      PLAIN_SETTING: "value",
+    });
+
+    // Sensitive value merged into the Secret without dropping existing keys.
+    const replacedSecret = mockReplaceNamespacedSecret.mock.calls[0][0].body;
+    expect(replacedSecret.stringData).toEqual({ OPENAI_API_KEY: "sk-new" });
+    expect(replacedSecret.data).toEqual({ EXISTING_TOKEN: "b2xk" });
+
+    // Deployment env references the Secret; only non-sensitive values inline.
+    const patch = mockPatchNamespacedDeployment.mock.calls[0][0].body;
+    const envOps = patch.filter((op) => op.path.includes("/env"));
+    const sensitiveOp = envOps.find((op) => op.value?.name === "OPENAI_API_KEY");
+    expect(sensitiveOp.value.valueFrom).toEqual({
+      secretKeyRef: { name: "nora-oclaw-nora-qa-123-env", key: "OPENAI_API_KEY" },
+    });
+    expect(sensitiveOp.value.value).toBeUndefined();
+    const plainOp = envOps.find((op) => op.value?.name === "PLAIN_SETTING");
+    expect(plainOp.value).toEqual({ name: "PLAIN_SETTING", value: "value" });
   });
 
   it("returns node-port endpoints for docker-hosted kind verification", async () => {
@@ -1326,10 +1421,12 @@ describe("provisioning runtime/gateway contracts", () => {
     mockDeleteNamespacedService.mockImplementation(deleteIfLegacyNamespace);
     mockDeleteNamespacedConfigMap.mockImplementation(deleteIfLegacyNamespace);
     mockDeleteNamespacedSecret.mockImplementation(deleteIfLegacyNamespace);
+    mockDeleteNamespacedPersistentVolumeClaim.mockImplementation(deleteIfLegacyNamespace);
     mockReadNamespacedDeployment.mockRejectedValue(notFound);
     mockReadNamespacedService.mockRejectedValue(notFound);
     mockReadNamespacedConfigMap.mockRejectedValue(notFound);
     mockReadNamespacedSecret.mockRejectedValue(notFound);
+    mockReadNamespacedPersistentVolumeClaim.mockRejectedValue(notFound);
 
     const K8sBackend = require("../../workers/provisioner/backends/k8s");
     const backend = new K8sBackend(
