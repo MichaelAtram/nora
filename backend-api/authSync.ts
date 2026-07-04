@@ -683,11 +683,7 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
         containerManager.isKubernetesAgent(agent) &&
         typeof containerManager.updateEnv === "function"
       ) {
-        const managedEnv = await buildOpenClawManagedEnvForAgent(
-          userId,
-          agent.id,
-          defaultProvider,
-        );
+        const managedEnv = await buildOpenClawManagedEnvForAgent(userId, agent.id, defaultProvider);
         if (Object.keys(managedEnv).length > 0) {
           await containerManager.updateEnv(agent, managedEnv);
         }

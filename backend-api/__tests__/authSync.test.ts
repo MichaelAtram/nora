@@ -84,9 +84,7 @@ describe("auth sync", () => {
     mockRestart.mockReset().mockResolvedValue(undefined);
     mockIsKubernetesAgent
       .mockReset()
-      .mockImplementation(
-        (agent) => String(agent?.backend_type || "").toLowerCase() === "k8s",
-      );
+      .mockImplementation((agent) => String(agent?.backend_type || "").toLowerCase() === "k8s");
     mockUpdateEnv.mockReset().mockResolvedValue(undefined);
     mockGetProviderKeys.mockReset().mockResolvedValue({
       OPENAI_API_KEY: "sk-live-test",
@@ -199,13 +197,10 @@ describe("auth sync", () => {
     );
     // Kubernetes restarts are rollouts: the replacement pod re-seeds auth
     // from the Deployment env, so the sync must patch it too.
-    expect(mockUpdateEnv).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "agent-k8s-1" }),
-      {
-        OPENAI_API_KEY: "sk-live-test",
-        NORA_DEFAULT_OPENCLAW_MODEL: "openai/gpt-5.5",
-      },
-    );
+    expect(mockUpdateEnv).toHaveBeenCalledWith(expect.objectContaining({ id: "agent-k8s-1" }), {
+      OPENAI_API_KEY: "sk-live-test",
+      NORA_DEFAULT_OPENCLAW_MODEL: "openai/gpt-5.5",
+    });
     expect(results).toEqual([{ agentId: "agent-k8s-1", status: "synced" }]);
   });
 
