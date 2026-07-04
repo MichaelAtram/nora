@@ -524,11 +524,18 @@ function buildOpenClawModelForProvider(noraProviderId, modelId) {
   return rawModelId.includes("/") ? rawModelId : `${openclawProvider}/${rawModelId}`;
 }
 
-const OPENCLAW_SQLITE_AUTH_SKIP_PROVIDERS = Object.freeze([
-  "microsoft-foundry",
-  FOUNDRY_OPENCLAW_PROVIDER_ID,
-  "demo",
-  DEMO_OPENCLAW_PROVIDER_ID,
+// OpenClaw ≥2026.6 resolves embedded-agent auth exclusively from the
+// per-agent SQLite store — the inline `apiKey` on a custom provider in
+// openclaw.json is not consulted for agent turns. Custom-provider profiles
+// therefore MUST be imported too, translated to the OpenClaw provider id
+// they are registered under (skipping them leaves the store empty and every
+// turn fails with missing-provider-auth). Their import is best-effort: the
+// registration may legitimately be absent (e.g. Foundry key without a base
+// URL), and a failed paste must not abort the builtin-provider imports.
+const OPENCLAW_SQLITE_AUTH_PROVIDER_ALIASES = NORA_TO_OPENCLAW_PROVIDER_ID;
+const OPENCLAW_SQLITE_AUTH_BEST_EFFORT_PROVIDERS = Object.freeze([
+  ...Object.keys(NORA_TO_OPENCLAW_PROVIDER_ID),
+  ...Object.values(NORA_TO_OPENCLAW_PROVIDER_ID),
 ]);
 
 function buildOpenClawAuthImportFromFileCommand(options = {}) {
@@ -549,14 +556,19 @@ function buildOpenClawAuthImportFromFileCommand(options = {}) {
     "const { spawnSync } = require('child_process');",
     `const authPath = ${JSON.stringify(authPath)};`,
     `const agentId = ${JSON.stringify(agentId)};`,
-    `const skipProviders = new Set(${JSON.stringify(OPENCLAW_SQLITE_AUTH_SKIP_PROVIDERS)});`,
+    `const providerAliases = ${JSON.stringify(OPENCLAW_SQLITE_AUTH_PROVIDER_ALIASES)};`,
+    `const bestEffortProviders = new Set(${JSON.stringify(OPENCLAW_SQLITE_AUTH_BEST_EFFORT_PROVIDERS)});`,
     "let auth = {};",
     "try { auth = JSON.parse(fs.readFileSync(authPath, 'utf8')); } catch { process.exit(0); }",
     "const profiles = auth && auth.profiles && typeof auth.profiles === 'object' ? auth.profiles : {};",
     "for (const [profileId, profile] of Object.entries(profiles)) {",
     "  if (!profile || profile.type !== 'api_key' || !profile.key) continue;",
-    "  const provider = String(profile.provider || '').trim();",
-    "  if (!provider || skipProviders.has(provider)) continue;",
+    "  const rawProvider = String(profile.provider || '').trim();",
+    "  if (!rawProvider) continue;",
+    "  const provider = providerAliases[rawProvider] || rawProvider;",
+    "  const importProfileId = provider === rawProvider",
+    "    ? String(profileId)",
+    "    : String(profileId).replace(`${rawProvider}:`, `${provider}:`);",
     "  const result = spawnSync(process.env.OPENCLAW_BIN, [",
     "    'models',",
     "    'auth',",
@@ -566,7 +578,7 @@ function buildOpenClawAuthImportFromFileCommand(options = {}) {
     "    '--provider',",
     "    provider,",
     "    '--profile-id',",
-    "    String(profileId),",
+    "    importProfileId,",
     "  ], {",
     "    input: `${String(profile.key)}\\n`,",
     "    encoding: 'utf8',",
@@ -576,6 +588,10 @@ function buildOpenClawAuthImportFromFileCommand(options = {}) {
     "  if (result.status !== 0) {",
     "    if (result.stderr) process.stderr.write(result.stderr);",
     "    if (result.stdout) process.stderr.write(result.stdout);",
+    "    if (bestEffortProviders.has(provider)) {",
+    "      process.stderr.write(`auth import skipped for ${provider} (custom provider not registered?)\\n`);",
+    "      continue;",
+    "    }",
     "    process.exit(result.status || 1);",
     "  }",
     "}",
@@ -647,6 +663,21 @@ function buildOpenClawConfigMergeScript(gatewayConfig) {
 // merge semantics as the boot-time script so both paths agree.
 function buildOpenClawConfigMergeCommand(configDelta) {
   return buildOpenClawConfigMergeScript(configDelta).join("\n");
+}
+
+// Default-model apply for sync flows. Deliberately NOT `openclaw models set`:
+// OpenClaw ≥2026.6 canonicalizes the model ref against its builtin catalog,
+// rewriting `azure-openai-responses/<deployment>` to `openai/<deployment>` —
+// a provider the agent holds no credentials for. Writing the value straight
+// into openclaw.json (the same shape the boot scripts use) keeps the
+// custom-provider prefix intact; the gateway re-reads it on restart or via
+// its config watcher.
+function buildOpenClawDefaultModelCommand(fullModel) {
+  const model = String(fullModel || "").trim();
+  if (!model) return null;
+  return buildOpenClawConfigMergeCommand({
+    agents: { defaults: { model: { primary: model }, models: { [model]: {} } } },
+  });
 }
 
 // buildMcpServersConfig lives in its own dependency-free module so it can be
@@ -768,6 +799,7 @@ module.exports = {
   buildIntegrationToolWrapperScript,
   buildOpenClawConfigMergeScript,
   buildOpenClawConfigMergeCommand,
+  buildOpenClawDefaultModelCommand,
   buildOpenClawAuthImportFromFileCommand,
   buildOpenClawAuthProfilesWriteCommand,
   buildMcpServersConfig,

@@ -124,9 +124,61 @@ describe("OpenClaw bootstrap helpers", () => {
       expect(fs.readFileSync(argsLog, "utf8")).toContain(
         "models auth --agent main paste-api-key --provider openai --profile-id openai:default",
       );
+      // Custom providers are imported under their OpenClaw id — the embedded
+      // agent resolves auth from the per-agent SQLite store only, so skipping
+      // Foundry here left agents failing with missing-provider-auth.
+      expect(fs.readFileSync(argsLog, "utf8")).toContain(
+        "models auth --agent main paste-api-key --provider azure-openai-responses --profile-id azure-openai-responses:default",
+      );
       expect(fs.readFileSync(argsLog, "utf8")).not.toContain("microsoft-foundry");
-      expect(fs.readFileSync(stdinLog, "utf8")).toBe("sk-openai\n");
+      expect(fs.readFileSync(stdinLog, "utf8")).toBe("sk-openai\nms-key\n");
       expect(fs.existsSync(path.join(tmpDir, "auth-profiles.json"))).toBe(true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps builtin-provider imports when a custom-provider paste fails", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nora-openclaw-auth-"));
+    try {
+      const fakeOpenClaw = path.join(tmpDir, "openclaw");
+      const argsLog = path.join(tmpDir, "args.log");
+      // Fail only the azure-openai-responses paste (provider not registered),
+      // as happens when a Foundry key is saved without a base URL.
+      fs.writeFileSync(
+        fakeOpenClaw,
+        '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$OPENCLAW_ARGS_LOG"\ncat > /dev/null\ncase "$*" in *azure-openai-responses*) exit 1 ;; esac\n',
+        { mode: 0o755 },
+      );
+
+      const command = buildOpenClawAuthProfilesWriteCommand(
+        {
+          version: 1,
+          profiles: {
+            "microsoft-foundry:default": {
+              type: "api_key",
+              provider: "microsoft-foundry",
+              key: "ms-key",
+            },
+            "openai:default": { type: "api_key", provider: "openai", key: "sk-openai" },
+          },
+        },
+        { authPath: path.join(tmpDir, "auth-profiles.json") },
+      );
+      const result = require("child_process").spawnSync("/bin/sh", ["-c", command], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_CLI_PATH: fakeOpenClaw,
+          OPENCLAW_ARGS_LOG: argsLog,
+        },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("auth import skipped for azure-openai-responses");
+      expect(fs.readFileSync(argsLog, "utf8")).toContain(
+        "models auth --agent main paste-api-key --provider openai --profile-id openai:default",
+      );
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

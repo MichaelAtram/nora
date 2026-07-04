@@ -17,6 +17,7 @@ const {
   buildOpenClawAuthProfilesWriteCommand,
   buildOpenClawConfigMergeCommand,
   buildOpenClawCustomProviders,
+  buildOpenClawDefaultModelCommand,
   buildOpenClawModelForProvider,
 } = require("../agent-runtime/lib/runtimeBootstrap");
 const { buildHermesRuntimeBootstrapEnv } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
@@ -201,6 +202,22 @@ function hasMeaningfulHermesModelConfig(modelConfig = {}) {
   );
 }
 
+async function getIntegrationLlmEnvVars(agentId) {
+  try {
+    const { getIntegrationEnvVars } = require("./integrations");
+    const integrationEnvVars = await getIntegrationEnvVars(agentId);
+    const integrationLlmKeys = {};
+    for (const [envVar, value] of Object.entries(integrationEnvVars)) {
+      if (LLM_ENV_VARS.has(envVar)) {
+        integrationLlmKeys[envVar] = value;
+      }
+    }
+    return integrationLlmKeys;
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Build auth-profiles.json content for a specific agent.
  * Merges per-user LLM provider keys with per-agent integration tokens
@@ -214,28 +231,58 @@ async function buildAuthProfilesForAgent(userId, agentId) {
       ? await llmProviders.getProviderEndpoints(userId)
       : { byEnvVar: {}, byProvider: {}, apiVersionByEnvVar: {}, apiVersionByProvider: {} };
 
-  try {
-    const { getIntegrationEnvVars } = require("./integrations");
-    const integrationEnvVars = await getIntegrationEnvVars(agentId);
-    const integrationLlmKeys = {};
-    for (const [envVar, value] of Object.entries(integrationEnvVars)) {
-      if (LLM_ENV_VARS.has(envVar)) {
-        integrationLlmKeys[envVar] = value;
-      }
-    }
-    // LLM provider keys win over integration-sourced tokens for the same env var
-    return llmProviders.buildAuthProfiles(
-      { ...integrationLlmKeys, ...llmKeys },
-      overrides.byProvider || {},
-      overrides.apiVersionByProvider || {},
-    );
-  } catch {
-    return llmProviders.buildAuthProfiles(
-      llmKeys,
-      overrides.byProvider || {},
-      overrides.apiVersionByProvider || {},
-    );
-  }
+  const integrationLlmKeys = await getIntegrationLlmEnvVars(agentId);
+  // LLM provider keys win over integration-sourced tokens for the same env var
+  return llmProviders.buildAuthProfiles(
+    { ...integrationLlmKeys, ...llmKeys },
+    overrides.byProvider || {},
+    overrides.apiVersionByProvider || {},
+  );
+}
+
+/**
+ * Env vars the OpenClaw boot script needs to rebuild auth from scratch.
+ * On Kubernetes a restart is a rollout: the replacement pod gets a fresh
+ * filesystem and re-seeds auth-profiles.json + the SQLite auth store from
+ * the pod env alone, so exec-written files never survive it. Keys saved
+ * after provisioning must therefore be patched onto the Deployment env.
+ */
+async function buildOpenClawManagedEnvForAgent(userId, agentId, defaultProvider = null) {
+  const llmKeys = await llmProviders.getProviderKeys(userId);
+  const overrides =
+    typeof llmProviders.getProviderEndpoints === "function"
+      ? await llmProviders.getProviderEndpoints(userId)
+      : { byEnvVar: {}, apiVersionByEnvVar: {}, deploymentByEnvVar: {} };
+  const baseUrlEnvVars =
+    typeof llmProviders.buildBaseUrlEnvVars === "function"
+      ? llmProviders.buildBaseUrlEnvVars(overrides.byEnvVar || {})
+      : {};
+  const apiVersionEnvVars =
+    typeof llmProviders.buildApiVersionEnvVars === "function"
+      ? llmProviders.buildApiVersionEnvVars(overrides.apiVersionByEnvVar || {})
+      : {};
+  const deploymentEnvVars =
+    typeof llmProviders.buildDeploymentEnvVars === "function"
+      ? llmProviders.buildDeploymentEnvVars(overrides.deploymentByEnvVar || {})
+      : {};
+  const integrationLlmKeys = await getIntegrationLlmEnvVars(agentId);
+  const fullModel = buildDefaultOpenClawModel(defaultProvider);
+
+  return Object.fromEntries(
+    Object.entries(
+      buildCustomProviderEnv(
+        {
+          ...integrationLlmKeys,
+          ...llmKeys,
+          ...baseUrlEnvVars,
+          ...apiVersionEnvVars,
+          ...deploymentEnvVars,
+          ...(fullModel ? { NORA_DEFAULT_OPENCLAW_MODEL: fullModel } : {}),
+        },
+        defaultProvider,
+      ),
+    ).filter(([key, value]) => key && value != null && String(value) !== ""),
+  );
 }
 
 async function buildHermesManagedEnvForAgent(userId, agentId) {
@@ -281,14 +328,7 @@ function buildDefaultModelCommand(defaultProvider = null) {
   const fullModel = buildDefaultOpenClawModel(defaultProvider);
   if (!fullModel) return null;
 
-  return (
-    'OPENCLAW_BIN="${OPENCLAW_CLI_PATH:-/usr/local/bin/openclaw}"; ' +
-    'if [ ! -x "$OPENCLAW_BIN" ]; then OPENCLAW_BIN="$(command -v openclaw 2>/dev/null || true)"; fi; ' +
-    '[ -n "$OPENCLAW_BIN" ] && [ -x "$OPENCLAW_BIN" ] || exit 127; ' +
-    `exec "$OPENCLAW_BIN" ${["models", "set", fullModel]
-      .map((arg) => JSON.stringify(String(arg)))
-      .join(" ")}`
-  );
+  return buildOpenClawDefaultModelCommand(fullModel);
 }
 
 function buildDefaultOpenClawModel(defaultProvider = null) {
@@ -633,6 +673,22 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
         results.push({ agentId: agent.id, status: "skipped" });
         continue;
       }
+
+      // Kubernetes: patch the Deployment env before any exec writes. The
+      // exec-written files below only fix the CURRENT pod; the rollout the
+      // restart triggers replaces it with a pod that re-seeds auth from env,
+      // and the same applies to evictions and node scale events later on.
+      if (
+        typeof containerManager.isKubernetesAgent === "function" &&
+        containerManager.isKubernetesAgent(agent) &&
+        typeof containerManager.updateEnv === "function"
+      ) {
+        const managedEnv = await buildOpenClawManagedEnvForAgent(userId, agent.id, defaultProvider);
+        if (Object.keys(managedEnv).length > 0) {
+          await containerManager.updateEnv(agent, managedEnv);
+        }
+      }
+
       await writeAuthToContainer(agent, authProfiles);
 
       // Merge custom-provider registrations (Foundry → azure-openai-responses)
@@ -715,6 +771,7 @@ module.exports = {
   buildAuthProfilesForAgent,
   buildAuthProfilesWriteCommand,
   buildDefaultModelCommand,
+  buildOpenClawManagedEnvForAgent,
   buildHermesModelConfig,
   buildHermesEnvWriteCommand,
   buildHermesManagedEnvForAgent,
