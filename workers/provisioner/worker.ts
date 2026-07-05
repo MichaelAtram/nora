@@ -1293,6 +1293,70 @@ async function markDeploymentLifecycle(db, agentId, status) {
   await db.query("UPDATE deployments SET status = $2 WHERE agent_id = $1", [agentId, status]);
 }
 
+function mergePlainObjects(current, next) {
+  if (!next || typeof next !== "object" || Array.isArray(next)) return next;
+  const out =
+    current && typeof current === "object" && !Array.isArray(current) ? { ...current } : {};
+  for (const [key, value] of Object.entries(next)) {
+    out[key] = mergePlainObjects(out[key], value);
+  }
+  return out;
+}
+
+/**
+ * Reseed persisted OpenClaw channel config into a fresh runtime. Channel
+ * config lives in the runtime's openclaw.json, which dies with the container
+ * on redeploy; every channel save keeps an encrypted per-channel config patch
+ * in openclaw_channel_state. Merging them back restores token channels —
+ * QR-linked sessions (WhatsApp device links) still need a re-pair, since
+ * device state cannot be captured control-plane-side.
+ */
+async function reconcileOpenClawChannelState({
+  agentId,
+  resolvedBackend,
+  containerId,
+  provisioner,
+  host,
+  runtimeHost,
+  runtimePort,
+  gatewayToken,
+}) {
+  const rows = await db.query(
+    "SELECT channel_id, config_encrypted FROM openclaw_channel_state WHERE agent_id = $1",
+    [agentId],
+  );
+  if (rows.rows.length === 0) return { status: "skipped" };
+
+  const { decrypt } = require("./crypto");
+  let delta = {};
+  for (const row of rows.rows) {
+    try {
+      delta = mergePlainObjects(delta, JSON.parse(decrypt(row.config_encrypted)));
+    } catch (error) {
+      console.warn(
+        `[provisioner] Skipping undecryptable channel state ${row.channel_id} for agent ${agentId}: ${error.message}`,
+      );
+    }
+  }
+  if (Object.keys(delta).length === 0) return { status: "skipped" };
+
+  const agentRef = {
+    backend_type: resolvedBackend,
+    host,
+    runtime_host: runtimeHost,
+    runtime_port: runtimePort,
+    gateway_token: gatewayToken,
+  };
+  const command = buildOpenClawConfigMergeCommand(delta);
+  try {
+    await runRuntimeCommand(agentRef, command);
+  } catch (error) {
+    if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) throw error;
+    await runProvisionerExecCommand(provisioner, containerId, command);
+  }
+  return { status: "synced", channels: rows.rows.length };
+}
+
 // ── ClawHub Helpers ──────────────────────────────────────
 function createClawhubSkillJobLogger({ jobId, agentId, slug, operation }) {
   const startedAt = Date.now();
@@ -2530,6 +2594,33 @@ const worker = new Worker(
           } catch (e) {
             console.warn(
               `[provisioner] Failed to reconcile runtime LLM auth for agent ${id}:`,
+              e.message,
+            );
+          }
+        }
+
+        // Reseed persisted channel config before skills/integrations so a
+        // redeploy comes back with its Telegram/Slack/Discord channels wired.
+        if (resolvedRuntimeFields.runtime_family === "openclaw" && readiness.ok) {
+          try {
+            const channelSeed = await reconcileOpenClawChannelState({
+              agentId: id,
+              resolvedBackend,
+              containerId,
+              provisioner,
+              host,
+              runtimeHost,
+              runtimePort,
+              gatewayToken,
+            });
+            if (channelSeed.status === "synced") {
+              console.log(
+                `[provisioner] Reseeded ${channelSeed.channels} OpenClaw channel config(s) for agent ${id}`,
+              );
+            }
+          } catch (e) {
+            console.warn(
+              `[provisioner] Failed to reseed OpenClaw channel config for agent ${id}:`,
               e.message,
             );
           }

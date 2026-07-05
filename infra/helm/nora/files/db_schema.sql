@@ -183,6 +183,18 @@ CREATE TABLE IF NOT EXISTS hermes_runtime_state (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Durable copy of OpenClaw channel config: the runtime's openclaw.json is the
+-- live source, but it dies with the container on redeploy, so each saved
+-- channel's config patch is persisted (encrypted) and reseeded on provision.
+CREATE TABLE IF NOT EXISTS openclaw_channel_state (
+  agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+  channel_id TEXT NOT NULL,
+  config_encrypted TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (agent_id, channel_id)
+);
+
 CREATE TABLE IF NOT EXISTS platform_settings (
   singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton = TRUE),
   default_vcpu INTEGER NOT NULL DEFAULT 1,
