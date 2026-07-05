@@ -280,6 +280,24 @@ async function refreshTwitterOAuthRowIfNeeded(row = {}) {
   };
 
   const outcome = await resolved.refreshCredentials(decryptedRow, providerDeps);
+
+  // A definitive provider rejection (revoked/expired grant) means the stored
+  // token is dead and every agent call will 401 — surface it to the operator
+  // instead of leaving the integration silently "active".
+  if (outcome?.failed) {
+    console.warn(
+      `[integrations] Marking integration ${row.id} (${provider}) needs_reconnect: ${outcome.error || "OAuth refresh failed"}`,
+    );
+    try {
+      await repo.updateStatus({ id: row.id, status: "needs_reconnect" });
+    } catch (statusError) {
+      console.warn(
+        `[integrations] Could not persist needs_reconnect for ${row.id}: ${statusError.message}`,
+      );
+    }
+    return { ...row, status: "needs_reconnect" };
+  }
+
   if (!outcome?.refreshed) return row;
 
   const newConfig = outcome.row.config || {};

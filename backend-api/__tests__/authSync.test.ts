@@ -158,6 +158,9 @@ describe("auth sync", () => {
     global.fetch
       .mockResolvedValueOnce(jsonResponse({ exitCode: 0, stdout: "", stderr: "" }))
       .mockResolvedValueOnce(jsonResponse({ exitCode: 0, stdout: "", stderr: "" }));
+    // Non-LLM integration tokens must reach the Deployment env too — they
+    // otherwise live only in the pod's openclaw.json and die with the pod.
+    mockGetIntegrationEnvVars.mockResolvedValue({ GITHUB_TOKEN: "gh-tok" });
 
     const results = await syncAuthToUserAgents("user-1");
 
@@ -198,6 +201,7 @@ describe("auth sync", () => {
     // Kubernetes restarts are rollouts: the replacement pod re-seeds auth
     // from the Deployment env, so the sync must patch it too.
     expect(mockUpdateEnv).toHaveBeenCalledWith(expect.objectContaining({ id: "agent-k8s-1" }), {
+      GITHUB_TOKEN: "gh-tok",
       OPENAI_API_KEY: "sk-live-test",
       NORA_DEFAULT_OPENCLAW_MODEL: "openai/gpt-5.5",
     });
