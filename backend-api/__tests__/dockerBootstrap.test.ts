@@ -573,7 +573,9 @@ describe("Provisioner backends", () => {
     );
 
     expect(k8sSource).toContain("buildOpenClawInstallCommand(");
-    expect(k8sSource).toContain('["openclaw@latest"]');
+    // k8s shares the docker package spec (OPENCLAW_DOCKER_PACKAGE env) so a
+    // fleet can be pinned with one knob instead of hardcoding @latest.
+    expect(k8sSource).toContain("getStandardDockerPackageSpec()");
     expect(k8sSource).toContain('"nemoclaw@latest"');
     expect(nemoclawSource).toContain("buildOpenClawInstallCommand([");
 

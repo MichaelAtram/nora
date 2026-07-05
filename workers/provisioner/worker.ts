@@ -2707,6 +2707,13 @@ worker.on("failed", async (job, err) => {
       `[DLQ] Agent "${job.data.name}" (${job.data.id}) exhausted all ${maxAttempts} retry attempts`,
     );
     try {
+      // Terminal: without this, a job that died after the container was
+      // created (e.g. the final status UPDATE failed) leaves the agent in
+      // 'deploying' forever — the background reconciler deliberately skips
+      // queued/deploying rows, so nothing else can ever move it.
+      await db.query("UPDATE agents SET status = 'error' WHERE id = $1 AND status = 'deploying'", [
+        job.data.id,
+      ]);
       await db.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
         "agent_deploy_dlq",
         `Agent "${job.data.name}" exhausted all ${maxAttempts} retry attempts`,
