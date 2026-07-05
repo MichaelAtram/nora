@@ -165,7 +165,8 @@ const email = {
   },
 
   async verify(config) {
-    if (!config.smtp_host || !config.smtp_user) return { valid: false, error: "SMTP host and user required" };
+    if (!config.smtp_host || !config.smtp_user)
+      return { valid: false, error: "SMTP host and user required" };
     return { valid: true };
   },
 
@@ -187,7 +188,13 @@ const webhook = {
 
   configFields: [
     { key: "url", label: "Webhook URL", type: "url", required: true },
-    { key: "method", label: "HTTP Method", type: "select", options: ["POST", "PUT"], required: false },
+    {
+      key: "method",
+      label: "HTTP Method",
+      type: "select",
+      options: ["POST", "PUT"],
+      required: false,
+    },
     { key: "headers", label: "Custom Headers (JSON)", type: "textarea", required: false },
     { key: "secret", label: "Signing Secret", type: "password", required: false },
   ],
@@ -201,7 +208,9 @@ const webhook = {
     if (channel.config.headers) {
       try {
         headers = { ...headers, ...filterWebhookHeaders(JSON.parse(channel.config.headers)) };
-      } catch { /* ignore parse errors */ }
+      } catch {
+        /* ignore parse errors */
+      }
     }
     const res = await fetch(url, {
       method,
@@ -439,7 +448,12 @@ const line = {
   icon: "message-square",
 
   configFields: [
-    { key: "channel_access_token", label: "Channel Access Token", type: "password", required: true },
+    {
+      key: "channel_access_token",
+      label: "Channel Access Token",
+      type: "password",
+      required: true,
+    },
     { key: "channel_secret", label: "Channel Secret", type: "password", required: false },
     { key: "user_id", label: "Default User/Group ID", type: "text", required: false },
   ],
@@ -468,7 +482,8 @@ const line = {
   },
 
   async verify(config) {
-    if (!config.channel_access_token) return { valid: false, error: "Channel Access Token required" };
+    if (!config.channel_access_token)
+      return { valid: false, error: "Channel Access Token required" };
     return { valid: true };
   },
 

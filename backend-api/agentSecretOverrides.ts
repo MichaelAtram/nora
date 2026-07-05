@@ -30,7 +30,7 @@ async function listAgentSecretOverrides(agentId, { decryptValues = false } = {})
        FROM agent_secret_overrides
       WHERE agent_id = $1
       ORDER BY env_key ASC`,
-    [agentId]
+    [agentId],
   );
 
   return result.rows.reduce((acc, row) => {
@@ -60,7 +60,7 @@ async function replaceAgentSecretOverrides(agentId, rawEntries = {}) {
     await db.query(
       `INSERT INTO agent_secret_overrides(agent_id, env_key, env_value)
        VALUES($1, $2, $3)`,
-      [agentId, envKey, encrypt(envValue)]
+      [agentId, envKey, encrypt(envValue)],
     );
   }
 

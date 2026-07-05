@@ -6,7 +6,9 @@ const { shellSingleQuote } = require("../agent-runtime/lib/containerCommand");
 const MAX_INLINE_FILE_BYTES = 5 * 1024 * 1024;
 
 function normalizeRelativePath(rawValue, { allowEmpty = true } = {}) {
-  const raw = String(rawValue || "").replace(/\\/g, "/").trim();
+  const raw = String(rawValue || "")
+    .replace(/\\/g, "/")
+    .trim();
   if (!raw) return allowEmpty ? "" : null;
 
   const normalized = path.posix.normalize(raw).replace(/^\/+/, "");
@@ -16,7 +18,11 @@ function normalizeRelativePath(rawValue, { allowEmpty = true } = {}) {
 }
 
 function rootsForAgent(agent = {}) {
-  if (String(agent.runtime_family || "").trim().toLowerCase() === "hermes") {
+  if (
+    String(agent.runtime_family || "")
+      .trim()
+      .toLowerCase() === "hermes"
+  ) {
     return [
       {
         id: "workspace",
@@ -68,7 +74,8 @@ function rootsForAgent(agent = {}) {
       path: "/root/.openclaw",
       access: "ro",
       kind: "directory",
-      description: "Read-only OpenClaw runtime home, including agent files, sessions, and support state.",
+      description:
+        "Read-only OpenClaw runtime home, including agent files, sessions, and support state.",
     },
   ];
 }
@@ -129,7 +136,7 @@ function assertWritableTarget(root, relativePath = "", operation = "write") {
   if (!isFileRoot(root)) return;
   if (operation !== "write") {
     const error = new Error(
-      "This filesystem root only supports editing and downloading the OpenClaw config file"
+      "This filesystem root only supports editing and downloading the OpenClaw config file",
     );
     error.statusCode = 403;
     throw error;
@@ -260,10 +267,9 @@ async function listFiles(agent, rootId, relativePath = "") {
     const type = segments[index + 1];
     const size = Number.parseInt(segments[index + 2], 10) || 0;
     const mtime = Number.parseFloat(segments[index + 3]);
-    const entryPath = normalizeRelativePath(
-      relativePath ? `${relativePath}/${name}` : name,
-      { allowEmpty: false }
-    );
+    const entryPath = normalizeRelativePath(relativePath ? `${relativePath}/${name}` : name, {
+      allowEmpty: false,
+    });
 
     if (!entryPath) continue;
 
@@ -449,10 +455,10 @@ async function downloadPath(agent, rootId, relativePath = "") {
     'if [ -d "$target_real" ]; then',
     '  printf "directory\\0"',
     '  tar -C "$target_real" -czf - . | base64 | tr -d "\\n"',
-    'else',
+    "else",
     '  printf "file\\0"',
     '  base64 "$target_real" | tr -d "\\n"',
-    'fi',
+    "fi",
   ].join("\n");
 
   const { output } = await runFileCommand(agent, command, { timeout: 120000 });
@@ -466,10 +472,8 @@ async function downloadPath(agent, rootId, relativePath = "") {
 
   return {
     kind,
-    filename:
-      kind === "directory" ? `${name || root.id}.tar.gz` : name || `${root.id}.bin`,
-    contentType:
-      kind === "directory" ? "application/gzip" : "application/octet-stream",
+    filename: kind === "directory" ? `${name || root.id}.tar.gz` : name || `${root.id}.bin`,
+    contentType: kind === "directory" ? "application/gzip" : "application/octet-stream",
     contentBase64,
   };
 }

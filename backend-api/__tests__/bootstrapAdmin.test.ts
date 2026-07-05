@@ -10,7 +10,9 @@ describe("bootstrap admin policy", () => {
   });
 
   it("rejects short bootstrap passwords", () => {
-    expect(getBootstrapAdminSeedConfig({ adminEmail: "admin@example.com", adminPassword: "shortpass" })).toMatchObject({
+    expect(
+      getBootstrapAdminSeedConfig({ adminEmail: "admin@example.com", adminPassword: "shortpass" }),
+    ).toMatchObject({
       shouldSeed: false,
       reason: "password_too_short",
       email: "admin@example.com",
@@ -18,7 +20,9 @@ describe("bootstrap admin policy", () => {
   });
 
   it("rejects the legacy default bootstrap password", () => {
-    expect(getBootstrapAdminSeedConfig({ adminEmail: "admin@example.com", adminPassword: "admin123" })).toMatchObject({
+    expect(
+      getBootstrapAdminSeedConfig({ adminEmail: "admin@example.com", adminPassword: "admin123" }),
+    ).toMatchObject({
       shouldSeed: false,
       reason: "default_password_forbidden",
       email: "admin@example.com",
@@ -26,7 +30,12 @@ describe("bootstrap admin policy", () => {
   });
 
   it("accepts explicit secure bootstrap credentials and trims the email", () => {
-    expect(getBootstrapAdminSeedConfig({ adminEmail: "  admin@example.com ", adminPassword: "supersecure12" })).toEqual({
+    expect(
+      getBootstrapAdminSeedConfig({
+        adminEmail: "  admin@example.com ",
+        adminPassword: "supersecure12",
+      }),
+    ).toEqual({
       shouldSeed: true,
       email: "admin@example.com",
       password: "supersecure12",

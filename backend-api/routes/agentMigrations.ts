@@ -28,7 +28,7 @@ router.post(
     });
 
     res.json({ draft: draft.preview });
-  })
+  }),
 );
 
 router.post(
@@ -43,7 +43,7 @@ router.post(
     });
 
     res.json({ draft: draft.preview });
-  })
+  }),
 );
 
 router.get(
@@ -55,7 +55,7 @@ router.get(
     }
 
     res.json({ draft: draft.preview });
-  })
+  }),
 );
 
 router.delete(
@@ -73,7 +73,7 @@ router.delete(
 
     const deleted = await deleteOwnedMigrationDraft(req.params.id, req.user.id);
     res.json({ success: deleted });
-  })
+  }),
 );
 
 module.exports = router;

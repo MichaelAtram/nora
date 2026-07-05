@@ -11,11 +11,7 @@ import {
 } from "lucide-react";
 import { fetchWithAuth } from "../../../lib/api";
 import { useToast } from "../../Toast";
-import {
-  formatModelLabel,
-  getProviderMeta,
-  ProviderLogo,
-} from "../providerLogos";
+import { formatModelLabel, getProviderMeta, ProviderLogo } from "../providerLogos";
 
 function formatTimestamp(value) {
   if (!value) return "Not reported";
@@ -28,9 +24,7 @@ function formatTimestamp(value) {
 }
 
 function renderStateTone(ready) {
-  return ready
-    ? "bg-emerald-50 text-emerald-700"
-    : "bg-amber-50 text-amber-700";
+  return ready ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700";
 }
 
 function formatProviderLabel(providerId, providerName, baseUrl = "") {
@@ -49,9 +43,7 @@ function buildChoiceKey(providerId, modelId) {
 function buildModelChoices(savedProviders, availableProviders) {
   const providerRows = Array.isArray(savedProviders) ? savedProviders : [];
   const catalogs = Array.isArray(availableProviders) ? availableProviders : [];
-  const catalogById = new Map(
-    catalogs.map((provider) => [provider.id, provider])
-  );
+  const catalogById = new Map(catalogs.map((provider) => [provider.id, provider]));
   const groups = [];
   const options = [];
   const unavailableProviders = [];
@@ -67,10 +59,9 @@ function buildModelChoices(savedProviders, availableProviders) {
 
   for (const [providerId, rows] of rowsByProvider.entries()) {
     const providerCatalog = catalogById.get(providerId) || null;
-    const providerName =
-      providerCatalog?.name || getProviderMeta(providerId, providerId).name;
+    const providerName = providerCatalog?.name || getProviderMeta(providerId, providerId).name;
     const normalizedRows = [...rows].sort(
-      (left, right) => Number(Boolean(right?.is_default)) - Number(Boolean(left?.is_default))
+      (left, right) => Number(Boolean(right?.is_default)) - Number(Boolean(left?.is_default)),
     );
     const anchorRow = normalizedRows[0] || null;
     const seenModels = new Set();
@@ -133,23 +124,15 @@ function resolveDefaultChoiceKey(savedProviders, options) {
   const exactMatch = options.find(
     (option) =>
       option.providerId === defaultRow.provider &&
-      option.modelId === String(defaultRow.model || "").trim()
+      option.modelId === String(defaultRow.model || "").trim(),
   );
   if (exactMatch) return exactMatch.key;
 
-  const providerMatch = options.find(
-    (option) => option.providerId === defaultRow.provider
-  );
+  const providerMatch = options.find((option) => option.providerId === defaultRow.provider);
   return providerMatch?.key || options[0]?.key || "";
 }
 
-export default function HermesStatusPanel({
-  agentId,
-  runtimeInfo,
-  loading,
-  error,
-  onRefresh,
-}) {
+export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error, onRefresh }) {
   const [providers, setProviders] = useState(null);
   const [availableProviders, setAvailableProviders] = useState([]);
   const [selectedChoiceKey, setSelectedChoiceKey] = useState("");
@@ -213,16 +196,10 @@ export default function HermesStatusPanel({
       return;
     }
 
-    const preferredChoiceKey = resolveDefaultChoiceKey(
-      providers,
-      nextChoices.options
-    );
+    const preferredChoiceKey = resolveDefaultChoiceKey(providers, nextChoices.options);
 
     setSelectedChoiceKey((current) => {
-      if (
-        current &&
-        nextChoices.options.some((option) => option.key === current)
-      ) {
+      if (current && nextChoices.options.some((option) => option.key === current)) {
         return current;
       }
       return preferredChoiceKey;
@@ -242,18 +219,17 @@ export default function HermesStatusPanel({
       ? providers.find((provider) => provider?.is_default) || providers[0]
       : null;
   const selectedChoice =
-    modelChoices.options.find((option) => option.key === selectedChoiceKey) ||
-    null;
+    modelChoices.options.find((option) => option.key === selectedChoiceKey) || null;
   const currentProviderLabel = savedDefaultProvider
     ? formatProviderLabel(
         savedDefaultProvider.provider,
         savedDefaultProvider.provider,
-        runtimeInfo?.configuredBaseUrl || ""
+        runtimeInfo?.configuredBaseUrl || "",
       )
     : formatProviderLabel(
         runtimeInfo?.configuredProvider,
         runtimeInfo?.configuredProvider,
-        runtimeInfo?.configuredBaseUrl || ""
+        runtimeInfo?.configuredBaseUrl || "",
       );
   const currentModelLabel =
     runtimeInfo?.configuredModel ||
@@ -351,16 +327,13 @@ export default function HermesStatusPanel({
 
     setChangingModel(true);
     try {
-      const updateResponse = await fetchWithAuth(
-        `/api/llm-providers/${selectedChoice.rowId}`,
-        {
-          method: "PUT",
-          body: JSON.stringify({
-            model: selectedChoice.modelId,
-            is_default: true,
-          }),
-        }
-      );
+      const updateResponse = await fetchWithAuth(`/api/llm-providers/${selectedChoice.rowId}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          model: selectedChoice.modelId,
+          is_default: true,
+        }),
+      });
       const updateData = await updateResponse.json().catch(() => ({}));
       if (!updateResponse.ok) {
         throw new Error(updateData.error || "Failed to save provider selection");
@@ -385,8 +358,8 @@ export default function HermesStatusPanel({
       await loadProviderChoices();
       toast.success(
         `Hermes now uses ${selectedChoice.providerName} / ${formatModelLabel(
-          selectedChoice.modelId
-        )}`
+          selectedChoice.modelId,
+        )}`,
       );
       window.setTimeout(() => {
         onRefresh?.();
@@ -412,9 +385,7 @@ export default function HermesStatusPanel({
         <div className="flex items-start gap-3">
           <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-600" />
           <div>
-            <p className="text-sm font-bold text-amber-800">
-              Hermes runtime details unavailable
-            </p>
+            <p className="text-sm font-bold text-amber-800">Hermes runtime details unavailable</p>
             <p className="mt-1 text-xs text-amber-700">
               {error || "The Hermes runtime has not reported status yet."}
             </p>
@@ -448,7 +419,7 @@ export default function HermesStatusPanel({
         <div className="flex flex-wrap items-center gap-2">
           <span
             className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-bold ${renderStateTone(
-              runtimeReady
+              runtimeReady,
             )}`}
           >
             <span
@@ -463,11 +434,7 @@ export default function HermesStatusPanel({
             disabled={syncingKeys}
             className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {syncingKeys ? (
-              <Loader2 size={12} className="animate-spin" />
-            ) : (
-              <Key size={12} />
-            )}
+            {syncingKeys ? <Loader2 size={12} className="animate-spin" /> : <Key size={12} />}
             Sync LLM
           </button>
           <button
@@ -494,12 +461,8 @@ export default function HermesStatusPanel({
         <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
           <AlertTriangle size={16} className="mt-0.5 shrink-0 text-slate-500" />
           <div>
-            <p className="text-sm font-bold text-slate-800">
-              Gateway snapshot unavailable
-            </p>
-            <p className="mt-1 text-xs text-slate-600">
-              {runtimeInfo.gatewayError}
-            </p>
+            <p className="text-sm font-bold text-slate-800">Gateway snapshot unavailable</p>
+            <p className="mt-1 text-xs text-slate-600">{runtimeInfo.gatewayError}</p>
           </div>
         </div>
       ) : null}
@@ -508,12 +471,8 @@ export default function HermesStatusPanel({
         <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
           <AlertTriangle size={16} className="mt-0.5 shrink-0 text-slate-500" />
           <div>
-            <p className="text-sm font-bold text-slate-800">
-              Model metadata warning
-            </p>
-            <p className="mt-1 text-xs text-slate-600">
-              {runtimeInfo.modelsError}
-            </p>
+            <p className="text-sm font-bold text-slate-800">Model metadata warning</p>
+            <p className="mt-1 text-xs text-slate-600">{runtimeInfo.modelsError}</p>
           </div>
         </div>
       ) : null}
@@ -575,8 +534,7 @@ export default function HermesStatusPanel({
                 <p className="mt-1 text-xs text-slate-600">
                   {runtimeReady
                     ? "Hermes reported a healthy runtime response."
-                    : runtimeInfo?.health?.error ||
-                      "Hermes has not completed startup yet."}
+                    : runtimeInfo?.health?.error || "Hermes has not completed startup yet."}
                 </p>
               </div>
             </div>
@@ -602,9 +560,7 @@ export default function HermesStatusPanel({
                 <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">
                   Current Selection
                 </p>
-                <p className="mt-1 text-sm font-bold text-slate-900">
-                  {currentProviderLabel}
-                </p>
+                <p className="mt-1 text-sm font-bold text-slate-900">{currentProviderLabel}</p>
                 <p className="mt-1 break-all text-xs font-mono text-slate-600">
                   {currentModelLabel}
                 </p>
@@ -708,8 +664,7 @@ export default function HermesStatusPanel({
                 </div>
               ) : (
                 <p className="mt-3 text-xs text-slate-500">
-                  No models reported yet. Hermes may still be starting or waiting for upstream
-                  auth.
+                  No models reported yet. Hermes may still be starting or waiting for upstream auth.
                 </p>
               )}
             </div>
@@ -783,9 +738,7 @@ export default function HermesStatusPanel({
                         </span>
                       </div>
                       {state?.error_message ? (
-                        <p className="mt-1 text-xs text-rose-600">
-                          {state.error_message}
-                        </p>
+                        <p className="mt-1 text-xs text-rose-600">{state.error_message}</p>
                       ) : null}
                     </div>
                   ))}
