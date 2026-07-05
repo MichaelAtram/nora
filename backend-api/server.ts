@@ -777,7 +777,9 @@ app.post("/webhooks/:channelId", async (req, res) => {
     await channels.handleInboundWebhook(req.params.channelId, req.body, req.headers);
     res.json({ received: true });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    // 503 for runtime-unreachable so providers retry delivery; 400 for
+    // malformed/unknown-channel requests they should not retry.
+    res.status(e.statusCode || 400).json({ error: e.message });
   }
 });
 

@@ -108,6 +108,7 @@ export const linkedinProvider: Provider = {
     });
 
     let tokenData: any = null;
+    let rejection: string | null = null;
     try {
       const response = await deps.fetch(LINKEDIN_TOKEN_URL, {
         method: "POST",
@@ -116,21 +117,31 @@ export const linkedinProvider: Provider = {
       });
       tokenData = await (response as any).json().catch(() => ({}));
       if (!response.ok) {
-        const message =
+        // The endpoint answered and said no — revoked/expired grant, not a blip.
+        rejection =
           stringValue(tokenData?.error_description) ||
           stringValue(tokenData?.error) ||
           `HTTP ${response.status}`;
-        throw new Error(message);
       }
     } catch (error: any) {
+      // Transient (network/DNS) — retry on the next sync without alarming the operator.
       console.warn(
         `[integrations] Failed to refresh LinkedIn OAuth token for integration ${row.id}: ${error?.message ?? error}`,
       );
       return { row, refreshed: false };
     }
 
+    if (rejection) {
+      console.warn(
+        `[integrations] LinkedIn rejected OAuth token refresh for integration ${row.id}: ${rejection}`,
+      );
+      return { row, refreshed: false, failed: true, error: rejection };
+    }
+
     const accessToken = stringValue(tokenData.access_token);
-    if (!accessToken) return { row, refreshed: false };
+    if (!accessToken) {
+      return { row, refreshed: false, failed: true, error: "Token response had no access_token" };
+    }
 
     deps.ensureEncryptionConfigured("LinkedIn OAuth token refresh");
     const nextConfig = {

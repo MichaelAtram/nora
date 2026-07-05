@@ -246,6 +246,9 @@ async function buildAuthProfilesForAgent(userId, agentId) {
  * filesystem and re-seeds auth-profiles.json + the SQLite auth store from
  * the pod env alone, so exec-written files never survive it. Keys saved
  * after provisioning must therefore be patched onto the Deployment env.
+ * Carries ALL integration env vars (not just LLM-overlapping ones) — a
+ * GITHUB_TOKEN/SLACK_TOKEN connected after provisioning otherwise lives
+ * only in the pod's openclaw.json and dies with the pod.
  */
 async function buildOpenClawManagedEnvForAgent(userId, agentId, defaultProvider = null) {
   const llmKeys = await llmProviders.getProviderKeys(userId);
@@ -265,14 +268,20 @@ async function buildOpenClawManagedEnvForAgent(userId, agentId, defaultProvider 
     typeof llmProviders.buildDeploymentEnvVars === "function"
       ? llmProviders.buildDeploymentEnvVars(overrides.deploymentByEnvVar || {})
       : {};
-  const integrationLlmKeys = await getIntegrationLlmEnvVars(agentId);
+  let integrationEnvVars = {};
+  try {
+    const { getIntegrationEnvVars } = require("./integrations");
+    integrationEnvVars = await getIntegrationEnvVars(agentId);
+  } catch {
+    integrationEnvVars = {};
+  }
   const fullModel = buildDefaultOpenClawModel(defaultProvider);
 
   return Object.fromEntries(
     Object.entries(
       buildCustomProviderEnv(
         {
-          ...integrationLlmKeys,
+          ...integrationEnvVars,
           ...llmKeys,
           ...baseUrlEnvVars,
           ...apiVersionEnvVars,

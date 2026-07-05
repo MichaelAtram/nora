@@ -320,6 +320,8 @@ async function handleInboundWebhook(channelId, payload, headers) {
   const runtimeUrl = runtimeUrlForAgent(agent, "/channels/receive");
   if (runtimeUrl && agent?.host !== "pending") {
     try {
+      // Bounded: a hung runtime socket must not stall the provider's webhook
+      // delivery worker.
       await fetch(runtimeUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(await runtimeAuthHeaders(agent)) },
@@ -330,9 +332,19 @@ async function handleInboundWebhook(channelId, payload, headers) {
           sender: formatted.sender,
           metadata: formatted.metadata,
         }),
+        signal: AbortSignal.timeout(10000),
       });
-    } catch {
-      // Agent may not be reachable — that's okay, message is already logged
+    } catch (error) {
+      // Do NOT swallow this as a 200: providers treat 2xx as delivered and
+      // never retry, so the message would be silently lost exactly when the
+      // agent pod is restarting. Signal "try again later" instead — the
+      // inbound copy is already logged for the audit trail.
+      const failure = new Error(
+        `Agent runtime unreachable — webhook not delivered (${error?.message || "fetch failed"})`,
+      );
+      failure.statusCode = 503;
+      failure.retryable = true;
+      throw failure;
     }
   }
 
