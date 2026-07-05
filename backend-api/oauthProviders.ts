@@ -31,14 +31,20 @@ async function fetchJson(url, options, providerLabel) {
     throw new Error(
       detail
         ? `${providerLabel} token verification failed: ${detail}`
-        : `${providerLabel} token verification failed (${res.status})`
+        : `${providerLabel} token verification failed (${res.status})`,
     );
   }
 
   return data || {};
 }
 
-function assertRequestedIdentityMatches({ requestedEmail, requestedProviderId, actualEmail, actualProviderId, providerLabel }) {
+function assertRequestedIdentityMatches({
+  requestedEmail,
+  requestedProviderId,
+  actualEmail,
+  actualProviderId,
+  providerLabel,
+}) {
   if (requestedEmail && normalizeEmail(requestedEmail) !== normalizeEmail(actualEmail)) {
     throw new Error(`${providerLabel} token email did not match the requested account`);
   }
@@ -75,7 +81,7 @@ async function verifyGoogleIdentity({ accessToken, idToken, email, providerId })
     const data = await fetchJson(
       GOOGLE_OIDC_USERINFO_URL,
       { headers: { Authorization: `Bearer ${accessToken}` } },
-      "Google"
+      "Google",
     );
 
     if (!data.sub) throw new Error("Google token verification failed: missing subject");
@@ -116,8 +122,8 @@ async function verifyGitHubIdentity({ accessToken, email, providerId }) {
   const user = await fetchJson(GITHUB_USER_URL, { headers }, "GitHub");
   const emails = await fetchJson(GITHUB_EMAILS_URL, { headers }, "GitHub");
   const primaryVerified = Array.isArray(emails)
-    ? emails.find((entry) => entry.primary && entry.verified && entry.email)
-      || emails.find((entry) => entry.verified && entry.email)
+    ? emails.find((entry) => entry.primary && entry.verified && entry.email) ||
+      emails.find((entry) => entry.verified && entry.email)
     : null;
   const verifiedEmail = primaryVerified?.email || null;
 

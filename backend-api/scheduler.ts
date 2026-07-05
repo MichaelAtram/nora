@@ -22,7 +22,7 @@ async function selectNode(options = {}) {
 
   // Query current agent distribution across nodes
   const result = await db.query(
-    "SELECT node, COUNT(*)::int AS agent_count FROM agents WHERE status NOT IN ('error', 'deleted') GROUP BY node"
+    "SELECT node, COUNT(*)::int AS agent_count FROM agents WHERE status NOT IN ('error', 'deleted') GROUP BY node",
   );
   const counts = {};
   result.rows.forEach((r) => {

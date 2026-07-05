@@ -17,7 +17,7 @@ async function ensureFirstRegisteredUserIsAdmin(queryable = db) {
      UPDATE users
      SET role = 'admin'
      WHERE id = (SELECT id FROM first_user)
-     RETURNING id, email, role, created_at`
+     RETURNING id, email, role, created_at`,
   );
 
   return result.rows[0] || null;

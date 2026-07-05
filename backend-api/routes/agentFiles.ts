@@ -14,10 +14,7 @@ const {
   rootsForAgent,
   writeFile,
 } = require("../agentFiles");
-const {
-  buildMigrationManifestFromAgent,
-  packMigrationBundle,
-} = require("../agentMigrations");
+const { buildMigrationManifestFromAgent, packMigrationBundle } = require("../agentMigrations");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { createMutationFailureAuditMiddleware } = require("../auditLog");
 
@@ -29,7 +26,7 @@ async function loadOwnedAgent(req, res) {
     `SELECT *
        FROM agents
       WHERE id = $1 AND user_id = $2`,
-    [req.params.id, req.user.id]
+    [req.params.id, req.user.id],
   );
   const agent = result.rows[0];
   if (!agent) {
@@ -64,10 +61,10 @@ router.get(
     res.setHeader("Content-Type", "application/gzip");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="${filenameSeed || "nora-agent"}.nora-migration.tgz"`
+      `attachment; filename="${filenameSeed || "nora-agent"}.nora-migration.tgz"`,
     );
     res.send(bundle);
-  })
+  }),
 );
 
 router.get(
@@ -76,7 +73,7 @@ router.get(
     const agent = await loadOwnedAgent(req, res);
     if (!agent) return;
     res.json({ roots: rootsForAgent(agent) });
-  })
+  }),
 );
 
 router.get(
@@ -88,10 +85,10 @@ router.get(
     const payload = await listFiles(
       agent,
       req.query.root,
-      typeof req.query.path === "string" ? req.query.path : ""
+      typeof req.query.path === "string" ? req.query.path : "",
     );
     res.json(payload);
-  })
+  }),
 );
 
 router.get(
@@ -103,10 +100,10 @@ router.get(
     const payload = await readFile(
       agent,
       req.query.root,
-      typeof req.query.path === "string" ? req.query.path : ""
+      typeof req.query.path === "string" ? req.query.path : "",
     );
     res.json(payload);
-  })
+  }),
 );
 
 router.get(
@@ -118,15 +115,12 @@ router.get(
     const payload = await downloadPath(
       agent,
       req.query.root,
-      typeof req.query.path === "string" ? req.query.path : ""
+      typeof req.query.path === "string" ? req.query.path : "",
     );
     res.setHeader("Content-Type", payload.contentType);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${payload.filename}"`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename="${payload.filename}"`);
     res.send(Buffer.from(payload.contentBase64, "base64"));
-  })
+  }),
 );
 
 router.put(
@@ -140,10 +134,10 @@ router.put(
       req.body?.root,
       req.body?.path,
       req.body?.contentBase64 || "",
-      Number.isInteger(req.body?.mode) ? req.body.mode : 0o644
+      Number.isInteger(req.body?.mode) ? req.body.mode : 0o644,
     );
     res.json(result);
-  })
+  }),
 );
 
 router.post(
@@ -160,20 +154,18 @@ router.post(
 
     const baseDirectory = normalizeRelativePath(
       typeof req.query.path === "string" ? req.query.path : "",
-      { allowEmpty: true }
+      { allowEmpty: true },
     );
-    const relativePath = baseDirectory
-      ? path.posix.join(baseDirectory, filename)
-      : filename;
+    const relativePath = baseDirectory ? path.posix.join(baseDirectory, filename) : filename;
 
     const result = await writeFile(
       agent,
       req.query.root,
       relativePath,
-      Buffer.from(req.body || Buffer.alloc(0)).toString("base64")
+      Buffer.from(req.body || Buffer.alloc(0)).toString("base64"),
     );
     res.json(result);
-  })
+  }),
 );
 
 router.post(
@@ -184,7 +176,7 @@ router.post(
 
     const result = await createDirectory(agent, req.body?.root, req.body?.path);
     res.json(result);
-  })
+  }),
 );
 
 router.post(
@@ -193,14 +185,9 @@ router.post(
     const agent = await loadOwnedAgent(req, res);
     if (!agent) return;
 
-    const result = await movePath(
-      agent,
-      req.body?.root,
-      req.body?.fromPath,
-      req.body?.toPath
-    );
+    const result = await movePath(agent, req.body?.root, req.body?.fromPath, req.body?.toPath);
     res.json(result);
-  })
+  }),
 );
 
 router.delete(
@@ -211,7 +198,7 @@ router.delete(
 
     const result = await deletePath(agent, req.body?.root, req.body?.path);
     res.json(result);
-  })
+  }),
 );
 
 module.exports = router;

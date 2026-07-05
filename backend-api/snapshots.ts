@@ -10,9 +10,7 @@ function stringifyConfig(config = {}) {
 function normalizeSnapshotOptions(options = {}) {
   return {
     kind:
-      typeof options.kind === "string" && options.kind.trim()
-        ? options.kind.trim()
-        : "snapshot",
+      typeof options.kind === "string" && options.kind.trim() ? options.kind.trim() : "snapshot",
     templateKey:
       typeof options.templateKey === "string" && options.templateKey.trim()
         ? options.templateKey.trim()
@@ -21,13 +19,7 @@ function normalizeSnapshotOptions(options = {}) {
   };
 }
 
-async function createSnapshot(
-  agentId,
-  name,
-  description,
-  config = {},
-  options = {}
-) {
+async function createSnapshot(agentId, name, description, config = {}, options = {}) {
   const normalized = normalizeSnapshotOptions(options);
   const result = await db.query(
     `INSERT INTO snapshots(agent_id, name, description, config, kind, template_key, built_in)
@@ -41,7 +33,7 @@ async function createSnapshot(
       normalized.kind,
       normalized.templateKey,
       normalized.builtIn,
-    ]
+    ],
   );
   return result.rows[0];
 }
@@ -60,7 +52,7 @@ async function getSnapshotByTemplateKey(templateKey) {
   if (!templateKey) return null;
   const result = await db.query(
     "SELECT * FROM snapshots WHERE template_key = $1 ORDER BY created_at ASC LIMIT 1",
-    [templateKey]
+    [templateKey],
   );
   return result.rows[0] || null;
 }
@@ -96,7 +88,7 @@ async function upsertSnapshot({
           normalized.kind,
           normalized.builtIn,
           existing.id,
-        ]
+        ],
       );
       return result.rows[0];
     }
@@ -107,23 +99,14 @@ async function upsertSnapshot({
 
 async function updateSnapshot(
   id,
-  {
-    agentId,
-    name,
-    description,
-    config,
-    kind,
-    templateKey,
-    builtIn,
-  } = {}
+  { agentId, name, description, config, kind, templateKey, builtIn } = {},
 ) {
   const existing = await getSnapshot(id);
   if (!existing) return null;
 
   const normalized = normalizeSnapshotOptions({
     kind: kind ?? existing.kind,
-    templateKey:
-      templateKey !== undefined ? templateKey : existing.template_key,
+    templateKey: templateKey !== undefined ? templateKey : existing.template_key,
     builtIn: builtIn ?? existing.built_in,
   });
 
@@ -147,7 +130,7 @@ async function updateSnapshot(
       normalized.templateKey,
       normalized.builtIn,
       id,
-    ]
+    ],
   );
 
   return result.rows[0] || null;
