@@ -1418,7 +1418,7 @@ describe("provisioning runtime/gateway contracts", () => {
         env: { OPENAI_API_KEY: "test-key" },
       }),
     ).rejects.toThrow(
-      "Timed out waiting for K8s LoadBalancer address for nora-oclaw-pending-loadbalancer-qa-999",
+      "Timed out waiting for a LoadBalancer address for nora-oclaw-pending-loadbalancer-qa-999",
     );
   });
 

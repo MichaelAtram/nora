@@ -97,13 +97,26 @@ async function deleteBudget(budgetId, workspaceId) {
   return Boolean(result.rows[0]);
 }
 
+const BUDGET_PERIOD_DAYS = { daily: 1, weekly: 7, monthly: 30 };
+
 // Check current spend against budgets and return an array of bucket
 // crossings (none / soft / hard). Callers (the cost route handler, or a
 // background task) decide whether to emit events from the result.
-async function evaluateBudgetCrossings(workspaceId, currentUsd) {
+// Spend is resolved PER BUDGET PERIOD — never from whatever window the
+// viewer happened to select (that measured a daily $10 budget against
+// 30-day spend and fired false alerts on every page view).
+async function evaluateBudgetCrossings(workspaceId, _ignoredViewerWindowUsd, deps = {}) {
+  const { costResolver = require("./metrics").getWorkspaceCost } = deps;
   const budgets = await listBudgets(workspaceId);
   const crossings = [];
+  const spendByPeriod = new Map();
   for (const budget of budgets) {
+    const periodDays = BUDGET_PERIOD_DAYS[budget.period] || 30;
+    if (!spendByPeriod.has(periodDays)) {
+      const cost = await costResolver(workspaceId, { periodDays });
+      spendByPeriod.set(periodDays, Number(cost?.totalUsd ?? cost?.total_cost ?? 0));
+    }
+    const currentUsd = spendByPeriod.get(periodDays);
     const pct = budget.limitUsd > 0 ? Math.floor((currentUsd / budget.limitUsd) * 100) : 0;
     let bucket = "none";
     if (pct >= 100) bucket = "hard";

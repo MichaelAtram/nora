@@ -891,6 +891,18 @@ router.post("/agents/:id/integrations", async (req, res) => {
       }
     }
 
+    // Auto-verify the stored credentials so broken keys surface at save time
+    // instead of at first agent use. Non-blocking: the row is already stored
+    // and synced — the outcome rides along for the UI to display.
+    if (result?.id) {
+      try {
+        const connectivity = await integrations.testIntegration(result.id, req.params.id);
+        result = { ...result, connectivity };
+      } catch (testError) {
+        result = { ...result, connectivity: { success: false, error: testError.message } };
+      }
+    }
+
     res.json(result);
   } catch (e) {
     res.status(e.statusCode || 500).json({ error: e.message });
