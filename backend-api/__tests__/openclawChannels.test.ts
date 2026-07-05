@@ -1,6 +1,9 @@
 // @ts-nocheck
+process.env.ENCRYPTION_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 const mockRpcCall = jest.fn();
 const mockRunContainerCommand = jest.fn();
+const mockDbQuery = jest.fn();
 
 jest.mock("../gatewayProxy", () => ({
   rpcCall: (...args) => mockRpcCall(...args),
@@ -8,6 +11,10 @@ jest.mock("../gatewayProxy", () => ({
 
 jest.mock("../authSync", () => ({
   runContainerCommand: (...args) => mockRunContainerCommand(...args),
+}));
+
+jest.mock("../db", () => ({
+  query: (...args) => mockDbQuery(...args),
 }));
 
 const {
@@ -193,6 +200,15 @@ describe("openclaw channel catalog compatibility", () => {
       channel: "telegram",
       restart: "requested",
     });
+    // The saved patch is also persisted (encrypted) so redeploys can reseed
+    // channel config — the runtime's openclaw.json dies with the container.
+    const persistCall = mockDbQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("openclaw_channel_state"),
+    );
+    expect(persistCall).toBeTruthy();
+    expect(persistCall[1][0]).toBe("agent-openclaw-1");
+    expect(persistCall[1][1]).toBe("telegram");
+    expect(String(persistCall[1][2])).not.toContain("secret-token");
     expect(mockRpcCall).toHaveBeenCalledTimes(3);
     expect(mockRpcCall).toHaveBeenNthCalledWith(
       3,

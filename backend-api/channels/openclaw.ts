@@ -2,6 +2,8 @@
 const { rpcCall } = require("../gatewayProxy");
 const { resolveAgentRuntimeFamily } = require("../agentRuntimeFields");
 const { OPENCLAW_GATEWAY_PORT } = require("../../agent-runtime/lib/contracts");
+const db = require("../db");
+const { encrypt, ensureEncryptionConfigured } = require("../crypto");
 
 const REDACTED_SECRET = "[REDACTED]";
 const OPENCLAW_RUNTIME_READY_STATUSES = new Set(["running", "warning"]);
@@ -1596,6 +1598,27 @@ async function getOpenClawChannelType(agent, channelId) {
   });
 }
 
+// Best-effort by design: the runtime write above already succeeded, so a DB
+// hiccup must not fail the save — it only means this channel won't reseed on
+// the next redeploy (and the next successful save repairs that).
+async function persistOpenClawChannelState(agentId, channelId, patch) {
+  if (!agentId || !channelId || !isPlainObject(patch)) return;
+  try {
+    ensureEncryptionConfigured("OpenClaw channel config persistence");
+    await db.query(
+      `INSERT INTO openclaw_channel_state(agent_id, channel_id, config_encrypted, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (agent_id, channel_id)
+       DO UPDATE SET config_encrypted = EXCLUDED.config_encrypted, updated_at = NOW()`,
+      [agentId, channelId, encrypt(JSON.stringify(patch))],
+    );
+  } catch (error) {
+    console.warn(
+      `[channels] Could not persist OpenClaw channel state for agent ${agentId}/${channelId}: ${error.message}`,
+    );
+  }
+}
+
 async function saveOpenClawChannel(agent, channelId, input = {}, { create = false } = {}) {
   let lastError = null;
 
@@ -1617,11 +1640,14 @@ async function saveOpenClawChannel(agent, channelId, input = {}, { create = fals
         nextConfig.enabled = input.enabled;
       }
 
-      const result = await writeConfigPatch(
-        agent,
-        snapshot,
-        buildOpenClawChannelConfigPatch(channelId, nextConfig),
-      );
+      const patch = buildOpenClawChannelConfigPatch(channelId, nextConfig);
+      const result = await writeConfigPatch(agent, snapshot, patch);
+
+      // The runtime's openclaw.json is the live source of channel config, but
+      // it dies with the container on redeploy — keep a durable encrypted
+      // copy so provisioning can reseed it. QR session state (device links)
+      // cannot be captured here; those channels re-pair after a rebuild.
+      await persistOpenClawChannelState(agent.id, channelId, patch);
 
       return {
         success: true,
