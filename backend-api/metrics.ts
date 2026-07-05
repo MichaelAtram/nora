@@ -53,9 +53,23 @@ function extractTokenUsage(payload = {}, defaults = {}) {
     {};
   if (!usage || typeof usage !== "object") return null;
 
-  const inputTokens = normalizeUsageNumber(
-    firstDefined(usage.input_tokens, usage.prompt_tokens, usage.inputTokens, usage.promptTokens),
+  // Anthropic reports input_tokens as the UNCACHED remainder — the cached
+  // read/write portions arrive in separate fields and were previously
+  // dropped entirely, understating both token counts and cost for
+  // cache-heavy agents. OpenAI nests cached counts in prompt_tokens_details
+  // (already included in prompt_tokens, so not re-added here).
+  const cacheReadTokens = normalizeUsageNumber(
+    firstDefined(usage.cache_read_input_tokens, usage.cacheReadInputTokens),
   );
+  const cacheWriteTokens = normalizeUsageNumber(
+    firstDefined(usage.cache_creation_input_tokens, usage.cacheCreationInputTokens),
+  );
+  const inputTokens =
+    normalizeUsageNumber(
+      firstDefined(usage.input_tokens, usage.prompt_tokens, usage.inputTokens, usage.promptTokens),
+    ) +
+    cacheReadTokens +
+    cacheWriteTokens;
   const outputTokens = normalizeUsageNumber(
     firstDefined(
       usage.output_tokens,
@@ -64,9 +78,12 @@ function extractTokenUsage(payload = {}, defaults = {}) {
       usage.completionTokens,
     ),
   );
-  const totalTokens =
-    normalizeUsageNumber(firstDefined(usage.total_tokens, usage.totalTokens, usage.tokens)) ||
-    inputTokens + outputTokens;
+  const recordedTotal = normalizeUsageNumber(
+    firstDefined(usage.total_tokens, usage.totalTokens, usage.tokens),
+  );
+  const totalTokens = recordedTotal
+    ? recordedTotal + cacheReadTokens + cacheWriteTokens
+    : inputTokens + outputTokens;
   if (!totalTokens) return null;
 
   const model = firstDefined(
@@ -467,6 +484,10 @@ function buildTokenCostModel(row, modelRates, fallbackPer1k) {
     output_tokens: outputTokens,
     total_tokens: totalTokens,
     token_cost: roundCurrency(tokenCost),
+    // Unrounded cost for summation: cent-rounding each model first zeroes
+    // out every model that costs <$0.005 in the window, silently understating
+    // agent/workspace/fleet totals on many-small-model fleets.
+    token_cost_raw: tokenCost,
     request_count: Number.parseInt(row.request_count, 10) || 0,
     rate_source: rateSource,
     rates: appliedRates,
@@ -509,7 +530,8 @@ async function getTokenCostBreakdown(agentId, costWindow) {
   const totalTokens = models.reduce((sum, row) => sum + row.total_tokens, 0);
   const inputTokens = models.reduce((sum, row) => sum + row.input_tokens, 0);
   const outputTokens = models.reduce((sum, row) => sum + row.output_tokens, 0);
-  const tokenCost = models.reduce((sum, row) => sum + row.token_cost, 0);
+  // Sum the unrounded per-model costs; round once at the total.
+  const tokenCost = models.reduce((sum, row) => sum + (row.token_cost_raw ?? row.token_cost), 0);
 
   return {
     fallback_per_1k: fallbackPer1k,
