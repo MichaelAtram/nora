@@ -1148,11 +1148,22 @@ class K8sBackend extends ProvisionerBackend {
 
   async _waitForLoadBalancerAddress(deployName, initialService, namespace = this.namespace) {
     const deadline = Date.now() + this.loadBalancerReadyTimeoutMs;
+    const halfway = Date.now() + this.loadBalancerReadyTimeoutMs / 2;
+    let warned = false;
     let service = this._serviceObject(initialService);
 
     while (Date.now() <= deadline) {
       const address = this._loadBalancerAddress(service);
       if (address) return address;
+
+      if (!warned && Date.now() >= halfway) {
+        warned = true;
+        console.warn(
+          `[k8s] Still waiting for a LoadBalancer address for ${deployName} — ` +
+            `each agent gets its own cloud load balancer + public IP in this exposure mode, ` +
+            `so slow allocation usually means an LB/IP quota is nearly exhausted.`,
+        );
+      }
 
       await sleep(this.loadBalancerReadyIntervalMs);
       service = this._serviceObject(
@@ -1164,8 +1175,10 @@ class K8sBackend extends ProvisionerBackend {
     }
 
     throw new Error(
-      `Timed out waiting for K8s LoadBalancer address for ${deployName} after ` +
-        `${this.loadBalancerReadyTimeoutMs}ms`,
+      `Timed out waiting for a LoadBalancer address for ${deployName} after ` +
+        `${this.loadBalancerReadyTimeoutMs}ms. This cluster's exposure mode allocates one ` +
+        `cloud load balancer + public IP PER AGENT — check the provider's LB/public-IP quota, ` +
+        `or switch the cluster's exposure mode to node-port/cluster-ip in Admin → Kubernetes.`,
     );
   }
 

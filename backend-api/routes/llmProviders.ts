@@ -26,7 +26,9 @@ router.post("/", async (req, res) => {
     if (!provider || (!apiKey && provider !== "demo"))
       return res.status(400).json({ error: "provider and apiKey required" });
     const result = await llmProviders.addProvider(req.user.id, provider, apiKey, model, config);
-    syncAuthToUserAgents(req.user.id).catch(() => {});
+    syncAuthToUserAgents(req.user.id).catch((error) =>
+      console.warn("[llmProviders] Post-save auth sync failed:", error.message),
+    );
     res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -36,7 +38,9 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   try {
     const result = await llmProviders.updateProvider(req.params.id, req.user.id, req.body);
-    syncAuthToUserAgents(req.user.id).catch(() => {});
+    syncAuthToUserAgents(req.user.id).catch((error) =>
+      console.warn("[llmProviders] Post-save auth sync failed:", error.message),
+    );
     res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -46,7 +50,9 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     await llmProviders.deleteProvider(req.params.id, req.user.id);
-    syncAuthToUserAgents(req.user.id).catch(() => {});
+    syncAuthToUserAgents(req.user.id).catch((error) =>
+      console.warn("[llmProviders] Post-save auth sync failed:", error.message),
+    );
     res.json({ success: true });
   } catch (e) {
     res.status(400).json({ error: e.message });

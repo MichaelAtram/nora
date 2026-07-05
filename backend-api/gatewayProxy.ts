@@ -397,10 +397,16 @@ function buildConnectDevice(identity, role, scopes, nonce) {
 // ─── WS-RPC Connection Pool ─────────────────────────────────────
 
 class GatewayConnection {
-  constructor(host, token, port) {
+  constructor(host, token, port, { resolveHost = null, sourceHost = null } = {}) {
     this.host = host;
     this.token = token;
     this.port = port || GATEWAY_PORT;
+    // Re-resolution hook: `host` is a concrete IP resolved from the agent's
+    // service DNS at pool-creation time. On k8s a pod replacement changes the
+    // pod IP, so reconnects must re-resolve the ORIGINAL name or they hammer
+    // the dead IP until the circuit opens (~30s of 502s per pod swap).
+    this._resolveHost = typeof resolveHost === "function" ? resolveHost : null;
+    this._sourceHost = sourceHost || host;
     this.ws = null;
     this.connected = false;
     this.pending = new Map(); // id -> { resolve, reject, timer }
@@ -581,6 +587,23 @@ class GatewayConnection {
     await new Promise((r) => setTimeout(r, delay));
     this._reconnectAttempts++;
 
+    // The cached IP may belong to a replaced pod — refresh it from the
+    // original service name before dialing. Failure keeps the previous
+    // address; the connect below will fail and back off as before.
+    if (this._resolveHost) {
+      try {
+        const nextHost = await this._resolveHost();
+        if (nextHost && nextHost !== this.host) {
+          console.log(
+            `[gatewayProxy] Gateway ${this._sourceHost} re-resolved ${this.host} -> ${nextHost}`,
+          );
+          this.host = nextHost;
+        }
+      } catch {
+        // DNS not answering right now — retry with the old address.
+      }
+    }
+
     try {
       await this.connect();
       this._reconnectAttempts = 0;
@@ -679,7 +702,10 @@ async function getConnection(agent) {
   );
   // gateway_token is encrypted at rest; decrypt() is transparent to legacy
   // plaintext, so it is safe regardless of the token's storage form.
-  conn = new GatewayConnection(connectHost, decrypt(agent.gateway_token), addr.port);
+  conn = new GatewayConnection(connectHost, decrypt(agent.gateway_token), addr.port, {
+    resolveHost: () => resolveGatewayHostForProxy(addr.host, "agent gateway", extraAllowedHosts),
+    sourceHost: addr.host,
+  });
   pool.set(key, conn);
   try {
     await conn.connect();
