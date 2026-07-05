@@ -15,7 +15,10 @@ const {
   AGENT_RUNTIME_PORT,
   HERMES_DASHBOARD_PORT,
 } = require("../../../agent-runtime/lib/contracts");
-const { getHermesDockerAgentImage } = require("../../../agent-runtime/lib/agentImages");
+const {
+  getHermesDockerAgentImage,
+  getStandardDockerPackageSpec,
+} = require("../../../agent-runtime/lib/agentImages");
 const { getNemoClawDefaultModel } = require("../../../agent-runtime/lib/nemoclawDefaults");
 const {
   buildContainerBootstrap,
@@ -1868,6 +1871,24 @@ class K8sBackend extends ProvisionerBackend {
                   { name: "runtime", containerPort: HERMES_RUNTIME_PORT },
                   { name: "dashboard", containerPort: HERMES_DASHBOARD_PORT },
                 ],
+                // See the OpenClaw deployment below for probe rationale; the
+                // Hermes image boots faster (prebaked), so a shorter startup
+                // budget suffices.
+                startupProbe: {
+                  tcpSocket: { port: HERMES_RUNTIME_PORT },
+                  periodSeconds: 10,
+                  failureThreshold: 30,
+                },
+                readinessProbe: {
+                  tcpSocket: { port: HERMES_RUNTIME_PORT },
+                  periodSeconds: 10,
+                  failureThreshold: 3,
+                },
+                livenessProbe: {
+                  tcpSocket: { port: HERMES_RUNTIME_PORT },
+                  periodSeconds: 30,
+                  failureThreshold: 4,
+                },
                 resources: {
                   requests: {
                     cpu: `${(vcpu || 2) * 1000}m`,
@@ -2027,8 +2048,14 @@ class K8sBackend extends ProvisionerBackend {
     const escapedPaired = pairedJson.replace(/'/g, "'\\''");
     const runtimeBootstrapCmd = buildRuntimeBootstrapCommand();
     const templateBootstrapCmd = buildTemplatePayloadBootstrapCommand(templatePayload);
+    // Same package spec as the docker backend (OPENCLAW_DOCKER_PACKAGE /
+    // NEMOCLAW_PACKAGE env) — one fleet-wide pin knob. An unpinned @latest
+    // here is a fleet-breakage lever: every fresh pod and every crash-restart
+    // npm-installs it at boot.
+    const openclawPackageSpec = getStandardDockerPackageSpec();
+    const nemoclawPackageSpec = process.env.NEMOCLAW_PACKAGE || "nemoclaw@latest";
     const ensureOpenClawCmd = buildOpenClawInstallCommand(
-      isNemoClaw ? ["openclaw@latest", "nemoclaw@latest"] : ["openclaw@latest"],
+      isNemoClaw ? [openclawPackageSpec, nemoclawPackageSpec] : [openclawPackageSpec],
     );
     const nemoPolicyCmd = isNemoClaw
       ? `mkdir -p /opt/openclaw && echo '${JSON.stringify({
@@ -2184,6 +2211,27 @@ class K8sBackend extends ProvisionerBackend {
                   { name: "gateway", containerPort: OPENCLAW_GATEWAY_PORT },
                   { name: "runtime", containerPort: AGENT_RUNTIME_PORT },
                 ],
+                // Without probes the pod is Ready the instant /bin/sh starts —
+                // long before the gateway listens — so status() reports running
+                // prematurely and a hung gateway is never restarted. Cold boot
+                // npm-installs the runtime (minutes on a fresh node); the
+                // startup probe gives it a 10-minute budget before liveness
+                // takes over.
+                startupProbe: {
+                  tcpSocket: { port: OPENCLAW_GATEWAY_PORT },
+                  periodSeconds: 10,
+                  failureThreshold: 60,
+                },
+                readinessProbe: {
+                  tcpSocket: { port: OPENCLAW_GATEWAY_PORT },
+                  periodSeconds: 10,
+                  failureThreshold: 3,
+                },
+                livenessProbe: {
+                  tcpSocket: { port: OPENCLAW_GATEWAY_PORT },
+                  periodSeconds: 30,
+                  failureThreshold: 4,
+                },
                 resources: {
                   requests: {
                     cpu: `${(vcpu || 2) * 1000}m`,

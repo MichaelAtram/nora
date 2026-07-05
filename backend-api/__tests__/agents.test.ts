@@ -452,7 +452,7 @@ describe("GET /agents", () => {
 });
 
 describe("GET /agents/:id", () => {
-  it("preserves warning status when the container is still live", async () => {
+  it("self-heals warning status to running when the container is still live", async () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
@@ -469,7 +469,7 @@ describe("GET /agents/:id", () => {
     const res = await auth(request(app).get("/agents/a-warning"));
 
     expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty("status", "warning");
+    expect(res.body).toHaveProperty("status", "running");
   });
 
   it("reconciles warning agents to stopped when the container is no longer live", async () => {

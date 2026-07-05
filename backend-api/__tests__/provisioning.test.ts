@@ -396,6 +396,17 @@ describe("provisioning runtime/gateway contracts", () => {
         expect.objectContaining({ name: "runtime", containerPort: AGENT_RUNTIME_PORT }),
       ]),
     );
+    // Pods must not report Ready before the gateway listens; cold boot gets a
+    // startup budget so liveness can't kill the npm install.
+    expect(container.startupProbe).toEqual(
+      expect.objectContaining({ tcpSocket: { port: OPENCLAW_GATEWAY_PORT } }),
+    );
+    expect(container.readinessProbe).toEqual(
+      expect.objectContaining({ tcpSocket: { port: OPENCLAW_GATEWAY_PORT } }),
+    );
+    expect(container.livenessProbe).toEqual(
+      expect.objectContaining({ tcpSocket: { port: OPENCLAW_GATEWAY_PORT } }),
+    );
     expect(service.spec.ports).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
