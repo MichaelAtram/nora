@@ -44,14 +44,18 @@ function normalizeSavedSkillEntries(entries = []) {
 
 function computeMissingSavedSkills(savedSkills = [], installedSkills = []) {
   const normalizedSaved = normalizeSavedSkillEntries(savedSkills);
-  const installedSlugs = new Set(normalizeInstalledSkillEntries(installedSkills).map((entry) => entry.slug));
+  const installedSlugs = new Set(
+    normalizeInstalledSkillEntries(installedSkills).map((entry) => entry.slug),
+  );
   return normalizedSaved.filter((entry) => !installedSlugs.has(entry.installSlug));
 }
 
 function computeOrphanedInstalledSkills(savedSkills = [], installedSkills = []) {
   const normalizedSaved = normalizeSavedSkillEntries(savedSkills);
   const savedSlugs = new Set(normalizedSaved.map((entry) => entry.installSlug));
-  return normalizeInstalledSkillEntries(installedSkills).filter((entry) => !savedSlugs.has(entry.slug));
+  return normalizeInstalledSkillEntries(installedSkills).filter(
+    (entry) => !savedSlugs.has(entry.slug),
+  );
 }
 
 function removeSavedSkillEntry(entries = [], slug, author = "") {
@@ -91,13 +95,14 @@ function mergeClawhubSkillState(savedSkills = [], installedSkills = [], pendingJ
       author: saved.author,
       pagePath: saved.pagePath,
       installedAt: saved.installedAt || null,
-      status: pending?.operation === "delete"
-        ? "pending_delete"
-        : pending?.operation === "install"
-          ? "pending_install"
-          : installed
-            ? "healthy"
-            : "missing_runtime",
+      status:
+        pending?.operation === "delete"
+          ? "pending_delete"
+          : pending?.operation === "install"
+            ? "pending_install"
+            : installed
+              ? "healthy"
+              : "missing_runtime",
     });
     installedBySlug.delete(saved.installSlug);
   }
