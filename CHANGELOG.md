@@ -4,6 +4,36 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.15.0](https://github.com/solomon2773/nora/releases/tag/v1.15.0) — 2026-07-06
+
+Reliability release: durability and honesty hardening across Kubernetes, Docker,
+integrations, channels, the gateway, and the cost dashboard, plus durable OpenClaw
+channel state.
+
+### Added
+
+- Durable OpenClaw channel configuration: channel state is persisted and reseeded on
+  provision instead of living only in the runtime, so channel credentials survive pod
+  rollouts and re-provisioning. (#263)
+
+### Fixed
+
+- Kubernetes and Docker agent state is now durable across restarts, MCP works on
+  Kubernetes, and env-secret handling was tightened. (#261)
+- Integration credential trust: dead OAuth tokens are surfaced instead of silently
+  failing, env is durable, and webhooks are retryable. (#262)
+- Kubernetes boot hardening: pinnable OpenClaw package, pod probes, and honest agent
+  status reporting. (#265)
+- Gateway re-resolves DNS on reconnect, credentials are auto-tested, and load-balancer
+  waits are informative. (#266)
+- Cost dashboard honesty: per-period budget alerts, current rates, and no rounding or
+  cache-driven loss. (#266)
+
+### Changed
+
+- Repository-wide Prettier/ESLint drift cleanup so the changed-files CI stays green.
+  (#264, #267)
+
 ## [v1.14.2](https://github.com/solomon2773/nora/releases/tag/v1.14.2) — 2026-07-04
 
 Patch release: OpenClaw ≥2026.6 auth fix for custom providers (Microsoft Foundry).
