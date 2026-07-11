@@ -26,6 +26,20 @@ Or in any MCP client's JSON config:
 }
 ```
 
+### Docker
+
+Build the same stdio server as a non-root container:
+
+```bash
+docker build -t nora-mcp ./mcp-server
+docker run --rm -i \
+  -e NORA_API_URL=https://nora.example.com \
+  -e NORA_API_KEY=nora_xxxxxxxx \
+  nora-mcp
+```
+
+MCP clients should keep stdin open and pass secrets through environment variables; the image does not persist credentials or other state.
+
 ## Auth
 
 Uses Nora workspace API keys (create one under Workspace → API Keys). Scopes apply unchanged:
