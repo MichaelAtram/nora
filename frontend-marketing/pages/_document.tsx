@@ -22,22 +22,24 @@ export default class MarketingDocument extends Document {
           {/* Default social share metadata (pages may override og:title/description) */}
           <meta property="og:type" content="website" />
           <meta property="og:site_name" content="Nora" />
-          <meta property="og:title" content="Nora — Deploy intelligence anywhere." />
+          <meta property="og:title" content="Nora — Self-hosted OpenClaw & Hermes control plane" />
           <meta
             property="og:description"
-            content="Self-hosted AI agent ops platform. Deploy, observe, and operate OpenClaw and Hermes agent runtimes across Docker, Kubernetes, and Proxmox. Open source, Apache-2.0."
+            content="Deploy, monitor, and operate OpenClaw and Hermes AI agent fleets on Docker or Kubernetes with Nora's open-source control plane, REST API, CLI, and MCP server."
           />
-          <meta property="og:url" content="https://nora.solomontsao.com" />
+          <meta property="og:url" content="https://nora.solomontsao.com/" />
           <meta property="og:image" content="https://nora.solomontsao.com/og-image.png" />
           <meta property="og:image:width" content="1200" />
           <meta property="og:image:height" content="630" />
+          <meta property="og:image:alt" content="Nora self-hosted AI agent control plane" />
           <meta name="twitter:card" content="summary_large_image" />
-          <meta name="twitter:title" content="Nora — Deploy intelligence anywhere." />
+          <meta name="twitter:title" content="Nora — Self-hosted OpenClaw & Hermes control plane" />
           <meta
             name="twitter:description"
-            content="Self-hosted AI agent ops platform. Open source, Apache-2.0."
+            content="Deploy and operate OpenClaw and Hermes fleets on Docker or Kubernetes with Nora's open-source control plane."
           />
           <meta name="twitter:image" content="https://nora.solomontsao.com/og-image.png" />
+          <meta name="twitter:image:alt" content="Nora self-hosted AI agent control plane" />
         </Head>
         <body>
           <Main />

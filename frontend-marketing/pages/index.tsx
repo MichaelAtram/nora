@@ -28,6 +28,24 @@ const RAW_REPO_BASE_URL = "https://raw.githubusercontent.com/solomon2773/nora/ma
 const SETUP_SH_URL = `${RAW_REPO_BASE_URL}/setup.sh`;
 const SETUP_PS1_URL = `${RAW_REPO_BASE_URL}/setup.ps1`;
 const LATEST_VERSION = "v1.15.0";
+const SITE_URL = "https://nora.solomontsao.com/";
+const SEO_TITLE = "Nora — Self-hosted OpenClaw & Hermes control plane";
+const SEO_DESCRIPTION =
+  "Deploy, monitor, and operate OpenClaw and Hermes AI agent fleets on Docker or Kubernetes with Nora's open-source control plane, REST API, CLI, and MCP server.";
+const HOMEPAGE_STRUCTURED_DATA = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: "Nora",
+  description: SEO_DESCRIPTION,
+  url: SITE_URL,
+  codeRepository: OSS_REPO_URL,
+  downloadUrl: `${OSS_REPO_URL}/releases/latest`,
+  softwareVersion: LATEST_VERSION.slice(1),
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: "Linux, macOS, Windows",
+  license: "https://www.apache.org/licenses/LICENSE-2.0",
+  isAccessibleForFree: true,
+};
 
 const TRUST_ITEMS = [
   {
@@ -137,10 +155,16 @@ export default function Home() {
   return (
     <>
       <Head>
-        <title>Nora | Deploy intelligence anywhere.</title>
+        <title>{SEO_TITLE}</title>
+        <meta name="description" content={SEO_DESCRIPTION} />
         <meta
-          name="description"
-          content="Nora helps teams deploy, observe, and operate OpenClaw and Hermes agent runtimes. Create an account, inspect the public repo, self-host it, and use it commercially under Apache 2.0."
+          name="robots"
+          content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1"
+        />
+        <link rel="canonical" href={SITE_URL} />
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(HOMEPAGE_STRUCTURED_DATA) }}
         />
       </Head>
 
