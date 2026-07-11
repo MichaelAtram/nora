@@ -105,6 +105,18 @@ Most teams running agents in production eventually rebuild the same layer around
 curl -fsSL https://raw.githubusercontent.com/solomon2773/nora/master/setup.sh | bash
 ```
 
+<details>
+<summary><strong>Prefer to inspect the installer first?</strong></summary>
+
+```bash
+git clone https://github.com/solomon2773/nora.git
+cd nora
+less setup.sh
+bash setup.sh
+```
+
+</details>
+
 **Windows (PowerShell):**
 
 ```powershell
@@ -122,6 +134,8 @@ helm show chart oci://ghcr.io/solomon2773/nora --version 0.6.0
 The public OCI chart installs the full Nora control plane. See the [Helm instructions](https://noradocs.solomontsao.com/self-hosting#kubernetes-helm) for the required secrets and Ingress options.
 
 The installer verifies prerequisites, generates or preserves secrets, optionally creates a bootstrap admin, picks free local ports when the defaults are busy, and starts the stack. Once it finishes, open the URL printed by setup. Local mode defaults to `http://localhost:8080`, but setup may select another port such as `8081` on a busy workstation. Then follow the [first-15-minutes walkthrough](https://noradocs.solomontsao.com/quickstart).
+
+> **No API key yet?** After signup, choose **Try the demo agent** on the Getting Started page. Nora deploys a working agent against its built-in deterministic demo provider, so you can validate chat and the operator workflow with zero keys and zero cost.
 
 For manual setup, environment variables, public-domain mode, TLS, Kubernetes, NemoClaw, and planned Proxmox configuration, see the docs:
 

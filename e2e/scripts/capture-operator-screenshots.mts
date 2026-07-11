@@ -1834,7 +1834,11 @@ function buildSeedSql({ operatorUser, adminUser, communityUser }) {
   ];
 
   return `
-UPDATE users SET name = ${sqlLiteral(ACCOUNTS.operator.name)}, role = 'user' WHERE id = ${sqlLiteral(operatorId)};
+UPDATE users
+   SET name = ${sqlLiteral(ACCOUNTS.operator.name)},
+       role = 'user',
+       agent_limit_override = 10
+ WHERE id = ${sqlLiteral(operatorId)};
 UPDATE users SET name = ${sqlLiteral(ACCOUNTS.admin.name)}, role = 'admin' WHERE id = ${sqlLiteral(adminId)};
 UPDATE users SET name = ${sqlLiteral(ACCOUNTS.community.name)}, role = 'user' WHERE id = ${sqlLiteral(communityId)};
 
