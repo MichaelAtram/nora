@@ -34,12 +34,12 @@
 ---
 
 <p align="center">
-  <a href="https://github.com/solomon2773/nora/raw/master/.github/readme-assets/walkthrough.mp4">
+  <a href="https://nora.solomontsao.com/walkthrough.mp4">
     <img src=".github/readme-assets/walkthrough.gif" alt="Watch the Nora walkthrough" width="900" />
   </a>
 </p>
 <p align="center">
-  <sub>▶ <b><a href="https://github.com/solomon2773/nora/raw/master/.github/readme-assets/walkthrough.mp4">Watch the walkthrough</a></b></sub>
+  <sub>▶ <b><a href="https://nora.solomontsao.com/walkthrough.mp4">Watch the walkthrough</a></b></sub>
 </p>
 
 ## What Is Nora?

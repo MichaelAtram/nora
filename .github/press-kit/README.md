@@ -85,7 +85,7 @@ Product screenshots (12, operator + admin surfaces) live in
 [`../readme-assets/`](../readme-assets) — e.g. `proof-operator-dashboard.png`,
 `proof-operator-deploy-flow.png`, `proof-operator-fleet.png`, `proof-admin-agent-hub.png`.
 
-Demo video: [60-second walkthrough (MP4)](https://github.com/solomon2773/nora/raw/master/.github/readme-assets/walkthrough.mp4)
+Demo video: [60-second walkthrough (MP4)](https://nora.solomontsao.com/walkthrough.mp4)
 
 ## Color palette
 

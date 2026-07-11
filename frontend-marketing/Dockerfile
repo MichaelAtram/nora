@@ -8,6 +8,7 @@ WORKDIR /app
 COPY tsconfig.base.json /tsconfig.base.json
 COPY --from=deps /app/node_modules ./node_modules
 COPY frontend-marketing/ ./
+COPY .github/readme-assets/walkthrough.mp4 ./public/walkthrough.mp4
 RUN npm run build
 
 FROM node:24-alpine AS runner
