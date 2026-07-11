@@ -135,6 +135,7 @@ test("the HTTP client sends bearer auth and parses JSON for a valid path", async
   const fetchImpl = async (url, opts) => {
     seen.url = url.toString();
     seen.auth = opts.headers.Authorization;
+    seen.userAgent = opts.headers["User-Agent"];
     return { ok: true, status: 200, text: async () => JSON.stringify({ id: AID }) };
   };
   const api = createApi({ baseUrl: "https://nora.example.com", apiKey: "nora_test", fetchImpl });
@@ -142,6 +143,7 @@ test("the HTTP client sends bearer auth and parses JSON for a valid path", async
   assert.deepEqual(body, { id: AID });
   assert.equal(seen.url, `https://nora.example.com/api/agents/${AID}`);
   assert.equal(seen.auth, "Bearer nora_test");
+  assert.equal(seen.userAgent, "nora-mcp-server/0.1.3");
 });
 
 test("per-agent observability tools use the /api/agents/:id paths", async () => {

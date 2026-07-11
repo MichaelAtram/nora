@@ -18,7 +18,7 @@
   "mcpServers": {
     "nora": {
       "command": "npx",
-      "args": ["-y", "@noraai/mcp-server@0.1.2"]
+      "args": ["-y", "@noraai/mcp-server@0.1.3"]
     }
   }
 }
