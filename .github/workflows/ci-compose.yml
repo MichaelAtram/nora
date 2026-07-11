@@ -7,6 +7,7 @@ on:
       - ".github/workflows/ci-compose.yml"
       - ".github/workflows/deploy-production.yml"
       - ".github/workflows/release-docker.yml"
+      - ".github/workflows/release-helm.yml"
       - ".github/workflows/scripts/require-workflow-success.mjs"
       - "docker-compose.yml"
       - "docker-compose.e2e.yml"
@@ -20,6 +21,7 @@ on:
       - "workers/provisioner/**"
       - "mcp-server/**"
       - "e2e/**"
+      - "infra/helm/nora/**"
   push:
     branches:
       - master

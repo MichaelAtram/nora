@@ -7,6 +7,7 @@ on:
       - ".github/workflows/ci-quality.yml"
       - ".github/workflows/deploy-production.yml"
       - ".github/workflows/release-docker.yml"
+      - ".github/workflows/release-helm.yml"
       - ".github/workflows/scripts/**"
       - ".prettierignore"
       - ".prettierrc.json"
@@ -23,6 +24,7 @@ on:
       - "e2e/**"
       - "mcp-server/**"
       - "cli/**"
+      - "infra/helm/nora/**"
   push:
     branches:
       - master
