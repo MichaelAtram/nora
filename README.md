@@ -113,6 +113,14 @@ iwr -useb https://raw.githubusercontent.com/solomon2773/nora/master/setup.ps1 | 
 
 > **Windows requires [PowerShell 7+](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows).** The default Windows PowerShell 5.1 is not supported — run the command above from a `pwsh` 7 session.
 
+**Kubernetes (Helm):**
+
+```bash
+helm show chart oci://ghcr.io/solomon2773/nora --version 0.6.0
+```
+
+The public OCI chart installs the full Nora control plane. See the [Helm instructions](https://noradocs.solomontsao.com/self-hosting#kubernetes-helm) for the required secrets and Ingress options.
+
 The installer verifies prerequisites, generates or preserves secrets, optionally creates a bootstrap admin, picks free local ports when the defaults are busy, and starts the stack. Once it finishes, open the URL printed by setup. Local mode defaults to `http://localhost:8080`, but setup may select another port such as `8081` on a busy workstation. Then follow the [first-15-minutes walkthrough](https://noradocs.solomontsao.com/quickstart).
 
 For manual setup, environment variables, public-domain mode, TLS, Kubernetes, NemoClaw, and planned Proxmox configuration, see the docs:
