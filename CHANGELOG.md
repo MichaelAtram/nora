@@ -12,22 +12,26 @@ channel state.
 
 ### Added
 
-- Durable OpenClaw channel configuration: channel state is persisted and reseeded on
-  provision instead of living only in the runtime, so channel credentials survive pod
-  rollouts and re-provisioning. (#263)
+- Durable OpenClaw channel configuration: token- and configuration-backed settings are
+  persisted and reseeded on provision; QR-linked device sessions still need to be
+  re-paired after a rebuild. (#263)
 
 ### Fixed
 
-- Kubernetes and Docker agent state is now durable across restarts, MCP works on
-  Kubernetes, and env-secret handling was tightened. (#261)
-- Integration credential trust: dead OAuth tokens are surfaced instead of silently
-  failing, env is durable, and webhooks are retryable. (#262)
-- Kubernetes boot hardening: pinnable OpenClaw package, pod probes, and honest agent
-  status reporting. (#265)
-- Gateway re-resolves DNS on reconnect, credentials are auto-tested, and load-balancer
-  waits are informative. (#266)
-- Cost dashboard honesty: per-period budget alerts, current rates, and no rounding or
-  cache-driven loss. (#266)
+- Newly deployed or redeployed agents receive durable Docker and Kubernetes runtime
+  storage; existing agents pick it up on their next redeploy. MCP now works on
+  Kubernetes, and sensitive environment values use Secrets. (#261)
+- Integration credential trust: definitive Twitter and LinkedIn OAuth rejections surface
+  `needs_reconnect`, integration environment variables are projected into Kubernetes
+  Deployments, and runtime-forward webhook failures return 503 so providers can retry.
+  (#262)
+- Kubernetes boot hardening: pinnable OpenClaw package, startup/readiness/liveness
+  probes, and status recovery once a runtime is demonstrably live. (#265)
+- Gateway reconnects re-resolve service DNS, new or replaced integrations receive
+  non-blocking connectivity tests, and load-balancer waits produce actionable warnings.
+  (#266)
+- Cost dashboard honesty: budget alerts use each budget period, totals round once, and
+  Anthropic cache tokens count toward usage. (#266)
 
 ### Changed
 
