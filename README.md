@@ -1,30 +1,34 @@
 <div align="center">
   <img src=".github/readme-assets/nora-logo.png" alt="Nora" width="112" height="112" />
   <h1>Nora</h1>
-  <p><strong>Deploy &amp; operate AI agent fleets on infrastructure you control.</strong></p>
-  <p>
-    The self-hosted, runtime-neutral control plane for OpenClaw and Hermes agents — deploy, monitor, and operate them from one operator surface, Apache 2.0. Run on Docker or Kubernetes today, use NemoClaw sandboxes experimentally, and track Proxmox as a planned execution target.
-  </p>
+  <p><strong>Run OpenClaw and Hermes fleets on your own infrastructure — from one control plane.</strong></p>
 </div>
+
+<p align="center">
+  <strong>OpenClaw + Hermes</strong>&nbsp;&nbsp;·&nbsp;&nbsp;
+  <strong>Docker + Kubernetes GA</strong>&nbsp;&nbsp;·&nbsp;&nbsp;
+  <strong>69 integrations</strong>&nbsp;&nbsp;·&nbsp;&nbsp;
+  <strong>Apache-2.0</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/solomon2773/nora"><img src="https://img.shields.io/badge/%E2%98%85-Star_Nora-f2d7a1?style=for-the-badge&amp;labelColor=071018" alt="Star Nora on GitHub" /></a>
+  <a href="https://noradocs.solomontsao.com/quickstart"><img src="https://img.shields.io/badge/%E2%86%92-Quick_Start-8ae6ff?style=for-the-badge&amp;labelColor=071018" alt="Quick Start" /></a>
+</p>
 
 <p align="center">
   <a href="https://github.com/solomon2773/nora/releases"><img src="https://img.shields.io/github/v/release/solomon2773/nora?color=6d28d9&label=release" alt="Latest release" /></a>
   <a href="https://github.com/solomon2773/nora/actions/workflows/ci-quality.yml"><img src="https://img.shields.io/github/actions/workflow/status/solomon2773/nora/ci-quality.yml?branch=master&label=CI" alt="CI status" /></a>
   <a href="https://www.npmjs.com/package/@noraai/cli"><img src="https://img.shields.io/npm/v/%40noraai%2Fcli?label=%40noraai%2Fcli&color=cb3837" alt="@noraai/cli on npm" /></a>
   <a href="https://www.npmjs.com/package/@noraai/mcp-server"><img src="https://img.shields.io/npm/v/%40noraai%2Fmcp-server?label=%40noraai%2Fmcp-server&color=cb3837" alt="@noraai/mcp-server on npm" /></a>
-  <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License" />
-  <img src="https://img.shields.io/badge/node-%3E%3D24-brightgreen.svg" alt="Node" />
 </p>
 
 <p align="center">
   <a href="https://noradocs.solomontsao.com">📚 Documentation</a> ·
-  <a href="https://noradocs.solomontsao.com/quickstart">Quick Start</a> ·
   <a href="https://noradocs.solomontsao.com/self-hosting">Self-Hosting</a> ·
   <a href="https://noradocs.solomontsao.com/concepts/architecture">Architecture</a> ·
   <a href="https://noradocs.solomontsao.com/compare">How Nora Compares</a> ·
-  <a href="CHANGELOG.md">Changelog</a> ·
-  <a href="https://nora.solomontsao.com">Public Site</a> ·
-  <a href="https://nora.solomontsao.com/signup">Create Account</a>
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 ---
@@ -75,12 +79,18 @@ Most teams running agents in production eventually rebuild the same layer around
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src=".github/readme-assets/proof-operator-deploy-flow.png" alt="Agent deploy flow" /><br />
-      <sub><b>Agent deploy flow</b></sub>
+      <img src=".github/readme-assets/proof-operator-openclaw-ui-tab.png" alt="Embedded OpenClaw gateway UI" /><br />
+      <sub><b>OpenClaw gateway embedded in Nora</b></sub>
     </td>
     <td align="center" width="50%">
-      <img src=".github/readme-assets/proof-operator-openclaw-ui-tab.png" alt="Embedded OpenClaw gateway UI" /><br />
-      <sub><b>Embedded OpenClaw gateway UI</b></sub>
+      <img src=".github/readme-assets/proof-operator-hermes-webui-tab.png" alt="Embedded Hermes WebUI" /><br />
+      <sub><b>Hermes WebUI embedded in Nora</b></sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <img src=".github/readme-assets/proof-operator-deploy-flow.png" alt="Agent deploy flow" /><br />
+      <sub><b>Agent deploy flow</b></sub>
     </td>
   </tr>
 </table>
