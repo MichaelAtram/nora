@@ -61,7 +61,7 @@ Most teams running agents in production eventually rebuild the same layer around
 - **Network isolation** — baseline Kubernetes NetworkPolicy ingress isolation with admin-managed CIDR allow rules, and an experimental NemoClaw hardened sandbox for untrusted code.
 - **Agent Hub** — installable, versioned starter templates to go from zero to a working agent fast.
 - **Integrations** — 69 integration providers (source control, chat, cloud, observability, vector DBs, automation) and 17+ LLM providers; expose connected integrations to agents as per-agent MCP servers.
-- **Automate everything** — a public REST API (OpenAPI 3.1), the `@noraai/cli`, and the `@noraai/mcp-server` for Claude Code, Claude Desktop, and Cursor.
+- **Automate everything** — a public REST API (OpenAPI 3.1), the `@noraai/cli`, and the `@noraai/mcp-server` for Claude Code, Gemini CLI, Claude Desktop, and Cursor.
 - **Workspaces & RBAC** — multi-tenant workspaces with ranked roles, a platform admin surface, account event history, and encrypted managed backups.
 
 ## Screenshots
@@ -200,7 +200,7 @@ curl -H "Authorization: Bearer $NORA_TOKEN" https://your-nora.example.com/api/ag
 
 A small CLI lives in [`cli/`](./cli) (`@noraai/cli`): run `nora login` once to save your host and API token, then `nora workspaces`, `nora agents`, and `nora monitoring` wrap the same REST surface. `nora doctor` runs an admin-only control-plane health check, and `nora mcp` launches the MCP stdio server. See the [API reference](https://noradocs.solomontsao.com/api/overview) for the supported endpoints and scopes.
 
-**Operate Nora from Claude Code, Claude Desktop, or Cursor:** the [`mcp-server/`](./mcp-server) package (`@noraai/mcp-server`) exposes the same API as [Model Context Protocol](https://modelcontextprotocol.io) tools — deploy agents, control their lifecycle, and read fleet metrics, events, and per-agent cost from any MCP client. Destructive deletion stays disabled unless explicitly opted in.
+**Operate Nora from Claude Code, Gemini CLI, Claude Desktop, or Cursor:** the [`mcp-server/`](./mcp-server) package (`@noraai/mcp-server`) exposes the same API as [Model Context Protocol](https://modelcontextprotocol.io) tools — deploy agents, control their lifecycle, and read fleet metrics, events, and per-agent cost from any MCP client. Destructive deletion stays disabled unless explicitly opted in.
 
 ```bash
 claude mcp add nora \
@@ -209,11 +209,17 @@ claude mcp add nora \
   -- npx -y @noraai/mcp-server
 ```
 
-See the [MCP guide](https://noradocs.solomontsao.com/guides/mcp-server) for Claude Desktop/Cursor config, the tool list, and security notes.
+Gemini CLI users can install the repository extension directly. The installer prompts for the Nora API URL and stores the workspace API key as a sensitive extension setting:
+
+```bash
+gemini extensions install https://github.com/solomon2773/nora
+```
+
+See the [MCP guide](https://noradocs.solomontsao.com/guides/mcp-server) for Gemini CLI, Claude Desktop, and Cursor configuration, the tool list, and security notes.
 
 ## Standards & isolation
 
-- **MCP — shipped.** A control-plane [MCP](https://modelcontextprotocol.io) server (`@noraai/mcp-server`, published to the official [MCP Registry](https://github.com/modelcontextprotocol/registry)) plus per-agent MCP server management — operate the fleet from Claude Code / Desktop / Cursor, and wire MCP tools into individual agents.
+- **MCP — shipped.** A control-plane [MCP](https://modelcontextprotocol.io) server (`@noraai/mcp-server`, published to the official [MCP Registry](https://github.com/modelcontextprotocol/registry)) plus per-agent MCP server management — operate the fleet from Claude Code, Gemini CLI, Claude Desktop, or Cursor, and wire MCP tools into individual agents.
 - **OpenTelemetry GenAI — available.** [OTLP + Prometheus export](https://noradocs.solomontsao.com/guides/opentelemetry) of runtime telemetry under the `gen_ai.*` semantic conventions — per-exchange chat spans plus token/cost/resource metrics flow into the Grafana / Datadog / Langfuse stack you already run. (Per-tool-call sub-spans depend on runtime event streams and remain on the roadmap.)
 - **A2A — on the roadmap.** Agent Cards / Agent-to-Agent discovery for managed OpenClaw and Hermes agents.
 - **Isolation, per deploy target.** Standard Docker and Kubernetes runs use container namespaces plus operator-set CPU / RAM / disk limits; the experimental **NemoClaw** profile hardens untrusted code with a non-root user, all Linux capabilities dropped, `no-new-privileges`, Landlock + seccomp, and default-deny egress; Proxmox VM placement (planned) is the future hardware-isolation tier. See the [isolation model](https://noradocs.solomontsao.com/concepts/security#runtime-isolation).
