@@ -45,6 +45,8 @@ Tool output is the raw Nora REST JSON; the server is a pure API client and store
 
 Full guide: [noradocs.solomontsao.com/guides/mcp-server](https://noradocs.solomontsao.com/guides/mcp-server)
 
+If Nora is useful to you, a ⭐ on the [GitHub repo](https://github.com/solomon2773/nora) helps other self-hosters find it.
+
 ## License
 
 Apache-2.0
