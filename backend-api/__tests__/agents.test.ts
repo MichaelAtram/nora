@@ -9,10 +9,16 @@ const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
 process.env.JWT_SECRET = JWT_SECRET;
 
-const mockDb = { query: jest.fn() };
+const mockDbClient = { query: jest.fn(), release: jest.fn() };
+const mockDb = { query: jest.fn(), connect: jest.fn() };
 const mockAddDeploymentJob = jest.fn();
+const mockCancelDeploymentJobsForAgent = jest.fn();
+const mockEnsureDemoProvider = jest.fn();
+const mockDockerPing = jest.fn((callback) => callback(null));
+const mockDockerInspect = jest.fn();
 const mockStats = jest.fn();
 const mockSyncAuthToUserAgents = jest.fn().mockResolvedValue([]);
+const mockPersistLifecycleRuntimeAddress = jest.fn();
 const mockRunContainerCommand = jest.fn();
 const mockListHermesChannels = jest.fn();
 const mockSaveHermesChannel = jest.fn();
@@ -63,6 +69,12 @@ const mockGetDeploymentDefaults = jest.fn().mockResolvedValue({
 const mockGetAgentHubSourceApiKey = jest.fn().mockResolvedValue("nora_hub_test_key");
 const mockAssertKubernetesExecutionTargetAvailable = jest.fn().mockResolvedValue();
 jest.mock("../db", () => mockDb);
+jest.mock("dockerode", () =>
+  jest.fn().mockImplementation(() => ({
+    ping: mockDockerPing,
+    getContainer: jest.fn(() => ({ inspect: mockDockerInspect })),
+  })),
+);
 // Marked, transparent crypto so we can assert gateway_token is encrypted on
 // write (enc(...) wrapper) while legacy/plaintext values still pass through
 // decrypt unchanged — keeping every existing plaintext-token assertion valid.
@@ -75,6 +87,7 @@ jest.mock("../crypto", () => ({
 }));
 jest.mock("../redisQueue", () => ({
   addDeploymentJob: mockAddDeploymentJob,
+  cancelDeploymentJobsForAgent: mockCancelDeploymentJobsForAgent,
   getDLQJobs: jest.fn(),
   retryDLQJob: jest.fn(),
 }));
@@ -90,6 +103,10 @@ jest.mock("../containerManager", () => ({
   stop: jest.fn().mockResolvedValue({}),
   restart: jest.fn().mockResolvedValue({}),
   destroy: jest.fn().mockResolvedValue({}),
+  persistLifecycleRuntimeAddress: mockPersistLifecycleRuntimeAddress,
+  isIgnorableStopError: jest.fn((error) =>
+    /already stopped|not running/i.test(String(error?.message || "")),
+  ),
   canMutate: jest.fn(
     (agent) =>
       Boolean(agent?.container_id) ||
@@ -198,6 +215,8 @@ jest.mock("../llmProviders", () => ({
   getAvailableProviders: jest.fn().mockReturnValue([]),
   listProviders: jest.fn().mockResolvedValue([]),
   addProvider: jest.fn(),
+  ensureDemoProvider: mockEnsureDemoProvider,
+  providerMutationLockKey: jest.fn((userId) => `nora:llm-providers:${userId}`),
   updateProvider: jest.fn(),
   deleteProvider: jest.fn(),
   getProviderKeys: jest.fn().mockResolvedValue([]),
@@ -335,8 +354,27 @@ function createMockFetchResponse({ ok = true, status = 200, body = {}, headers =
 beforeEach(() => {
   jest.clearAllMocks();
   mockDb.query.mockReset();
+  mockDb.connect.mockReset().mockResolvedValue(mockDbClient);
+  mockDbClient.query.mockReset().mockResolvedValue({ rows: [] });
+  mockDbClient.release.mockReset();
   mockAddDeploymentJob.mockReset();
+  mockCancelDeploymentJobsForAgent.mockReset().mockResolvedValue({ removed: 0, active: 0 });
+  mockEnsureDemoProvider.mockReset().mockResolvedValue({
+    id: "provider-demo",
+    provider: "demo",
+    model: "nora-demo-1",
+    is_default: true,
+  });
+  mockDockerPing.mockReset().mockImplementation((callback) => callback(null));
+  mockDockerInspect.mockReset();
   mockSyncAuthToUserAgents.mockReset().mockResolvedValue([]);
+  mockPersistLifecycleRuntimeAddress.mockReset().mockImplementation(async (_db, agent, result) => {
+    const host = typeof result?.host === "string" ? result.host.trim() : "";
+    const runtimeHost = typeof result?.runtimeHost === "string" ? result.runtimeHost.trim() : host;
+    if (host) agent.host = host;
+    if (runtimeHost) agent.runtime_host = runtimeHost;
+    return agent;
+  });
   mockRunContainerCommand.mockReset();
   mockListHermesChannels.mockReset().mockResolvedValue({
     channels: [],
@@ -1833,6 +1871,91 @@ describe("agent audit logging", () => {
   });
 });
 
+describe("agent lifecycle address persistence", () => {
+  it("persists a refreshed runtime address before start auth sync", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.start.mockResolvedValueOnce({
+      host: "10.20.30.41",
+      runtimeHost: "10.20.30.41",
+    });
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-address",
+            name: "Start Address Agent",
+            user_id: "user-1",
+            backend_type: "proxmox",
+            container_id: "201",
+            host: "10.20.30.10",
+            runtime_host: "10.20.30.10",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-address",
+            name: "Start Address Agent",
+            user_id: "user-1",
+            backend_type: "proxmox",
+            container_id: "201",
+            status: "running",
+            host: "10.20.30.41",
+            runtime_host: "10.20.30.41",
+          },
+        ],
+      });
+
+    const res = await auth(request(app).post("/agents/agent-start-address/start"));
+
+    expect(res.status).toBe(200);
+    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ id: "agent-start-address" }),
+      { host: "10.20.30.41", runtimeHost: "10.20.30.41" },
+    );
+    expect(res.body).toEqual(
+      expect.objectContaining({ host: "10.20.30.41", runtime_host: "10.20.30.41" }),
+    );
+    expect(mockPersistLifecycleRuntimeAddress.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSyncAuthToUserAgents.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("persists a refreshed runtime address after restart", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.restart.mockResolvedValueOnce({
+      host: "10.20.30.42",
+      runtimeHost: "10.20.30.42",
+    });
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-restart-address",
+            name: "Restart Address Agent",
+            user_id: "user-1",
+            backend_type: "proxmox",
+            container_id: "202",
+            host: "10.20.30.11",
+            runtime_host: "10.20.30.11",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(request(app).post("/agents/agent-restart-address/restart"));
+
+    expect(res.status).toBe(200);
+    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ id: "agent-restart-address" }),
+      { host: "10.20.30.42", runtimeHost: "10.20.30.42" },
+    );
+  });
+});
+
 describe("GET /agents/:id/stats", () => {
   it("returns normalized live stats with derived rate fields", async () => {
     mockDb.query
@@ -2215,6 +2338,371 @@ describe("POST /agents/adopt (external runtime)", () => {
     );
     expect(res.status).toBe(402);
     expect(mockDb.query).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /agents/activate-demo", () => {
+  it("serializes concurrent activation requests and returns one demo agent", async () => {
+    let locked = false;
+    const waiters = [];
+    let persistedAgent = null;
+    const clients = [];
+
+    async function acquireLock() {
+      if (!locked) {
+        locked = true;
+        return;
+      }
+      await new Promise((resolve) => waiters.push(resolve));
+    }
+
+    function releaseLock() {
+      const next = waiters.shift();
+      if (next) next();
+      else locked = false;
+    }
+
+    mockDb.connect.mockImplementation(async () => {
+      const client = {
+        release: jest.fn(),
+        query: jest.fn(async (sql, params) => {
+          if (sql.includes("pg_advisory_lock")) {
+            await acquireLock();
+            return { rows: [] };
+          }
+          if (sql.includes("pg_advisory_unlock")) {
+            releaseLock();
+            return { rows: [] };
+          }
+          if (sql.includes("FROM agents") && sql.includes("template_payload @>")) {
+            return { rows: persistedAgent ? [persistedAgent] : [] };
+          }
+          if (sql.includes("INSERT INTO agents")) {
+            await new Promise((resolve) => setImmediate(resolve));
+            persistedAgent = {
+              id: "agent-demo",
+              user_id: "user-1",
+              name: "Demo Agent",
+              status: "queued",
+              backend_type: "docker",
+              sandbox_type: "standard",
+              runtime_family: "openclaw",
+              deploy_target: "docker",
+              execution_target_id: "docker",
+              sandbox_profile: "standard",
+              container_name: params[8],
+              image: params[9],
+              created_at: "2026-07-12T00:00:00.000Z",
+            };
+            return { rows: [persistedAgent] };
+          }
+          return { rows: [] };
+        }),
+      };
+      clients.push(client);
+      return client;
+    });
+    mockAddDeploymentJob.mockResolvedValue(undefined);
+
+    const [first, second] = await Promise.all([
+      auth(request(app).post("/agents/activate-demo").send({})),
+      auth(request(app).post("/agents/activate-demo").send({})),
+    ]);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.id).toBe("agent-demo");
+    expect(second.body.id).toBe("agent-demo");
+    expect(mockAddDeploymentJob).toHaveBeenCalledTimes(2);
+    for (const [payload, options] of mockAddDeploymentJob.mock.calls) {
+      expect(payload).toEqual(
+        expect.objectContaining({
+          id: "agent-demo",
+          backend: "docker",
+          execution_target_id: "docker",
+          sandbox: "standard",
+          llm_provider_id: "provider-demo",
+        }),
+      );
+      expect(options).toEqual({ jobId: "demo-activation-agent-demo" });
+    }
+    expect(mockDockerPing).toHaveBeenCalledTimes(2);
+    const insertCalls = clients
+      .flatMap((client) => client.query.mock.calls)
+      .filter(([sql]) => sql.includes("INSERT INTO agents"));
+    expect(insertCalls).toHaveLength(1);
+    expect(JSON.parse(insertCalls[0][1][10])).toEqual(
+      expect.objectContaining({
+        metadata: expect.objectContaining({ activation: "local-docker-demo-v1" }),
+      }),
+    );
+    expect(clients).toHaveLength(2);
+    expect(clients.every((client) => client.release.mock.calls.length === 1)).toBe(true);
+  });
+
+  it("removes the new deployment and agent when queueing fails", async () => {
+    const client = {
+      release: jest.fn(),
+      query: jest.fn(async (sql, params) => {
+        if (sql.includes("FROM agents") && sql.includes("template_payload @>")) {
+          return { rows: [] };
+        }
+        if (sql.includes("INSERT INTO agents")) {
+          return {
+            rows: [
+              {
+                id: "agent-demo-failed",
+                user_id: "user-1",
+                name: "Demo Agent",
+                status: "queued",
+                runtime_family: "openclaw",
+                deploy_target: "docker",
+                execution_target_id: "docker",
+                sandbox_profile: "standard",
+                backend_type: "docker",
+                sandbox_type: "standard",
+                container_name: params[8],
+                image: params[9],
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      }),
+    };
+    mockDb.connect.mockResolvedValue(client);
+    mockAddDeploymentJob.mockRejectedValue(new Error("Redis unavailable"));
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(500);
+    expect(response.body.error).toMatch(/Redis unavailable/i);
+    expect(client.query).toHaveBeenCalledWith("DELETE FROM deployments WHERE agent_id = $1", [
+      "agent-demo-failed",
+    ]);
+    expect(client.query).toHaveBeenCalledWith("DELETE FROM agents WHERE id = $1 AND user_id = $2", [
+      "agent-demo-failed",
+      "user-1",
+    ]);
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets and requeues the same demo agent after a terminal deployment failure", async () => {
+    const containerManager = require("../containerManager");
+    const failedAgent = {
+      id: "agent-demo-error",
+      user_id: "user-1",
+      name: "Demo Agent",
+      status: "error",
+      backend_type: "docker",
+      sandbox_type: "standard",
+      runtime_family: "openclaw",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      container_id: "stale-demo-container",
+      container_name: "nora-oclaw-demo-agent-error",
+      image: "nora-openclaw-agent:local",
+      vcpu: 1,
+      ram_mb: 1024,
+      disk_gb: 10,
+    };
+    const queuedAgent = { ...failedAgent, status: "queued", container_id: null };
+    const client = {
+      release: jest.fn(),
+      query: jest.fn(async (sql) => {
+        if (sql.includes("FROM agents") && sql.includes("template_payload @>")) {
+          return { rows: [failedAgent] };
+        }
+        if (sql.includes("UPDATE agents") && sql.includes("SET status = 'queued'")) {
+          return { rows: [queuedAgent] };
+        }
+        return { rows: [] };
+      }),
+    };
+    mockDb.connect.mockResolvedValue(client);
+    mockAddDeploymentJob.mockResolvedValue(undefined);
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(
+      expect.objectContaining({ id: failedAgent.id, status: "queued" }),
+    );
+    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledWith(failedAgent.id);
+    expect(containerManager.destroy).toHaveBeenCalledWith(failedAgent);
+    const resetCallIndex = client.query.mock.calls.findIndex(
+      ([sql]) => sql.includes("UPDATE agents") && sql.includes("SET status = 'queued'"),
+    );
+    expect(resetCallIndex).toBeGreaterThanOrEqual(0);
+    expect(containerManager.destroy.mock.invocationCallOrder[0]).toBeLessThan(
+      client.query.mock.invocationCallOrder[resetCallIndex],
+    );
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: failedAgent.id, llm_provider_id: "provider-demo" }),
+      { jobId: `demo-activation-${failedAgent.id}` },
+    );
+  });
+
+  it("returns 409 without resetting an error agent while its previous deployment is active", async () => {
+    const containerManager = require("../containerManager");
+    const failedAgent = {
+      id: "agent-demo-active",
+      user_id: "user-1",
+      name: "Demo Agent",
+      status: "error",
+      backend_type: "docker",
+      runtime_family: "openclaw",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      container_id: "active-demo-container",
+      container_name: "nora-oclaw-demo-agent-active",
+    };
+    const client = {
+      release: jest.fn(),
+      query: jest.fn(async (sql) =>
+        sql.includes("FROM agents") && sql.includes("template_payload @>")
+          ? { rows: [failedAgent] }
+          : { rows: [] },
+      ),
+    };
+    mockDb.connect.mockResolvedValue(client);
+    mockCancelDeploymentJobsForAgent.mockResolvedValue({ removed: 0, active: 1 });
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toMatch(/still finishing/i);
+    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledWith(failedAgent.id);
+    expect(containerManager.destroy).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    expect(
+      client.query.mock.calls.some(
+        ([sql]) => sql.includes("UPDATE agents") && sql.includes("SET status = 'queued'"),
+      ),
+    ).toBe(false);
+    expect(
+      client.query.mock.calls.some(
+        ([sql]) => sql.includes("UPDATE deployments") && sql.includes("status = 'queued'"),
+      ),
+    ).toBe(false);
+  });
+
+  it("preserves an intentionally stopped demo agent for the agent-detail Start action", async () => {
+    const stoppedAgent = {
+      id: "agent-demo-stopped",
+      user_id: "user-1",
+      name: "Demo Agent",
+      status: "stopped",
+      backend_type: "docker",
+      runtime_family: "openclaw",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      container_id: "stopped-demo-container",
+    };
+    const client = {
+      release: jest.fn(),
+      query: jest.fn(async (sql) =>
+        sql.includes("FROM agents") && sql.includes("template_payload @>")
+          ? { rows: [stoppedAgent] }
+          : { rows: [] },
+      ),
+    };
+    mockDb.connect.mockResolvedValue(client);
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(
+      expect.objectContaining({ id: stoppedAgent.id, status: "stopped" }),
+    );
+    expect(mockCancelDeploymentJobsForAgent).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
+  it("rejects activation with an actionable error when local Docker is unavailable", async () => {
+    const client = {
+      release: jest.fn(),
+      query: jest.fn(async (sql) => {
+        if (sql.includes("FROM agents") && sql.includes("template_payload @>")) {
+          return { rows: [] };
+        }
+        return { rows: [] };
+      }),
+    };
+    mockDb.connect.mockResolvedValue(client);
+    mockDockerPing.mockImplementationOnce((callback) =>
+      callback(new Error("connect ENOENT /var/run/docker.sock")),
+    );
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/start Docker/i);
+    expect(response.body.error).toMatch(/\/var\/run\/docker\.sock/i);
+    expect(mockEnsureDemoProvider).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    expect(client.query.mock.calls.some(([sql]) => sql.includes("INSERT INTO agents"))).toBe(false);
+  });
+
+  it("does not let a durable demo row bypass the local Docker availability gate", async () => {
+    const existingAgent = {
+      id: "agent-demo-restored",
+      user_id: "user-1",
+      name: "Demo Agent",
+      status: "error",
+      backend_type: "docker",
+      runtime_family: "openclaw",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      container_id: "restored-container",
+    };
+    const client = {
+      release: jest.fn(),
+      query: jest.fn(async (sql) =>
+        sql.includes("FROM agents") && sql.includes("template_payload @>")
+          ? { rows: [existingAgent] }
+          : { rows: [] },
+      ),
+    };
+    mockDb.connect.mockResolvedValue(client);
+    mockDockerPing.mockImplementationOnce((callback) =>
+      callback(new Error("connect ENOENT /var/run/docker.sock")),
+    );
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/start Docker/i);
+    expect(mockEnsureDemoProvider).not.toHaveBeenCalled();
+    expect(mockCancelDeploymentJobsForAgent).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
+  it("rejects durable demo activation when the Docker deploy target is disabled", async () => {
+    process.env.ENABLED_BACKENDS = "k8s";
+    const client = {
+      release: jest.fn(),
+      query: jest.fn().mockResolvedValue({ rows: [] }),
+    };
+    mockDb.connect.mockResolvedValue(client);
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/docker/i);
+    expect(response.body.error).toMatch(/not enabled/i);
+    expect(mockDockerPing).not.toHaveBeenCalled();
+    expect(mockEnsureDemoProvider).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    expect(
+      client.query.mock.calls.some(
+        ([sql]) => sql.includes("FROM agents") && sql.includes("template_payload @>"),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -4216,6 +4704,57 @@ describe("POST /agents/:id/stop", () => {
     expect(res.body.error).toMatch(/Kubernetes patch failed/i);
     expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps a Proxmox agent running when shutdown fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.stop.mockRejectedValueOnce(new Error("Proxmox shutdown task failed"));
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-proxmox-stop-fail",
+          name: "Proxmox Stop Fail",
+          status: "running",
+          user_id: "user-1",
+          runtime_family: "openclaw",
+          backend_type: "proxmox",
+          deploy_target: "proxmox",
+          execution_target_id: "proxmox",
+          sandbox_profile: "standard",
+          container_id: "301",
+        },
+      ],
+    });
+
+    const res = await auth(request(app).post("/agents/a-proxmox-stop-fail/stop"));
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/Proxmox shutdown task failed/i);
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks an already stopped runtime as stopped idempotently", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.stop.mockRejectedValueOnce(new Error("Container is not running"));
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-already-stopped",
+            name: "Already Stopped",
+            status: "running",
+            user_id: "user-1",
+            backend_type: "docker",
+            container_id: "container-stopped",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [{ id: "a-already-stopped", status: "stopped" }] });
+
+    const res = await auth(request(app).post("/agents/a-already-stopped/stop"));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expect.objectContaining({ status: "stopped" }));
+  });
 });
 
 describe("POST /agents/:id/redeploy", () => {
@@ -4512,6 +5051,20 @@ describe("POST /agents/:id/delete", () => {
     const res = await auth(request(app).post("/agents/a1/delete"));
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("success", true);
+    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledWith("a1");
+  });
+
+  it("keeps the agent record when its pending deployment jobs cannot be cancelled", async () => {
+    mockCancelDeploymentJobsForAgent.mockRejectedValueOnce(new Error("Redis unavailable"));
+    mockDb.query.mockResolvedValueOnce({
+      rows: [{ id: "a-queued", container_id: null, user_id: "user-1", status: "queued" }],
+    });
+
+    const res = await auth(request(app).delete("/agents/a-queued"));
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe("Internal server error");
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
 
   it("rejects deleting a workspace-shared agent when caller is not the direct owner", async () => {
@@ -4585,6 +5138,32 @@ describe("POST /agents/:id/delete", () => {
 
     expect(res.status).toBe(500);
     expect(res.body.error).toMatch(/Kubernetes API unreachable/i);
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a Proxmox agent record when runtime cleanup fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.destroy.mockRejectedValueOnce(new Error("Proxmox destroy task failed"));
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-proxmox-delete-fail",
+          name: "Proxmox Delete Fail",
+          user_id: "user-1",
+          runtime_family: "openclaw",
+          backend_type: "proxmox",
+          deploy_target: "proxmox",
+          execution_target_id: "proxmox",
+          sandbox_profile: "standard",
+          container_id: "302",
+        },
+      ],
+    });
+
+    const res = await auth(request(app).delete("/agents/a-proxmox-delete-fail"));
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/Proxmox destroy task failed/i);
     expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
 

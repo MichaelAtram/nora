@@ -68,9 +68,7 @@ function getDefaultAgentImage({
   }
 
   if (resolvedSandboxProfile === "nemoclaw") {
-    return resolvedDeployTarget === "proxmox"
-      ? process.env.PROXMOX_NEMOCLAW_TEMPLATE || getNemoClawAgentImage()
-      : getNemoClawAgentImage();
+    return getNemoClawAgentImage();
   }
 
   if (resolvedDeployTarget === "docker") {

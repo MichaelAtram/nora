@@ -1,9 +1,11 @@
 import { expect, test } from "@playwright/test";
 import {
+  DEMO_ADMIN_EMAIL,
   DEFAULT_PASSWORD,
   apiJson,
   authenticatePage,
   createUserSession,
+  ensureUserSession,
   extractIdFromUrl,
   getCurrentUser,
   getPreferredProvider,
@@ -15,6 +17,40 @@ import {
   waitForOwnedListingByName,
   waitForUserEvent,
 } from "./support/app";
+
+const PLATFORM_OPERATOR_EMAIL = "nora-platform-journey@example.com";
+const PLATFORM_AGENT_NAME_PREFIXES = [
+  "Primary Agent ",
+  "Renamed Agent ",
+  "Duplicate Agent ",
+  "Community Install ",
+];
+
+async function cleanupPlatformAgents(request, token) {
+  const { body } = await apiJson(request, "/api/agents?scope=owned", { token });
+  const agents = Array.isArray(body) ? body : [];
+
+  for (const agent of agents) {
+    if (
+      typeof agent?.id !== "string" ||
+      typeof agent?.name !== "string" ||
+      !PLATFORM_AGENT_NAME_PREFIXES.some((prefix) => agent.name.startsWith(prefix))
+    ) {
+      continue;
+    }
+
+    const { response, body: deleteBody } = await apiJson(request, `/api/agents/${agent.id}`, {
+      method: "DELETE",
+      token,
+      failOnStatus: false,
+    });
+    if (!response.ok() && response.status() !== 404) {
+      throw new Error(
+        `DELETE /api/agents/${agent.id} failed with ${response.status()}: ${JSON.stringify(deleteBody)}`,
+      );
+    }
+  }
+}
 
 test.describe("Complete platform journey", () => {
   test.describe.configure({ mode: "serial" });
@@ -35,6 +71,25 @@ test.describe("Complete platform journey", () => {
   let workspaceName = "";
   const authCookieName = "nora_auth";
 
+  test.afterAll(async ({ request }) => {
+    if (admin?.token) {
+      await apiJson(request, "/api/admin/settings/language", {
+        method: "PUT",
+        token: admin.token,
+        data: { defaultLocale: "en" },
+      });
+      await cleanupPlatformAgents(request, admin.token);
+    }
+    if (secondaryUser?.token) {
+      await apiJson(request, "/api/auth/profile", {
+        method: "PATCH",
+        token: secondaryUser.token,
+        data: { preferredLocale: null },
+      });
+      await cleanupPlatformAgents(request, secondaryUser.token);
+    }
+  });
+
   async function loginAndCaptureToken(_requestContext, email, password) {
     return loginInFreshContext(email, password);
   }
@@ -49,78 +104,117 @@ test.describe("Complete platform journey", () => {
       bootstrapBody !== null &&
       (bootstrapBody as { needsFirstAdmin?: unknown }).needsFirstAdmin === true;
 
-    admin = {
-      email: uniqueEmail("nora-admin"),
+    let operator = {
+      email: PLATFORM_OPERATOR_EMAIL,
       password: DEFAULT_PASSWORD,
       token: "",
-      profile: null,
     };
+    if (!needsFirstAdmin) {
+      operator = await ensureUserSession(request, {
+        email: operator.email,
+        password: operator.password,
+      });
+    }
 
-    await page.goto("/signup");
-    // The signup heading is race-prone: it renders "Create operator account" by
-    // default, then flips to "Claim this server" once the async bootstrap-status
-    // fetch confirms a zero-user instance. On a fresh E2E stack the page settles
-    // on the claim variant, so accept either heading (same idiom as
-    // navigation.spec.ts) — this is just a "signup page is ready" gate.
-    await expect(
-      page.getByRole("heading", { name: /create operator account|claim this server/i }),
-    ).toBeVisible();
+    if (!operator.token) {
+      await page.goto("/signup");
+      // The signup heading is race-prone: it renders "Create operator account" by
+      // default, then flips to "Claim this server" once the async bootstrap-status
+      // fetch confirms a zero-user instance. Accept either as the page-ready gate.
+      await expect(
+        page.getByRole("heading", { name: /create operator account|claim this server/i }),
+      ).toBeVisible();
 
-    await page.getByLabel(/email address/i).fill(admin.email);
-    await page.getByLabel(/^password$/i).fill(admin.password);
+      await page.getByLabel(/email address/i).fill(operator.email);
+      await page.getByLabel(/^password$/i).fill(operator.password);
 
-    await Promise.all([
-      page.waitForURL(/\/app\/getting-started$/, {
-        waitUntil: "domcontentloaded",
-      }),
-      page.getByRole("button", { name: /^create account$/i }).click(),
-    ]);
+      await Promise.all([
+        page.waitForURL(/\/app\/getting-started$/, {
+          waitUntil: "domcontentloaded",
+        }),
+        page.getByRole("button", { name: /^create account$/i }).click(),
+      ]);
 
-    await expect(
-      page.getByRole("heading", {
-        name: /bring nora online like a production operator platform/i,
-      }),
-    ).toBeVisible();
+      await expect(
+        page.getByRole("heading", {
+          name: /bring nora online like a production operator platform/i,
+        }),
+      ).toBeVisible();
 
-    await expect
-      .poll(async () => {
-        const cookies = await page.context().cookies();
-        return cookies.some((cookie) => cookie.name === authCookieName);
-      })
-      .toBe(true);
+      await expect
+        .poll(async () => {
+          const cookies = await page.context().cookies();
+          return cookies.some((cookie) => cookie.name === authCookieName);
+        })
+        .toBe(true);
 
-    admin.token = await loginAndCaptureToken(request, admin.email, admin.password);
-    admin.profile = await getCurrentUser(request, admin.token);
+      operator.token = await loginAndCaptureToken(request, operator.email, operator.password);
+    }
 
-    expect(admin.profile.email).toBe(admin.email);
-    // On the first fresh run this user should claim the server and become the
-    // admin. During Playwright retries the suite reuses the same E2E stack, so
-    // a previous failed attempt may already have created the first admin.
-    expect(admin.profile.role).toBe(needsFirstAdmin ? "admin" : "user");
+    let operatorProfile = await getCurrentUser(request, operator.token);
+    expect(operatorProfile.email).toBe(operator.email);
+
+    if (operatorProfile.role !== "admin") {
+      const demoAdmin = await ensureUserSession(request, {
+        email: DEMO_ADMIN_EMAIL,
+        password: DEFAULT_PASSWORD,
+      });
+      const demoAdminProfile = await getCurrentUser(request, demoAdmin.token);
+      expect(demoAdminProfile.role).toBe("admin");
+      expect(typeof operatorProfile.id).toBe("string");
+
+      await apiJson(request, `/api/admin/users/${operatorProfile.id}/role`, {
+        method: "PUT",
+        token: demoAdmin.token,
+        data: { role: "admin" },
+      });
+      operator.token = await loginInFreshContext(operator.email, operator.password);
+      operatorProfile = await getCurrentUser(request, operator.token);
+    }
+
+    expect(operatorProfile.role).toBe("admin");
+    admin = { ...operator, profile: operatorProfile };
+    await apiJson(request, "/api/admin/settings/language", {
+      method: "PUT",
+      token: admin.token,
+      data: { defaultLocale: "en" },
+    });
+    await apiJson(request, "/api/auth/profile", {
+      method: "PATCH",
+      token: admin.token,
+      data: { preferredLocale: null },
+    });
+    await cleanupPlatformAgents(request, admin.token);
   });
 
-  test("settings can change the password and save a provider key", async ({ page, request }) => {
-    provider = await getPreferredProvider(request, admin.token);
-    expect(provider).toBeTruthy();
-
-    await authenticatePage(page, admin.token, "/app/settings");
+  test("settings can change a password and save an admin provider key", async ({
+    page,
+    request,
+  }) => {
+    const settingsUser = await createUserSession(request);
+    await authenticatePage(page, settingsUser.token, "/app/settings");
     await expect(page.getByRole("heading", { name: /^settings$/i })).toBeVisible();
-    await expect(page.getByText(admin.email)).toBeVisible();
+    await expect(page.getByText(settingsUser.email)).toBeVisible();
     await expect(page.getByText(/resource limits/i)).toBeVisible();
 
     const nextPassword = "SmokePassword456!";
-    await page.getByPlaceholder("Enter current password").fill(admin.password);
+    await page.getByPlaceholder("Enter current password").fill(settingsUser.password);
     await page.getByPlaceholder("At least 6 characters").fill(nextPassword);
     await page.getByPlaceholder("Re-enter new password").fill(nextPassword);
     await page.getByRole("button", { name: /update password/i }).click();
     await expect(page.getByText(/password updated successfully/i)).toBeVisible();
-    admin.password = nextPassword;
+
+    provider = await getPreferredProvider(request, admin.token);
+    expect(provider).toBeTruthy();
+    await authenticatePage(page, admin.token, "/app/settings");
+    await expect(page.getByRole("heading", { name: /^settings$/i })).toBeVisible();
+    await expect(page.getByText(admin.email)).toBeVisible();
 
     const providerButton = page.getByRole("button").filter({ hasText: provider.name }).first();
     await providerButton.click();
     await page
       .getByPlaceholder(new RegExp(`Enter your ${provider.name} API key`, "i"))
-      .fill(`e2e-${provider.id}-key`);
+      .fill(`e2e-${provider.id}-${Date.now()}-key`);
     await page.getByRole("button", { name: /save api key/i }).click();
     await expect(page.getByRole("heading", { name: /provider added!/i })).toBeVisible();
     await page.getByRole("button", { name: /add another/i }).click();

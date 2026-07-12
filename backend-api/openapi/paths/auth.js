@@ -22,17 +22,55 @@ const credentialsBody = {
   },
 };
 
+const signupBody = {
+  required: true,
+  content: {
+    "application/json": {
+      schema: {
+        ...credentialsBody.content["application/json"].schema,
+        properties: {
+          ...credentialsBody.content["application/json"].schema.properties,
+          botProtectionToken: {
+            type: "string",
+            description:
+              "Turnstile or reCAPTCHA token when signup bot protection is enabled by the operator.",
+          },
+        },
+      },
+    },
+  },
+};
+
 module.exports = {
   "/auth/bootstrap-status": {
     get: {
       tags: ["Auth"],
-      summary: "First-run claim check",
+      summary: "Public runtime authentication bootstrap status",
       description:
-        "True until the first user registers (who becomes the platform admin). Public; exposes only the boolean.",
+        "True until the first user registers (who becomes the platform admin), plus safe runtime OAuth, platform-mode, and signup-challenge metadata. Public; never exposes verification secrets.",
       security: [],
       responses: ok("Status", {
         type: "object",
-        properties: { needsFirstAdmin: { type: "boolean" } },
+        required: ["needsFirstAdmin", "oauthLoginEnabled", "platformMode", "signupBotProtection"],
+        properties: {
+          needsFirstAdmin: { type: "boolean" },
+          oauthLoginEnabled: { type: "boolean" },
+          platformMode: { type: "string", enum: ["selfhosted", "paas"] },
+          signupBotProtection: {
+            type: "object",
+            required: ["enabled", "provider", "siteKey", "configured", "configurationError"],
+            properties: {
+              enabled: { type: "boolean" },
+              provider: {
+                type: ["string", "null"],
+                enum: ["none", "turnstile", "recaptcha", null],
+              },
+              siteKey: { type: ["string", "null"] },
+              configured: { type: "boolean" },
+              configurationError: { type: ["string", "null"] },
+            },
+          },
+        },
       }),
     },
   },
@@ -43,7 +81,7 @@ module.exports = {
       description:
         "The first registered user becomes the platform admin. Rate-limited; optional bot-protection token when the operator configured Turnstile/reCAPTCHA.",
       security: [],
-      requestBody: credentialsBody,
+      requestBody: signupBody,
       responses: ok("Created user"),
     },
   },

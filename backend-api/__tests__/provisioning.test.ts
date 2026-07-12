@@ -8,6 +8,7 @@ const {
   waitForHttpReady,
   waitForAgentReadiness,
 } = require("../../workers/provisioner/healthChecks");
+const { waitForAgentReadiness: waitForBackendAgentReadiness } = require("../healthChecks");
 
 const mockReadNamespace = jest.fn();
 const mockCreateNamespace = jest.fn();
@@ -307,6 +308,40 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(fetchImpl.mock.calls[1][0]).toBe("http://gateway.service:28789/");
   });
 
+  it.each([
+    ["provisioner", waitForAgentReadiness],
+    ["backend", waitForBackendAgentReadiness],
+  ])(
+    "prefers the %s internal gateway endpoint over a loopback-published host port",
+    async (_consumer, readinessFn) => {
+      const fetchImpl = jest
+        .fn()
+        .mockResolvedValueOnce({ status: 200 })
+        .mockResolvedValueOnce({ status: 401 });
+
+      const readiness = await readinessFn(
+        {
+          host: "agent.internal",
+          runtimeHost: "agent.internal",
+          runtimePort: AGENT_RUNTIME_PORT,
+          gatewayHostPort: 19123,
+          gatewayHost: "agent.internal",
+          gatewayPort: OPENCLAW_GATEWAY_PORT,
+        },
+        {
+          runtime: { attempts: 1, intervalMs: 1, timeoutMs: 1, fetchImpl },
+          gateway: { attempts: 1, intervalMs: 1, timeoutMs: 1, fetchImpl },
+        },
+      );
+
+      expect(readiness.ok).toBe(true);
+      expect(fetchImpl.mock.calls[1][0]).toBe(`http://agent.internal:${OPENCLAW_GATEWAY_PORT}/`);
+      expect(readiness.gateway).toEqual(
+        expect.objectContaining({ host: "agent.internal", port: OPENCLAW_GATEWAY_PORT }),
+      );
+    },
+  );
+
   it("can skip the gateway probe for runtime-only families", async () => {
     const fetchImpl = jest.fn().mockResolvedValueOnce({ status: 200 });
 
@@ -362,6 +397,13 @@ describe("provisioning runtime/gateway contracts", () => {
     // Recreate: required for the RWO state volume and prevents RollingUpdate
     // surge pods sticking Pending on full clusters.
     expect(deployment.spec.strategy).toEqual({ type: "Recreate" });
+    expect(deployment.spec.template.spec.securityContext).toEqual({
+      seccompProfile: { type: "RuntimeDefault" },
+    });
+    expect(container.securityContext).toEqual({
+      allowPrivilegeEscalation: false,
+      capabilities: { drop: ["ALL"] },
+    });
     // Agent state must survive pod replacement — a k8s restart is a rollout.
     expect(mockCreateNamespacedPersistentVolumeClaim).toHaveBeenCalledTimes(1);
     const pvc = mockCreateNamespacedPersistentVolumeClaim.mock.calls[0][0].body;
@@ -742,6 +784,10 @@ describe("provisioning runtime/gateway contracts", () => {
 
     expect(container.image).toBe("registry.example.com/nora-nemoclaw-agent:stable");
     expect(container.workingDir).toBe("/sandbox");
+    expect(container.securityContext).toEqual({
+      allowPrivilegeEscalation: false,
+      capabilities: { drop: ["ALL"] },
+    });
     expect(envVars).toEqual(
       expect.objectContaining({
         HOME: "/sandbox",
@@ -1016,10 +1062,22 @@ describe("provisioning runtime/gateway contracts", () => {
     });
 
     const policies = mockCreateNamespacedNetworkPolicy.mock.calls.map((call) => call[0].body);
+    const deployment = mockCreateNamespacedDeployment.mock.calls[0][0].body;
+    const container = deployment.spec.template.spec.containers[0];
     expect(policies.map((policy) => policy.metadata.name)).toEqual([
       "nora-hermes-default-deny-ingress",
       "nora-hermes-allow-trusted-ingress",
     ]);
+    expect(deployment.spec.template.spec.securityContext).toEqual({
+      seccompProfile: { type: "RuntimeDefault" },
+    });
+    expect(container.securityContext).toEqual({
+      allowPrivilegeEscalation: false,
+      capabilities: {
+        drop: ["ALL"],
+        add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID"],
+      },
+    });
     expect(mockCreateNamespacedDeployment).toHaveBeenCalledTimes(1);
     expect(mockCreateNamespacedNetworkPolicy.mock.invocationCallOrder[1]).toBeLessThan(
       mockCreateNamespacedDeployment.mock.invocationCallOrder[0],
@@ -1636,6 +1694,14 @@ describe("Hermes dashboard provisioning", () => {
       "8642/tcp": {},
       "9119/tcp": {},
     });
+    expect(config.HostConfig).toEqual(
+      expect.objectContaining({
+        CapDrop: ["ALL"],
+        CapAdd: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID"],
+        SecurityOpt: ["no-new-privileges:true"],
+        PidsLimit: 512,
+      }),
+    );
     expect(config.Labels).toEqual(
       expect.objectContaining({
         "nora.dashboard.port": String(HERMES_DASHBOARD_PORT),
@@ -1654,6 +1720,10 @@ describe("Hermes dashboard provisioning", () => {
 });
 
 describe("docker gateway port allocation (BYOC Phase B)", () => {
+  afterEach(() => {
+    delete process.env.DOCKER_AGENT_BIND_IP;
+  });
+
   function mockDockerBackend() {
     const DockerBackend = require("../../workers/provisioner/backends/docker");
     const backend = new DockerBackend();
@@ -1677,6 +1747,7 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
       getContainer: jest
         .fn()
         .mockReturnValue({ inspect: jest.fn().mockRejectedValue(new Error("not found")) }),
+      listContainers: jest.fn().mockResolvedValue([]),
       createVolume: jest.fn().mockResolvedValue({}),
       createContainer: jest.fn().mockResolvedValue(createdContainer),
       getNetwork: jest.fn().mockReturnValue({ connect: jest.fn().mockResolvedValue({}) }),
@@ -1689,7 +1760,7 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
 
   it("publishes the worker-allocated host port", async () => {
     const backend = mockDockerBackend();
-    await backend.create({
+    const result = await backend.create({
       id: "999",
       name: "Port QA",
       gatewayHostPort: 19500,
@@ -1697,8 +1768,27 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
       env: {},
     });
     const config = backend.docker.createContainer.mock.calls[0][0];
-    expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([{ HostPort: "19500" }]);
-    expect(config.HostConfig.PortBindings["9090/tcp"]).toEqual([{ HostPort: "19501" }]);
+    expect(config.HostConfig).toEqual(
+      expect.objectContaining({
+        CapDrop: ["ALL"],
+        SecurityOpt: ["no-new-privileges:true"],
+        PidsLimit: 512,
+      }),
+    );
+    expect(config.HostConfig.CapAdd).toBeUndefined();
+    expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([
+      { HostIp: "127.0.0.1", HostPort: "19500" },
+    ]);
+    expect(config.HostConfig.PortBindings["9090/tcp"]).toEqual([
+      { HostIp: "127.0.0.1", HostPort: "19501" },
+    ]);
+    expect(result).toEqual(
+      expect.objectContaining({
+        gatewayHostPort: "19500",
+        gatewayHost: "10.0.0.7",
+        gatewayPort: OPENCLAW_GATEWAY_PORT,
+      }),
+    );
   });
 
   it("falls back to the deterministic hash when no port is allocated", async () => {
@@ -1706,7 +1796,73 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
     // id "999" -> 19000 + (999 % 1000) = 19999
     await backend.create({ id: "999", name: "Port QA", env: {} });
     const config = backend.docker.createContainer.mock.calls[0][0];
-    expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([{ HostPort: "19999" }]);
+    expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([
+      { HostIp: "127.0.0.1", HostPort: "19999" },
+    ]);
+  });
+
+  it("allows an explicit concrete host bind IP while rejecting implicit wildcard exposure", async () => {
+    process.env.DOCKER_AGENT_BIND_IP = "192.0.2.10";
+    const backend = mockDockerBackend();
+    await backend.create({ id: "999", name: "Port QA", gatewayHostPort: 19500, env: {} });
+    const config = backend.docker.createContainer.mock.calls[0][0];
+    expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([
+      { HostIp: "192.0.2.10", HostPort: "19500" },
+    ]);
+  });
+
+  it("detects a host port published by another running Docker container", async () => {
+    const backend = mockDockerBackend();
+    backend.docker.listContainers.mockResolvedValue([
+      {
+        Id: "other-container",
+        Names: ["/unrelated-service"],
+        Ports: [{ IP: "0.0.0.0", PrivatePort: 8080, PublicPort: 19500, Type: "tcp" }],
+      },
+    ]);
+
+    await expect(
+      backend.isHostPortBound(19500, { ignoreContainerName: "nora-oclaw-port-qa-999" }),
+    ).resolves.toBe(true);
+  });
+
+  it("ignores the replaceable same-name container when checking its reserved port", async () => {
+    const backend = mockDockerBackend();
+    backend.docker.listContainers.mockResolvedValue([
+      {
+        Id: "old-agent-container",
+        Names: ["/nora-oclaw-port-qa-999"],
+        Ports: [{ IP: "127.0.0.1", PrivatePort: 18789, PublicPort: 19500, Type: "tcp" }],
+      },
+    ]);
+
+    await expect(
+      backend.isHostPortBound(19500, { ignoreContainerName: "nora-oclaw-port-qa-999" }),
+    ).resolves.toBe(false);
+  });
+
+  it("removes agent volumes when the Docker container is already missing", async () => {
+    const backend = mockDockerBackend();
+    const missingContainer = {
+      inspect: jest.fn().mockRejectedValue(
+        Object.assign(new Error("No such container: missing-agent"), {
+          statusCode: 404,
+        }),
+      ),
+      stop: jest.fn(),
+      remove: jest.fn(),
+    };
+    const removeVolume = jest.fn().mockResolvedValue({});
+    backend.docker.getContainer.mockReturnValue(missingContainer);
+    backend.docker.getVolume.mockImplementation(() => ({ remove: removeVolume }));
+
+    await expect(backend.destroy("missing-agent", { agentId: "agent-1" })).resolves.toBeUndefined();
+
+    expect(missingContainer.stop).not.toHaveBeenCalled();
+    expect(missingContainer.remove).not.toHaveBeenCalled();
+    expect(backend.docker.getVolume).toHaveBeenNthCalledWith(1, "nora_agent_state_agent-1");
+    expect(backend.docker.getVolume).toHaveBeenNthCalledWith(2, "nora_agent_home_agent-1");
+    expect(removeVolume).toHaveBeenCalledTimes(2);
   });
 
   it("preserves durable volumes when a bind conflict will be retried", async () => {

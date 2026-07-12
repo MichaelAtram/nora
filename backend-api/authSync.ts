@@ -580,6 +580,7 @@ async function refreshDockerRuntimeAddress(agent) {
 
 async function restartAgentAndRefreshAddress(agent) {
   const result = await containerManager.restart(agent);
+  await containerManager.persistLifecycleRuntimeAddress(db, agent, result);
   await refreshDockerRuntimeAddress(agent);
   return result;
 }

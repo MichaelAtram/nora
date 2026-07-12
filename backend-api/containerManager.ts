@@ -78,6 +78,14 @@ function isKubernetesAgent(agent = {}) {
   return resolveAgentBackendType(agent) === "k8s";
 }
 
+function isProxmoxAgent(agent = {}) {
+  return resolveAgentBackendType(agent) === "proxmox";
+}
+
+function usesLifecycleOptions(agent = {}) {
+  return isKubernetesAgent(agent) || isProxmoxAgent(agent);
+}
+
 function resolveKubernetesRuntimeId(agent, operation) {
   if (!isKubernetesAgent(agent)) {
     return ensureContainerId(agent, operation);
@@ -112,6 +120,55 @@ function resolveDestroyContainerId(agent) {
 
 function canDestroy(agent = {}) {
   return canMutate(agent);
+}
+
+function normalizeLifecycleHost(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized || null;
+}
+
+function lifecycleRuntimeAddress(result = {}) {
+  if (!result || typeof result !== "object") return null;
+  const host = normalizeLifecycleHost(result.host);
+  const runtimeHost =
+    normalizeLifecycleHost(result.runtimeHost ?? result.runtime_host) || host || null;
+  if (!host && !runtimeHost) return null;
+  return { host, runtimeHost };
+}
+
+async function persistLifecycleRuntimeAddress(queryable, agent, result) {
+  const address = lifecycleRuntimeAddress(result);
+  if (!address) return agent;
+  if (!queryable || typeof queryable.query !== "function") {
+    throw new TypeError("Lifecycle runtime address persistence requires a database client");
+  }
+  if (!agent?.id) {
+    throw new TypeError("Lifecycle runtime address persistence requires an agent id");
+  }
+
+  const updated = await queryable.query(
+    `UPDATE agents
+        SET host = COALESCE($2, host),
+            runtime_host = COALESCE($3, runtime_host)
+      WHERE id = $1
+      RETURNING host, runtime_host`,
+    [agent.id, address.host, address.runtimeHost],
+  );
+  if (!updated.rows[0]) {
+    const error = new Error(`Agent ${agent.id} no longer exists after lifecycle operation`);
+    error.statusCode = 404;
+    error.code = "AGENT_NOT_FOUND";
+    throw error;
+  }
+
+  agent.host = updated.rows[0].host;
+  agent.runtime_host = updated.rows[0].runtime_host;
+  return agent;
+}
+
+function isIgnorableStopError(error) {
+  return /already stopped|not running/i.test(String(error?.message || ""));
 }
 
 /**
@@ -260,7 +317,7 @@ module.exports = {
   async start(agent) {
     const id = resolveKubernetesRuntimeId(agent, "start");
     const backend = await backendFor(agent);
-    return isKubernetesAgent(agent)
+    return usesLifecycleOptions(agent)
       ? backend.start(id, lifecycleOptions(agent))
       : backend.start(id);
   },
@@ -268,13 +325,15 @@ module.exports = {
   async stop(agent) {
     const id = resolveKubernetesRuntimeId(agent, "stop");
     const backend = await backendFor(agent);
-    return isKubernetesAgent(agent) ? backend.stop(id, lifecycleOptions(agent)) : backend.stop(id);
+    return usesLifecycleOptions(agent)
+      ? backend.stop(id, lifecycleOptions(agent))
+      : backend.stop(id);
   },
 
   async restart(agent) {
     const id = resolveKubernetesRuntimeId(agent, "restart");
     const backend = await backendFor(agent);
-    return isKubernetesAgent(agent)
+    return usesLifecycleOptions(agent)
       ? backend.restart(id, lifecycleOptions(agent))
       : backend.restart(id);
   },
@@ -310,7 +369,9 @@ module.exports = {
       return { running: false, uptime: 0, cpu: null, memory: null };
     }
     const backend = await backendFor(agent);
-    return kubernetes ? backend.status(id, lifecycleOptions(agent)) : backend.status(id);
+    return usesLifecycleOptions(agent)
+      ? backend.status(id, lifecycleOptions(agent))
+      : backend.status(id);
   },
 
   async stats(agent) {
@@ -318,7 +379,7 @@ module.exports = {
     if (typeof id !== "string" || id.length === 0) return null;
     const backend = await backendFor(agent);
     if (typeof backend.stats === "function") {
-      return backend.stats(id, agent);
+      return backend.stats(id, isProxmoxAgent(agent) ? lifecycleOptions(agent) : agent);
     }
     return null;
   },
@@ -331,7 +392,10 @@ module.exports = {
     const id = ensureContainerId(agent, "stream logs");
     const backend = await backendFor(agent);
     if (typeof backend.logs === "function") {
-      return backend.logs(id, opts);
+      return backend.logs(
+        id,
+        isProxmoxAgent(agent) ? { ...opts, ...lifecycleOptions(agent) } : opts,
+      );
     }
     return null;
   },
@@ -344,7 +408,10 @@ module.exports = {
     const id = ensureContainerId(agent, "exec");
     const backend = await backendFor(agent);
     if (typeof backend.exec === "function") {
-      return backend.exec(id, opts);
+      return backend.exec(
+        id,
+        isProxmoxAgent(agent) ? { ...opts, ...lifecycleOptions(agent) } : opts,
+      );
     }
     return null;
   },
@@ -354,4 +421,7 @@ module.exports = {
   canMutate,
   canDestroy,
   isKubernetesAgent,
+  lifecycleRuntimeAddress,
+  persistLifecycleRuntimeAddress,
+  isIgnorableStopError,
 };

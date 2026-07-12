@@ -171,6 +171,20 @@ describe("openclaw channel catalog compatibility", () => {
     );
   });
 
+  it.each(["__proto__", "constructor", "prototype"])(
+    "rejects the unsafe OpenClaw channel id %s before gateway access",
+    async (channelId) => {
+      await expect(
+        saveOpenClawChannel(agent, channelId, { enabled: true }, { create: true }),
+      ).rejects.toMatchObject({
+        statusCode: 400,
+        message: "Invalid OpenClaw channel type.",
+      });
+
+      expect(mockRpcCall).not.toHaveBeenCalled();
+    },
+  );
+
   it("allows creating a metadata-only OpenClaw channel", async () => {
     mockRpcCall
       .mockResolvedValueOnce({

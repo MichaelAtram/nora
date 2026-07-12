@@ -531,6 +531,74 @@ const OPENCLAW_SQLITE_AUTH_BEST_EFFORT_PROVIDERS = Object.freeze([
   ...Object.values(NORA_TO_OPENCLAW_PROVIDER_ID),
 ]);
 
+function remapOpenClawAuthProfileId(profileId, rawProvider, provider) {
+  const value = String(profileId || "");
+  if (!rawProvider || rawProvider === provider) return value;
+
+  const rawPrefix = `${rawProvider}:`;
+  return value.startsWith(rawPrefix) ? `${provider}:${value.slice(rawPrefix.length)}` : value;
+}
+
+// OpenClaw 2026.4.x reads auth-profiles.json directly and does not expose the
+// non-interactive paste-api-key command. Normalize custom-provider ids in the
+// file itself so those releases can resolve credentials without a CLI import;
+// newer releases then import the same normalized profiles into their runtime
+// auth store below.
+function normalizeOpenClawAuthProfiles(authProfiles = {}) {
+  const source =
+    authProfiles && typeof authProfiles === "object" && !Array.isArray(authProfiles)
+      ? authProfiles
+      : {};
+  const sourceProfiles =
+    source.profiles && typeof source.profiles === "object" && !Array.isArray(source.profiles)
+      ? source.profiles
+      : {};
+  const profiles = {};
+
+  for (const [profileId, profile] of Object.entries(sourceProfiles)) {
+    if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
+      profiles[profileId] = profile;
+      continue;
+    }
+    const rawProvider = String(profile.provider || "").trim();
+    const provider = OPENCLAW_SQLITE_AUTH_PROVIDER_ALIASES[rawProvider] || rawProvider;
+    const normalizedProfileId = remapOpenClawAuthProfileId(profileId, rawProvider, provider);
+    profiles[normalizedProfileId] =
+      provider && provider !== rawProvider ? { ...profile, provider } : { ...profile };
+  }
+
+  const normalized = {
+    ...source,
+    version: source.version || 1,
+    profiles,
+  };
+
+  if (source.order && typeof source.order === "object" && !Array.isArray(source.order)) {
+    normalized.order = Object.fromEntries(
+      Object.entries(source.order).map(([rawProvider, profileIds]) => {
+        const provider = OPENCLAW_SQLITE_AUTH_PROVIDER_ALIASES[rawProvider] || rawProvider;
+        const normalizedProfileIds = Array.isArray(profileIds)
+          ? profileIds.map((profileId) =>
+              remapOpenClawAuthProfileId(profileId, rawProvider, provider),
+            )
+          : profileIds;
+        return [provider, normalizedProfileIds];
+      }),
+    );
+  }
+
+  if (source.lastGood && typeof source.lastGood === "object" && !Array.isArray(source.lastGood)) {
+    normalized.lastGood = Object.fromEntries(
+      Object.entries(source.lastGood).map(([rawProvider, profileId]) => {
+        const provider = OPENCLAW_SQLITE_AUTH_PROVIDER_ALIASES[rawProvider] || rawProvider;
+        return [provider, remapOpenClawAuthProfileId(profileId, rawProvider, provider)];
+      }),
+    );
+  }
+
+  return normalized;
+}
+
 function buildOpenClawAuthImportFromFileCommand(options = {}) {
   const authPath = options.authPath || OPENCLAW_AUTH_PROFILES_PATH;
   const agentId = options.agentId || "main";
@@ -578,6 +646,11 @@ function buildOpenClawAuthImportFromFileCommand(options = {}) {
     "    stdio: ['pipe', 'pipe', 'pipe'],",
     "    env: process.env,",
     "  });",
+    "  const output = `${result.stderr || ''}\\n${result.stdout || ''}`;",
+    "  if (result.status !== 0 && /unknown (?:command|option)|not a command/i.test(output)) {",
+    "    process.stderr.write(`auth CLI import unavailable for ${provider}; using normalized auth-profiles.json\\n`);",
+    "    continue;",
+    "  }",
     "  if (result.status !== 0) {",
     "    if (result.stderr) process.stderr.write(result.stderr);",
     "    if (result.stdout) process.stderr.write(result.stdout);",
@@ -599,7 +672,7 @@ function buildOpenClawAuthProfilesWriteCommand(authProfiles, options = {}) {
   const authPath = options.authPath || OPENCLAW_AUTH_PROFILES_PATH;
   const authDir = authPath.slice(0, authPath.lastIndexOf("/")) || ".";
   const authJsonB64 = Buffer.from(
-    JSON.stringify(authProfiles || { version: 1, profiles: {} }),
+    JSON.stringify(normalizeOpenClawAuthProfiles(authProfiles)),
   ).toString("base64");
 
   return [

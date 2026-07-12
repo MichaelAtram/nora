@@ -24,6 +24,14 @@ function isOAuthLoginEnabled() {
   return process.env.OAUTH_LOGIN_ENABLED === "true";
 }
 
+function getPublicPlatformMode() {
+  return String(process.env.PLATFORM_MODE || "selfhosted")
+    .trim()
+    .toLowerCase() === "paas"
+    ? "paas"
+    : "selfhosted";
+}
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -70,47 +78,122 @@ function normalizeSignupBotProtectionProvider(value) {
   return "invalid";
 }
 
+function readFirstSignupEnv(...names) {
+  for (const name of names) {
+    const value = String(process.env[name] || "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+function getSignupBotProtectionSiteKey(provider) {
+  return provider === "turnstile"
+    ? readFirstSignupEnv("SIGNUP_TURNSTILE_SITE_KEY", "NEXT_PUBLIC_SIGNUP_TURNSTILE_SITE_KEY")
+    : readFirstSignupEnv("SIGNUP_RECAPTCHA_SITE_KEY", "NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY");
+}
+
 function getSignupBotProtectionConfig() {
   const explicitProvider = normalizeSignupBotProtectionProvider(
-    process.env.SIGNUP_BOT_PROTECTION_PROVIDER,
+    readFirstSignupEnv(
+      "SIGNUP_BOT_PROTECTION_PROVIDER",
+      "NEXT_PUBLIC_SIGNUP_BOT_PROTECTION_PROVIDER",
+    ),
   );
 
-  if (explicitProvider === "none") return { provider: "none" };
+  if (explicitProvider === "none") {
+    return { enabled: false, provider: "none", configured: true, siteKey: "" };
+  }
   if (explicitProvider === "invalid") {
-    return { provider: "invalid", error: "Invalid SIGNUP_BOT_PROTECTION_PROVIDER" };
-  }
-
-  const hasTurnstileSecret = Boolean(process.env.SIGNUP_TURNSTILE_SECRET);
-  const hasRecaptchaSecret = Boolean(process.env.SIGNUP_RECAPTCHA_SECRET);
-  let provider = explicitProvider;
-
-  if (!provider) {
-    if (hasTurnstileSecret && hasRecaptchaSecret) {
-      return {
-        provider: "invalid",
-        error:
-          "Both signup bot protection secrets are configured; set SIGNUP_BOT_PROTECTION_PROVIDER",
-      };
-    }
-    if (hasTurnstileSecret) provider = "turnstile";
-    if (hasRecaptchaSecret) provider = "recaptcha";
-  }
-
-  if (!provider) return { provider: "none" };
-
-  const secret =
-    provider === "turnstile"
-      ? process.env.SIGNUP_TURNSTILE_SECRET
-      : process.env.SIGNUP_RECAPTCHA_SECRET;
-
-  if (!secret) {
     return {
+      enabled: true,
       provider: "invalid",
-      error: `Missing secret for signup ${provider} bot protection`,
+      configured: false,
+      siteKey: "",
+      error: "Invalid SIGNUP_BOT_PROTECTION_PROVIDER",
+      publicError:
+        "Signup verification is enabled, but its provider configuration is invalid. Contact the administrator.",
     };
   }
 
-  return { provider, secret };
+  const turnstileSecret = readFirstSignupEnv("SIGNUP_TURNSTILE_SECRET");
+  const recaptchaSecret = readFirstSignupEnv("SIGNUP_RECAPTCHA_SECRET");
+  const turnstileSiteKey = getSignupBotProtectionSiteKey("turnstile");
+  const recaptchaSiteKey = getSignupBotProtectionSiteKey("recaptcha");
+  const hasTurnstileConfig = Boolean(turnstileSecret || turnstileSiteKey);
+  const hasRecaptchaConfig = Boolean(recaptchaSecret || recaptchaSiteKey);
+  let provider = explicitProvider;
+
+  if (!provider) {
+    if (hasTurnstileConfig && hasRecaptchaConfig) {
+      return {
+        enabled: true,
+        provider: "invalid",
+        configured: false,
+        siteKey: "",
+        error:
+          "Both signup bot protection providers are configured; set SIGNUP_BOT_PROTECTION_PROVIDER",
+        publicError:
+          "Signup verification is enabled for multiple providers. Select one provider in the server configuration.",
+      };
+    }
+    if (hasTurnstileConfig) provider = "turnstile";
+    if (hasRecaptchaConfig) provider = "recaptcha";
+  }
+
+  if (!provider) {
+    return { enabled: false, provider: "none", configured: true, siteKey: "" };
+  }
+
+  const secret = provider === "turnstile" ? turnstileSecret : recaptchaSecret;
+  const siteKey = provider === "turnstile" ? turnstileSiteKey : recaptchaSiteKey;
+
+  if (!secret) {
+    return {
+      enabled: true,
+      provider,
+      configured: false,
+      siteKey,
+      error: `Missing secret for signup ${provider} bot protection`,
+      publicError:
+        "Signup verification is enabled, but server verification is incomplete. Contact the administrator.",
+    };
+  }
+
+  if (!siteKey) {
+    return {
+      enabled: true,
+      provider,
+      configured: false,
+      siteKey: "",
+      secret,
+      error: `Missing public site key for signup ${provider} bot protection`,
+      publicError:
+        "Signup verification is enabled, but its public site key is missing. Contact the administrator.",
+    };
+  }
+
+  return { enabled: true, provider, configured: true, siteKey, secret };
+}
+
+function getPublicSignupBotProtectionConfig() {
+  const config = getSignupBotProtectionConfig();
+  const provider = ["turnstile", "recaptcha"].includes(config.provider)
+    ? config.provider
+    : config.provider === "none"
+      ? "none"
+      : null;
+
+  return {
+    enabled: config.enabled === true,
+    provider,
+    siteKey: provider && provider !== "none" ? config.siteKey || null : null,
+    configured: config.configured === true,
+    configurationError:
+      config.configured === true
+        ? null
+        : config.publicError ||
+          "Signup verification is enabled, but its runtime configuration is incomplete.",
+  };
 }
 
 function getSignupBotProtectionToken(body = {}) {
@@ -119,8 +202,8 @@ function getSignupBotProtectionToken(body = {}) {
 
 async function verifySignupBotProtection(req) {
   const config = getSignupBotProtectionConfig();
-  if (config.provider === "none") return;
-  if (config.provider === "invalid") {
+  if (!config.enabled) return;
+  if (!config.configured || config.provider === "invalid") {
     throw createHttpError(config.error || "Signup bot protection is misconfigured", 500);
   }
 
@@ -239,13 +322,19 @@ function isDuplicateUserError(error) {
 // ─── Public routes ────────────────────────────────────────────────
 
 // First-run claim check: true until the first user registers (who becomes the
-// platform admin). The login/signup pages use it to render "Claim this server"
-// instead of a generic signup. Deliberately exposes only a boolean — user
-// count or emails would aid enumeration.
+// platform admin). Login/signup also consume runtime OAuth and platform-mode
+// metadata from this endpoint so reusable frontend images do not bake deploy-time
+// auth behavior. Only the public portion of signup-challenge configuration is
+// exposed; secret verification keys stay server-side.
 router.get("/bootstrap-status", async (req, res) => {
   try {
     const { rows } = await db.query("SELECT 1 FROM users LIMIT 1");
-    res.json({ needsFirstAdmin: rows.length === 0 });
+    res.json({
+      needsFirstAdmin: rows.length === 0,
+      oauthLoginEnabled: isOAuthLoginEnabled(),
+      platformMode: getPublicPlatformMode(),
+      signupBotProtection: getPublicSignupBotProtectionConfig(),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -7,6 +7,7 @@ const mockRestart = jest.fn();
 const mockExec = jest.fn();
 const mockIsKubernetesAgent = jest.fn();
 const mockUpdateEnv = jest.fn();
+const mockPersistLifecycleRuntimeAddress = jest.fn();
 const mockGetProviderKeys = jest.fn();
 const mockBuildAuthProfiles = jest.fn();
 const mockGetIntegrationEnvVars = jest.fn();
@@ -19,6 +20,7 @@ jest.mock("../containerManager", () => ({
   restart: mockRestart,
   isKubernetesAgent: mockIsKubernetesAgent,
   updateEnv: mockUpdateEnv,
+  persistLifecycleRuntimeAddress: mockPersistLifecycleRuntimeAddress,
 }));
 jest.mock("../llmProviders", () => ({
   PROVIDERS: [
@@ -86,6 +88,16 @@ describe("auth sync", () => {
       .mockReset()
       .mockImplementation((agent) => String(agent?.backend_type || "").toLowerCase() === "k8s");
     mockUpdateEnv.mockReset().mockResolvedValue(undefined);
+    mockPersistLifecycleRuntimeAddress
+      .mockReset()
+      .mockImplementation(async (_db, agent, result) => {
+        const host = typeof result?.host === "string" ? result.host.trim() : "";
+        const runtimeHost =
+          typeof result?.runtimeHost === "string" ? result.runtimeHost.trim() : host;
+        if (host) agent.host = host;
+        if (runtimeHost) agent.runtime_host = runtimeHost;
+        return agent;
+      });
     mockGetProviderKeys.mockReset().mockResolvedValue({
       OPENAI_API_KEY: "sk-live-test",
     });
@@ -206,6 +218,50 @@ describe("auth sync", () => {
       NORA_DEFAULT_OPENCLAW_MODEL: "openai/gpt-5.5",
     });
     expect(results).toEqual([{ agentId: "agent-k8s-1", status: "synced" }]);
+  });
+
+  it("uses a refreshed Proxmox address for readiness after auth-sync restart", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ provider: "openai", model: "gpt-5.5" }],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-proxmox-auth",
+            container_id: "501",
+            backend_type: "proxmox",
+            host: "10.80.90.10",
+            runtime_host: "10.80.90.10",
+            runtime_port: 9090,
+            gateway_host_port: null,
+            gateway_host: null,
+            gateway_port: 18789,
+          },
+        ],
+      });
+    global.fetch
+      .mockResolvedValueOnce(jsonResponse({ exitCode: 0, stdout: "", stderr: "" }))
+      .mockResolvedValueOnce(jsonResponse({ exitCode: 0, stdout: "", stderr: "" }));
+    mockRestart.mockResolvedValueOnce({
+      host: "10.80.90.51",
+      runtimeHost: "10.80.90.51",
+    });
+
+    const results = await syncAuthToUserAgents("user-1");
+
+    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ id: "agent-proxmox-auth" }),
+      { host: "10.80.90.51", runtimeHost: "10.80.90.51" },
+    );
+    expect(mockWaitForAgentReadiness).toHaveBeenCalledWith(
+      expect.objectContaining({
+        host: "10.80.90.51",
+        runtimeHost: "10.80.90.51",
+      }),
+    );
+    expect(results).toEqual([{ agentId: "agent-proxmox-auth", status: "synced" }]);
   });
 
   it("returns a failed sync result when the runtime write command fails", async () => {

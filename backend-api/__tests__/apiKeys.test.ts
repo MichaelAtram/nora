@@ -190,6 +190,7 @@ describe("API key endpoints (HTTP)", () => {
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
     expect(res.body.find((s) => s.value === "agents:read")).toBeDefined();
+    expect(res.body.find((s) => s.value === "admin:read")).toBeDefined();
   });
 
   it("POST /workspaces/:id/api-keys requires admin role", async () => {
@@ -325,6 +326,94 @@ describe("auth middleware: API key intake", () => {
     expect(res.status).toBe(403);
     expect(res.body.code).toBe("missing_scope");
     expect(res.body.error).toMatch(/workspaces:read/);
+  });
+
+  it("keeps Agent Hub and backup state behind session authentication", async () => {
+    const keyRow = {
+      id: "k-sensitive",
+      workspace_id: "ws-1",
+      created_by: "user-1",
+      key_hash: "h",
+      key_prefix: "nora_p",
+      scopes: ["agents:read", "agents:write", "integrations:read", "integrations:write"],
+      status: "active",
+      workspace_name: "Prod",
+      user_email: "u@x.com",
+      user_role: "user",
+      user_name: "U",
+    };
+
+    mockDb.query.mockResolvedValueOnce({ rows: [keyRow] }).mockResolvedValueOnce({ rows: [] });
+    const hub = await request(app)
+      .get("/agent-hub")
+      .set("Authorization", "Bearer nora_sensitive_hub");
+    expect(hub.status).toBe(403);
+    expect(hub.body.code).toBe("session_required");
+
+    mockDb.query.mockResolvedValueOnce({ rows: [keyRow] }).mockResolvedValueOnce({ rows: [] });
+    const backups = await request(app)
+      .get("/agents/agent-1/backups")
+      .set("Authorization", "Bearer nora_sensitive_backup");
+    expect(backups.status).toBe(403);
+    expect(backups.body.code).toBe("session_required");
+  });
+
+  it("requires integration scopes before an API key can reach channel ownership", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "k-channels",
+            workspace_id: "ws-1",
+            created_by: "user-1",
+            key_hash: "h",
+            key_prefix: "nora_p",
+            scopes: ["agents:read"],
+            status: "active",
+            workspace_name: "Prod",
+            user_email: "u@x.com",
+            user_role: "user",
+            user_name: "U",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app)
+      .get("/agents/agent-1/channels")
+      .set("Authorization", "Bearer nora_channels_readonly");
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("missing_scope");
+    expect(res.body.error).toMatch(/integrations:read/);
+  });
+
+  it("requires the explicit admin:read scope for API-key doctor access", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "k-admin",
+            workspace_id: "ws-1",
+            created_by: "admin-1",
+            key_hash: "h",
+            key_prefix: "nora_p",
+            scopes: ["monitoring:read"],
+            status: "active",
+            workspace_name: "Prod",
+            user_email: "admin@x.com",
+            user_role: "admin",
+            user_name: "Admin",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app)
+      .get("/admin/doctor")
+      .set("Authorization", "Bearer nora_admin_without_scope");
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("missing_scope");
+    expect(res.body.error).toMatch(/admin:read/);
   });
 
   it("blocks API keys from mutating workspaces (session-required)", async () => {

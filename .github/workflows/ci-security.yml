@@ -38,6 +38,7 @@ jobs:
           - frontend-marketing
           - backend-api
           - agent-runtime
+          - workers/backup
           - workers/provisioner
           - e2e
           - mcp-server
@@ -68,6 +69,7 @@ jobs:
           - frontend-marketing
           - backend-api
           - agent-runtime
+          - workers/backup
           - workers/provisioner
           - e2e
           - mcp-server
@@ -108,3 +110,39 @@ jobs:
             | tar -xz kubeconform
           sudo mv kubeconform /usr/local/bin/kubeconform
       - run: npm run ci:validate-infra
+
+  security-gate:
+    name: Security gate
+    if: ${{ always() }}
+    needs:
+      - secret-scan
+      - dependency-audit
+      - license-compliance
+      - infra-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every security job to succeed
+        shell: bash
+        env:
+          SECURITY_RESULTS: >-
+            secret-scan=${{ needs.secret-scan.result }}
+            dependency-audit=${{ needs.dependency-audit.result }}
+            license-compliance=${{ needs.license-compliance.result }}
+            infra-validation=${{ needs.infra-validation.result }}
+        run: |
+          set -euo pipefail
+          failed=()
+          for job_result in ${SECURITY_RESULTS}; do
+            job="${job_result%%=*}"
+            result="${job_result#*=}"
+            if [ "${result}" != "success" ]; then
+              failed+=("${job}=${result}")
+            fi
+          done
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf 'Security gate failed: %s\n' "${failed[*]}" >&2
+            exit 1
+          fi
+
+          echo "Every CI Security job succeeded."

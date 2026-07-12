@@ -9,9 +9,6 @@ const nextConfig: NextConfig = {
     defaultLocale: "en",
     localeDetection: false,
   },
-  env: {
-    NEXT_PUBLIC_PLATFORM_MODE: process.env.PLATFORM_MODE || "selfhosted",
-  },
   turbopack: {
     root: path.resolve(process.cwd(), ".."),
   },

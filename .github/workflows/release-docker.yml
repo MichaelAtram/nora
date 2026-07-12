@@ -16,6 +16,7 @@ on:
       - "frontend-marketing/**"
       - "backend-api/**"
       - "agent-runtime/**"
+      - "workers/backup/**"
       - "workers/provisioner/**"
   workflow_dispatch:
     inputs:
@@ -72,6 +73,7 @@ jobs:
         CI Compose Pipeline
         CI Security
         CodeQL
+        Supply chain
       OPTIONAL_WORKFLOWS: |
         CodeQL
     steps:

@@ -7,18 +7,19 @@ Nora operates in one of two platform modes, controlled by the `PLATFORM_MODE` en
 ![Settings — subscription / platform-mode card at the bottom of the Settings page](/images/configuration/platform-modes-toggle.png)
 
 <Note>
-  You can check which mode is currently active by calling the `/config/platform` endpoint on your backend API. It returns a JSON object with the current `platform_mode` value.
+  You can check which mode is currently active by calling the `/config/platform` endpoint on your
+  backend API. It returns a JSON object with the current `mode` value.
 </Note>
 
 ## Comparing modes
 
-|                              | Self-hosted                             | PaaS                                                         |
-| ---------------------------- | --------------------------------------- | ------------------------------------------------------------ |
-| **`PLATFORM_MODE` value**    | `selfhosted`                            | `paas`                                                       |
-| **Resource limits**          | Set by operator via env vars            | Locked to Stripe subscription plan tier                      |
-| **Billing**                  | None                                    | Stripe (when `BILLING_ENABLED=true`)                         |
-| **Agent limit source**       | `MAX_AGENTS` env var                    | Subscription plan                                            |
-| **vCPU / RAM / disk source** | `MAX_VCPU`, `MAX_RAM_MB`, `MAX_DISK_GB` | Platform-wide deployment defaults (Admin Settings), shared across all plan tiers |
+|                              | Self-hosted                             | PaaS                                                                                                      |
+| ---------------------------- | --------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **`PLATFORM_MODE` value**    | `selfhosted`                            | `paas`                                                                                                    |
+| **Resource limits**          | Set by operator via env vars            | Locked to Stripe subscription plan tier                                                                   |
+| **Billing**                  | None                                    | Stripe (when `BILLING_ENABLED=true`)                                                                      |
+| **Agent limit source**       | `MAX_AGENTS` env var                    | Subscription plan                                                                                         |
+| **vCPU / RAM / disk source** | `MAX_VCPU`, `MAX_RAM_MB`, `MAX_DISK_GB` | Platform-wide deployment defaults (Admin Settings), shared across all plan tiers                          |
 | **Free tier**                | All users share operator limits         | Automatic free plan (3 agents; compute comes from the platform deployment defaults, not a per-plan value) |
 
 ## Self-hosted mode
@@ -48,7 +49,8 @@ MAX_AGENTS=50
 | `MAX_AGENTS`  | `50`    | Maximum number of agents a single user may deploy.     |
 
 <Tip>
-  Size these limits to your host's available capacity. On a modest server, reducing `MAX_VCPU` and `MAX_RAM_MB` prevents any single user from exhausting shared resources.
+  Size these limits to your host's available capacity. On a modest server, reducing `MAX_VCPU` and
+  `MAX_RAM_MB` prevents any single user from exhausting shared resources.
 </Tip>
 
 When a user reaches `MAX_AGENTS`, the deployment request is rejected with the message:
@@ -77,7 +79,10 @@ Three tiers are defined in the billing module:
 | `enterprise` | 100    |
 
 <Note>
-  vCPU, RAM, and disk are not differentiated by plan tier. Every PaaS subscription receives the platform-wide deployment defaults (`default_vcpu` / `default_ram_mb` / `default_disk_gb`) configured in Admin Settings — only the per-tier agent limit (and managed-backup limits) differ. The shipped fallback defaults are 1 vCPU / 1024 MB / 10 GB.
+  vCPU, RAM, and disk are not differentiated by plan tier. Every PaaS subscription receives the
+  platform-wide deployment defaults (`default_vcpu` / `default_ram_mb` / `default_disk_gb`)
+  configured in Admin Settings — only the per-tier agent limit (and managed-backup limits) differ.
+  The shipped fallback defaults are 1 vCPU / 1024 MB / 10 GB.
 </Note>
 
 New users are automatically placed on the `free` plan when they first deploy an agent.
@@ -101,7 +106,9 @@ STRIPE_PRICE_ENTERPRISE=price_...
 | `STRIPE_PRICE_ENTERPRISE` | Stripe Price ID for the Enterprise plan.                                                      |
 
 <Warning>
-  Set `BILLING_ENABLED=false` while testing in PaaS mode. With billing disabled, users in PaaS mode can deploy unlimited agents and the Stripe limit enforcement is bypassed. Only set `BILLING_ENABLED=true` when your Stripe integration is fully configured and tested.
+  Set `BILLING_ENABLED=false` while testing in PaaS mode. With billing disabled, users in PaaS mode
+  can deploy unlimited agents and the Stripe limit enforcement is bypassed. Only set
+  `BILLING_ENABLED=true` when your Stripe integration is fully configured and tested.
 </Warning>
 
 ### How billing enforcement works
@@ -129,5 +136,6 @@ docker compose up -d
 ```
 
 <Note>
-  Existing agents are not affected when you switch modes. The mode change only affects how new deployment requests are evaluated and what resource limits are applied.
+  Existing agents are not affected when you switch modes. The mode change only affects how new
+  deployment requests are evaluated and what resource limits are applied.
 </Note>

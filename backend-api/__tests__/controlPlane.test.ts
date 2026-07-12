@@ -280,6 +280,39 @@ describe("public platform config", () => {
     });
   });
 
+  it("reports the exact runtime tuple required by local Docker demo activation", async () => {
+    const res = await request(app).get("/config/platform");
+
+    expect(res.status).toBe(200);
+    expect(res.body.capabilities.localDockerDemo).toEqual({
+      enabled: true,
+      runtimeFamily: "openclaw",
+      deployTarget: "docker",
+      executionTargetId: "docker",
+      sandboxProfile: "standard",
+      requiresLiveDocker: true,
+      issue: null,
+    });
+  });
+
+  it("disables local Docker demo activation when its runtime tuple is unavailable", async () => {
+    process.env.ENABLED_BACKENDS = "k8s";
+
+    const res = await request(app).get("/config/platform");
+
+    expect(res.status).toBe(200);
+    expect(res.body.capabilities.localDockerDemo).toEqual(
+      expect.objectContaining({
+        enabled: false,
+        runtimeFamily: "openclaw",
+        deployTarget: "docker",
+        sandboxProfile: "standard",
+        requiresLiveDocker: true,
+        issue: expect.any(String),
+      }),
+    );
+  });
+
   it("returns runtime, deploy-target, sandbox, and legacy backend catalogs", async () => {
     const res = await request(app).get("/config/backends");
 
@@ -403,9 +436,7 @@ describe("public platform config", () => {
     expect(proxmoxTarget).toEqual(
       expect.objectContaining({
         enabled: true,
-        available: false,
-        maturityTier: "blocked",
-        availableForOnboarding: false,
+        maturityTier: "experimental",
       }),
     );
   });
@@ -446,7 +477,7 @@ describe("public platform config", () => {
         expect.objectContaining({
           id: "proxmox",
           runtimeFamily: "hermes",
-          maturityTier: "blocked",
+          maturityTier: "experimental",
         }),
       ]),
     );

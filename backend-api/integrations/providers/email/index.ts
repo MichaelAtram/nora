@@ -24,6 +24,11 @@ function boolValue(value: unknown, fallback = false): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+function mailEndpointUrl(host: string, port: number): string {
+  const normalizedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `https://${normalizedHost}:${port}`;
+}
+
 function setNested(target: Record<string, any>, path: string, value: unknown) {
   const parts = path.split(".");
   let cursor = target;
@@ -101,9 +106,17 @@ export const emailProvider: Provider = {
   id: "email",
   authType: "custom",
 
-  async test(ctx: DecryptedIntegration, _deps: ProviderDeps): Promise<ConnectivityResult> {
+  async test(ctx: DecryptedIntegration, deps: ProviderDeps): Promise<ConnectivityResult> {
     const normalized = normalizeEmailConfigInput(ctx.config || {});
     if (ctx.token) normalized.auth.password = ctx.token;
+    await deps.assertSafeUrl(
+      mailEndpointUrl(normalized.imap.host, normalized.imap.port),
+      "Email IMAP endpoint",
+    );
+    await deps.assertSafeUrl(
+      mailEndpointUrl(normalized.smtp.host, normalized.smtp.port),
+      "Email SMTP endpoint",
+    );
     return testEmailConnection(normalized);
   },
 

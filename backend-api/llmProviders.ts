@@ -184,36 +184,153 @@ async function listProviders(userId) {
   });
 }
 
+function providerMutationLockKey(userId) {
+  return `nora:llm-providers:${String(userId || "")}`;
+}
+
+async function withProviderMutationLock(userId, operation) {
+  const client = await db.connect();
+  let transactionOpen = false;
+  try {
+    await client.query("BEGIN");
+    transactionOpen = true;
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      providerMutationLockKey(userId),
+    ]);
+    const result = await operation(client);
+    await client.query("COMMIT");
+    transactionOpen = false;
+    return result;
+  } catch (error) {
+    if (transactionOpen) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Ensure the user's built-in demo provider exists and is configured for this
+ * control-plane instance. Callers must serialize this mutation with
+ * providerMutationLockKey(userId); addProvider does so transactionally, while
+ * demo activation holds the same key as a session lock across DB + queue work.
+ */
+async function ensureDemoProvider(userId, queryable = db) {
+  const apiKey = deriveDemoToken();
+  const model = DEMO_MODEL_ID;
+  const config = { baseUrl: demoLlmBaseUrl() };
+  const encryptedKey = encrypt(apiKey);
+  const existing = await queryable.query(
+    `SELECT id, provider, model, config, is_default, created_at
+      FROM llm_providers
+      WHERE user_id = $1 AND provider = $2
+      ORDER BY is_default DESC, created_at, id`,
+    [userId, DEMO_PROVIDER_ID],
+  );
+
+  if (existing.rows[0]) {
+    const canonical = existing.rows[0];
+    const refreshed = await queryable.query(
+      `UPDATE llm_providers
+          SET api_key = $3, model = $4, config = $5
+        WHERE id = $1 AND user_id = $2
+        RETURNING id, provider, model, is_default, created_at`,
+      [canonical.id, userId, encryptedKey, model, JSON.stringify(config)],
+    );
+    if (existing.rows.length > 1) {
+      await queryable.query(
+        "DELETE FROM llm_providers WHERE user_id = $1 AND provider = $2 AND id <> $3",
+        [userId, DEMO_PROVIDER_ID, canonical.id],
+      );
+    }
+    return refreshed.rows[0];
+  }
+
+  const providerState = await queryable.query(
+    "SELECT COUNT(*)::int AS provider_count FROM llm_providers WHERE user_id = $1",
+    [userId],
+  );
+  const isDefault = Number(providerState.rows[0]?.provider_count || 0) === 0;
+  const inserted = await queryable.query(
+    `INSERT INTO llm_providers(user_id, provider, api_key, model, config, is_default)
+     VALUES($1, $2, $3, $4, $5, $6)
+     RETURNING id, provider, model, is_default, created_at`,
+    [userId, DEMO_PROVIDER_ID, encryptedKey, model, JSON.stringify(config), isDefault],
+  );
+  return inserted.rows[0];
+}
+
 async function addProvider(userId, provider, apiKey, model, config = {}) {
   if (!PROVIDERS.find((p) => p.id === provider)) {
     throw new Error(`Unknown LLM provider: ${provider}`);
   }
   if (provider === DEMO_PROVIDER_ID) {
-    // Zero-key path: the token is derived (not user secret material) and the
-    // base URL points at this control plane's stub as reachable from agent
-    // containers. Deliberately no ensureEncryptionConfigured — the demo must
-    // work on a fresh install before any secrets are set up.
-    apiKey = deriveDemoToken();
-    model = model || DEMO_MODEL_ID;
-    config = { ...config, baseUrl: demoLlmBaseUrl() };
-  } else {
-    if (!apiKey) throw new Error("API key is required");
-    ensureEncryptionConfigured("LLM provider credential storage");
+    // Deliberately no ensureEncryptionConfigured: the derived demo token is
+    // not user secret material and must work on a fresh installation.
+    return withProviderMutationLock(userId, (client) => ensureDemoProvider(userId, client));
   }
+  if (!apiKey) throw new Error("API key is required");
+  ensureEncryptionConfigured("LLM provider credential storage");
   const encryptedKey = encrypt(apiKey);
 
-  // If no other providers exist for this user, make it default
-  const existing = await db.query("SELECT COUNT(*) FROM llm_providers WHERE user_id = $1", [
-    userId,
-  ]);
-  const isDefault = parseInt(existing.rows[0].count) === 0;
+  return withProviderMutationLock(userId, async (client) => {
+    const providerState = await client.query(
+      `SELECT COUNT(*)::int AS provider_count,
+              COALESCE(bool_or(is_default AND provider = $2), false) AS demo_is_default
+         FROM llm_providers
+        WHERE user_id = $1`,
+      [userId, DEMO_PROVIDER_ID],
+    );
+    const state = providerState.rows[0] || {};
+    const isDefault = Number(state.provider_count || 0) === 0 || state.demo_is_default === true;
 
-  const result = await db.query(
-    `INSERT INTO llm_providers(user_id, provider, api_key, model, config, is_default)
-     VALUES($1, $2, $3, $4, $5, $6) RETURNING id, provider, model, is_default, created_at`,
-    [userId, provider, encryptedKey, model || null, JSON.stringify(config), isDefault],
+    // The built-in demo is a temporary onboarding default. The first real
+    // provider replaces it atomically; an existing real default is preserved.
+    if (state.demo_is_default === true) {
+      await client.query("UPDATE llm_providers SET is_default = false WHERE user_id = $1", [
+        userId,
+      ]);
+    }
+
+    const result = await client.query(
+      `INSERT INTO llm_providers(user_id, provider, api_key, model, config, is_default)
+       VALUES($1, $2, $3, $4, $5, $6)
+       RETURNING id, provider, model, is_default, created_at`,
+      [userId, provider, encryptedKey, model || null, JSON.stringify(config), isDefault],
+    );
+    return result.rows[0];
+  });
+}
+
+async function getDeploymentProvider(userId, providerId = null, queryable = db) {
+  if (!userId) return null;
+
+  if (providerId) {
+    const explicit = await queryable.query(
+      `SELECT id, provider, model, config
+         FROM llm_providers
+        WHERE user_id = $1 AND id = $2
+        LIMIT 1`,
+      [userId, providerId],
+    );
+    if (!explicit.rows[0]) {
+      const error = new Error("Deployment LLM provider was not found for this user");
+      error.code = "DEPLOYMENT_LLM_PROVIDER_NOT_FOUND";
+      throw error;
+    }
+    return explicit.rows[0];
+  }
+
+  const fallback = await queryable.query(
+    `SELECT id, provider, model, config
+       FROM llm_providers
+      WHERE user_id = $1 AND is_default = true
+      LIMIT 1`,
+    [userId],
   );
-  return result.rows[0];
+  return fallback.rows[0] || null;
 }
 
 async function updateProvider(id, userId, updates) {
@@ -474,6 +591,9 @@ module.exports = {
   getProviderEnvVar,
   listProviders,
   addProvider,
+  ensureDemoProvider,
+  providerMutationLockKey,
+  getDeploymentProvider,
   updateProvider,
   deleteProvider,
   getProviderKeys,

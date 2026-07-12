@@ -1,0 +1,338 @@
+name: Proxmox Real Hardware
+run-name: Proxmox hardware gate @ ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_families:
+        description: Runtime families to create and destroy on the real Proxmox node
+        required: true
+        type: choice
+        options:
+          - openclaw
+          - openclaw,hermes
+      keep_on_failure:
+        description: Preserve a failed LXC for operator diagnosis
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxmox-real-hardware
+  cancel-in-progress: false
+
+jobs:
+  validate-target:
+    name: Validate trusted target
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.target.outputs.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a commit reachable from the default branch
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/master" ]; then
+            echo "::error::Dispatch this protected workflow from the master branch only"
+            exit 1
+          fi
+          git fetch --no-tags origin master
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "Validated Proxmox hardware target SHA: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  lifecycle-smoke:
+    name: Destructive lifecycle smoke
+    runs-on: [self-hosted, linux, x64, nora-proxmox]
+    needs: validate-target
+    environment: proxmox-real-hardware
+    timeout-minutes: 120
+    env:
+      COMPOSE_PROJECT_NAME: nora-proxmox-${{ github.run_id }}-${{ github.run_attempt }}
+      BACKEND_API_PORT: "44100"
+      NODE_ENV: production
+      ENABLED_BACKENDS: docker,proxmox
+      ENABLED_RUNTIME_FAMILIES: ${{ inputs.runtime_families }}
+      ENABLED_SANDBOX_PROFILES: standard
+      PROXMOX_SMOKE_RUNTIME_FAMILIES: ${{ inputs.runtime_families }}
+      PROXMOX_SMOKE_KEEP_ON_FAILURE: ${{ inputs.keep_on_failure }}
+      PROXMOX_API_URL: ${{ secrets.PROXMOX_API_URL }}
+      PROXMOX_TOKEN_ID: ${{ secrets.PROXMOX_TOKEN_ID }}
+      PROXMOX_TOKEN_SECRET: ${{ secrets.PROXMOX_TOKEN_SECRET }}
+      PROXMOX_VERIFY_TLS: "true"
+      PROXMOX_CA_CERT: ${{ secrets.PROXMOX_CA_CERT }}
+      PROXMOX_ALLOW_INSECURE_HTTP: "false"
+      PROXMOX_NODE: ${{ vars.PROXMOX_NODE }}
+      PROXMOX_TEMPLATE: ${{ vars.PROXMOX_TEMPLATE }}
+      PROXMOX_HERMES_TEMPLATE: ${{ vars.PROXMOX_HERMES_TEMPLATE }}
+      PROXMOX_ROOTFS_STORAGE: ${{ vars.PROXMOX_ROOTFS_STORAGE }}
+      PROXMOX_BRIDGE: ${{ vars.PROXMOX_BRIDGE }}
+      PROXMOX_SSH_HOST: ${{ secrets.PROXMOX_SSH_HOST }}
+      PROXMOX_SSH_USER: ${{ secrets.PROXMOX_SSH_USER }}
+      PROXMOX_SSH_PORT: ${{ vars.PROXMOX_SSH_PORT || '22' }}
+      PROXMOX_SSH_PRIVATE_KEY: ${{ secrets.PROXMOX_SSH_PRIVATE_KEY }}
+      PROXMOX_SSH_PRIVATE_KEY_PASSPHRASE: ${{ secrets.PROXMOX_SSH_PRIVATE_KEY_PASSPHRASE }}
+      PROXMOX_SSH_PASSWORD: ${{ secrets.PROXMOX_SSH_PASSWORD }}
+      PROXMOX_SSH_HOST_FINGERPRINT: ${{ secrets.PROXMOX_SSH_HOST_FINGERPRINT }}
+      PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY: "false"
+      PROXMOX_PCT_COMMAND: ${{ vars.PROXMOX_PCT_COMMAND || 'pct' }}
+      PROXMOX_SUDO: ${{ vars.PROXMOX_SUDO }}
+      PROXMOX_NODE_MAJOR: ${{ vars.PROXMOX_NODE_MAJOR || '24' }}
+      PROXMOX_OPENCLAW_PACKAGE: ${{ vars.PROXMOX_OPENCLAW_PACKAGE }}
+      PROXMOX_HERMES_BIN: ${{ vars.PROXMOX_HERMES_BIN || '/opt/hermes/.venv/bin/hermes' }}
+      PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD: "false"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate-target.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify runner and external gate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null
+          command -v node >/dev/null
+          command -v openssl >/dev/null
+
+          compose_version="$(docker compose version --short | sed 's/^v//; s/[^0-9.].*$//')"
+          IFS=. read -r compose_major compose_minor compose_patch <<< "$compose_version"
+          compose_major="${compose_major:-0}"
+          compose_minor="${compose_minor:-0}"
+          compose_patch="${compose_patch:-0}"
+          if (( compose_major < 2 || (compose_major == 2 && compose_minor < 24) || (compose_major == 2 && compose_minor == 24 && compose_patch < 4) )); then
+            echo "::error::Docker Compose 2.24.4 or newer is required; found ${compose_version:-unknown}"
+            exit 1
+          fi
+
+          missing=0
+          required=(
+            PROXMOX_API_URL
+            PROXMOX_TOKEN_ID
+            PROXMOX_TOKEN_SECRET
+            PROXMOX_NODE
+            PROXMOX_TEMPLATE
+            PROXMOX_ROOTFS_STORAGE
+            PROXMOX_BRIDGE
+            PROXMOX_SSH_HOST
+            PROXMOX_SSH_USER
+            PROXMOX_SSH_HOST_FINGERPRINT
+            PROXMOX_OPENCLAW_PACKAGE
+          )
+          for name in "${required[@]}"; do
+            if [[ ! "${!name:-}" =~ [^[:space:]] ]]; then
+              echo "::error::The proxmox-real-hardware environment must define $name"
+              missing=1
+            fi
+          done
+          if [[ ! "${PROXMOX_SSH_PRIVATE_KEY:-}" =~ [^[:space:]] ]] && [[ ! "${PROXMOX_SSH_PASSWORD:-}" =~ [^[:space:]] ]]; then
+            echo "::error::Define PROXMOX_SSH_PRIVATE_KEY or PROXMOX_SSH_PASSWORD as an environment secret"
+            missing=1
+          fi
+          if [[ ",${PROXMOX_SMOKE_RUNTIME_FAMILIES}," == *,hermes,* ]] && [[ ! "${PROXMOX_HERMES_TEMPLATE:-}" =~ [^[:space:]] ]]; then
+            echo "::error::PROXMOX_HERMES_TEMPLATE is required for the Hermes smoke cell"
+            missing=1
+          fi
+          test "$missing" -eq 0
+
+      - name: Assemble ephemeral Compose inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          env_file="$RUNNER_TEMP/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.env"
+          override_file="$RUNNER_TEMP/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.override.yml"
+          wrapper_file="$RUNNER_TEMP/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-compose"
+          secrets_dir="$RUNNER_TEMP/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-secrets"
+
+          # Publish paths before writing secrets so the always() cleanup step
+          # can scrub partial inputs even if this preparation step fails.
+          {
+            printf 'NORA_ENV_FILE=%s\n' "$env_file"
+            printf 'NORA_PROXMOX_COMPOSE_OVERRIDE=%s\n' "$override_file"
+            printf 'NORA_PROXMOX_COMPOSE=%s\n' "$wrapper_file"
+            printf 'NORA_PROXMOX_COMPOSE_SECRETS=%s\n' "$secrets_dir"
+          } >> "$GITHUB_ENV"
+
+          install -m 600 /dev/null "$env_file"
+          {
+            printf 'NODE_ENV=production\n'
+            printf 'PLATFORM_MODE=selfhosted\n'
+            printf 'DB_HOST=postgres\n'
+            printf 'DB_USER=nora\n'
+            printf 'DB_PASSWORD=%s\n' "$(openssl rand -hex 24)"
+            printf 'DB_NAME=nora\n'
+            printf 'DB_PORT=5432\n'
+            printf 'REDIS_HOST=redis\n'
+            printf 'REDIS_PORT=6379\n'
+            printf 'PORT=4000\n'
+            printf 'JWT_SECRET=%s\n' "$(openssl rand -hex 32)"
+            printf 'ENCRYPTION_KEY=%s\n' "$(openssl rand -hex 32)"
+            printf 'NORA_BACKUP_ENCRYPTION_KEY=%s\n' "$(openssl rand -hex 32)"
+            printf 'NORA_AGENT_HUB_API_KEY_HASH_SECRET=%s\n' "$(openssl rand -hex 32)"
+            printf 'NORA_API_KEY_HASH_SECRET=%s\n' "$(openssl rand -hex 32)"
+            printf 'NORA_COMPOSE_SECRETS_DIR=%s\n' "$secrets_dir"
+            printf 'NORA_UPGRADE_STATE_VOLUME=%s-upgrade-state\n' "$COMPOSE_PROJECT_NAME"
+            printf 'KEY_STORAGE=database\n'
+            printf 'ENABLED_BACKENDS=docker,proxmox\n'
+            printf 'ENABLED_RUNTIME_FAMILIES=%s\n' "$ENABLED_RUNTIME_FAMILIES"
+            printf 'ENABLED_SANDBOX_PROFILES=standard\n'
+          } > "$env_file"
+
+          bash scripts/materialize-compose-secrets.sh "$env_file"
+
+          install -m 600 /dev/null "$override_file"
+          cat > "$override_file" <<'YAML'
+          x-proxmox-environment: &proxmox-environment
+            PROXMOX_API_URL:
+            PROXMOX_TOKEN_ID:
+            PROXMOX_TOKEN_SECRET:
+            PROXMOX_VERIFY_TLS:
+            PROXMOX_CA_CERT:
+            PROXMOX_ALLOW_INSECURE_HTTP:
+            PROXMOX_NODE:
+            PROXMOX_TEMPLATE:
+            PROXMOX_HERMES_TEMPLATE:
+            PROXMOX_ROOTFS_STORAGE:
+            PROXMOX_BRIDGE:
+            PROXMOX_SSH_HOST:
+            PROXMOX_SSH_USER:
+            PROXMOX_SSH_PORT:
+            PROXMOX_SSH_PRIVATE_KEY:
+            PROXMOX_SSH_PRIVATE_KEY_PASSPHRASE:
+            PROXMOX_SSH_PASSWORD:
+            PROXMOX_SSH_HOST_FINGERPRINT:
+            PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY:
+            PROXMOX_PCT_COMMAND:
+            PROXMOX_SUDO:
+            PROXMOX_NODE_MAJOR:
+            PROXMOX_OPENCLAW_PACKAGE:
+            PROXMOX_HERMES_BIN:
+            PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD:
+
+          services:
+            backend-api:
+              environment:
+                <<: *proxmox-environment
+              ports: !reset []
+            worker-provisioner:
+              environment:
+                <<: *proxmox-environment
+            postgres:
+              ports: !reset []
+          YAML
+
+          install -m 700 /dev/null "$wrapper_file"
+          cat > "$wrapper_file" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          : "${NORA_ENV_FILE:?NORA_ENV_FILE is required}"
+          : "${NORA_PROXMOX_COMPOSE_OVERRIDE:?NORA_PROXMOX_COMPOSE_OVERRIDE is required}"
+          : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+
+          while IFS='=' read -r name value || [ -n "$name" ]; do
+            if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "Invalid key in the ephemeral Nora environment" >&2
+              exit 1
+            fi
+            export "$name=$value"
+          done < "$NORA_ENV_FILE"
+
+          exec docker compose \
+            --env-file "$NORA_ENV_FILE" \
+            -f "$GITHUB_WORKSPACE/docker-compose.yml" \
+            -f "$NORA_PROXMOX_COMPOSE_OVERRIDE" \
+            "$@"
+          BASH
+
+          export NORA_ENV_FILE="$env_file"
+          export NORA_PROXMOX_COMPOSE_OVERRIDE="$override_file"
+          "$wrapper_file" config --quiet
+          "$wrapper_file" config --format json | node -e '
+            const fs = require("fs");
+            const config = JSON.parse(fs.readFileSync(0, "utf8"));
+            const required = [
+              "PROXMOX_API_URL",
+              "PROXMOX_TOKEN_ID",
+              "PROXMOX_TOKEN_SECRET",
+              "PROXMOX_NODE",
+              "PROXMOX_TEMPLATE",
+              "PROXMOX_ROOTFS_STORAGE",
+              "PROXMOX_BRIDGE",
+              "PROXMOX_SSH_HOST",
+              "PROXMOX_SSH_USER",
+              "PROXMOX_SSH_HOST_FINGERPRINT",
+              "PROXMOX_OPENCLAW_PACKAGE",
+            ];
+            for (const serviceName of ["backend-api", "worker-provisioner"]) {
+              const environment = config.services?.[serviceName]?.environment || {};
+              const missing = required.filter((name) => !String(environment[name] || "").trim());
+              if (missing.length) {
+                throw new Error(`${serviceName} is missing protected Proxmox inputs: ${missing.join(", ")}`);
+              }
+            }
+          '
+
+      - name: Start isolated Nora control-plane services
+        run: |
+          "$NORA_PROXMOX_COMPOSE" up -d --build postgres redis backend-api worker-provisioner
+
+      - name: Wait for the provisioner health gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..180}; do
+            if "$NORA_PROXMOX_COMPOSE" ps --format json worker-provisioner | grep -q '"Health":"healthy"'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          "$NORA_PROXMOX_COMPOSE" ps
+          exit 1
+
+      - name: Run destructive real-hardware lifecycle gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS='=' read -r name value || [ -n "$name" ]; do
+            if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "Invalid key in the ephemeral Nora environment" >&2
+              exit 1
+            fi
+            export "$name=$value"
+          done < "$NORA_ENV_FILE"
+          export COMPOSE_FILE="$GITHUB_WORKSPACE/docker-compose.yml:$NORA_PROXMOX_COMPOSE_OVERRIDE"
+          e2e/scripts/run-proxmox-smoke.sh
+
+      - name: Stop isolated Nora services
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup_status=0
+          env_file="${NORA_ENV_FILE:-$RUNNER_TEMP/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.env}"
+          override_file="${NORA_PROXMOX_COMPOSE_OVERRIDE:-$RUNNER_TEMP/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.override.yml}"
+          wrapper_file="${NORA_PROXMOX_COMPOSE:-$RUNNER_TEMP/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-compose}"
+          secrets_dir="${NORA_PROXMOX_COMPOSE_SECRETS:-$RUNNER_TEMP/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-secrets}"
+          if [ -x "$wrapper_file" ]; then
+            export NORA_ENV_FILE="$env_file"
+            export NORA_PROXMOX_COMPOSE_OVERRIDE="$override_file"
+            "$wrapper_file" down -v --remove-orphans || cleanup_status=$?
+          fi
+          for path in "$env_file" "$override_file" "$wrapper_file"; do
+            rm -f "$path"
+          done
+          rm -rf "$secrets_dir"
+          exit "$cleanup_status"

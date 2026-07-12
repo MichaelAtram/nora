@@ -159,10 +159,16 @@ beforeEach(() => {
     release: jest.fn(),
   });
   process.env.OAUTH_LOGIN_ENABLED = "false";
+  process.env.PLATFORM_MODE = "selfhosted";
   process.env.GOOGLE_CLIENT_ID = "google-client-id";
   delete process.env.SIGNUP_BOT_PROTECTION_PROVIDER;
+  delete process.env.NEXT_PUBLIC_SIGNUP_BOT_PROTECTION_PROVIDER;
   delete process.env.SIGNUP_TURNSTILE_SECRET;
+  delete process.env.SIGNUP_TURNSTILE_SITE_KEY;
+  delete process.env.NEXT_PUBLIC_SIGNUP_TURNSTILE_SITE_KEY;
   delete process.env.SIGNUP_RECAPTCHA_SECRET;
+  delete process.env.SIGNUP_RECAPTCHA_SITE_KEY;
+  delete process.env.NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY;
   global.fetch = jest.fn();
   mockVerifyApiKey.mockReset();
 });
@@ -290,6 +296,7 @@ describe("POST /auth/signup", () => {
   it("rejects signup when Turnstile is configured and the token is missing", async () => {
     process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "turnstile";
     process.env.SIGNUP_TURNSTILE_SECRET = "turnstile-secret";
+    process.env.SIGNUP_TURNSTILE_SITE_KEY = "turnstile-site-key";
 
     const res = await signupRequest().send({
       email: "turnstile@example.com",
@@ -305,6 +312,7 @@ describe("POST /auth/signup", () => {
   it("allows signup when Turnstile verification succeeds", async () => {
     process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "turnstile";
     process.env.SIGNUP_TURNSTILE_SECRET = "turnstile-secret";
+    process.env.SIGNUP_TURNSTILE_SITE_KEY = "turnstile-site-key";
     global.fetch.mockResolvedValueOnce(jsonResponse({ success: true }));
     mockDb.query
       .mockResolvedValueOnce({ rows: [] })
@@ -335,6 +343,7 @@ describe("POST /auth/signup", () => {
   it("rejects signup when reCAPTCHA verification fails", async () => {
     process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "recaptcha";
     process.env.SIGNUP_RECAPTCHA_SECRET = "recaptcha-secret";
+    process.env.SIGNUP_RECAPTCHA_SITE_KEY = "recaptcha-site-key";
     global.fetch.mockResolvedValueOnce(jsonResponse({ success: false }));
 
     const res = await signupRequest().send({
@@ -351,6 +360,7 @@ describe("POST /auth/signup", () => {
   it("rejects signup when bot verification cannot be reached", async () => {
     process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "recaptcha";
     process.env.SIGNUP_RECAPTCHA_SECRET = "recaptcha-secret";
+    process.env.SIGNUP_RECAPTCHA_SITE_KEY = "recaptcha-site-key";
     global.fetch.mockRejectedValueOnce(new Error("network unavailable"));
 
     const res = await signupRequest().send({
@@ -367,6 +377,7 @@ describe("POST /auth/signup", () => {
   it("allows signup when reCAPTCHA verification succeeds", async () => {
     process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "recaptcha";
     process.env.SIGNUP_RECAPTCHA_SECRET = "recaptcha-secret";
+    process.env.SIGNUP_RECAPTCHA_SITE_KEY = "recaptcha-site-key";
     global.fetch.mockResolvedValueOnce(jsonResponse({ success: true }));
     mockDb.query
       .mockResolvedValueOnce({ rows: [] })
@@ -392,6 +403,24 @@ describe("POST /auth/signup", () => {
     const verifyBody = global.fetch.mock.calls[0][1].body;
     expect(verifyBody.get("secret")).toBe("recaptcha-secret");
     expect(verifyBody.get("response")).toBe("recaptcha-token");
+  });
+
+  it("fails closed when bot protection is enabled without a public site key", async () => {
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "turnstile";
+    process.env.SIGNUP_TURNSTILE_SECRET = "turnstile-secret";
+    const consoleSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await signupRequest().send({
+      email: "turnstile-misconfigured@example.com",
+      password: "validpassword123",
+      botProtectionToken: "unverifiable-token",
+    });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/could not create account/i);
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(mockDb.query).not.toHaveBeenCalled();
+    consoleSpy.mockRestore();
   });
 });
 
@@ -1143,24 +1172,111 @@ describe("OAuth hardening", () => {
 });
 
 describe("GET /auth/bootstrap-status", () => {
+  const disabledSignupBotProtection = {
+    enabled: false,
+    provider: "none",
+    siteKey: null,
+    configured: true,
+    configurationError: null,
+  };
+
   it("reports needsFirstAdmin=true when no users exist", async () => {
     mockDb.query.mockResolvedValueOnce({ rows: [] });
     const res = await request(app).get("/auth/bootstrap-status");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ needsFirstAdmin: true });
+    expect(res.body).toEqual({
+      needsFirstAdmin: true,
+      oauthLoginEnabled: false,
+      platformMode: "selfhosted",
+      signupBotProtection: disabledSignupBotProtection,
+    });
   });
 
   it("reports needsFirstAdmin=false once a user is registered", async () => {
     mockDb.query.mockResolvedValueOnce({ rows: [{ "?column?": 1 }] });
     const res = await request(app).get("/auth/bootstrap-status");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ needsFirstAdmin: false });
+    expect(res.body).toEqual({
+      needsFirstAdmin: false,
+      oauthLoginEnabled: false,
+      platformMode: "selfhosted",
+      signupBotProtection: disabledSignupBotProtection,
+    });
   });
 
-  it("is publicly reachable without a token and leaks only the boolean", async () => {
+  it("reports runtime OAuth and hosted platform configuration", async () => {
+    process.env.OAUTH_LOGIN_ENABLED = "true";
+    process.env.PLATFORM_MODE = "PAAS";
     mockDb.query.mockResolvedValueOnce({ rows: [{ "?column?": 1 }] });
+
     const res = await request(app).get("/auth/bootstrap-status");
+
     expect(res.status).toBe(200);
-    expect(Object.keys(res.body)).toEqual(["needsFirstAdmin"]);
+    expect(res.body).toEqual({
+      needsFirstAdmin: false,
+      oauthLoginEnabled: true,
+      platformMode: "paas",
+      signupBotProtection: disabledSignupBotProtection,
+    });
+  });
+
+  it("returns only safe public Turnstile configuration without secret material", async () => {
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "turnstile";
+    process.env.SIGNUP_TURNSTILE_SITE_KEY = "turnstile-site-key";
+    process.env.SIGNUP_TURNSTILE_SECRET = "turnstile-secret";
+    mockDb.query.mockResolvedValueOnce({ rows: [{ "?column?": 1 }] });
+
+    const res = await request(app).get("/auth/bootstrap-status");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      needsFirstAdmin: false,
+      oauthLoginEnabled: false,
+      platformMode: "selfhosted",
+      signupBotProtection: {
+        enabled: true,
+        provider: "turnstile",
+        siteKey: "turnstile-site-key",
+        configured: true,
+        configurationError: null,
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain("turnstile-secret");
+  });
+
+  it("accepts the legacy public site-key alias at runtime", async () => {
+    process.env.NEXT_PUBLIC_SIGNUP_BOT_PROTECTION_PROVIDER = "recaptcha";
+    process.env.NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY = "legacy-recaptcha-site-key";
+    process.env.SIGNUP_RECAPTCHA_SECRET = "recaptcha-secret";
+    mockDb.query.mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app).get("/auth/bootstrap-status");
+
+    expect(res.status).toBe(200);
+    expect(res.body.signupBotProtection).toEqual({
+      enabled: true,
+      provider: "recaptcha",
+      siteKey: "legacy-recaptcha-site-key",
+      configured: true,
+      configurationError: null,
+    });
+    expect(JSON.stringify(res.body)).not.toContain("recaptcha-secret");
+  });
+
+  it("reports a fail-closed public configuration error when the site key is missing", async () => {
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "turnstile";
+    process.env.SIGNUP_TURNSTILE_SECRET = "turnstile-secret";
+    mockDb.query.mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app).get("/auth/bootstrap-status");
+
+    expect(res.status).toBe(200);
+    expect(res.body.signupBotProtection).toEqual({
+      enabled: true,
+      provider: "turnstile",
+      siteKey: null,
+      configured: false,
+      configurationError: expect.stringMatching(/public site key is missing/i),
+    });
   });
 });

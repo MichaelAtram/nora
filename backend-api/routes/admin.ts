@@ -21,7 +21,7 @@ const {
   retryDLQJob,
 } = require("../redisQueue");
 const backups = require("../backups");
-const { requireAdmin } = require("../middleware/auth");
+const { requireAdmin, requireScope, requireSession } = require("../middleware/auth");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { reconcileAgentStatus } = require("../agentStatus");
 const {
@@ -75,18 +75,23 @@ const { resolveAuditSource } = require("../auditSource");
 const router = express.Router();
 
 router.use(requireAdmin);
-router.use(createMutationFailureAuditMiddleware("admin"));
 
 // Control-plane self-check (DB, queue, Kubernetes targets, secret posture,
 // fleet health, gateway exposure). Backs `nora doctor` and the admin Health
-// panel. Cached briefly; pass ?fresh=1 to force a recompute.
+// panel. API clients need the explicit admin:read scope; every other admin
+// route below remains session-only. Cached briefly; pass ?fresh=1 to force a
+// recompute.
 router.get(
-  "/admin/doctor",
+  "/doctor",
+  requireScope("admin:read"),
   asyncHandler(async (req, res) => {
     const fresh = req.query.fresh === "1" || req.query.fresh === "true";
     res.json(await doctor.getDoctorReport({ fresh }));
   }),
 );
+
+router.use(requireSession);
+router.use(createMutationFailureAuditMiddleware("admin"));
 
 function parseInterval(pg) {
   const match = String(pg || "").match(/(\d+)\s*(day|minute|hour|second)/);
@@ -104,11 +109,6 @@ function createHttpError(message, statusCode = 400) {
   const error = new Error(message);
   error.statusCode = statusCode;
   return error;
-}
-
-function isIgnorableStopError(error) {
-  const message = String(error?.message || "");
-  return message.includes("already stopped") || message.includes("not running");
 }
 
 function normalizeRequestedRuntimeFamily(value) {
@@ -502,14 +502,7 @@ async function ensureNotLastAdmin(user) {
 
 async function destroyAgent(agent) {
   if (containerManager.canDestroy(agent)) {
-    try {
-      await containerManager.destroy(agent);
-    } catch (error) {
-      console.error("Container cleanup error:", error.message);
-      if (containerManager.isKubernetesAgent(agent)) {
-        throw error;
-      }
-    }
+    await containerManager.destroy(agent);
   }
 
   await db.query("DELETE FROM agents WHERE id = $1", [agent.id]);
@@ -1551,7 +1544,8 @@ router.post(
       return res.status(400).json({ error: "No container - redeploy the agent first" });
     }
 
-    await containerManager.start(agent);
+    const lifecycleResult = await containerManager.start(agent);
+    await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
     const updated = await db.query(
       "UPDATE agents SET status = 'running' WHERE id = $1 RETURNING *",
       [agent.id],
@@ -1585,11 +1579,9 @@ router.post(
       try {
         await containerManager.stop(agent);
       } catch (error) {
-        if (!isIgnorableStopError(error)) {
+        if (!containerManager.isIgnorableStopError(error)) {
           console.error("Container stop error:", error.message);
-          if (containerManager.isKubernetesAgent(agent)) {
-            throw error;
-          }
+          throw error;
         }
       }
     }
@@ -1626,7 +1618,8 @@ router.post(
       return res.status(400).json({ error: "No container - redeploy the agent first" });
     }
 
-    await containerManager.restart(agent);
+    const lifecycleResult = await containerManager.restart(agent);
+    await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
     const updated = await db.query(
       "UPDATE agents SET status = 'running' WHERE id = $1 RETURNING *",
       [agent.id],

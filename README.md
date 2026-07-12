@@ -7,7 +7,7 @@
 <p align="center">
   <strong>OpenClaw + Hermes</strong>&nbsp;&nbsp;·&nbsp;&nbsp;
   <strong>Docker + Kubernetes GA</strong>&nbsp;&nbsp;·&nbsp;&nbsp;
-  <strong>69 integrations</strong>&nbsp;&nbsp;·&nbsp;&nbsp;
+  <strong>69 provider connections</strong>&nbsp;&nbsp;·&nbsp;&nbsp;
   <strong>Apache-2.0</strong>
 </p>
 
@@ -60,7 +60,8 @@ Most teams running agents in production eventually rebuild the same layer around
 - **Secrets that fail closed** — provider keys AES-256-GCM encrypted at rest and synced to running runtimes; production refuses to boot without a valid encryption key; SSH host-key pinning protects remote (BYOC) Docker hosts.
 - **Network isolation** — baseline Kubernetes NetworkPolicy ingress isolation with admin-managed CIDR allow rules, and an experimental NemoClaw hardened sandbox for untrusted code.
 - **Agent Hub** — installable, versioned starter templates to go from zero to a working agent fast.
-- **Integrations** — 69 integration providers (source control, chat, cloud, observability, vector DBs, automation) and 17+ LLM providers; expose connected integrations to agents as per-agent MCP servers.
+- **Integrations** — a 69-entry credential/connectivity catalog (source control, chat, cloud, observability, vector DBs, automation) plus 17+ LLM providers. Executable behavior comes from runtime skills or MCP adapters; supported per-agent MCP servers are enabled explicitly.
+- **Experimental Proxmox LXC** — deploy standard OpenClaw or a prepared Hermes image into unprivileged LXC with verified API TLS and pinned SSH. It is not VM-grade isolation and still requires the real-hardware smoke gate before production use.
 - **Automate everything** — a public REST API (OpenAPI 3.1), the `@noraai/cli`, and the `@noraai/mcp-server` for Claude Code, Gemini CLI, Claude Desktop, and Cursor.
 - **Workspaces & RBAC** — multi-tenant workspaces with ranked roles, a platform admin surface, account event history, and encrypted managed backups.
 
@@ -79,8 +80,8 @@ Most teams running agents in production eventually rebuild the same layer around
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src=".github/readme-assets/proof-operator-openclaw-ui-tab.png" alt="Embedded OpenClaw gateway UI" /><br />
-      <sub><b>OpenClaw gateway embedded in Nora</b></sub>
+      <img src=".github/readme-assets/proof-operator-agent-detail.png" alt="Nora agent detail and operations view" /><br />
+      <sub><b>Agent detail &amp; lifecycle operations</b></sub>
     </td>
     <td align="center" width="50%">
       <img src=".github/readme-assets/proof-operator-hermes-webui-tab.png" alt="Embedded Hermes WebUI" /><br />
@@ -128,20 +129,20 @@ iwr -useb https://raw.githubusercontent.com/solomon2773/nora/master/setup.ps1 | 
 **Kubernetes (Helm):**
 
 ```bash
-helm show chart oci://ghcr.io/solomon2773/nora --version 0.6.0
+helm show chart oci://ghcr.io/solomon2773/nora --version 0.7.0
 ```
 
 The public OCI chart installs the full Nora control plane. See the [Helm instructions](https://noradocs.solomontsao.com/self-hosting#kubernetes-helm) for the required secrets and Ingress options.
 
 The installer verifies prerequisites, generates or preserves secrets, optionally creates a bootstrap admin, picks free local ports when the defaults are busy, and starts the stack. Once it finishes, open the URL printed by setup. Local mode defaults to `http://localhost:8080`, but setup may select another port such as `8081` on a busy workstation. Then follow the [first-15-minutes walkthrough](https://noradocs.solomontsao.com/quickstart).
 
-> **No API key yet?** After signup, choose **Try the demo agent** on the Getting Started page. Nora deploys a working agent against its built-in deterministic demo provider, so you can validate chat and the operator workflow with zero keys and zero cost.
+> **No API key yet?** On installations with the local Docker target enabled, choose **Launch local Docker demo** on the Getting Started page. Nora deploys a working agent against its built-in deterministic demo provider, so you can validate chat and the operator workflow with zero keys and zero cost. Kubernetes-only installations start by adding a model provider and deploying to an enabled cluster target.
 
-For manual setup, environment variables, public-domain mode, TLS, Kubernetes, NemoClaw, and planned Proxmox configuration, see the docs:
+For manual setup, environment variables, public-domain mode, TLS, Kubernetes, NemoClaw, and experimental Proxmox LXC configuration, see the docs:
 
 - [Self-hosting guide](https://noradocs.solomontsao.com/self-hosting)
 - [Environment variables reference](https://noradocs.solomontsao.com/configuration/environment-variables)
-- [Provisioner backends](https://noradocs.solomontsao.com/configuration/provisioner-backends) (Docker and k3s/Kubernetes are GA; NemoClaw is experimental; Proxmox is planned)
+- [Provisioner backends](https://noradocs.solomontsao.com/configuration/provisioner-backends) (Docker and k3s/Kubernetes are GA; NemoClaw and Proxmox LXC are experimental)
 - [TLS and public domains](https://noradocs.solomontsao.com/configuration/tls-domains)
 - [Fronting a launch with Cloudflare](infra/cloudflare-launch.md) — edge caching, rate limiting, and spike absorption for the single-host deploy
 
@@ -170,24 +171,26 @@ Nginx
                        ├── Redis + BullMQ  (deployments, clawhub-jobs, backups, alert-deliveries)
                        ├── worker-provisioner
                        ├── worker-backup
-                       └── runtime adapters/profiles  (Docker GA · k3s/k8s GA · NemoClaw experimental · Proxmox planned)
+                       ├── deploy-target adapters  (Docker GA · k3s/k8s GA · Proxmox LXC experimental)
+                       └── sandbox profiles        (standard · NemoClaw experimental)
 ```
 
 Full architecture write-up — system map, queue/worker boundaries, RBAC, migration contract, deployment topologies — is in [docs/concepts/architecture](https://noradocs.solomontsao.com/concepts/architecture).
 
 ## Tech Stack
 
-| Layer                 | Technology                                                                         |
-| --------------------- | ---------------------------------------------------------------------------------- |
-| Reverse proxy         | Nginx                                                                              |
-| Frontends             | Next.js 16, React 19, Tailwind CSS                                                 |
-| Backend API           | Express.js 5, Node.js 24 LTS                                                       |
-| Auth                  | JWT, HttpOnly cookies, bcryptjs, provider OAuth bridge                             |
-| Database              | PostgreSQL 15                                                                      |
-| Queue                 | BullMQ + Redis 7                                                                   |
-| Runtime families      | OpenClaw, Hermes                                                                   |
-| Provisioning backends | Docker and k3s/Kubernetes (GA); NemoClaw (experimental sandbox); Proxmox (planned) |
-| Secrets at rest       | AES-256-GCM (provider keys, integrations, backups)                                 |
+| Layer              | Technology                                                              |
+| ------------------ | ----------------------------------------------------------------------- |
+| Reverse proxy      | Nginx                                                                   |
+| Frontends          | Next.js 16, React 19, Tailwind CSS                                      |
+| Backend API        | Express.js 5, Node.js 24 LTS                                            |
+| Auth               | JWT, HttpOnly cookies, bcryptjs, provider OAuth bridge                  |
+| Database           | PostgreSQL 15                                                           |
+| Queue              | BullMQ + Redis 7                                                        |
+| Runtime families   | OpenClaw, Hermes                                                        |
+| Deployment targets | Docker and k3s/Kubernetes (GA); Proxmox unprivileged LXC (experimental) |
+| Sandbox profiles   | Standard; NemoClaw (experimental, not available on Proxmox)             |
+| Secrets at rest    | AES-256-GCM (provider keys, integrations, backups)                      |
 
 ## Public REST API, CLI, and MCP
 
@@ -222,12 +225,12 @@ See the [MCP guide](https://noradocs.solomontsao.com/guides/mcp-server) for Gemi
 - **MCP — shipped.** A control-plane [MCP](https://modelcontextprotocol.io) server (`@noraai/mcp-server`, published to the official [MCP Registry](https://github.com/modelcontextprotocol/registry)) plus per-agent MCP server management — operate the fleet from Claude Code, Gemini CLI, Claude Desktop, or Cursor, and wire MCP tools into individual agents.
 - **OpenTelemetry GenAI — available.** [OTLP + Prometheus export](https://noradocs.solomontsao.com/guides/opentelemetry) of runtime telemetry under the `gen_ai.*` semantic conventions — per-exchange chat spans plus token/cost/resource metrics flow into the Grafana / Datadog / Langfuse stack you already run. (Per-tool-call sub-spans depend on runtime event streams and remain on the roadmap.)
 - **A2A — on the roadmap.** Agent Cards / Agent-to-Agent discovery for managed OpenClaw and Hermes agents.
-- **Isolation, per deploy target.** Standard Docker and Kubernetes runs use container namespaces plus operator-set CPU / RAM / disk limits; the experimental **NemoClaw** profile hardens untrusted code with a non-root user, all Linux capabilities dropped, `no-new-privileges`, Landlock + seccomp, and default-deny egress; Proxmox VM placement (planned) is the future hardware-isolation tier. See the [isolation model](https://noradocs.solomontsao.com/concepts/security#runtime-isolation).
+- **Isolation, per deploy target.** Standard Docker and Kubernetes runs use container namespaces plus operator-set CPU / RAM / disk limits; the experimental **NemoClaw** profile hardens untrusted code with a non-root user, all Linux capabilities dropped, `no-new-privileges`, Landlock + seccomp, and default-deny egress. Experimental Proxmox placement uses unprivileged LXC, which remains a shared-kernel boundary and is not presented as VM-grade isolation. See the [isolation model](https://noradocs.solomontsao.com/concepts/security#runtime-isolation).
 
 ## Roadmap
 
 - **NemoClaw hardening** _(high priority)_ — mature the experimental secure-sandbox profile end to end: enablement, policy controls, approvals, telemetry, and validation.
-- **Proxmox execution target** — complete the planned LXC deployment path with lifecycle operations, log streaming, telemetry, and smoke coverage.
+- **Proxmox release gate** — validate the experimental LXC adapter on real hardware, publish prepared-Hermes image guidance, and harden recovery before considering a beta label.
 - **Hermes/OpenClaw parity** — close runtime gaps across validation, logs, terminal access, monitoring, and failure reporting.
 - **First-run operator UX** — a tighter path from install to the first deployed, validated agent.
 - **Account-scoped monitoring** — account-level health roll-ups across workspaces, agents, cost, and alerts, with drill-downs.

@@ -33,6 +33,7 @@ const {
   normalizeBackendName,
 } = require("../../agent-runtime/lib/backendCatalog");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { requireSession } = require("../middleware/auth");
 const {
   buildAgentContext,
   buildAuditMetadata,
@@ -47,6 +48,11 @@ const {
 } = require("../agentRuntimeFields");
 
 const router = express.Router();
+// Agent Hub publishing, installation, reporting, and installation-key
+// lifecycle can cross workspace and upstream-hub boundaries. Keep the entire
+// authenticated UI surface behind a browser session until dedicated scopes
+// and workspace-bound contracts are introduced.
+router.use(requireSession);
 router.use(createMutationFailureAuditMiddleware("agent_hub"));
 
 function stripAsciiControlCharacters(value) {

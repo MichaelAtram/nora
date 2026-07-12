@@ -1,7 +1,11 @@
 // @ts-nocheck
-const { Worker } = require("bullmq");
+const { UnrecoverableError, Worker } = require("bullmq");
 const IORedis = require("ioredis");
 const { Pool } = require("pg");
+const {
+  buildPostgresConfig,
+  createRedisClient,
+} = require("../../backend-api/lib/connectionConfig");
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
 const { NEMOCLAW_DEFAULT_MODEL } = require("../../agent-runtime/lib/nemoclawDefaults");
 const {
@@ -16,6 +20,7 @@ const {
 } = require("../../agent-runtime/lib/backendCatalog");
 const { buildAgentRuntimeFields } = require("../../agent-runtime/lib/agentRuntimeFields");
 const { getAgentSecretEnvVars } = require("../../backend-api/agentSecretOverrides");
+const { getDeploymentProvider } = require("../../backend-api/llmProviders");
 const {
   buildHermesSeedArchive,
   getMigrationManifestForAgent,
@@ -32,8 +37,11 @@ const {
 const { getRemoteHostProfile } = require("../../backend-api/remoteHosts");
 const {
   allocateGatewayPort,
+  DEFAULT_RANGE_MIN,
+  DEFAULT_RANGE_MAX,
   reallocateGatewayPort,
   LOCAL_HOST_KEY,
+  GATEWAY_PORT_PURPOSE,
   DASHBOARD_PORT_PURPOSE,
   RUNTIME_PORT_PURPOSE,
 } = require("../../backend-api/portAllocations");
@@ -76,19 +84,16 @@ const {
 } = require("../../agent-runtime/lib/clawhubReconciliation");
 
 // ── Connections ──────────────────────────────────────────
-const connection = new IORedis({
-  host: process.env.REDIS_HOST || "redis",
-  port: parseInt(process.env.REDIS_PORT || "6379"),
+const connection = createRedisClient(IORedis, process.env, {
   maxRetriesPerRequest: null,
 });
 
-const db = new Pool({
-  user: process.env.DB_USER || "nora",
-  password: process.env.DB_PASSWORD || "nora",
-  host: process.env.DB_HOST || "postgres",
-  database: process.env.DB_NAME || "nora",
-  port: parseInt(process.env.DB_PORT || "5432"),
-});
+const db = new Pool(
+  buildPostgresConfig({
+    ...process.env,
+    DB_APPLICATION_NAME: process.env.DB_APPLICATION_NAME || "nora-worker-provisioner",
+  }),
+);
 
 // Hash any agent ID (uuid string or integer) to a signed 64-bit BigInt suitable
 // for pg_try_advisory_lock(bigint). Uses FNV-1a over the string form. The lock
@@ -169,6 +174,285 @@ function parsePositiveInteger(rawValue, fallbackValue, { min = 1, max = 32 } = {
   const parsed = Number.parseInt(rawValue, 10);
   if (!Number.isFinite(parsed)) return fallbackValue;
   return Math.min(max, Math.max(min, parsed));
+}
+
+function deploymentAttemptInfo(job = {}) {
+  const attemptsMade = Number.isFinite(Number(job?.attemptsMade))
+    ? Math.max(0, Number(job.attemptsMade))
+    : 0;
+  const maxAttempts = Number.isFinite(Number(job?.opts?.attempts))
+    ? Math.max(1, Number(job.opts.attempts))
+    : 1;
+  return { attempt: attemptsMade + 1, maxAttempts };
+}
+
+function isFinalDeploymentAttempt(job) {
+  const { attempt, maxAttempts } = deploymentAttemptInfo(job);
+  return attempt >= maxAttempts;
+}
+
+async function allocateAvailableLocalDockerGatewayPort({
+  agentId,
+  containerName,
+  provisioner,
+  allocatePort = allocateGatewayPort,
+  queryable = db,
+} = {}) {
+  let rangeMin = DEFAULT_RANGE_MIN;
+
+  while (rangeMin <= DEFAULT_RANGE_MAX) {
+    const port = await allocatePort({
+      hostKey: LOCAL_HOST_KEY,
+      agentId,
+      purpose: GATEWAY_PORT_PURPOSE,
+      rangeMin,
+      rangeMax: DEFAULT_RANGE_MAX,
+    });
+    const bound =
+      typeof provisioner?.isHostPortBound === "function"
+        ? await provisioner.isHostPortBound(port, { ignoreContainerName: containerName })
+        : false;
+    if (!bound) return port;
+
+    console.warn(
+      `[provisioner] Local Docker host port ${port} is already published outside Nora's allocation table; trying the next slot`,
+    );
+    await queryable.query(
+      `DELETE FROM gateway_port_allocations
+        WHERE host_key = $1 AND agent_id = $2 AND purpose = $3 AND port = $4`,
+      [LOCAL_HOST_KEY, agentId, GATEWAY_PORT_PURPOSE, port],
+    );
+    rangeMin = Number(port) + 1;
+  }
+
+  const error = new Error(
+    `No Docker-publishable gateway port available on ${LOCAL_HOST_KEY} (range ${DEFAULT_RANGE_MIN}-${DEFAULT_RANGE_MAX}).`,
+  );
+  error.statusCode = 503;
+  throw error;
+}
+
+async function persistProvisioningFailure({
+  queryable = db,
+  job,
+  agentId,
+  name,
+  error,
+  forceTerminal = false,
+} = {}) {
+  const existing = await queryable.query("SELECT id FROM agents WHERE id = $1", [agentId]);
+  if (!existing.rows[0]) {
+    return { canceled: true, terminal: false };
+  }
+
+  const { attempt, maxAttempts } = deploymentAttemptInfo(job);
+  const terminal = forceTerminal || isFinalDeploymentAttempt(job);
+  if (!terminal) {
+    await queryable.query(
+      "UPDATE agents SET status = 'queued' WHERE id = $1 AND status IN ('deploying', 'running', 'warning')",
+      [agentId],
+    );
+    await queryable.query(
+      "UPDATE deployments SET status = 'queued' WHERE agent_id = $1 AND status IN ('deploying', 'completed')",
+      [agentId],
+    );
+    return { canceled: false, terminal: false };
+  }
+
+  await queryable.query("UPDATE agents SET status = 'error' WHERE id = $1", [agentId]);
+  await queryable.query("UPDATE deployments SET status = 'failed' WHERE agent_id = $1", [agentId]);
+  await queryable.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
+    "agent_deploy_failed",
+    `Agent "${name}" failed to deploy: ${error?.message || "Unknown provisioning error"}`,
+    JSON.stringify({
+      agentId,
+      attempt,
+      maxAttempts,
+      ...(forceTerminal ? { retrySuppressed: true } : {}),
+      ...(error?.containerId ? { containerId: String(error.containerId) } : {}),
+    }),
+  ]);
+  return { canceled: false, terminal: true };
+}
+
+async function persistProvisionedRuntimeIdentity({
+  queryable = db,
+  agentId,
+  containerId,
+  containerName = null,
+} = {}) {
+  const result = await queryable.query(
+    `UPDATE agents
+        SET container_id = COALESCE(container_id, $2),
+            container_name = COALESCE($3, container_name)
+      WHERE id = $1
+        AND (container_id IS NULL OR container_id = $2)
+      RETURNING id, container_id`,
+    [agentId, containerId, containerName],
+  );
+  return {
+    persisted: Boolean(result.rows[0]),
+    containerId: result.rows[0]?.container_id || null,
+  };
+}
+
+async function preserveUnresolvedRuntimeIdentity({ queryable, agentId, containerId } = {}) {
+  try {
+    return await persistProvisionedRuntimeIdentity({ queryable, agentId, containerId });
+  } catch (error) {
+    console.error(
+      `[provisioner] Failed to persist unresolved runtime ${containerId} for agent ${agentId}: ${error.message}`,
+    );
+    return { persisted: false, containerId: null, error };
+  }
+}
+
+function buildUnresolvedRuntimeError({ agentId, containerId, error } = {}) {
+  const runtimeLabel = containerId ? `runtime ${containerId}` : "a possibly created runtime";
+  const unresolvedError = new UnrecoverableError(
+    `Automatic retry disabled for agent ${agentId}: ${runtimeLabel} could not be safely reconciled after provisioning failed. Resolve the existing runtime before retrying. ${error?.message || "Unknown provisioning error"}`,
+  );
+  unresolvedError.code = "UNRESOLVED_RUNTIME_IDENTITY";
+  unresolvedError.containerId = containerId || null;
+  if (error) unresolvedError.cause = error;
+  return unresolvedError;
+}
+
+async function failDeploymentForUnresolvedRuntime({
+  queryable = db,
+  job,
+  agentId,
+  name,
+  containerId,
+  error,
+} = {}) {
+  const unresolvedError = buildUnresolvedRuntimeError({ agentId, containerId, error });
+  try {
+    const failure = await persistProvisioningFailure({
+      queryable,
+      job,
+      agentId,
+      name,
+      error: unresolvedError,
+      forceTerminal: true,
+    });
+    if (failure.canceled) {
+      return { canceled: true, reason: "agent-deleted-with-unresolved-runtime" };
+    }
+  } catch (persistError) {
+    console.error(
+      `[provisioner] Failed to persist terminal state for unresolved runtime ${containerId || "unknown"} on agent ${agentId}: ${persistError.message}`,
+    );
+  }
+  throw unresolvedError;
+}
+
+async function cleanupProvisionedRuntimeAfterFailure({
+  queryable = db,
+  provisioner,
+  agentId,
+  containerId,
+  destroyAllowed = true,
+  persistIdentity = true,
+} = {}) {
+  if (!containerId) {
+    return { destroyed: false, reason: "no-runtime", retrySafe: true };
+  }
+
+  if (typeof provisioner?.destroy !== "function") {
+    const identity = persistIdentity
+      ? await preserveUnresolvedRuntimeIdentity({ queryable, agentId, containerId })
+      : { persisted: false, containerId: null };
+    return {
+      destroyed: false,
+      reason: "destroy-unavailable",
+      retrySafe: false,
+      identityPersisted: identity.persisted,
+    };
+  }
+
+  if (!destroyAllowed) {
+    const identity = persistIdentity
+      ? await preserveUnresolvedRuntimeIdentity({ queryable, agentId, containerId })
+      : { persisted: false, containerId: null };
+    return {
+      destroyed: false,
+      reason: "destroy-not-authorized",
+      retrySafe: false,
+      identityPersisted: identity.persisted,
+      ...(identity.error ? { error: identity.error } : {}),
+    };
+  }
+
+  try {
+    await provisioner.destroy(containerId, { agentId });
+  } catch (error) {
+    console.error(
+      `[provisioner] Failed to clean runtime ${containerId} for agent ${agentId}: ${error.message}`,
+    );
+    const identity = persistIdentity
+      ? await preserveUnresolvedRuntimeIdentity({ queryable, agentId, containerId })
+      : { persisted: false, containerId: null };
+    return {
+      destroyed: false,
+      reason: "destroy-failed",
+      retrySafe: false,
+      identityPersisted: identity.persisted,
+      error,
+    };
+  }
+
+  try {
+    await queryable.query(
+      `UPDATE agents
+          SET container_id = NULL,
+              host = NULL,
+              runtime_host = NULL,
+              runtime_port = NULL,
+              gateway_host = NULL,
+              gateway_port = NULL,
+              gateway_host_port = NULL,
+              gateway_token = NULL,
+              dashboard_port = NULL
+        WHERE id = $1 AND container_id = $2`,
+      [agentId, containerId],
+    );
+  } catch (error) {
+    console.warn(
+      `[provisioner] Runtime ${containerId} was destroyed but identity cleanup failed for agent ${agentId}: ${error.message}`,
+    );
+    return {
+      destroyed: true,
+      reason: "identity-clear-failed",
+      retrySafe: false,
+      error,
+    };
+  }
+
+  return { destroyed: true, retrySafe: true };
+}
+
+async function reconcileProvisioningFailureRuntime({
+  queryable = db,
+  provisioner,
+  agentId,
+  containerId,
+  error,
+} = {}) {
+  const runtimeIdentity = error?.runtimeIdentity || null;
+  const unresolvedContainerId = containerId || runtimeIdentity?.containerId || null;
+  if (!unresolvedContainerId) {
+    return { destroyed: false, reason: "no-runtime", retrySafe: true, containerId: null };
+  }
+  const cleanup = await cleanupProvisionedRuntimeAfterFailure({
+    queryable,
+    provisioner,
+    agentId,
+    containerId: unresolvedContainerId,
+    destroyAllowed: runtimeIdentity?.destroyAllowed !== false,
+    persistIdentity: runtimeIdentity?.persistIdentity !== false,
+  });
+  return { ...cleanup, containerId: unresolvedContainerId };
 }
 
 const OPENCLAW_WORKSPACE_PATH = "/root/.openclaw/workspace";
@@ -610,15 +894,20 @@ function pickProviderDeployment(config = {}, model = "") {
   return typeof model === "string" ? model.trim() : "";
 }
 
-async function fetchUserLlmEnvVars(userId) {
+async function fetchUserLlmEnvVars(userId, providerId = null) {
   if (!userId || (process.env.KEY_STORAGE || "database") !== "database") {
     return {};
   }
 
   try {
+    const params = [userId];
+    const providerFilter = providerId ? " AND id = $2" : "";
+    if (providerId) params.push(providerId);
     const keysResult = await db.query(
-      "SELECT provider, api_key, model, config FROM llm_providers WHERE user_id = $1",
-      [userId],
+      `SELECT provider, api_key, model, config
+         FROM llm_providers
+        WHERE user_id = $1${providerFilter}`,
+      params,
     );
     const { decrypt } = require("./crypto");
     const llmEnvVars = {};
@@ -657,18 +946,24 @@ async function fetchUserLlmEnvVars(userId) {
   }
 }
 
-async function fetchDefaultProvider(userId) {
+async function fetchDeploymentProvider(userId, providerId = null) {
   if (!userId || (process.env.KEY_STORAGE || "database") !== "database") {
+    if (providerId) {
+      throw new Error("Explicit deployment LLM providers require KEY_STORAGE=database");
+    }
     return null;
   }
 
   try {
-    const result = await db.query(
-      "SELECT id, provider, model, config FROM llm_providers WHERE user_id = $1 AND is_default = true LIMIT 1",
-      [userId],
-    );
-    return result.rows[0] || null;
+    return await getDeploymentProvider(userId, providerId, db);
   } catch (error) {
+    if (providerId) {
+      console.warn(
+        `[provisioner] Failed to fetch explicit LLM provider ${providerId} for user ${userId}:`,
+        error.message,
+      );
+      throw error;
+    }
     console.warn(
       `[provisioner] Failed to fetch default LLM provider for user ${userId}:`,
       error.message,
@@ -785,12 +1080,13 @@ async function runProvisionerExecCommand(
   provisioner,
   containerId,
   command,
-  { timeout = 30000, maxOutputBytes = 65536, tty = false, env = [] } = {},
+  { timeout = 30000, maxOutputBytes = 65536, tty = false, env = [], agentId = null } = {},
 ) {
   const execResult = await provisioner.exec(containerId, {
     cmd: ["/bin/sh", "-lc", command],
     tty,
     env,
+    ...(agentId ? { agentId } : {}),
   });
   if (!execResult?.exec || !execResult?.stream) {
     throw new Error("Container exec unavailable");
@@ -885,6 +1181,7 @@ function wrapCommandWithContainerTimeout(command, timeoutMs) {
  * @param {object} params Reconciliation inputs for the live runtime.
  * @param {string} params.agentId Agent id used for persisted Hermes lookups.
  * @param {string} params.userId User id whose provider credentials are read.
+ * @param {string} params.llmProviderId Explicit provider selected when this deployment was queued.
  * @param {string} params.runtimeFamily Runtime family, e.g. `hermes` or `openclaw`.
  * @param {string} params.resolvedBackend Normalized backend name for exec fallback behavior.
  * @param {string} params.containerId Runtime container identifier.
@@ -902,6 +1199,7 @@ function wrapCommandWithContainerTimeout(command, timeoutMs) {
 async function reconcileRuntimeLlmAuth({
   agentId,
   userId,
+  llmProviderId,
   runtimeFamily,
   resolvedBackend,
   containerId,
@@ -914,8 +1212,8 @@ async function reconcileRuntimeLlmAuth({
   gatewayPort,
   gatewayToken,
 } = {}) {
-  const llmEnvVars = await fetchUserLlmEnvVars(userId);
-  const defaultProvider = await fetchDefaultProvider(userId);
+  const llmEnvVars = await fetchUserLlmEnvVars(userId, llmProviderId);
+  const defaultProvider = await fetchDeploymentProvider(userId, llmProviderId);
   const hasLlmKeys = Object.keys(llmEnvVars).length > 0;
   if (!hasLlmKeys && !defaultProvider) {
     return { status: "skipped" };
@@ -953,14 +1251,16 @@ async function reconcileRuntimeLlmAuth({
         provisioner,
         containerId,
         buildHermesModelConfigWriteCommand(modelConfig),
+        { agentId },
       );
     }
     await runProvisionerExecCommand(
       provisioner,
       containerId,
       buildHermesEnvWriteCommand(llmEnvVars),
+      { agentId },
     );
-    await provisioner.restart(containerId);
+    await provisioner.restart(containerId, { agentId });
     const readiness = await waitForAgentReadiness(
       {
         host,
@@ -1000,7 +1300,7 @@ async function reconcileRuntimeLlmAuth({
     if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) {
       throw error;
     }
-    await runProvisionerExecCommand(provisioner, containerId, authWriteCommand);
+    await runProvisionerExecCommand(provisioner, containerId, authWriteCommand, { agentId });
   }
 
   // Merge custom-provider registrations (Microsoft Foundry) into openclaw.json
@@ -1027,11 +1327,13 @@ async function reconcileRuntimeLlmAuth({
       if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) {
         throw error;
       }
-      await runProvisionerExecCommand(provisioner, containerId, providerMergeCommand);
+      await runProvisionerExecCommand(provisioner, containerId, providerMergeCommand, {
+        agentId,
+      });
     }
   }
 
-  await provisioner.restart(containerId);
+  await provisioner.restart(containerId, { agentId });
   const readiness = await waitForAgentReadiness({
     host,
     runtimeHost,
@@ -1357,7 +1659,7 @@ async function reconcileOpenClawChannelState({
     await runRuntimeCommand(agentRef, command);
   } catch (error) {
     if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) throw error;
-    await runProvisionerExecCommand(provisioner, containerId, command);
+    await runProvisionerExecCommand(provisioner, containerId, command, { agentId });
   }
   return { status: "synced", channels: rows.rows.length };
 }
@@ -1404,7 +1706,7 @@ function normalizeInstalledSkillsLockfile(parsed = {}) {
  * @returns {Promise<Array<{slug: string, version: string}>>} The installed
  * ClawHub skills currently represented in the runtime lockfile.
  */
-async function readInstalledClawhubSkills(provisioner, containerId) {
+async function readInstalledClawhubSkills(provisioner, containerId, agentId) {
   const readCommand =
     `if [ -f ${JSON.stringify(CLAWHUB_LOCKFILE_PATH)} ]; then ` +
     `base64 < ${JSON.stringify(CLAWHUB_LOCKFILE_PATH)} | tr -d '\\n'; ` +
@@ -1418,6 +1720,7 @@ async function readInstalledClawhubSkills(provisioner, containerId) {
       // JSON parsing only happens after the transport output is normalized.
       tty: true,
       env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+      agentId,
     });
 
     try {
@@ -1437,7 +1740,7 @@ async function readInstalledClawhubSkills(provisioner, containerId) {
   throw new Error(`Failed to parse ClawHub lockfile: ${lastError?.message || "unknown error"}`);
 }
 
-async function ensureClawhubCli(provisioner, containerId) {
+async function ensureClawhubCli(provisioner, containerId, agentId) {
   try {
     await runProvisionerExecCommand(
       provisioner,
@@ -1451,6 +1754,7 @@ async function ensureClawhubCli(provisioner, containerId) {
       {
         timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
         env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+        agentId,
       },
     );
   } catch (error) {
@@ -1507,8 +1811,8 @@ async function removeSavedClawhubSkill(agentId, slug, skillEntry) {
   ]);
 }
 
-async function installClawhubSkill(provisioner, containerId, slug) {
-  await ensureClawhubCli(provisioner, containerId);
+async function installClawhubSkill(provisioner, containerId, slug, agentId) {
+  await ensureClawhubCli(provisioner, containerId, agentId);
   // Keep the install invocation unwrapped (no nested in-container `timeout ... /bin/sh -lc ...`).
   // A nested timeout caused Nora-driven ClawHub installs to hang even though the same CLI command
   // completed quickly when run directly in the container. The outer exec timeout below is the single
@@ -1523,12 +1827,13 @@ async function installClawhubSkill(provisioner, containerId, slug) {
       timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
       maxOutputBytes: 32768,
       env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+      agentId,
     },
   );
 }
 
-async function uninstallClawhubSkill(provisioner, containerId, slug) {
-  await ensureClawhubCli(provisioner, containerId);
+async function uninstallClawhubSkill(provisioner, containerId, slug, agentId) {
+  await ensureClawhubCli(provisioner, containerId, agentId);
   // `slug` is shell-quoted (single quotes) so it cannot inject into the container shell.
   await runProvisionerExecCommand(
     provisioner,
@@ -1540,6 +1845,7 @@ async function uninstallClawhubSkill(provisioner, containerId, slug) {
       timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
       maxOutputBytes: 32768,
       env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+      agentId,
     },
   );
 }
@@ -1585,7 +1891,7 @@ async function reconcileClawhubSkills({
 
   let installedSkills = [];
   try {
-    installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+    installedSkills = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   } catch (error) {
     console.warn(
       `${logPrefix} agent=${agentId} Failed to read installed skills before reconciliation: ${error.message}`,
@@ -1612,7 +1918,7 @@ async function reconcileClawhubSkills({
       console.log(
         `${logPrefix} agent=${agentId} slug=${skill.installSlug} Installing missing saved skill`,
       );
-      await installClawhubSkill(provisioner, containerId, skill.installSlug);
+      await installClawhubSkill(provisioner, containerId, skill.installSlug, agentId);
       console.log(
         `${logPrefix} agent=${agentId} slug=${skill.installSlug} Reconciliation install completed`,
       );
@@ -1654,7 +1960,7 @@ async function reconcileClawhubSkills({
         console.warn(
           `${logPrefix} agent=${agentId} slug=${skill.slug} Removing orphaned runtime skill`,
         );
-        await uninstallClawhubSkill(provisioner, containerId, skill.slug);
+        await uninstallClawhubSkill(provisioner, containerId, skill.slug, agentId);
         console.warn(
           `${logPrefix} agent=${agentId} slug=${skill.slug} Reconciliation uninstall completed`,
         );
@@ -1720,11 +2026,11 @@ async function runClawhubInstallJob({
   logJob,
 }) {
   logJob("cli-check", "Ensuring clawhub CLI is available");
-  await ensureClawhubCli(provisioner, containerId);
+  await ensureClawhubCli(provisioner, containerId, agentId);
   logJob("cli-check", "Clawhub CLI is ready");
 
   logJob("precheck", "Reading installed skills before install");
-  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
+  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   logJob("precheck", "Read installed skills before install", {
     installedCount: installedBefore.length,
   });
@@ -1747,7 +2053,7 @@ async function runClawhubInstallJob({
     logJob("install", "Running clawhub install command", {
       timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
     });
-    await installClawhubSkill(provisioner, containerId, slug);
+    await installClawhubSkill(provisioner, containerId, slug, agentId);
     logJob("install", "Clawhub install command finished");
   } catch (error) {
     const message = String(error?.message || "");
@@ -1761,7 +2067,7 @@ async function runClawhubInstallJob({
   }
 
   logJob("verify", "Reading installed skills after install");
-  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   logJob("verify", "Read installed skills after install", {
     installedCount: installedSkills.length,
   });
@@ -1814,11 +2120,11 @@ async function runClawhubDeleteJob({
   logJob,
 }) {
   logJob("cli-check", "Ensuring clawhub CLI is available");
-  await ensureClawhubCli(provisioner, containerId);
+  await ensureClawhubCli(provisioner, containerId, agentId);
   logJob("cli-check", "Clawhub CLI is ready");
 
   logJob("precheck", "Reading installed skills before delete");
-  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
+  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   logJob("precheck", "Read installed skills before delete", {
     installedCount: installedBefore.length,
   });
@@ -1827,14 +2133,14 @@ async function runClawhubDeleteJob({
     logJob("delete", "Running clawhub uninstall command", {
       timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
     });
-    await uninstallClawhubSkill(provisioner, containerId, slug);
+    await uninstallClawhubSkill(provisioner, containerId, slug, agentId);
     logJob("delete", "Clawhub uninstall command finished");
   } else {
     logJob("precheck", "Skill already absent before delete");
   }
 
   logJob("verify", "Reading installed skills after delete");
-  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   logJob("verify", "Read installed skills after delete", {
     installedCount: installedSkills.length,
   });
@@ -1870,7 +2176,18 @@ console.log(
 const worker = new Worker(
   "deployments",
   async (job) => {
-    const { id, name, image, specs, userId, sandbox, backend, container_name, model } = job.data;
+    const {
+      id,
+      name,
+      image,
+      specs,
+      userId,
+      sandbox,
+      backend,
+      container_name,
+      model,
+      llm_provider_id: llmProviderId,
+    } = job.data;
     const vcpu = specs?.vcpu || 1;
     const ram_mb = specs?.ram_mb || 1024;
     const disk_gb = specs?.disk_gb || 10;
@@ -1882,12 +2199,36 @@ const worker = new Worker(
     try {
       const agentRowResult = await db.query(
         `SELECT image, template_payload, sandbox_type, backend_type, runtime_family,
-            deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers
+            deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers, status,
+            container_id
        FROM agents
       WHERE id = $1`,
         [id],
       );
-      const agentRow = agentRowResult.rows[0] || {};
+      const agentRow = agentRowResult.rows[0];
+      if (!agentRow) {
+        console.warn(`[provisioner] Skipping deployment job ${job.id}; agent ${id} was deleted`);
+        return { canceled: true, reason: "agent-deleted" };
+      }
+      if (!["queued", "deploying", "error"].includes(agentRow.status)) {
+        console.warn(
+          `[provisioner] Skipping deployment job ${job.id}; agent ${id} is ${agentRow.status}`,
+        );
+        return { canceled: true, reason: `agent-${agentRow.status}` };
+      }
+      if (agentRow.container_id) {
+        console.error(
+          `[provisioner] Refusing to create a replacement runtime for agent ${id}; unresolved runtime ${agentRow.container_id} is still persisted`,
+        );
+        return await failDeploymentForUnresolvedRuntime({
+          queryable: db,
+          job,
+          agentId: id,
+          name,
+          containerId: agentRow.container_id,
+          error: new Error("A previous provisioning attempt left runtime identity in place"),
+        });
+      }
       // gateway_token is encrypted at rest. Decrypt the stored value in place so
       // the reuse path (k8s/Hermes pass it back into the container as the runtime
       // password) gets plaintext. A rotated/corrupted key → treat as no reusable
@@ -1948,8 +2289,8 @@ const worker = new Worker(
       });
 
       // Fetch user's LLM provider keys from DB for injection into container
-      const llmEnvVars = await fetchUserLlmEnvVars(userId);
-      const defaultLlmProvider = await fetchDefaultProvider(userId);
+      const llmEnvVars = await fetchUserLlmEnvVars(userId, llmProviderId);
+      const defaultLlmProvider = await fetchDeploymentProvider(userId, llmProviderId);
       const defaultOpenClawModel = buildDefaultOpenClawModel(defaultLlmProvider);
       const hermesRuntimeBootstrapEnv =
         resolvedRuntimeFields.runtime_family === "hermes"
@@ -2229,6 +2570,7 @@ const worker = new Worker(
       try {
         const abortController = new AbortController();
         let provisionTimeoutHandle = null;
+        let runtimeIdentityPersisted = false;
         if (resolvedBackend === "k8s" && container_name) {
           containerId = container_name;
         }
@@ -2284,6 +2626,36 @@ const worker = new Worker(
             });
           }
         }
+        const currentAgent = await db.query("SELECT status FROM agents WHERE id = $1", [id]);
+        if (!currentAgent.rows[0]) {
+          console.warn(
+            `[provisioner] Canceling deployment job ${job.id}; agent ${id} was deleted before create`,
+          );
+          return { canceled: true, reason: "agent-deleted-before-create" };
+        }
+        const onRuntimeIdentity = async (identity = {}) => {
+          const createdContainerId = String(identity.containerId || "").trim();
+          if (!createdContainerId) {
+            throw new Error("Provisioner reported an empty runtime identity");
+          }
+          containerId = createdContainerId;
+          containerName = identity.containerName || containerName || container_name;
+          const persisted = await persistProvisionedRuntimeIdentity({
+            queryable: db,
+            agentId: id,
+            containerId,
+            containerName: containerName || null,
+          });
+          if (!persisted.persisted) {
+            const identityError = new Error(
+              `Agent ${id} was deleted or already references another runtime while ${containerId} was being created`,
+            );
+            identityError.code = "RUNTIME_IDENTITY_PERSIST_FAILED";
+            identityError.containerId = containerId;
+            throw identityError;
+          }
+          runtimeIdentityPersisted = true;
+        };
         const createOnce = (gatewayHostPort) =>
           provisioner.create({
             id,
@@ -2304,6 +2676,7 @@ const worker = new Worker(
             executionTargetId: resolvedRuntimeFields.execution_target_id,
             sandboxProfile: resolvedRuntimeFields.sandbox_profile,
             abortSignal: abortController.signal,
+            onRuntimeIdentity,
             env: {
               AGENT_ID: String(id),
               AGENT_NAME: name || "",
@@ -2396,15 +2769,21 @@ const worker = new Worker(
         // and cleaned up by the failure catch, a reconciler, or a retry. Without
         // this, a crash between create() and the final UPDATE leaves an orphan
         // container that no DB row references.
-        if (containerId) {
+        if (containerId && !runtimeIdentityPersisted) {
           try {
-            await db.query(
-              `UPDATE agents
-                SET container_id = $2,
-                    container_name = COALESCE($3, container_name)
-              WHERE id = $1`,
-              [id, containerId, containerName || null],
-            );
+            const persistedContainer = await persistProvisionedRuntimeIdentity({
+              queryable: db,
+              agentId: id,
+              containerId,
+              containerName: containerName || null,
+            });
+            if (!persistedContainer.persisted) {
+              console.warn(
+                `[provisioner] Agent ${id} was deleted during create; removing runtime ${containerId}`,
+              );
+              await provisioner.destroy(containerId, { agentId: id }).catch(() => {});
+              return { canceled: true, reason: "agent-deleted-during-create" };
+            }
           } catch (e) {
             console.error(
               `[provisioner] Failed to persist container_id for agent ${id} (will still attempt final update): ${e.message}`,
@@ -2506,21 +2885,37 @@ const worker = new Worker(
           `[${resolvedBackend}] Provisioning failed for agent ${id} (attempt ${job.attemptsMade + 1}/${job.opts?.attempts || 1}):`,
           err.message,
         );
-        if (containerId) {
-          try {
-            await provisioner.destroy(containerId);
-          } catch {
-            // Best-effort cleanup only.
-          }
+        const cleanup = await reconcileProvisioningFailureRuntime({
+          queryable: db,
+          provisioner,
+          agentId: id,
+          containerId,
+          error: err,
+        });
+        if (!cleanup.retrySafe) {
+          const unresolved = await failDeploymentForUnresolvedRuntime({
+            queryable: db,
+            job,
+            agentId: id,
+            name,
+            containerId: cleanup.containerId,
+            error: cleanup.error || err,
+          });
+          if (unresolved.canceled) return unresolved;
         }
-        // Mark as failed in DB
-        await db.query("UPDATE agents SET status = 'error' WHERE id = $1", [id]);
-        await db.query("UPDATE deployments SET status = 'failed' WHERE agent_id = $1", [id]);
-        await db.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
-          "agent_deploy_failed",
-          `Agent "${name}" failed to deploy: ${err.message}`,
-          JSON.stringify({ agentId: id, attempt: job.attemptsMade + 1 }),
-        ]);
+        const failure = await persistProvisioningFailure({
+          queryable: db,
+          job,
+          agentId: id,
+          name,
+          error: err,
+        });
+        if (failure.canceled) {
+          console.warn(
+            `[provisioner] Suppressing retry for deployment job ${job.id}; agent ${id} was deleted`,
+          );
+          return { canceled: true, reason: "agent-deleted-after-failure" };
+        }
         throw err;
       }
 
@@ -2530,7 +2925,7 @@ const worker = new Worker(
       const { encrypt } = require("./crypto");
       const gatewayTokenForStorage = gatewayToken ? encrypt(gatewayToken) : gatewayToken;
       try {
-        await db.query(
+        const finalUpdate = await db.query(
           `UPDATE agents
           SET status = 'running',
               container_id = $2,
@@ -2551,7 +2946,8 @@ const worker = new Worker(
               sandbox_type = $17,
               network_policy_status = $18,
               dashboard_port = $19
-        WHERE id = $1`,
+        WHERE id = $1
+        RETURNING id`,
           [
             id,
             containerId,
@@ -2574,6 +2970,15 @@ const worker = new Worker(
             dashboardPort ? parseInt(dashboardPort, 10) : null,
           ],
         );
+        if (!finalUpdate.rows[0]) {
+          console.warn(
+            `[provisioner] Agent ${id} was deleted before final persistence; removing runtime ${containerId}`,
+          );
+          if (containerId) {
+            await provisioner.destroy(containerId, { agentId: id }).catch(() => {});
+          }
+          return { canceled: true, reason: "agent-deleted-before-final-update" };
+        }
         await db.query("UPDATE deployments SET status = 'completed' WHERE agent_id = $1", [id]);
         await db.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
           "agent_deployed",
@@ -2607,6 +3012,7 @@ const worker = new Worker(
             const authSyncResult = await reconcileRuntimeLlmAuth({
               agentId: id,
               userId,
+              llmProviderId,
               runtimeFamily: resolvedRuntimeFields.runtime_family,
               resolvedBackend,
               containerId,
@@ -2707,7 +3113,7 @@ const worker = new Worker(
               provisioner,
               containerId,
               buildHermesIntegrationInstallCommand(syncData),
-              { timeout: 30000 },
+              { timeout: 30000, agentId: id },
             );
             console.log(
               `[provisioner] Installed Nora integration skill with ${syncData.length} integration(s) to Hermes agent ${id}`,
@@ -2718,6 +3124,34 @@ const worker = new Worker(
         }
       } catch (err) {
         console.error("Failed to update agent status:", err.message);
+        const cleanup = await reconcileProvisioningFailureRuntime({
+          queryable: db,
+          provisioner,
+          agentId: id,
+          containerId,
+          error: err,
+        });
+        if (!cleanup.retrySafe) {
+          const unresolved = await failDeploymentForUnresolvedRuntime({
+            queryable: db,
+            job,
+            agentId: id,
+            name,
+            containerId: cleanup.containerId,
+            error: cleanup.error || err,
+          });
+          if (unresolved.canceled) return unresolved;
+        }
+        const failure = await persistProvisioningFailure({
+          queryable: db,
+          job,
+          agentId: id,
+          name,
+          error: err,
+        });
+        if (failure.canceled) {
+          return { canceled: true, reason: "agent-deleted-after-persistence-failure" };
+        }
         throw err;
       }
     } finally {
@@ -2964,3 +3398,16 @@ const healthServer = http.createServer((req, res) => {
 healthServer.listen(HEALTH_PORT, () => {
   console.log(`Worker health check listening on port ${HEALTH_PORT}`);
 });
+
+module.exports = {
+  allocateAvailableLocalDockerGatewayPort,
+  buildUnresolvedRuntimeError,
+  cleanupProvisionedRuntimeAfterFailure,
+  failDeploymentForUnresolvedRuntime,
+  fetchDeploymentProvider,
+  fetchUserLlmEnvVars,
+  isFinalDeploymentAttempt,
+  persistProvisionedRuntimeIdentity,
+  persistProvisioningFailure,
+  reconcileProvisioningFailureRuntime,
+};

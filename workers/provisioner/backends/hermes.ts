@@ -23,6 +23,18 @@ const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
 const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
+const DEFAULT_AGENT_PIDS_LIMIT = 512;
+// The official Hermes image starts s6 as root, repairs mounted-state
+// ownership, then drops its supervised services to the hermes user. Drop the
+// default Docker capability set and add back only that lifecycle subset.
+const HERMES_INIT_CAPABILITIES = Object.freeze([
+  "CHOWN",
+  "DAC_OVERRIDE",
+  "FOWNER",
+  "KILL",
+  "SETGID",
+  "SETUID",
+]);
 
 function isMutableImageReference(imgName) {
   const ref = String(imgName || "").trim();
@@ -210,6 +222,10 @@ class HermesBackend extends DockerBackend {
           NanoCpus: (vcpu || 2) * 1e9,
           Memory: (ram_mb || 2048) * 1024 * 1024,
           RestartPolicy: { Name: "unless-stopped" },
+          CapDrop: ["ALL"],
+          CapAdd: [...HERMES_INIT_CAPABILITIES],
+          SecurityOpt: ["no-new-privileges:true"],
+          PidsLimit: DEFAULT_AGENT_PIDS_LIMIT,
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
           // Local Hermes is reached via the container IP on the shared compose
           // network (no host publish). The remote variant overrides this to

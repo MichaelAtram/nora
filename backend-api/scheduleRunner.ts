@@ -23,6 +23,7 @@ const { resolveAgentRuntimeFamily } = require("./agentRuntimeFields");
 // Lifecycle actions that bring an agent UP — must not resurrect a budget-paused
 // agent (the budget sweep would just re-pause it; a schedule shouldn't fight it).
 const REVIVE_ACTIONS = new Set(["start", "restart", "redeploy"]);
+const ADDRESS_REFRESH_ACTIONS = new Set(["start", "restart"]);
 
 const CHAT_TIMEOUT_MS = 240000;
 
@@ -144,7 +145,10 @@ async function runScheduledAction(payload = {}) {
   }
 
   try {
-    await performAction(agent, actionType, prompt, createdBy);
+    const lifecycleResult = await performAction(agent, actionType, prompt, createdBy);
+    if (ADDRESS_REFRESH_ACTIONS.has(actionType)) {
+      await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
+    }
   } catch (err) {
     const status = `failed: ${err?.message || err}`.slice(0, 180);
     await agentSchedules.markRun(scheduleId, status).catch(() => {});

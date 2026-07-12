@@ -75,6 +75,7 @@ const mockDockerPing = jest.fn();
 const mockDockerGetContainer = jest.fn();
 const mockDockerContainerInspect = jest.fn();
 const mockAssertKubernetesExecutionTargetAvailable = jest.fn().mockResolvedValue();
+const mockPersistLifecycleRuntimeAddress = jest.fn();
 
 jest.mock("../db", () => mockDb);
 jest.mock("../redisQueue", () => ({
@@ -98,6 +99,10 @@ jest.mock("../containerManager", () => ({
   stop: jest.fn().mockResolvedValue({}),
   restart: jest.fn().mockResolvedValue({}),
   destroy: jest.fn().mockResolvedValue({}),
+  persistLifecycleRuntimeAddress: mockPersistLifecycleRuntimeAddress,
+  isIgnorableStopError: jest.fn((error) =>
+    /already stopped|not running/i.test(String(error?.message || "")),
+  ),
   canMutate: jest.fn(
     (agent) =>
       Boolean(agent?.container_id) ||
@@ -280,6 +285,7 @@ jest.mock("dockerode", () =>
 );
 
 const app = require("../server");
+const { normalizeHealthcheckBudget } = require("../releaseUpgrade");
 
 const adminToken = jwt.sign(
   { id: "admin-1", email: "admin@nora.test", role: "admin" },
@@ -347,6 +353,13 @@ beforeEach(() => {
   mockDockerPing.mockReset().mockImplementation((callback) => callback(null));
   mockDockerContainerInspect.mockReset().mockResolvedValue({ Config: { Labels: {} } });
   mockDockerGetContainer.mockReset().mockReturnValue({ inspect: mockDockerContainerInspect });
+  mockPersistLifecycleRuntimeAddress.mockReset().mockImplementation(async (_db, agent, result) => {
+    const host = typeof result?.host === "string" ? result.host.trim() : "";
+    const runtimeHost = typeof result?.runtimeHost === "string" ? result.runtimeHost.trim() : host;
+    if (host) agent.host = host;
+    if (runtimeHost) agent.runtime_host = runtimeHost;
+    return agent;
+  });
   mockGetDeploymentDefaults.mockReset().mockResolvedValue({
     vcpu: 1,
     ram_mb: 1024,
@@ -912,6 +925,85 @@ describe("admin routes", () => {
     expect(res.body.runnerReachable).toBe(true);
   });
 
+  it("uses the migration-aware release upgrade health-check defaults", () => {
+    const warn = jest.fn();
+
+    expect(normalizeHealthcheckBudget({}, warn)).toEqual({
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("upgrades the former 40x3 built-in health-check budget", () => {
+    const warn = jest.fn();
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "40",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual({
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("preserves valid release upgrade health-check overrides", () => {
+    const warn = jest.fn();
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "101",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "6",
+        },
+        warn,
+      ),
+    ).toEqual({
+      attempts: 101,
+      intervalSeconds: 6,
+      firstToFinalWindowSeconds: 600,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("falls back safely for invalid or over-budget release upgrade health checks", () => {
+    const warn = jest.fn();
+    const defaults = {
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    };
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "not-a-number",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual(defaults);
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "1302",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual(defaults);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenLastCalledWith(expect.stringContaining("no greater than 3900s"));
+  });
+
   it("starts a direct GitHub release upgrade runner for admins", async () => {
     const monitoringModule = require("../monitoring");
     process.env.NORA_CURRENT_VERSION = "1.0.0";
@@ -942,6 +1034,8 @@ describe("admin routes", () => {
           "NORA_HOST_REPO_DIR=/srv/nora",
           "NORA_ENV_FILE=deploy.env",
           "NORA_UPGRADE_COMPOSE_FILES=docker-compose.yml:infra/docker-compose.public-tls.yml:docker-compose.kubernetes.yml",
+          "NORA_UPGRADE_HEALTHCHECK_ATTEMPTS=221",
+          "NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS=3",
           "NORA_UPGRADE_PUBLIC_HEALTH_URL=https://nora.test/api/health",
         ]),
         Cmd: expect.arrayContaining([
@@ -1762,6 +1856,110 @@ describe("admin routes", () => {
     expect(res.body.samples).toHaveLength(1);
   });
 
+  it("persists a refreshed runtime address when an admin starts an agent", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.start.mockResolvedValueOnce({
+      host: "10.40.50.61",
+      runtimeHost: "10.40.50.61",
+    });
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-start-address",
+            user_id: "user-proxmox",
+            name: "Admin Start Address",
+            status: "stopped",
+            backend_type: "proxmox",
+            container_id: "401",
+            host: "10.40.50.10",
+            runtime_host: "10.40.50.10",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-start-address",
+            user_id: "user-proxmox",
+            name: "Admin Start Address",
+            status: "running",
+            backend_type: "proxmox",
+            container_id: "401",
+            host: "10.40.50.61",
+            runtime_host: "10.40.50.61",
+          },
+        ],
+      });
+
+    const res = await withToken(
+      request(app).post("/admin/agents/agent-admin-start-address/start"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ id: "agent-admin-start-address" }),
+      { host: "10.40.50.61", runtimeHost: "10.40.50.61" },
+    );
+    expect(res.body).toEqual(
+      expect.objectContaining({ host: "10.40.50.61", runtime_host: "10.40.50.61" }),
+    );
+  });
+
+  it("persists a refreshed runtime address when an admin restarts an agent", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.restart.mockResolvedValueOnce({
+      host: "10.40.50.62",
+      runtimeHost: "10.40.50.62",
+    });
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-restart-address",
+            user_id: "user-proxmox",
+            name: "Admin Restart Address",
+            status: "running",
+            backend_type: "proxmox",
+            container_id: "402",
+            host: "10.40.50.11",
+            runtime_host: "10.40.50.11",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-restart-address",
+            user_id: "user-proxmox",
+            name: "Admin Restart Address",
+            status: "running",
+            backend_type: "proxmox",
+            container_id: "402",
+            host: "10.40.50.62",
+            runtime_host: "10.40.50.62",
+          },
+        ],
+      });
+
+    const res = await withToken(
+      request(app).post("/admin/agents/agent-admin-restart-address/restart"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ id: "agent-admin-restart-address" }),
+      { host: "10.40.50.62", runtimeHost: "10.40.50.62" },
+    );
+    expect(res.body).toEqual(
+      expect.objectContaining({ host: "10.40.50.62", runtime_host: "10.40.50.62" }),
+    );
+  });
+
   it("stops a Kubernetes deployment by container_name from admin when container_id is missing", async () => {
     const containerManager = require("../containerManager");
     mockDb.query
@@ -1796,6 +1994,32 @@ describe("admin routes", () => {
       }),
     );
     expect(res.body).toEqual(expect.objectContaining({ status: "stopped" }));
+  });
+
+  it("keeps a Proxmox agent running when an admin stop fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.stop.mockRejectedValueOnce(new Error("Proxmox admin shutdown failed"));
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-admin-proxmox-stop-fail",
+          user_id: "user-proxmox",
+          name: "Admin Proxmox Stop Fail",
+          status: "running",
+          backend_type: "proxmox",
+          deploy_target: "proxmox",
+          container_id: "403",
+        },
+      ],
+    });
+
+    const res = await withToken(
+      request(app).post("/admin/agents/agent-admin-proxmox-stop-fail/stop"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(500);
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
 
   it("requeues an agent redeploy with the owning user id", async () => {
@@ -2076,6 +2300,34 @@ describe("admin routes", () => {
     expect(mockDb.query).toHaveBeenLastCalledWith("DELETE FROM users WHERE id = $1", ["user-7"]);
   });
 
+  it("keeps the user and agent rows when owned runtime cleanup fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.destroy.mockRejectedValueOnce(new Error("Proxmox user cleanup failed"));
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "user-proxmox-fail", email: "proxmox@example.com", role: "user" }],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-proxmox-user-fail",
+            user_id: "user-proxmox-fail",
+            name: "Proxmox User Agent",
+            backend_type: "proxmox",
+            container_id: "404",
+          },
+        ],
+      });
+
+    const res = await withToken(request(app).delete("/admin/users/user-proxmox-fail"), adminToken);
+
+    expect(res.status).toBe(500);
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockDb.query).not.toHaveBeenCalledWith("DELETE FROM users WHERE id = $1", [
+      "user-proxmox-fail",
+    ]);
+  });
+
   it("deletes global agents with admin privileges", async () => {
     const containerManager = require("../containerManager");
     mockDb.query
@@ -2098,6 +2350,33 @@ describe("admin routes", () => {
       expect.objectContaining({ id: "agent-9" }),
     );
     expect(res.body).toEqual({ success: true });
+  });
+
+  it("keeps a global agent row when non-Kubernetes runtime cleanup fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.destroy.mockRejectedValueOnce(new Error("Proxmox admin destroy failed"));
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-proxmox-admin-fail",
+          user_id: "user-proxmox",
+          name: "Delete Proxmox Agent",
+          backend_type: "proxmox",
+          container_id: "405",
+        },
+      ],
+    });
+
+    const res = await withToken(
+      request(app).delete("/admin/agents/agent-proxmox-admin-fail"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(500);
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(mockDb.query).not.toHaveBeenCalledWith("DELETE FROM agents WHERE id = $1", [
+      "agent-proxmox-admin-fail",
+    ]);
   });
 
   it("destroys Kubernetes resources by container_name before admin agent deletion", async () => {
