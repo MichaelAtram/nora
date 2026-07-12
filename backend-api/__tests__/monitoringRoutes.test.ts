@@ -15,15 +15,10 @@ const mockMetrics = {
   getAgentSummary: jest.fn(),
   getAgentCost: jest.fn(),
 };
-const mockOwnership = {
-  findAccessibleAgent: jest.fn(),
-  requireAccessibleAgent: jest.fn(() => (req, res, next) => next()),
-};
 
 jest.mock("../db", () => mockDb);
 jest.mock("../monitoring", () => mockMonitoring);
 jest.mock("../metrics", () => mockMetrics);
-jest.mock("../middleware/ownership", () => mockOwnership);
 
 const router = require("../routes/monitoring");
 
@@ -37,7 +32,6 @@ describe("monitoring route ownership", () => {
     mockMonitoring.getRecentEvents.mockReset();
     mockMonitoring.getUserRecentEvents.mockReset();
     mockMonitoring.getUserEventsPage.mockReset();
-    mockOwnership.findAccessibleAgent.mockReset();
     currentUser = { id: "user-1", role: "user" };
 
     app = express();
@@ -47,6 +41,30 @@ describe("monitoring route ownership", () => {
       next();
     });
     app.use(router);
+  });
+
+  it("lets unrelated static agent POST routes fall through without an ownership lookup", async () => {
+    const res = await request(app).post("/agents/activate-demo").send({});
+
+    expect(res.status).toBe(404);
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
+  it("still applies the ownership guard to agent monitoring routes", async () => {
+    const agentId = "00000000-0000-4000-8000-000000000001";
+    mockDb.query.mockResolvedValueOnce({ rows: [{ id: agentId, user_id: "user-1" }] });
+    mockMetrics.getAgentMetrics.mockResolvedValueOnce([]);
+
+    const res = await request(app).get(`/agents/${agentId}/metrics`);
+
+    expect(res.status).toBe(200);
+    expect(mockDb.query).toHaveBeenCalledWith("SELECT * FROM agents WHERE id = $1", [agentId]);
+    expect(mockMetrics.getAgentMetrics).toHaveBeenCalledWith(
+      agentId,
+      null,
+      expect.any(String),
+      expect.any(String),
+    );
   });
 
   it("returns the current user's recent events", async () => {

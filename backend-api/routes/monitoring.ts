@@ -10,7 +10,10 @@ const { requireAdmin, scopeByMethod } = require("../middleware/auth");
 
 const router = express.Router();
 
-router.use("/agents/:id", requireAccessibleAgent("viewer", "id"));
+const requireAccessibleMonitoringAgent = requireAccessibleAgent("viewer", "id");
+router.get("/agents/:id/metrics", requireAccessibleMonitoringAgent);
+router.get("/agents/:id/metrics/summary", requireAccessibleMonitoringAgent);
+router.get("/agents/:id/cost", requireAccessibleMonitoringAgent);
 // Monitoring is read-only via API keys. We scope-gate the specific path
 // prefixes the router handles — applying scopeByMethod at the router root
 // would block unrelated requests because this router is mounted at "/".
