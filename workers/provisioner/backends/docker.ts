@@ -29,6 +29,7 @@ const {
   DOCKER_CAPABILITIES,
   uptimeFromContainerInfo,
 } = require("./telemetry");
+const { isDockerPortBindConflict } = require("./dockerPublishedPorts");
 
 const pendingImageBuilds = new Map();
 
@@ -582,7 +583,6 @@ class DockerBackend extends ProvisionerBackend {
       allocatedRuntimePortNumber <= 65535
         ? allocatedRuntimePortNumber
         : null;
-
     const allowedOrigins = new Set([
       "http://localhost:8080",
       "http://127.0.0.1:8080",
@@ -715,7 +715,11 @@ class DockerBackend extends ProvisionerBackend {
           // Use a deterministic port based on agent ID to survive container restarts.
           PortBindings: {
             "18789/tcp": [{ HostPort: String(hostPort) }],
-            ...(runtimeHostPort ? { "9090/tcp": [{ HostPort: String(runtimeHostPort) }] } : {}),
+            ...(runtimeHostPort
+              ? {
+                  "9090/tcp": [{ HostPort: String(runtimeHostPort) }],
+                }
+              : {}),
           },
           // DNS servers for internet access from within the container
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
@@ -782,11 +786,17 @@ class DockerBackend extends ProvisionerBackend {
           // Best effort cleanup only.
         }
       }
-      for (const volume of [volumeName, homeVolumeName]) {
-        try {
-          await this.docker.getVolume(volume).remove({ force: true });
-        } catch {
-          // Best effort cleanup only.
+      // A bind conflict is recoverable locally: the worker can persist a
+      // replacement reservation and retry create(). Keep named volumes on every
+      // bind conflict, including remote Docker failures, so a port collision
+      // never erases durable agent state while the operator resolves it.
+      if (!isDockerPortBindConflict(error)) {
+        for (const volume of [volumeName, homeVolumeName]) {
+          try {
+            await this.docker.getVolume(volume).remove({ force: true });
+          } catch {
+            // Best effort cleanup only.
+          }
         }
       }
       throw error;
