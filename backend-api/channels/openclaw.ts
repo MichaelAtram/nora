@@ -992,7 +992,19 @@ function getConfigChannels(snapshot = {}) {
 }
 
 function normalizeChannelId(value) {
-  return typeof value === "string" ? value.trim().toLowerCase() : "";
+  const channelId = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (channelId === "__proto__" || channelId === "constructor" || channelId === "prototype") {
+    return "";
+  }
+  return channelId;
+}
+
+function requireSafeChannelId(value) {
+  const channelId = normalizeChannelId(value);
+  if (!channelId) {
+    throw createHttpError(400, "Invalid OpenClaw channel type.");
+  }
+  return channelId;
 }
 
 function normalizeLabel(value) {
@@ -1482,8 +1494,11 @@ function requireSupportedLogoutChannel(channelId) {
 }
 
 function buildSeededChannelConfig(channelId, currentConfig = {}) {
+  const seed = Object.prototype.hasOwnProperty.call(OPENCLAW_CHANNEL_SEEDS, channelId)
+    ? OPENCLAW_CHANNEL_SEEDS[channelId]
+    : null;
   const seeded = deepMerge(
-    OPENCLAW_CHANNEL_SEEDS[channelId] ? cloneJson(OPENCLAW_CHANNEL_SEEDS[channelId]) : {},
+    seed ? cloneJson(seed) : {},
     isPlainObject(currentConfig) ? currentConfig : {},
   );
 
@@ -1496,23 +1511,27 @@ function buildSeededChannelConfig(channelId, currentConfig = {}) {
 
 function buildOpenClawChannelConfigPatch(channelId, nextConfig) {
   const patch = {};
-  const provider = OPENCLAW_QR_LOGIN_PROVIDERS[channelId];
+  const provider = Object.prototype.hasOwnProperty.call(OPENCLAW_QR_LOGIN_PROVIDERS, channelId)
+    ? OPENCLAW_QR_LOGIN_PROVIDERS[channelId]
+    : null;
   if (provider?.pluginId && typeof nextConfig?.enabled === "boolean") {
     patch.plugins = {
-      entries: {
-        [provider.pluginId]: {
-          enabled: nextConfig.enabled,
-        },
-      },
+      entries: Object.fromEntries([
+        [
+          provider.pluginId,
+          {
+            enabled: nextConfig.enabled,
+          },
+        ],
+      ]),
     };
   }
-  patch.channels = {
-    [channelId]: nextConfig,
-  };
+  patch.channels = Object.fromEntries([[channelId, nextConfig]]);
   return patch;
 }
 
 async function ensureKnownChannel(agent, channelId) {
+  channelId = requireSafeChannelId(channelId);
   const snapshot = await readChannelSnapshot(agent);
   let ids = buildAvailableChannelIds(snapshot.status, snapshot.configSnapshot);
 
@@ -1563,6 +1582,7 @@ async function listOpenClawChannels(agent) {
 }
 
 async function getOpenClawChannelType(agent, channelId) {
+  channelId = requireSafeChannelId(channelId);
   const { status, schemaEntries } = await ensureKnownChannel(agent, channelId);
   const typeMetaById = buildTypeMetaById(status);
   if (Array.isArray(schemaEntries) && schemaEntries.length > 0) {
@@ -1620,6 +1640,7 @@ async function persistOpenClawChannelState(agentId, channelId, patch) {
 }
 
 async function saveOpenClawChannel(agent, channelId, input = {}, { create = false } = {}) {
+  channelId = requireSafeChannelId(channelId);
   let lastError = null;
 
   for (const delayMs of OPENCLAW_GATEWAY_RESTART_RETRY_DELAYS_MS) {
@@ -1627,7 +1648,10 @@ async function saveOpenClawChannel(agent, channelId, input = {}, { create = fals
     try {
       const { configSnapshot } = await ensureKnownChannel(agent, channelId);
       const snapshot = configSnapshot;
-      const currentConfig = getConfigChannels(snapshot)[channelId];
+      const configChannels = getConfigChannels(snapshot);
+      const currentConfig = Object.prototype.hasOwnProperty.call(configChannels, channelId)
+        ? configChannels[channelId]
+        : undefined;
       let nextConfig = create
         ? buildSeededChannelConfig(channelId, currentConfig)
         : buildSeededChannelConfig(channelId, currentConfig);
@@ -1667,6 +1691,7 @@ async function saveOpenClawChannel(agent, channelId, input = {}, { create = fals
 }
 
 async function connectOpenClawChannel(agent, channelId, options = {}) {
+  channelId = requireSafeChannelId(channelId);
   if (OPENCLAW_CLI_LOGIN_CHANNELS.has(channelId)) {
     const loginResult = await startOpenClawChannelLogin(agent, channelId, options);
     return {

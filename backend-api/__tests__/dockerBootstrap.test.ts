@@ -132,7 +132,17 @@ describe("OpenClaw bootstrap helpers", () => {
       );
       expect(fs.readFileSync(argsLog, "utf8")).not.toContain("microsoft-foundry");
       expect(fs.readFileSync(stdinLog, "utf8")).toBe("sk-openai\nms-key\n");
-      expect(fs.existsSync(path.join(tmpDir, "auth-profiles.json"))).toBe(true);
+      const writtenAuth = JSON.parse(
+        fs.readFileSync(path.join(tmpDir, "auth-profiles.json"), "utf8"),
+      );
+      expect(writtenAuth.profiles).toEqual({
+        "openai:default": { type: "api_key", provider: "openai", key: "sk-openai" },
+        "azure-openai-responses:default": {
+          type: "api_key",
+          provider: "azure-openai-responses",
+          key: "ms-key",
+        },
+      });
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -179,6 +189,71 @@ describe("OpenClaw bootstrap helpers", () => {
       expect(fs.readFileSync(argsLog, "utf8")).toContain(
         "models auth --agent main paste-api-key --provider openai --profile-id openai:default",
       );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses normalized auth-profiles.json when pinned OpenClaw lacks paste-api-key", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nora-openclaw-auth-compat-"));
+    try {
+      const fakeOpenClaw = path.join(tmpDir, "openclaw");
+      const argsLog = path.join(tmpDir, "args.log");
+      fs.writeFileSync(
+        fakeOpenClaw,
+        `#!/bin/sh
+printf '%s\n' "$*" >> "$OPENCLAW_ARGS_LOG"
+cat > /dev/null
+case " $* " in
+  *" paste-api-key "*)
+    echo "error: unknown option '--provider'" >&2
+    exit 1
+    ;;
+esac
+exit 2
+`,
+        { mode: 0o755 },
+      );
+
+      const command = buildOpenClawAuthProfilesWriteCommand(
+        {
+          version: 1,
+          profiles: {
+            "demo:default": { type: "api_key", provider: "demo", key: "demo-key" },
+          },
+          order: { demo: ["demo:default"] },
+          lastGood: { demo: "demo:default" },
+        },
+        { authPath: path.join(tmpDir, "auth-profiles.json") },
+      );
+      const result = require("child_process").spawnSync("/bin/sh", ["-c", command], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_CLI_PATH: fakeOpenClaw,
+          OPENCLAW_ARGS_LOG: argsLog,
+        },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("auth CLI import unavailable for nora-demo");
+      const calls = fs.readFileSync(argsLog, "utf8");
+      expect(calls).toContain(
+        "models auth --agent main paste-api-key --provider nora-demo --profile-id nora-demo:default",
+      );
+      expect(calls).not.toContain("paste-token");
+      expect(JSON.parse(fs.readFileSync(path.join(tmpDir, "auth-profiles.json"), "utf8"))).toEqual({
+        version: 1,
+        profiles: {
+          "nora-demo:default": {
+            type: "api_key",
+            provider: "nora-demo",
+            key: "demo-key",
+          },
+        },
+        order: { "nora-demo": ["nora-demo:default"] },
+        lastGood: { "nora-demo": "nora-demo:default" },
+      });
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

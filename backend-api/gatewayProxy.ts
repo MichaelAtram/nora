@@ -397,10 +397,11 @@ function buildConnectDevice(identity, role, scopes, nonce) {
 // ─── WS-RPC Connection Pool ─────────────────────────────────────
 
 class GatewayConnection {
-  constructor(host, token, port, { resolveHost = null, sourceHost = null } = {}) {
+  constructor(host, token, port, { resolveHost = null, sourceHost = null, agentId = null } = {}) {
     this.host = host;
     this.token = token;
     this.port = port || GATEWAY_PORT;
+    this.agentId = agentId ? String(agentId) : null;
     // Re-resolution hook: `host` is a concrete IP resolved from the agent's
     // service DNS at pool-creation time. On k8s a pod replacement changes the
     // pod IP, so reconnects must re-resolve the ORIGINAL name or they hammer
@@ -414,6 +415,7 @@ class GatewayConnection {
     this._reqId = 0;
     this._connectPromise = null;
     this._identity = deriveDeviceIdentity(token);
+    this._retired = false;
 
     // Reconnection state
     this._reconnectAttempts = 0;
@@ -430,6 +432,7 @@ class GatewayConnection {
 
   /** Open WS, complete challenge-response handshake, resolve when ready. */
   connect() {
+    if (this._retired) return Promise.reject(new Error("Gateway connection retired"));
     if (this._connectPromise) return this._connectPromise;
     this._connectPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -567,6 +570,7 @@ class GatewayConnection {
 
   /** Attempt reconnection with exponential backoff, respecting circuit breaker. */
   async reconnect() {
+    if (this._retired) throw new Error("Gateway connection retired");
     if (this._circuitState === "open") {
       if (Date.now() - this._circuitOpenedAt < this._circuitCooldown) {
         throw new Error("Circuit breaker open — gateway temporarily unavailable");
@@ -585,6 +589,7 @@ class GatewayConnection {
       `[gatewayProxy] Reconnecting to ${this.host}:${this.port} in ${delay}ms (attempt ${this._reconnectAttempts + 1}/${this._maxReconnectAttempts})`,
     );
     await new Promise((r) => setTimeout(r, delay));
+    if (this._retired) throw new Error("Gateway connection retired");
     this._reconnectAttempts++;
 
     // The cached IP may belong to a replaced pod — refresh it from the
@@ -628,7 +633,7 @@ class GatewayConnection {
 
   /** Schedule a background reconnect attempt (non-blocking). */
   _scheduleBackgroundReconnect() {
-    if (this._backgroundReconnecting) return;
+    if (this._retired || this._backgroundReconnecting) return;
     this._backgroundReconnecting = true;
     this.reconnect()
       .then(() => console.log(`[gatewayProxy] Background reconnect succeeded for ${this.host}`))
@@ -651,6 +656,13 @@ class GatewayConnection {
     }
   }
 
+  /** Permanently retire a pooled connection and suppress delayed reconnects. */
+  retire() {
+    this._retired = true;
+    this.eventListeners.clear();
+    this.close();
+  }
+
   get isAlive() {
     return this.connected && this.ws?.readyState === WebSocket.OPEN;
   }
@@ -660,8 +672,49 @@ class GatewayConnection {
   }
 }
 
-// Simple connection pool: one connection per resolved gateway address
-const pool = new Map(); // host:port -> GatewayConnection
+// Pool connections by agent + credential + logical endpoint. Docker may reuse
+// an IP/port immediately after an agent is deleted; address-only pooling would
+// then hand the replacement agent the previous runtime's authenticated socket,
+// device identity, and session stream.
+const pool = new Map(); // opaque identity hash -> GatewayConnection
+const pendingConnections = new Map(); // opaque identity hash -> pending connection state
+
+function buildConnectionPoolKey(agent, addr, token) {
+  return crypto
+    .createHash("sha256")
+    .update(String(agent?.id || ""))
+    .update("\0")
+    .update(addr.host)
+    .update("\0")
+    .update(String(addr.port))
+    .update("\0")
+    .update(String(token || ""))
+    .digest("hex");
+}
+
+function retireConflictingConnections(key, agent, addr) {
+  const agentId = agent?.id ? String(agent.id) : null;
+  for (const [existingKey, existing] of pool) {
+    if (existingKey === key) continue;
+    const sameAgent = agentId && existing.agentId === agentId;
+    const reusedEndpoint = existing._sourceHost === addr.host && existing.port === addr.port;
+    if (!sameAgent && !reusedEndpoint) continue;
+
+    existing.retire();
+    pool.delete(existingKey);
+  }
+
+  for (const [existingKey, pending] of pendingConnections) {
+    if (existingKey === key) continue;
+    const sameAgent = agentId && pending.agentId === agentId;
+    const reusedEndpoint = pending.sourceHost === addr.host && pending.port === addr.port;
+    if (!sameAgent && !reusedEndpoint) continue;
+
+    pending.retired = true;
+    pending.connection?.retire();
+    pendingConnections.delete(existingKey);
+  }
+}
 
 async function getConnection(agent) {
   const rawAddr = resolveGatewayAddress(agent);
@@ -670,7 +723,15 @@ async function getConnection(agent) {
   if (!isAllowedGatewayPort(addr.port)) {
     throw new Error("Agent gateway port is not allowed");
   }
-  const key = `${addr.host}:${addr.port}`;
+  // gateway_token is encrypted at rest; decrypt() is transparent to legacy
+  // plaintext, so it is safe regardless of the token's storage form. The token
+  // is hashed into the pool key and is never logged or stored in plaintext there.
+  const token = decrypt(agent.gateway_token);
+  const key = buildConnectionPoolKey(agent, addr, token);
+  retireConflictingConnections(key, agent, addr);
+  const pending = pendingConnections.get(key);
+  if (pending && !pending.retired) return pending.promise;
+
   let conn = pool.get(key);
   if (conn?.isAlive) return conn;
 
@@ -680,45 +741,83 @@ async function getConnection(agent) {
       throw new Error("Circuit breaker open — gateway temporarily unavailable");
     }
     // Cooldown expired — clean up and start fresh
-    conn.close();
+    conn.retire();
     pool.delete(key);
     conn = null;
   }
 
   // Clean up dead connection
   if (conn) {
-    conn.close();
+    conn.retire();
     pool.delete(key);
   }
 
-  // Validate + resolve the gateway host before opening a NEW connection (the
-  // alive-cache hit above already passed this when it was created). Closes the
-  // gap where the RPC pool checked only the port, not the host.
-  const extraAllowedHosts = await allowedGatewayHostsForAgent(agent);
-  const connectHost = await resolveGatewayHostForProxy(
-    addr.host,
-    "agent gateway",
-    extraAllowedHosts,
-  );
-  // gateway_token is encrypted at rest; decrypt() is transparent to legacy
-  // plaintext, so it is safe regardless of the token's storage form.
-  conn = new GatewayConnection(connectHost, decrypt(agent.gateway_token), addr.port, {
-    resolveHost: () => resolveGatewayHostForProxy(addr.host, "agent gateway", extraAllowedHosts),
+  const pendingState = {
+    agentId: agent?.id ? String(agent.id) : null,
     sourceHost: addr.host,
-  });
-  pool.set(key, conn);
-  try {
-    await conn.connect();
-  } catch (err) {
-    // First connect failed — try one reconnect with backoff
+    port: addr.port,
+    connection: null,
+    retired: false,
+    promise: null,
+  };
+
+  pendingState.promise = (async () => {
     try {
-      await conn.reconnect();
-    } catch {
-      pool.delete(key);
-      throw err;
+      // Validate + resolve the gateway host before opening a NEW connection
+      // (the alive-cache hit above already passed this when it was created).
+      const extraAllowedHosts = await allowedGatewayHostsForAgent(agent);
+      const connectHost = await resolveGatewayHostForProxy(
+        addr.host,
+        "agent gateway",
+        extraAllowedHosts,
+      );
+      if (pendingState.retired) throw new Error("Gateway connection retired");
+
+      // A different identity may have reached the pool while DNS/allowlist
+      // resolution was in flight. Retire it before this connection becomes
+      // visible; newer conflicting requests retire this pending state instead.
+      retireConflictingConnections(key, agent, addr);
+      if (pendingState.retired) throw new Error("Gateway connection retired");
+
+      conn = new GatewayConnection(connectHost, token, addr.port, {
+        resolveHost: () =>
+          resolveGatewayHostForProxy(addr.host, "agent gateway", extraAllowedHosts),
+        sourceHost: addr.host,
+        agentId: agent.id,
+      });
+      pendingState.connection = conn;
+      if (pendingState.retired) {
+        conn.retire();
+        throw new Error("Gateway connection retired");
+      }
+      pool.set(key, conn);
+
+      try {
+        await conn.connect();
+      } catch (err) {
+        // First connect failed — try one reconnect with backoff.
+        try {
+          await conn.reconnect();
+        } catch {
+          conn.retire();
+          if (pool.get(key) === conn) pool.delete(key);
+          throw err;
+        }
+      }
+      if (pendingState.retired) {
+        conn.retire();
+        if (pool.get(key) === conn) pool.delete(key);
+        throw new Error("Gateway connection retired");
+      }
+      return conn;
+    } finally {
+      if (pendingConnections.get(key) === pendingState) {
+        pendingConnections.delete(key);
+      }
     }
-  }
-  return conn;
+  })();
+  pendingConnections.set(key, pendingState);
+  return pendingState.promise;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
@@ -1616,18 +1715,35 @@ function attachGatewayWS(server) {
 function evictConnection(target) {
   const address =
     typeof target === "string" ? { host: target } : resolveGatewayAddress(target || {});
-  if (!address?.host) return;
+  const targetAgentId = typeof target === "object" && target?.id != null ? String(target.id) : null;
+  if (!address?.host && !targetAgentId) return;
 
-  const keyPrefix = `${address.host}:`;
   for (const [key, conn] of pool) {
-    if (
-      key === address.host ||
-      key === `${address.host}:${address.port}` ||
-      key.startsWith(keyPrefix)
-    ) {
-      conn.close();
+    const matchesAgent = targetAgentId && conn.agentId === targetAgentId;
+    const matchesAddress =
+      address?.host &&
+      conn._sourceHost === address.host &&
+      (!address.port || conn.port === Number(address.port));
+    if (matchesAgent || matchesAddress) {
+      conn.retire();
       pool.delete(key);
-      console.log(`[gatewayProxy] Evicted connection for ${key}`);
+      console.log(
+        `[gatewayProxy] Evicted connection for ${conn._sourceHost}:${conn.port}` +
+          (conn.agentId ? ` (agent ${conn.agentId})` : ""),
+      );
+    }
+  }
+
+  for (const [key, pending] of pendingConnections) {
+    const matchesAgent = targetAgentId && pending.agentId === targetAgentId;
+    const matchesAddress =
+      address?.host &&
+      pending.sourceHost === address.host &&
+      (!address.port || pending.port === Number(address.port));
+    if (matchesAgent || matchesAddress) {
+      pending.retired = true;
+      pending.connection?.retire();
+      pendingConnections.delete(key);
     }
   }
 }

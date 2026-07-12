@@ -1080,12 +1080,13 @@ async function runProvisionerExecCommand(
   provisioner,
   containerId,
   command,
-  { timeout = 30000, maxOutputBytes = 65536, tty = false, env = [] } = {},
+  { timeout = 30000, maxOutputBytes = 65536, tty = false, env = [], agentId = null } = {},
 ) {
   const execResult = await provisioner.exec(containerId, {
     cmd: ["/bin/sh", "-lc", command],
     tty,
     env,
+    ...(agentId ? { agentId } : {}),
   });
   if (!execResult?.exec || !execResult?.stream) {
     throw new Error("Container exec unavailable");
@@ -1250,14 +1251,16 @@ async function reconcileRuntimeLlmAuth({
         provisioner,
         containerId,
         buildHermesModelConfigWriteCommand(modelConfig),
+        { agentId },
       );
     }
     await runProvisionerExecCommand(
       provisioner,
       containerId,
       buildHermesEnvWriteCommand(llmEnvVars),
+      { agentId },
     );
-    await provisioner.restart(containerId);
+    await provisioner.restart(containerId, { agentId });
     const readiness = await waitForAgentReadiness(
       {
         host,
@@ -1297,7 +1300,7 @@ async function reconcileRuntimeLlmAuth({
     if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) {
       throw error;
     }
-    await runProvisionerExecCommand(provisioner, containerId, authWriteCommand);
+    await runProvisionerExecCommand(provisioner, containerId, authWriteCommand, { agentId });
   }
 
   // Merge custom-provider registrations (Microsoft Foundry) into openclaw.json
@@ -1324,11 +1327,13 @@ async function reconcileRuntimeLlmAuth({
       if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) {
         throw error;
       }
-      await runProvisionerExecCommand(provisioner, containerId, providerMergeCommand);
+      await runProvisionerExecCommand(provisioner, containerId, providerMergeCommand, {
+        agentId,
+      });
     }
   }
 
-  await provisioner.restart(containerId);
+  await provisioner.restart(containerId, { agentId });
   const readiness = await waitForAgentReadiness({
     host,
     runtimeHost,
@@ -1654,7 +1659,7 @@ async function reconcileOpenClawChannelState({
     await runRuntimeCommand(agentRef, command);
   } catch (error) {
     if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) throw error;
-    await runProvisionerExecCommand(provisioner, containerId, command);
+    await runProvisionerExecCommand(provisioner, containerId, command, { agentId });
   }
   return { status: "synced", channels: rows.rows.length };
 }
@@ -1701,7 +1706,7 @@ function normalizeInstalledSkillsLockfile(parsed = {}) {
  * @returns {Promise<Array<{slug: string, version: string}>>} The installed
  * ClawHub skills currently represented in the runtime lockfile.
  */
-async function readInstalledClawhubSkills(provisioner, containerId) {
+async function readInstalledClawhubSkills(provisioner, containerId, agentId) {
   const readCommand =
     `if [ -f ${JSON.stringify(CLAWHUB_LOCKFILE_PATH)} ]; then ` +
     `base64 < ${JSON.stringify(CLAWHUB_LOCKFILE_PATH)} | tr -d '\\n'; ` +
@@ -1715,6 +1720,7 @@ async function readInstalledClawhubSkills(provisioner, containerId) {
       // JSON parsing only happens after the transport output is normalized.
       tty: true,
       env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+      agentId,
     });
 
     try {
@@ -1734,7 +1740,7 @@ async function readInstalledClawhubSkills(provisioner, containerId) {
   throw new Error(`Failed to parse ClawHub lockfile: ${lastError?.message || "unknown error"}`);
 }
 
-async function ensureClawhubCli(provisioner, containerId) {
+async function ensureClawhubCli(provisioner, containerId, agentId) {
   try {
     await runProvisionerExecCommand(
       provisioner,
@@ -1748,6 +1754,7 @@ async function ensureClawhubCli(provisioner, containerId) {
       {
         timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
         env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+        agentId,
       },
     );
   } catch (error) {
@@ -1804,8 +1811,8 @@ async function removeSavedClawhubSkill(agentId, slug, skillEntry) {
   ]);
 }
 
-async function installClawhubSkill(provisioner, containerId, slug) {
-  await ensureClawhubCli(provisioner, containerId);
+async function installClawhubSkill(provisioner, containerId, slug, agentId) {
+  await ensureClawhubCli(provisioner, containerId, agentId);
   // Keep the install invocation unwrapped (no nested in-container `timeout ... /bin/sh -lc ...`).
   // A nested timeout caused Nora-driven ClawHub installs to hang even though the same CLI command
   // completed quickly when run directly in the container. The outer exec timeout below is the single
@@ -1820,12 +1827,13 @@ async function installClawhubSkill(provisioner, containerId, slug) {
       timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
       maxOutputBytes: 32768,
       env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+      agentId,
     },
   );
 }
 
-async function uninstallClawhubSkill(provisioner, containerId, slug) {
-  await ensureClawhubCli(provisioner, containerId);
+async function uninstallClawhubSkill(provisioner, containerId, slug, agentId) {
+  await ensureClawhubCli(provisioner, containerId, agentId);
   // `slug` is shell-quoted (single quotes) so it cannot inject into the container shell.
   await runProvisionerExecCommand(
     provisioner,
@@ -1837,6 +1845,7 @@ async function uninstallClawhubSkill(provisioner, containerId, slug) {
       timeout: CLAWHUB_INSTALL_TIMEOUT_MS + 10000,
       maxOutputBytes: 32768,
       env: ["TERM=dumb", "CI=1", "NO_COLOR=1", "CLICOLOR=0"],
+      agentId,
     },
   );
 }
@@ -1882,7 +1891,7 @@ async function reconcileClawhubSkills({
 
   let installedSkills = [];
   try {
-    installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+    installedSkills = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   } catch (error) {
     console.warn(
       `${logPrefix} agent=${agentId} Failed to read installed skills before reconciliation: ${error.message}`,
@@ -1909,7 +1918,7 @@ async function reconcileClawhubSkills({
       console.log(
         `${logPrefix} agent=${agentId} slug=${skill.installSlug} Installing missing saved skill`,
       );
-      await installClawhubSkill(provisioner, containerId, skill.installSlug);
+      await installClawhubSkill(provisioner, containerId, skill.installSlug, agentId);
       console.log(
         `${logPrefix} agent=${agentId} slug=${skill.installSlug} Reconciliation install completed`,
       );
@@ -1951,7 +1960,7 @@ async function reconcileClawhubSkills({
         console.warn(
           `${logPrefix} agent=${agentId} slug=${skill.slug} Removing orphaned runtime skill`,
         );
-        await uninstallClawhubSkill(provisioner, containerId, skill.slug);
+        await uninstallClawhubSkill(provisioner, containerId, skill.slug, agentId);
         console.warn(
           `${logPrefix} agent=${agentId} slug=${skill.slug} Reconciliation uninstall completed`,
         );
@@ -2017,11 +2026,11 @@ async function runClawhubInstallJob({
   logJob,
 }) {
   logJob("cli-check", "Ensuring clawhub CLI is available");
-  await ensureClawhubCli(provisioner, containerId);
+  await ensureClawhubCli(provisioner, containerId, agentId);
   logJob("cli-check", "Clawhub CLI is ready");
 
   logJob("precheck", "Reading installed skills before install");
-  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
+  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   logJob("precheck", "Read installed skills before install", {
     installedCount: installedBefore.length,
   });
@@ -2044,7 +2053,7 @@ async function runClawhubInstallJob({
     logJob("install", "Running clawhub install command", {
       timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
     });
-    await installClawhubSkill(provisioner, containerId, slug);
+    await installClawhubSkill(provisioner, containerId, slug, agentId);
     logJob("install", "Clawhub install command finished");
   } catch (error) {
     const message = String(error?.message || "");
@@ -2058,7 +2067,7 @@ async function runClawhubInstallJob({
   }
 
   logJob("verify", "Reading installed skills after install");
-  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   logJob("verify", "Read installed skills after install", {
     installedCount: installedSkills.length,
   });
@@ -2111,11 +2120,11 @@ async function runClawhubDeleteJob({
   logJob,
 }) {
   logJob("cli-check", "Ensuring clawhub CLI is available");
-  await ensureClawhubCli(provisioner, containerId);
+  await ensureClawhubCli(provisioner, containerId, agentId);
   logJob("cli-check", "Clawhub CLI is ready");
 
   logJob("precheck", "Reading installed skills before delete");
-  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId);
+  const installedBefore = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   logJob("precheck", "Read installed skills before delete", {
     installedCount: installedBefore.length,
   });
@@ -2124,14 +2133,14 @@ async function runClawhubDeleteJob({
     logJob("delete", "Running clawhub uninstall command", {
       timeoutMs: CLAWHUB_INSTALL_TIMEOUT_MS,
     });
-    await uninstallClawhubSkill(provisioner, containerId, slug);
+    await uninstallClawhubSkill(provisioner, containerId, slug, agentId);
     logJob("delete", "Clawhub uninstall command finished");
   } else {
     logJob("precheck", "Skill already absent before delete");
   }
 
   logJob("verify", "Reading installed skills after delete");
-  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId);
+  const installedSkills = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   logJob("verify", "Read installed skills after delete", {
     installedCount: installedSkills.length,
   });
@@ -2772,7 +2781,7 @@ const worker = new Worker(
               console.warn(
                 `[provisioner] Agent ${id} was deleted during create; removing runtime ${containerId}`,
               );
-              await provisioner.destroy(containerId).catch(() => {});
+              await provisioner.destroy(containerId, { agentId: id }).catch(() => {});
               return { canceled: true, reason: "agent-deleted-during-create" };
             }
           } catch (e) {
@@ -2966,7 +2975,7 @@ const worker = new Worker(
             `[provisioner] Agent ${id} was deleted before final persistence; removing runtime ${containerId}`,
           );
           if (containerId) {
-            await provisioner.destroy(containerId).catch(() => {});
+            await provisioner.destroy(containerId, { agentId: id }).catch(() => {});
           }
           return { canceled: true, reason: "agent-deleted-before-final-update" };
         }
@@ -3104,7 +3113,7 @@ const worker = new Worker(
               provisioner,
               containerId,
               buildHermesIntegrationInstallCommand(syncData),
-              { timeout: 30000 },
+              { timeout: 30000, agentId: id },
             );
             console.log(
               `[provisioner] Installed Nora integration skill with ${syncData.length} integration(s) to Hermes agent ${id}`,

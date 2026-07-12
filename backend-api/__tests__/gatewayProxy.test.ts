@@ -14,6 +14,7 @@ class mockFakeWebSocket extends EventEmitter {
     super();
     this.url = url;
     this.readyState = mockFakeWebSocket.OPEN;
+    mockFakeWebSocket.instances.push(this);
     setImmediate(() => {
       if (this.readyState !== mockFakeWebSocket.OPEN) return;
       this.emit(
@@ -189,6 +190,7 @@ mockFakeWebSocket.healthMode = "success";
 mockFakeWebSocket.statusMode = "success";
 mockFakeWebSocket.toolsCatalogResult = { tools: [] };
 mockFakeWebSocket.connectParams = [];
+mockFakeWebSocket.instances = [];
 mockFakeWebSocket.streamMode = false;
 
 class mockFakeWebSocketServer {
@@ -228,6 +230,7 @@ describe("gateway proxy control-plane routes", () => {
     mockFakeWebSocket.statusMode = "success";
     mockFakeWebSocket.toolsCatalogResult = { tools: [] };
     mockFakeWebSocket.connectParams = [];
+    mockFakeWebSocket.instances = [];
     mockFakeWebSocket.streamMode = false;
     mockGetIntegrationsForSync.mockReset();
     mockBuildIntegrationToolCatalogEntries.mockReset();
@@ -281,6 +284,167 @@ describe("gateway proxy control-plane routes", () => {
       expect.objectContaining({ usage: { total_tokens: 42 } }),
       expect.objectContaining({ source: "openclaw.gateway", sessionId: "main" }),
     );
+  });
+
+  it("creates a fresh authenticated connection when Docker reuses an agent endpoint", async () => {
+    const agents = new Map([
+      [
+        "agent-old",
+        {
+          id: "agent-old",
+          user_id: "user-1",
+          status: "running",
+          host: "10.0.0.10",
+          gateway_token: "old-gateway-token",
+          gateway_host_port: null,
+        },
+      ],
+      [
+        "agent-new",
+        {
+          id: "agent-new",
+          user_id: "user-1",
+          status: "running",
+          host: "10.0.0.10",
+          gateway_token: "new-gateway-token",
+          gateway_host_port: null,
+        },
+      ],
+    ]);
+    mockDb.query.mockImplementation(async (sql, params = []) => {
+      if (String(sql).includes("FROM agents WHERE id = $1")) {
+        const agent = agents.get(params[0]);
+        return { rows: agent ? [agent] : [] };
+      }
+      return { rows: [] };
+    });
+
+    const first = await request(app)
+      .post("/agents/agent-old/gateway/chat")
+      .send({ message: "first" });
+    const second = await request(app)
+      .post("/agents/agent-new/gateway/chat")
+      .send({ message: "second" });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(mockFakeWebSocket.connectParams.map((params) => params.auth.password)).toEqual([
+      "old-gateway-token",
+      "new-gateway-token",
+    ]);
+    expect(mockFakeWebSocket.connectParams[0].device.id).not.toBe(
+      mockFakeWebSocket.connectParams[1].device.id,
+    );
+    expect(mockFakeWebSocket.instances).toHaveLength(2);
+    expect(mockFakeWebSocket.instances[0].readyState).toBe(mockFakeWebSocket.CLOSED);
+    expect(mockFakeWebSocket.instances[1].readyState).toBe(mockFakeWebSocket.OPEN);
+  });
+
+  it("coalesces concurrent cold gateway status probes into one authenticated socket", async () => {
+    mockDb.query.mockImplementation(async (sql) => {
+      if (String(sql).includes("FROM agents WHERE id = $1")) {
+        return {
+          rows: [
+            {
+              id: "agent-concurrent-status",
+              user_id: "user-1",
+              status: "running",
+              host: "10.0.0.44",
+              gateway_token: "concurrent-gateway-token",
+              gateway_host_port: null,
+            },
+          ],
+        };
+      }
+      return { rows: [] };
+    });
+
+    const response = await request(app).get("/agents/agent-concurrent-status/gateway/status");
+
+    expect(response.status).toBe(200);
+    expect(mockFakeWebSocket.instances).toHaveLength(1);
+    expect(mockFakeWebSocket.instances[0].readyState).toBe(mockFakeWebSocket.OPEN);
+    expect(mockFakeWebSocket.connectParams).toHaveLength(1);
+    expect(mockFakeWebSocket.connectParams[0].auth.password).toBe("concurrent-gateway-token");
+  });
+
+  it("reconnects with a new identity when an agent gateway token rotates", async () => {
+    let token = "gateway-token-v1";
+    mockDb.query.mockImplementation(async (sql) => {
+      if (String(sql).includes("FROM agents WHERE id = $1")) {
+        return {
+          rows: [
+            {
+              id: "agent-1",
+              user_id: "user-1",
+              status: "running",
+              host: "10.0.0.10",
+              gateway_token: token,
+              gateway_host_port: null,
+            },
+          ],
+        };
+      }
+      return { rows: [] };
+    });
+
+    await request(app).post("/agents/agent-1/gateway/chat").send({ message: "before rotation" });
+    token = "gateway-token-v2";
+    await request(app).post("/agents/agent-1/gateway/chat").send({ message: "after rotation" });
+
+    expect(mockFakeWebSocket.connectParams.map((params) => params.auth.password)).toEqual([
+      "gateway-token-v1",
+      "gateway-token-v2",
+    ]);
+    expect(mockFakeWebSocket.instances).toHaveLength(2);
+    expect(mockFakeWebSocket.instances[0].readyState).toBe(mockFakeWebSocket.CLOSED);
+  });
+
+  it("does not reconnect a retired socket after its endpoint is reassigned", async () => {
+    const agents = new Map([
+      [
+        "agent-old",
+        {
+          id: "agent-old",
+          user_id: "user-1",
+          status: "running",
+          host: "10.0.0.10",
+          gateway_token: "old-gateway-token",
+          gateway_host_port: null,
+        },
+      ],
+      [
+        "agent-new",
+        {
+          id: "agent-new",
+          user_id: "user-1",
+          status: "running",
+          host: "10.0.0.10",
+          gateway_token: "new-gateway-token",
+          gateway_host_port: null,
+        },
+      ],
+    ]);
+    mockDb.query.mockImplementation(async (sql, params = []) => {
+      if (String(sql).includes("FROM agents WHERE id = $1")) {
+        const agent = agents.get(params[0]);
+        return { rows: agent ? [agent] : [] };
+      }
+      return { rows: [] };
+    });
+
+    await request(app).post("/agents/agent-old/gateway/chat").send({ message: "first" });
+    mockFakeWebSocket.instances[0].close();
+    await request(app).post("/agents/agent-new/gateway/chat").send({ message: "second" });
+
+    // The old connection already scheduled its one-second background retry
+    // before the replacement request retired it. It must not dial again.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(mockFakeWebSocket.instances).toHaveLength(2);
+    expect(mockFakeWebSocket.connectParams.map((params) => params.auth.password)).toEqual([
+      "old-gateway-token",
+      "new-gateway-token",
+    ]);
   });
 
   it("records model token metadata from streaming chat final events", async () => {

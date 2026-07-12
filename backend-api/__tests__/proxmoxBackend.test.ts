@@ -44,6 +44,14 @@ function fingerprintFor(key) {
   return `SHA256:${crypto.createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
 }
 
+function ownershipMarkerFor(agentId) {
+  const digest = crypto
+    .createHash("sha256")
+    .update(`nora:proxmox:agent:${String(agentId).trim()}`, "utf8")
+    .digest("hex");
+  return `nora-agent:v1:${digest}`;
+}
+
 function configureProxmox() {
   const hostKey = Buffer.from("test-proxmox-host-key");
   process.env.PROXMOX_API_URL = "https://pve.example.com:8006/api2/json";
@@ -224,10 +232,19 @@ describe("ProxmoxBackend", () => {
         ostemplate: "local:vztmpl/ubuntu-22.04-standard.tar.zst",
         unprivileged: 1,
         start: 0,
-        description: expect.stringMatching(/\nnora-owner:[a-f0-9]{32}$/),
+        description: expect.stringContaining(ownershipMarkerFor("agent-1")),
       }),
       expect.any(Object),
     ]);
+    const description = requestData.mock.calls[0][2].description;
+    expect(description).toMatch(/\nnora-owner:[a-f0-9]{32}$/);
+    expect(backend._ownsCreatedLxc).toHaveBeenCalledWith(
+      "101",
+      ownershipMarkerFor("agent-1"),
+      expect.objectContaining({
+        createOwnershipMarker: expect.stringMatching(/^nora-owner:[a-f0-9]{32}$/),
+      }),
+    );
     expect(result).toEqual(
       expect.objectContaining({
         containerId: "101",
@@ -271,7 +288,13 @@ describe("ProxmoxBackend", () => {
         image: "local:vztmpl/ubuntu-22.04-standard.tar.zst",
       }),
     ).rejects.toThrow("bootstrap failed");
-    expect(destroy).toHaveBeenCalledWith("102");
+    expect(destroy).toHaveBeenCalledWith(
+      "102",
+      expect.objectContaining({
+        agentId: "agent-2",
+        createOwnershipMarker: expect.stringMatching(/^nora-owner:[a-f0-9]{32}$/),
+      }),
+    );
 
     const controller = new AbortController();
     controller.abort(new Error("operator cancelled"));
@@ -308,9 +331,102 @@ describe("ProxmoxBackend", () => {
       }),
     ).rejects.toThrow("VM 102 already exists");
 
-    expect(requestData).toHaveBeenCalledWith("GET", "/nodes/pve-a/lxc/102/config", null, {});
+    expect(requestData).toHaveBeenCalledWith(
+      "GET",
+      "/nodes/pve-a/lxc/102/config",
+      null,
+      expect.objectContaining({
+        createOwnershipMarker: expect.stringMatching(/^nora-owner:[a-f0-9]{32}$/),
+      }),
+    );
     expect(destroy).not.toHaveBeenCalled();
     expect(onRuntimeIdentity).not.toHaveBeenCalled();
+  });
+
+  it("does not destroy an older LXC for the same agent when nextid collides", async () => {
+    const backend = new ProxmoxBackend();
+    const agentId = "agent-same-id";
+    jest.spyOn(backend, "_getNextVmid").mockResolvedValue("102");
+    const collision = Object.assign(new Error("VM 102 already exists"), { statusCode: 400 });
+    jest.spyOn(backend, "_requestData").mockImplementation(async (method, requestPath) => {
+      if (method === "POST" && requestPath === "/nodes/pve-a/lxc") throw collision;
+      if (method === "GET" && requestPath === "/nodes/pve-a/lxc/102/config") {
+        return {
+          description: `${ownershipMarkerFor(agentId)}\nnora-owner:${"a".repeat(32)}`,
+        };
+      }
+      throw new Error(`Unexpected Proxmox request: ${method} ${requestPath}`);
+    });
+    const destroy = jest.spyOn(backend, "destroy").mockResolvedValue(undefined);
+
+    await expect(
+      backend.create({
+        id: agentId,
+        image: "local:vztmpl/ubuntu-22.04-standard.tar.zst",
+      }),
+    ).rejects.toThrow("VM 102 already exists");
+
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
+  it("preserves the VMID when a create request has an ambiguous transport failure", async () => {
+    const backend = new ProxmoxBackend();
+    jest.spyOn(backend, "_getNextVmid").mockResolvedValue("103");
+    const transportError = new Error("socket hang up after request write");
+    const missing = Object.assign(new Error("configuration not visible yet"), {
+      statusCode: 404,
+    });
+    jest.spyOn(backend, "_requestData").mockImplementation(async (method, requestPath) => {
+      if (method === "POST" && requestPath === "/nodes/pve-a/lxc") throw transportError;
+      if (method === "GET" && requestPath === "/nodes/pve-a/lxc/103/config") throw missing;
+      throw new Error(`Unexpected Proxmox request: ${method} ${requestPath}`);
+    });
+    const destroy = jest.spyOn(backend, "destroy").mockResolvedValue(undefined);
+
+    await expect(
+      backend.create({
+        id: "agent-ambiguous-create",
+        image: "local:vztmpl/ubuntu-22.04-standard.tar.zst",
+      }),
+    ).rejects.toMatchObject({
+      code: "PROXMOX_RUNTIME_OWNERSHIP_UNVERIFIED",
+      containerId: "103",
+      runtimeIdentity: {
+        containerId: "103",
+        destroyAllowed: false,
+        persistIdentity: true,
+      },
+    });
+
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
+  it("persists an ambiguous VMID when ownership verification also fails", async () => {
+    const backend = new ProxmoxBackend();
+    jest.spyOn(backend, "_getNextVmid").mockResolvedValue("103");
+    const transportError = new Error("socket hang up after request write");
+    jest.spyOn(backend, "_requestData").mockImplementation(async (method, requestPath) => {
+      if (method === "POST" && requestPath === "/nodes/pve-a/lxc") throw transportError;
+      if (method === "GET" && requestPath === "/nodes/pve-a/lxc/103/config") {
+        throw new Error("Proxmox API unavailable during ownership verification");
+      }
+      throw new Error(`Unexpected Proxmox request: ${method} ${requestPath}`);
+    });
+
+    await expect(
+      backend.create({
+        id: "agent-ambiguous-unverified",
+        image: "local:vztmpl/ubuntu-22.04-standard.tar.zst",
+      }),
+    ).rejects.toMatchObject({
+      code: "PROXMOX_RUNTIME_CLEANUP_FAILED",
+      containerId: "103",
+      runtimeIdentity: {
+        containerId: "103",
+        destroyAllowed: false,
+        persistIdentity: true,
+      },
+    });
   });
 
   it("reports unresolved identity without deleting when cleanup ownership cannot be reverified", async () => {
@@ -354,6 +470,89 @@ describe("ProxmoxBackend", () => {
     });
 
     expect(destroy).not.toHaveBeenCalled();
+  });
+
+  it("requires an agent id before resolving a persisted Proxmox VMID", async () => {
+    const backend = new ProxmoxBackend();
+    const requestData = jest.spyOn(backend, "_requestData");
+
+    await expect(backend.destroy("104")).rejects.toMatchObject({
+      code: "PROXMOX_AGENT_ID_REQUIRED",
+      statusCode: 400,
+    });
+    expect(requestData).not.toHaveBeenCalled();
+  });
+
+  it("refuses to destroy an LXC whose Nora ownership marker is missing", async () => {
+    const backend = new ProxmoxBackend();
+    const requestData = jest
+      .spyOn(backend, "_requestData")
+      .mockResolvedValue({ description: "Operator-managed LXC" });
+
+    await expect(backend.destroy("104", { agentId: "agent-current" })).rejects.toMatchObject({
+      code: "PROXMOX_RUNTIME_OWNERSHIP_MISMATCH",
+      statusCode: 409,
+      containerId: "104",
+    });
+    expect(requestData).toHaveBeenCalledTimes(1);
+    expect(requestData).toHaveBeenCalledWith("GET", "/nodes/pve-a/lxc/104/config", null, {});
+  });
+
+  it.each([
+    ["start", (backend) => backend.start("104", { agentId: "agent-current" })],
+    ["stop", (backend) => backend.stop("104", { agentId: "agent-current" })],
+    ["restart", (backend) => backend.restart("104", { agentId: "agent-current" })],
+    ["destroy", (backend) => backend.destroy("104", { agentId: "agent-current" })],
+    ["status", (backend) => backend.status("104", { agentId: "agent-current" })],
+    ["stats", (backend) => backend.stats("104", { agentId: "agent-current" })],
+    [
+      "updateEnv",
+      (backend) =>
+        backend.updateEnv("104", { OPENAI_API_KEY: "secret" }, { agentId: "agent-current" }),
+    ],
+    ["logs", (backend) => backend.logs("104", { agentId: "agent-current" })],
+    ["exec", (backend) => backend.exec("104", { cmd: ["true"], agentId: "agent-current" })],
+  ])("refuses %s when a reused VMID belongs to a different agent", async (_name, invoke) => {
+    const backend = new ProxmoxBackend();
+    const requestData = jest
+      .spyOn(backend, "_requestData")
+      .mockResolvedValue({ description: ownershipMarkerFor("agent-previous") });
+
+    await expect(invoke(backend)).rejects.toMatchObject({
+      code: "PROXMOX_RUNTIME_OWNERSHIP_MISMATCH",
+      containerId: "104",
+    });
+    expect(requestData).toHaveBeenCalledTimes(1);
+    expect(requestData).toHaveBeenCalledWith("GET", "/nodes/pve-a/lxc/104/config", null, {});
+  });
+
+  it("re-verifies matching ownership before both stop and delete during destroy", async () => {
+    const backend = new ProxmoxBackend();
+    const agentId = "agent-owned";
+    const marker = ownershipMarkerFor(agentId);
+    const requestData = jest
+      .spyOn(backend, "_requestData")
+      .mockImplementation(async (method, requestPath) => {
+        if (method === "GET" && requestPath === "/nodes/pve-a/lxc/104/config") {
+          return { description: `Nora openclaw agent\n${marker}` };
+        }
+        if (method === "POST" && requestPath === "/nodes/pve-a/lxc/104/status/stop") {
+          return "UPID:stop";
+        }
+        if (method === "DELETE" && requestPath === "/nodes/pve-a/lxc/104") {
+          return "UPID:delete";
+        }
+        throw new Error(`Unexpected Proxmox request: ${method} ${requestPath}`);
+      });
+    const waitForTask = jest.spyOn(backend, "_waitForTask").mockResolvedValue(undefined);
+
+    await expect(backend.destroy("104", { agentId })).resolves.toBeUndefined();
+
+    expect(requestData.mock.calls.filter(([, path]) => path.endsWith("/config"))).toHaveLength(2);
+    expect(requestData).toHaveBeenCalledWith("POST", "/nodes/pve-a/lxc/104/status/stop");
+    expect(requestData).toHaveBeenCalledWith("DELETE", "/nodes/pve-a/lxc/104");
+    expect(waitForTask).toHaveBeenNthCalledWith(1, "UPID:stop");
+    expect(waitForTask).toHaveBeenNthCalledWith(2, "UPID:delete");
   });
 
   it("refuses to advertise NemoClaw when no enforced sandbox exists", async () => {
@@ -460,12 +659,16 @@ describe("ProxmoxBackend", () => {
 
   it("merges env updates without placing secret values in the SSH command", async () => {
     const backend = new ProxmoxBackend();
+    const agentId = "agent-env";
+    jest
+      .spyOn(backend, "_requestData")
+      .mockResolvedValue({ description: ownershipMarkerFor(agentId) });
     const writeFile = jest.spyOn(backend, "_writeFile").mockResolvedValue(undefined);
     const pctExec = jest
       .spyOn(backend, "_pctExec")
       .mockResolvedValue({ stdout: "", stderr: "", code: 0 });
 
-    await backend.updateEnv("105", { OPENAI_API_KEY: "rotated-secret" });
+    await backend.updateEnv("105", { OPENAI_API_KEY: "rotated-secret" }, { agentId });
 
     expect(writeFile).toHaveBeenCalledWith(
       "105",
@@ -479,6 +682,10 @@ describe("ProxmoxBackend", () => {
 
   it("quotes command strings inside the guest and provides a separate stdin stream", async () => {
     const backend = new ProxmoxBackend();
+    const agentId = "agent-exec";
+    jest
+      .spyOn(backend, "_requestData")
+      .mockResolvedValue({ description: ownershipMarkerFor(agentId) });
     const stream = new PassThrough();
     const stdin = new PassThrough();
     const inspect = jest.fn().mockResolvedValue({ Running: false, ExitCode: 0 });
@@ -490,30 +697,38 @@ describe("ProxmoxBackend", () => {
       resize,
     });
 
-    const result = await backend.exec("106", { cmd: "printf safe; uname", tty: false });
+    const result = await backend.exec("106", {
+      cmd: "printf safe; uname",
+      tty: false,
+      agentId,
+    });
 
     expect(open.mock.calls[0][0]).toContain("pct exec 106 -- /bin/sh -lc 'printf safe; uname'");
     expect(result.stream).toBe(stream);
     expect(result.stdin).toBe(stdin);
     await expect(result.exec.inspect()).resolves.toEqual({ Running: false, ExitCode: 0 });
-    await expect(backend.exec("106; rm -rf /", { cmd: ["true"] })).rejects.toThrow(/VMID/);
+    await expect(backend.exec("106; rm -rf /", { cmd: ["true"], agentId })).rejects.toThrow(/VMID/);
   });
 
   it("clamps log tails and does not hide API authentication failures as stopped", async () => {
     const backend = new ProxmoxBackend();
+    const agentId = "agent-observe";
     const stream = new PassThrough();
     const open = jest.spyOn(backend, "_openSshStream").mockReturnValue({ stream });
-    await backend.logs("107", { tail: 999999, follow: false });
+    const requestData = jest
+      .spyOn(backend, "_requestData")
+      .mockResolvedValueOnce({ description: ownershipMarkerFor(agentId) });
+    await backend.logs("107", { tail: 999999, follow: false, agentId });
     expect(open.mock.calls[0][0]).toContain("-n 10000");
     expect(open.mock.calls[0][0]).not.toContain(" -f ");
 
     const authError = Object.assign(new Error("forbidden"), { statusCode: 403 });
-    jest.spyOn(backend, "_requestData").mockRejectedValueOnce(authError);
-    await expect(backend.status("107")).rejects.toBe(authError);
+    requestData.mockRejectedValueOnce(authError);
+    await expect(backend.status("107", { agentId })).rejects.toBe(authError);
 
     const missing = Object.assign(new Error("missing"), { statusCode: 404 });
-    backend._requestData.mockRejectedValueOnce(missing);
-    await expect(backend.status("107")).resolves.toEqual({
+    requestData.mockRejectedValueOnce(missing);
+    await expect(backend.status("107", { agentId })).resolves.toEqual({
       running: false,
       uptime: 0,
       cpu: null,

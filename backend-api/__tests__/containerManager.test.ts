@@ -24,6 +24,15 @@ const mockK8sStatus = jest.fn();
 const mockK8sStats = jest.fn();
 const mockK8sLogs = jest.fn();
 const mockK8sExec = jest.fn();
+const mockProxmoxStart = jest.fn();
+const mockProxmoxStop = jest.fn();
+const mockProxmoxRestart = jest.fn();
+const mockProxmoxDestroy = jest.fn();
+const mockProxmoxStatus = jest.fn();
+const mockProxmoxStats = jest.fn();
+const mockProxmoxLogs = jest.fn();
+const mockProxmoxExec = jest.fn();
+const mockProxmoxUpdateEnv = jest.fn();
 const mockRemoteStart = jest.fn();
 const mockRemoteHermesStart = jest.fn();
 const mockRemoteNemoStart = jest.fn();
@@ -100,6 +109,27 @@ describe("containerManager NemoClaw routing", () => {
     const localK8sBackendPath = path.resolve(__dirname, "../backends/k8s");
     jest.doMock(localK8sBackendPath, k8sBackendFactory, { virtual: true });
     jest.doMock(`${localK8sBackendPath}.ts`, k8sBackendFactory, { virtual: true });
+    const proxmoxBackendFactory = () =>
+      jest.fn().mockImplementation(() => ({
+        start: mockProxmoxStart,
+        stop: mockProxmoxStop,
+        restart: mockProxmoxRestart,
+        destroy: mockProxmoxDestroy,
+        status: mockProxmoxStatus,
+        stats: mockProxmoxStats,
+        logs: mockProxmoxLogs,
+        exec: mockProxmoxExec,
+        updateEnv: mockProxmoxUpdateEnv,
+      }));
+    const proxmoxBackendPath = path.resolve(
+      __dirname,
+      "../../workers/provisioner/backends/proxmox",
+    );
+    jest.doMock(proxmoxBackendPath, proxmoxBackendFactory);
+    jest.doMock(`${proxmoxBackendPath}.ts`, proxmoxBackendFactory);
+    const localProxmoxBackendPath = path.resolve(__dirname, "../backends/proxmox");
+    jest.doMock(localProxmoxBackendPath, proxmoxBackendFactory, { virtual: true });
+    jest.doMock(`${localProxmoxBackendPath}.ts`, proxmoxBackendFactory, { virtual: true });
     const remoteBackendFactory = () =>
       jest.fn().mockImplementation(() => ({
         start: mockRemoteStart,
@@ -179,6 +209,21 @@ describe("containerManager NemoClaw routing", () => {
     });
     mockK8sLogs.mockReset().mockResolvedValue("k8s-log-stream");
     mockK8sExec.mockReset().mockResolvedValue({ exec: "k8s-exec", stream: "k8s-stream" });
+    mockProxmoxStart.mockReset().mockResolvedValue(undefined);
+    mockProxmoxStop.mockReset().mockResolvedValue(undefined);
+    mockProxmoxRestart.mockReset().mockResolvedValue(undefined);
+    mockProxmoxDestroy.mockReset().mockResolvedValue(undefined);
+    mockProxmoxStatus.mockReset().mockResolvedValue({ running: true });
+    mockProxmoxStats.mockReset().mockResolvedValue({
+      backend_type: "proxmox",
+      capabilities: { cpu: true, memory: true, network: true, disk: true, pids: true },
+      current: { recorded_at: "2026-07-12T00:00:00.000Z", running: true, uptime_seconds: 5 },
+    });
+    mockProxmoxLogs.mockReset().mockResolvedValue("proxmox-log-stream");
+    mockProxmoxExec
+      .mockReset()
+      .mockResolvedValue({ exec: "proxmox-exec", stream: "proxmox-stream" });
+    mockProxmoxUpdateEnv.mockReset().mockResolvedValue(undefined);
   });
 
   it("routes lifecycle, telemetry, logs, and exec calls to the NemoClaw backend", async () => {
@@ -276,6 +321,56 @@ describe("containerManager NemoClaw routing", () => {
     expect(telemetry).toEqual(expect.objectContaining({ backend_type: "k8s" }));
     expect(logs).toBe("k8s-log-stream");
     expect(exec).toEqual({ exec: "k8s-exec", stream: "k8s-stream" });
+  });
+
+  it("passes the agent-bound ownership identity to every Proxmox operation", async () => {
+    const containerManager = require("../containerManager");
+    const agent = {
+      id: "agent-proxmox-1",
+      runtime_family: "openclaw",
+      deploy_target: "proxmox",
+      backend_type: "proxmox",
+      container_id: "108",
+      host: "10.20.30.40",
+    };
+    const lifecycleOptions = {
+      agentId: "agent-proxmox-1",
+      host: "10.20.30.40",
+      runtimeFamily: "openclaw",
+    };
+
+    await containerManager.start(agent);
+    await containerManager.stop(agent);
+    await containerManager.restart(agent);
+    await containerManager.updateEnv(agent, { OPENAI_API_KEY: "rotated" });
+    await containerManager.destroy(agent);
+    await containerManager.status(agent);
+    const telemetry = await containerManager.stats(agent);
+    const logs = await containerManager.logs(agent, { tail: 25 });
+    const exec = await containerManager.exec(agent, { tty: true });
+
+    expect(mockProxmoxStart).toHaveBeenCalledWith("108", lifecycleOptions);
+    expect(mockProxmoxStop).toHaveBeenCalledWith("108", lifecycleOptions);
+    expect(mockProxmoxRestart).toHaveBeenCalledWith("108", lifecycleOptions);
+    expect(mockProxmoxUpdateEnv).toHaveBeenCalledWith(
+      "108",
+      { OPENAI_API_KEY: "rotated" },
+      lifecycleOptions,
+    );
+    expect(mockProxmoxDestroy).toHaveBeenCalledWith("108", lifecycleOptions);
+    expect(mockProxmoxStatus).toHaveBeenCalledWith("108", lifecycleOptions);
+    expect(mockProxmoxStats).toHaveBeenCalledWith("108", lifecycleOptions);
+    expect(mockProxmoxLogs).toHaveBeenCalledWith("108", {
+      tail: 25,
+      ...lifecycleOptions,
+    });
+    expect(mockProxmoxExec).toHaveBeenCalledWith("108", {
+      tty: true,
+      ...lifecycleOptions,
+    });
+    expect(telemetry).toEqual(expect.objectContaining({ backend_type: "proxmox" }));
+    expect(logs).toBe("proxmox-log-stream");
+    expect(exec).toEqual({ exec: "proxmox-exec", stream: "proxmox-stream" });
   });
 
   it("routes remote-docker lifecycle calls to the remote backend, not the local docker host", async () => {

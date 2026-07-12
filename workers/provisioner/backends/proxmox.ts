@@ -50,7 +50,8 @@ const OPENCLAW_CUSTOM_PROVIDERS_FILE = "/etc/nora/openclaw-custom-providers.json
 const HERMES_ENV_FILE = `${HERMES_HOME}/.nora-system-env.b64`;
 const PROXMOX_NEMOCLAW_UNSUPPORTED =
   "NemoClaw on Proxmox is not supported: writing a policy file inside an LXC does not provide the enforced OpenShell sandbox contract.";
-const PROXMOX_OWNERSHIP_MARKER_PREFIX = "nora-owner:";
+const PROXMOX_AGENT_OWNERSHIP_MARKER_PREFIX = "nora-agent:";
+const PROXMOX_CREATE_OWNERSHIP_MARKER_PREFIX = "nora-owner:";
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PROXMOX_TEMPLATE_RE = /^[A-Za-z0-9_.-]+:vztmpl\/[A-Za-z0-9._+~:-]+$/;
 
@@ -204,14 +205,81 @@ function isMissingResourceError(error) {
   );
 }
 
-function buildOwnershipMarker() {
-  return `${PROXMOX_OWNERSHIP_MARKER_PREFIX}${crypto.randomBytes(16).toString("hex")}`;
+function isDefinitiveCreateRejection(error) {
+  const statusCode = Number(error?.statusCode);
+  return (
+    Number.isInteger(statusCode) &&
+    statusCode >= 400 &&
+    statusCode < 500 &&
+    ![408, 425, 429].includes(statusCode)
+  );
 }
 
-function descriptionHasOwnershipMarker(description, ownershipMarker) {
-  return String(description || "")
+function normalizeAgentId(value) {
+  const agentId = String(value ?? "").trim();
+  if (!agentId) {
+    const error = new Error("Proxmox operations require a non-empty agentId ownership option");
+    error.code = "PROXMOX_AGENT_ID_REQUIRED";
+    error.statusCode = 400;
+    throw error;
+  }
+  return agentId;
+}
+
+function buildAgentOwnershipMarker(agentId) {
+  const digest = crypto
+    .createHash("sha256")
+    .update(`nora:proxmox:agent:${normalizeAgentId(agentId)}`, "utf8")
+    .digest("hex");
+  return `${PROXMOX_AGENT_OWNERSHIP_MARKER_PREFIX}v1:${digest}`;
+}
+
+function buildCreateOwnershipMarker() {
+  return `${PROXMOX_CREATE_OWNERSHIP_MARKER_PREFIX}${crypto.randomBytes(16).toString("hex")}`;
+}
+
+function descriptionHasUniqueMarker(description, marker, prefix) {
+  const markers = String(description || "")
     .split(/\r?\n/)
-    .some((line) => line.trim() === ownershipMarker);
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith(prefix));
+  return markers.length === 1 && timingSafeEqualText(markers[0], marker);
+}
+
+function descriptionHasOwnershipMarkers(
+  description,
+  agentOwnershipMarker,
+  createOwnershipMarker = null,
+) {
+  const hasAgentMarker = descriptionHasUniqueMarker(
+    description,
+    agentOwnershipMarker,
+    PROXMOX_AGENT_OWNERSHIP_MARKER_PREFIX,
+  );
+  if (!hasAgentMarker || !createOwnershipMarker) return hasAgentMarker;
+  return descriptionHasUniqueMarker(
+    description,
+    createOwnershipMarker,
+    PROXMOX_CREATE_OWNERSHIP_MARKER_PREFIX,
+  );
+}
+
+function ownershipMismatchError(vmid, agentId, operation) {
+  const error = new Error(
+    `Refusing to ${operation} Proxmox LXC ${vmid}: Nora ownership does not match agent ${agentId}`,
+  );
+  error.code = "PROXMOX_RUNTIME_OWNERSHIP_MISMATCH";
+  error.statusCode = 409;
+  error.containerId = String(vmid);
+  return error;
+}
+
+function missingLxcError(vmid, operation) {
+  const error = new Error(`Cannot ${operation} Proxmox LXC ${vmid}: the LXC does not exist`);
+  error.code = "PROXMOX_RUNTIME_NOT_FOUND";
+  error.statusCode = 404;
+  error.containerId = String(vmid);
+  return error;
 }
 
 function safeHostname(name, fallback) {
@@ -652,14 +720,17 @@ class ProxmoxBackend extends ProvisionerBackend {
     const vmid = await this._getNextVmid({ signal: abortSignal });
     const hostname = safeHostname(container_name || name, `nora-${runtimeFamily}-${id}`);
     const rootfsSize = Math.max(1, Number.parseInt(disk_gb || "20", 10) || 20);
-    const ownershipMarker = buildOwnershipMarker();
+    const agentOwnershipMarker = buildAgentOwnershipMarker(id);
+    const createOwnershipMarker = buildCreateOwnershipMarker();
     const description = [
       `Nora ${normalizedRuntimeFamily} agent ${name || id}`,
-      ownershipMarker,
+      agentOwnershipMarker,
+      createOwnershipMarker,
     ].join("\n");
 
     console.log(`[proxmox] Creating LXC ${hostname} (vmid=${vmid}) on node ${this.node}`);
     let createAttempted = false;
+    let createTaskAccepted = false;
     let createTaskCompleted = false;
     let ownershipConfirmed = false;
     try {
@@ -682,9 +753,11 @@ class ProxmoxBackend extends ProvisionerBackend {
         },
         { signal: abortSignal },
       );
+      createTaskAccepted = true;
       await this._waitForTask(createTask, { signal: abortSignal });
       createTaskCompleted = true;
-      ownershipConfirmed = await this._ownsCreatedLxc(String(vmid), ownershipMarker, {
+      ownershipConfirmed = await this._ownsCreatedLxc(String(vmid), agentOwnershipMarker, {
+        createOwnershipMarker,
         signal: abortSignal,
       });
       if (!ownershipConfirmed) {
@@ -726,11 +799,16 @@ class ProxmoxBackend extends ProvisionerBackend {
       };
     } catch (error) {
       if (createAttempted) {
+        const createOutcomeAmbiguous = createTaskAccepted || !isDefinitiveCreateRejection(error);
         try {
-          const cleanup = await this._cleanupFailedCreate(String(vmid), ownershipMarker);
-          if (createTaskCompleted && !cleanup.destroyed) {
+          const cleanup = await this._cleanupFailedCreate(String(vmid), id, createOwnershipMarker, {
+            missingIsUnresolved: createOutcomeAmbiguous,
+          });
+          if ((createTaskCompleted || createOutcomeAmbiguous) && !cleanup.destroyed) {
             const cleanupError = new Error(
-              `Refusing to delete Proxmox LXC ${vmid} because its Nora ownership marker is no longer present`,
+              cleanup.reason === "missing-unverified"
+                ? `Proxmox create outcome for LXC ${vmid} is ambiguous; refusing to retry without operator reconciliation`
+                : `Refusing to delete Proxmox LXC ${vmid} because its Nora ownership marker is no longer present`,
             );
             cleanupError.code = "PROXMOX_RUNTIME_OWNERSHIP_UNVERIFIED";
             cleanupError.containerId = String(vmid);
@@ -755,7 +833,7 @@ class ProxmoxBackend extends ProvisionerBackend {
           unresolvedError.runtimeIdentity = {
             containerId: String(vmid),
             destroyAllowed: cleanupError?.proxmoxOwnershipVerified === true,
-            persistIdentity: ownershipConfirmed || createTaskCompleted,
+            persistIdentity: createOutcomeAmbiguous || ownershipConfirmed || createTaskCompleted,
           };
           unresolvedError.cause = error;
           unresolvedError.cleanupError = cleanupError;
@@ -766,7 +844,7 @@ class ProxmoxBackend extends ProvisionerBackend {
     }
   }
 
-  async _ownsCreatedLxc(vmid, ownershipMarker, options = {}) {
+  async _getOwnershipState(vmid, agentOwnershipMarker, options = {}) {
     const normalizedVmid = normalizeVmid(vmid);
     try {
       const config = await this._requestData(
@@ -775,33 +853,78 @@ class ProxmoxBackend extends ProvisionerBackend {
         null,
         options,
       );
-      return descriptionHasOwnershipMarker(config?.description, ownershipMarker);
+      return descriptionHasOwnershipMarkers(
+        config?.description,
+        agentOwnershipMarker,
+        options.createOwnershipMarker,
+      )
+        ? "owned"
+        : "mismatch";
     } catch (error) {
-      if (isMissingResourceError(error)) return false;
+      if (isMissingResourceError(error)) return "missing";
       throw error;
     }
   }
 
-  async _cleanupFailedCreate(vmid, ownershipMarker) {
-    let owned = false;
+  async _ownsCreatedLxc(vmid, agentOwnershipMarker, options = {}) {
+    return (await this._getOwnershipState(vmid, agentOwnershipMarker, options)) === "owned";
+  }
+
+  async _assertOwnedLxc(vmid, options = {}, { allowMissing = false, operation = "access" } = {}) {
+    const normalizedVmid = normalizeVmid(vmid);
+    const agentId = normalizeAgentId(options.agentId);
+    const agentOwnershipMarker = buildAgentOwnershipMarker(agentId);
+    const state = await this._getOwnershipState(normalizedVmid, agentOwnershipMarker, {
+      ...(options.createOwnershipMarker
+        ? { createOwnershipMarker: options.createOwnershipMarker }
+        : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    if (state === "owned") return true;
+    if (state === "missing") {
+      if (allowMissing) return false;
+      throw missingLxcError(normalizedVmid, operation);
+    }
+    throw ownershipMismatchError(normalizedVmid, agentId, operation);
+  }
+
+  async _cleanupFailedCreate(vmid, agentId, createOwnershipMarker, options = {}) {
+    let ownershipState;
     try {
-      owned = await this._ownsCreatedLxc(vmid, ownershipMarker);
+      ownershipState = await this._getOwnershipState(vmid, buildAgentOwnershipMarker(agentId), {
+        createOwnershipMarker,
+      });
     } catch (error) {
       error.proxmoxOwnershipVerified = false;
       throw error;
     }
-    if (!owned) {
+    if (ownershipState === "missing") {
+      if (options.missingIsUnresolved) {
+        return { destroyed: false, reason: "missing-unverified" };
+      }
+      return { destroyed: true, reason: "missing" };
+    }
+    if (ownershipState !== "owned") {
       return { destroyed: false, reason: "not-owned" };
     }
     let lastError = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
       try {
-        await this.destroy(vmid);
+        await this.destroy(vmid, { agentId, createOwnershipMarker });
         return { destroyed: true };
       } catch (error) {
-        error.proxmoxOwnershipVerified = true;
+        // The create nonce is intentionally not persisted in the control plane.
+        // If nonce-bound cleanup cannot finish here, later retries that only know
+        // the agent id must not be authorized to destroy a possibly reused VMID.
+        error.proxmoxOwnershipVerified = false;
         lastError = error;
-        if (error?.statusCode === 401 || error?.statusCode === 403) throw error;
+        if (
+          error?.code === "PROXMOX_RUNTIME_OWNERSHIP_MISMATCH" ||
+          error?.statusCode === 401 ||
+          error?.statusCode === 403
+        ) {
+          throw error;
+        }
         if (attempt < 5) await sleep(2000);
       }
     }
@@ -1119,9 +1242,14 @@ class ProxmoxBackend extends ProvisionerBackend {
     };
   }
 
-  async destroy(containerId) {
+  async destroy(containerId, options = {}) {
     this._assertConfigured();
     const vmid = normalizeVmid(containerId);
+    const exists = await this._assertOwnedLxc(vmid, options, {
+      allowMissing: true,
+      operation: "destroy",
+    });
+    if (!exists) return;
     console.log(`[proxmox] Destroying LXC ${vmid}`);
     try {
       const stopTask = await this._requestData(
@@ -1133,6 +1261,11 @@ class ProxmoxBackend extends ProvisionerBackend {
       if (error?.statusCode === 401 || error?.statusCode === 403) throw error;
       // Already stopped or missing.
     }
+    const stillExists = await this._assertOwnedLxc(vmid, options, {
+      allowMissing: true,
+      operation: "destroy",
+    });
+    if (!stillExists) return;
     try {
       await this._waitForTask(await this._requestData("DELETE", `/nodes/${this.node}/lxc/${vmid}`));
     } catch (error) {
@@ -1141,9 +1274,14 @@ class ProxmoxBackend extends ProvisionerBackend {
     console.log(`[proxmox] LXC ${vmid} deleted`);
   }
 
-  async status(containerId) {
+  async status(containerId, options = {}) {
     this._assertConfigured();
     const vmid = normalizeVmid(containerId);
+    const exists = await this._assertOwnedLxc(vmid, options, {
+      allowMissing: true,
+      operation: "inspect",
+    });
+    if (!exists) return { running: false, uptime: 0, cpu: null, memory: null };
     try {
       const data = await this._requestData("GET", `/nodes/${this.node}/lxc/${vmid}/status/current`);
       return {
@@ -1158,10 +1296,21 @@ class ProxmoxBackend extends ProvisionerBackend {
     }
   }
 
-  async stats(containerId) {
+  async stats(containerId, options = {}) {
     const vmid = normalizeVmid(containerId);
     try {
       this._assertConfigured();
+      const exists = await this._assertOwnedLxc(vmid, options, {
+        allowMissing: true,
+        operation: "inspect metrics for",
+      });
+      if (!exists) {
+        return buildUnavailableTelemetry({
+          backendType: "proxmox",
+          running: false,
+          capabilities: PROXMOX_DEFAULT_CAPABILITIES,
+        });
+      }
       const data = await this._requestData("GET", `/nodes/${this.node}/lxc/${vmid}/status/current`);
       const cpuPercent = typeof data?.cpu === "number" ? roundMetric(data.cpu * 100) : null;
       const memoryUsageMb = bytesToMegabytes(data?.mem, 0);
@@ -1194,7 +1343,15 @@ class ProxmoxBackend extends ProvisionerBackend {
           pids: toFiniteInteger(data?.pid ?? data?.pids),
         },
       });
-    } catch {
+    } catch (error) {
+      if (
+        error?.code === "PROXMOX_AGENT_ID_REQUIRED" ||
+        error?.code === "PROXMOX_RUNTIME_OWNERSHIP_MISMATCH" ||
+        error?.statusCode === 401 ||
+        error?.statusCode === 403
+      ) {
+        throw error;
+      }
       return buildUnavailableTelemetry({
         backendType: "proxmox",
         running: false,
@@ -1203,10 +1360,11 @@ class ProxmoxBackend extends ProvisionerBackend {
     }
   }
 
-  async stop(containerId) {
+  async stop(containerId, options = {}) {
     const vmid = normalizeVmid(containerId);
-    const current = await this.status(vmid);
+    const current = await this.status(vmid, options);
     if (!current.running) return;
+    await this._assertOwnedLxc(vmid, options, { operation: "stop" });
     console.log(`[proxmox] Stopping LXC ${vmid}`);
     await this._waitForTask(
       await this._requestData("POST", `/nodes/${this.node}/lxc/${vmid}/status/shutdown`, {
@@ -1215,29 +1373,34 @@ class ProxmoxBackend extends ProvisionerBackend {
     );
   }
 
-  async start(containerId) {
+  async start(containerId, options = {}) {
     const vmid = normalizeVmid(containerId);
-    const current = await this.status(vmid);
+    const current = await this.status(vmid, options);
     if (current.running) {
+      await this._assertOwnedLxc(vmid, options, { operation: "read the address of" });
       const host = await this._waitForIp(vmid);
       return { host, runtimeHost: host };
     }
+    await this._assertOwnedLxc(vmid, options, { operation: "start" });
     console.log(`[proxmox] Starting LXC ${vmid}`);
     await this._waitForTask(
       await this._requestData("POST", `/nodes/${this.node}/lxc/${vmid}/status/start`),
     );
+    await this._assertOwnedLxc(vmid, options, { operation: "read the address of" });
     const host = await this._waitForIp(vmid);
     return { host, runtimeHost: host };
   }
 
-  async restart(containerId) {
+  async restart(containerId, options = {}) {
     const vmid = normalizeVmid(containerId);
-    const current = await this.status(vmid);
-    if (!current.running) return this.start(vmid);
+    const current = await this.status(vmid, options);
+    if (!current.running) return this.start(vmid, options);
+    await this._assertOwnedLxc(vmid, options, { operation: "restart" });
     console.log(`[proxmox] Restarting LXC ${vmid}`);
     await this._waitForTask(
       await this._requestData("POST", `/nodes/${this.node}/lxc/${vmid}/status/reboot`),
     );
+    await this._assertOwnedLxc(vmid, options, { operation: "read the address of" });
     const host = await this._waitForIp(vmid);
     return { host, runtimeHost: host };
   }
@@ -1246,6 +1409,7 @@ class ProxmoxBackend extends ProvisionerBackend {
     const vmid = normalizeVmid(containerId);
     const entries = normalizeEnv(envVars);
     if (Object.keys(entries).length === 0) return;
+    await this._assertOwnedLxc(vmid, options, { operation: "update the environment of" });
     const envFile = options.runtimeFamily === "hermes" ? HERMES_ENV_FILE : OPENCLAW_ENV_FILE;
     const resetHermesBootstrap =
       options.runtimeFamily === "hermes" &&
@@ -1284,6 +1448,7 @@ class ProxmoxBackend extends ProvisionerBackend {
 
   async logs(containerId, opts = {}) {
     const vmid = normalizeVmid(containerId);
+    await this._assertOwnedLxc(vmid, opts, { operation: "read logs from" });
     const tail = normalizeTail(opts.tail);
     const follow = opts.follow !== false ? "-f" : "";
     const command = `${this.sudoPrefix}${this.pctCommand} exec ${vmid} -- journalctl -u nora-openclaw.service -u nora-hermes.service -n ${tail} ${follow} --no-pager`;
@@ -1406,6 +1571,7 @@ class ProxmoxBackend extends ProvisionerBackend {
   async exec(containerId, opts = {}) {
     this._assertConfigured();
     const vmid = normalizeVmid(containerId);
+    await this._assertOwnedLxc(vmid, opts, { operation: "execute commands in" });
     const cmd = opts.cmd || [
       "/bin/sh",
       "-lc",

@@ -158,6 +158,7 @@ async function runCell(runtimeFamily) {
   backend._assertConfigured();
   const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const agentId = `proxmox-smoke-${runtimeFamily}-${suffix}`;
+  const ownershipOptions = { agentId };
   let result = null;
   let destroyed = false;
 
@@ -180,7 +181,7 @@ async function runCell(runtimeFamily) {
     });
     assert(/^\d+$/.test(result.containerId), "create did not return a numeric Proxmox VMID");
 
-    const live = await backend.status(result.containerId);
+    const live = await backend.status(result.containerId, ownershipOptions);
     assert(live.running, "new Proxmox LXC is not running");
     await waitUntilReady(runtimeFamily, result);
 
@@ -189,6 +190,7 @@ async function runCell(runtimeFamily) {
       await backend.exec(result.containerId, {
         cmd: ["/bin/sh", "-lc", `printf %s ${JSON.stringify(marker)}`],
         tty: false,
+        agentId,
       }),
     );
     assert(commandOutput === marker, `exec output mismatch: ${JSON.stringify(commandOutput)}`);
@@ -196,9 +198,9 @@ async function runCell(runtimeFamily) {
     await backend.updateEnv(
       result.containerId,
       { NORA_PROXMOX_SMOKE_MARKER: marker },
-      { runtimeFamily },
+      { runtimeFamily, agentId },
     );
-    const restarted = await backend.restart(result.containerId);
+    const restarted = await backend.restart(result.containerId, ownershipOptions);
     result = { ...result, ...(restarted || {}) };
     await waitUntilReady(runtimeFamily, result);
 
@@ -211,26 +213,37 @@ async function runCell(runtimeFamily) {
           `pid="$(systemctl show -p MainPID --value ${serviceName})"; tr '\\0' '\\n' < "/proc/$pid/environ" | grep -Fx ${JSON.stringify(`NORA_PROXMOX_SMOKE_MARKER=${marker}`)}`,
         ],
         tty: false,
+        agentId,
       }),
     );
     assert(envOutput.trim() === `NORA_PROXMOX_SMOKE_MARKER=${marker}`, "env rotation did not survive restart");
 
-    const logStream = await backend.logs(result.containerId, { follow: false, tail: 50 });
+    const logStream = await backend.logs(result.containerId, {
+      follow: false,
+      tail: 50,
+      agentId,
+    });
     await new Promise((resolve, reject) => {
       logStream.resume();
       logStream.on("end", resolve);
       logStream.on("error", reject);
     });
 
-    await backend.stop(result.containerId);
-    assert(!(await backend.status(result.containerId)).running, "stop did not halt the LXC");
-    const started = await backend.start(result.containerId);
+    await backend.stop(result.containerId, ownershipOptions);
+    assert(
+      !(await backend.status(result.containerId, ownershipOptions)).running,
+      "stop did not halt the LXC",
+    );
+    const started = await backend.start(result.containerId, ownershipOptions);
     result = { ...result, ...(started || {}) };
     await waitUntilReady(runtimeFamily, result);
 
-    await backend.destroy(result.containerId);
+    await backend.destroy(result.containerId, ownershipOptions);
     destroyed = true;
-    assert(!(await backend.status(result.containerId)).running, "destroy left the LXC present");
+    assert(
+      !(await backend.status(result.containerId, ownershipOptions)).running,
+      "destroy left the LXC present",
+    );
     console.log(`[proxmox-smoke] ${runtimeFamily} lifecycle passed (vmid=${result.containerId})`);
   } catch (error) {
     if (result?.containerId && keepOnFailure) {
@@ -242,7 +255,7 @@ async function runCell(runtimeFamily) {
   } finally {
     if (result?.containerId && !destroyed && !keepOnFailure) {
       try {
-        await backend.destroy(result.containerId);
+        await backend.destroy(result.containerId, ownershipOptions);
       } catch (cleanupError) {
         console.error(
           `[proxmox-smoke] cleanup failed for vmid=${result.containerId}: ${cleanupError.message}`,

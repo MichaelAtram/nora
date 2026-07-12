@@ -1,11 +1,11 @@
 import { expect, test } from "@playwright/test";
 import {
+  DEMO_ADMIN_EMAIL,
   DEFAULT_PASSWORD,
   apiJson,
   assertJsonRecord,
-  createUserSession,
+  ensureUserSession,
   isJsonRecord,
-  uniqueEmail,
 } from "./support/app";
 import {
   deleteAgent,
@@ -68,8 +68,8 @@ test.describe("Built-in demo activation", () => {
   }) => {
     test.setTimeout(15 * 60 * 1000);
 
-    const operator = await createUserSession(request, {
-      email: uniqueEmail("nora-demo-activation"),
+    const operator = await ensureUserSession(request, {
+      email: DEMO_ADMIN_EMAIL,
       password: DEFAULT_PASSWORD,
     });
     let agentId = "";
@@ -129,7 +129,7 @@ test.describe("Built-in demo activation", () => {
       );
       expect(typeof chatBody).toBe("string");
       const reply = finalAssistantText(String(chatBody));
-      expect(reply).toContain(
+      expect(reply, `Raw gateway SSE:\n${String(chatBody)}`).toContain(
         "Hi! I'm Nora's demo agent, running on a built-in stub model — no API key required.",
       );
       // OpenClaw prepends sender metadata and a timestamp before the user text;
