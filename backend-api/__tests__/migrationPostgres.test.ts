@@ -15,6 +15,7 @@ describeWithPostgres("PostgreSQL legacy migration gate", () => {
   let migrationPool;
   let schemaName;
   let migrateDB;
+  let userId;
 
   beforeAll(async () => {
     schemaName = `nora_migration_${process.pid}_${Date.now()}`;
@@ -41,6 +42,16 @@ describeWithPostgres("PostgreSQL legacy migration gate", () => {
       ALTER TABLE workspace_agents
         DROP CONSTRAINT IF EXISTS workspace_agents_workspace_id_agent_id_key;
       DROP INDEX IF EXISTS idx_workspace_agents_unique;
+      CREATE TABLE llm_providers (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        provider VARCHAR(30) NOT NULL,
+        api_key TEXT,
+        model VARCHAR(100),
+        config JSONB DEFAULT '{}',
+        is_default BOOLEAN DEFAULT false,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
 
     const userResult = await migrationPool.query(
@@ -48,7 +59,7 @@ describeWithPostgres("PostgreSQL legacy migration gate", () => {
        VALUES($1, 'admin', 'Migration Test') RETURNING id`,
       [`migration-${Date.now()}@example.test`],
     );
-    const userId = userResult.rows[0].id;
+    userId = userResult.rows[0].id;
     const agentResult = await migrationPool.query(
       `INSERT INTO agents(user_id, name) VALUES($1, 'Legacy agent') RETURNING id`,
       [userId],
@@ -78,6 +89,13 @@ describeWithPostgres("PostgreSQL legacy migration gate", () => {
          ('installation', 'legacy-full', $1, NULL),
          ('legacy-agent', 'legacy-runtime', $1, $2)`,
       [userId, agentId],
+    );
+    await migrationPool.query(
+      `INSERT INTO llm_providers(user_id, provider, api_key, model, is_default)
+       VALUES
+         ($1, 'demo', 'legacy-demo', 'nora-demo-1', false),
+         ($1, 'openai', 'legacy-openai', 'gpt-5.5', false)`,
+      [userId],
     );
 
     const snapshots = await migrationPool.query(
@@ -146,6 +164,18 @@ describeWithPostgres("PostgreSQL legacy migration gate", () => {
        HAVING COUNT(*) > 1`,
     );
     expect(duplicateSlugs.rows).toEqual([]);
+
+    const providerDefaults = await migrationPool.query(
+      `SELECT provider, is_default
+         FROM llm_providers
+        WHERE user_id = $1
+        ORDER BY provider`,
+      [userId],
+    );
+    expect(providerDefaults.rows).toEqual([
+      { provider: "demo", is_default: false },
+      { provider: "openai", is_default: true },
+    ]);
 
     const ledger = await migrationPool.query(
       "SELECT COUNT(*)::int AS count FROM schema_migrations",
