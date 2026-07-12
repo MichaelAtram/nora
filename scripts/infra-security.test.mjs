@@ -541,6 +541,8 @@ test("production deploy accepts only exact Nora product release tags", () => {
 
   assert.match(workflow, /git tag --points-at HEAD/);
   assert.match(workflow, /Version override must be an exact Nora product tag/);
+  assert.match(workflow, /Version override must name an existing Nora product tag/);
+  assert.match(workflow, /is not reachable from target commit/);
   assert.doesNotMatch(workflow, /git describe --tags/);
   assert.doesNotMatch(workflow, /latest_tag=/);
   assert.match(setupBash, /resolve_current_release_version\(\)/);
@@ -649,15 +651,67 @@ test("production deploy accepts only exact Nora product release tags", () => {
     assert.equal(automaticSetupVersion.status, 0, automaticSetupVersion.stderr);
     assert.equal(automaticSetupVersion.stdout.trim(), "v1.16.0");
 
-    const manualProductVersion = runMetadata("v2.3.4");
+    writeFileSync(path.join(fixtureRepo, "post-release.txt"), "post-release source checkout\n");
+    runChecked("git", ["add", "post-release.txt"], { cwd: fixtureRepo });
+    runChecked(
+      "git",
+      [
+        "-c",
+        "user.name=Nora CI",
+        "-c",
+        "user.email=ci@example.invalid",
+        "commit",
+        "-qm",
+        "post-release source checkout",
+      ],
+      { cwd: fixtureRepo },
+    );
+
+    const sourceCheckout = runMetadata();
+    assert.equal(sourceCheckout.result.status, 0, sourceCheckout.result.stderr);
+    assert.match(sourceCheckout.output, /^version=$/m);
+
+    const manualProductVersion = runMetadata("v1.16.0");
     assert.equal(manualProductVersion.result.status, 0, manualProductVersion.result.stderr);
-    assert.match(manualProductVersion.output, /^version=v2\.3\.4$/m);
+    assert.match(manualProductVersion.output, /^version=v1\.16\.0$/m);
+
+    const nonexistentManualVersion = runMetadata("v2.3.4");
+    assert.notEqual(nonexistentManualVersion.result.status, 0);
+    assert.match(
+      `${nonexistentManualVersion.result.stderr}${nonexistentManualVersion.result.stdout}`,
+      /Version override must name an existing Nora product tag/,
+    );
 
     const invalidManualVersion = runMetadata("nora-copilot-plugin-v0.1.3");
     assert.notEqual(invalidManualVersion.result.status, 0);
     assert.match(
       `${invalidManualVersion.result.stderr}${invalidManualVersion.result.stdout}`,
       /Version override must be an exact Nora product tag/,
+    );
+
+    const tree = runChecked("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd: fixtureRepo,
+    }).trim();
+    const unrelatedCommit = runChecked(
+      "git",
+      [
+        "-c",
+        "user.name=Nora CI",
+        "-c",
+        "user.email=ci@example.invalid",
+        "commit-tree",
+        tree,
+        "-m",
+        "unrelated release",
+      ],
+      { cwd: fixtureRepo },
+    ).trim();
+    runChecked("git", ["tag", "v2.0.0", unrelatedCommit], { cwd: fixtureRepo });
+    const unrelatedManualVersion = runMetadata("v2.0.0");
+    assert.notEqual(unrelatedManualVersion.result.status, 0);
+    assert.match(
+      `${unrelatedManualVersion.result.stderr}${unrelatedManualVersion.result.stdout}`,
+      /is not reachable from target commit/,
     );
   } finally {
     rmSync(fixtureRepo, { recursive: true, force: true });

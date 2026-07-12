@@ -118,6 +118,8 @@ jest.mock("../metrics", () => ({
   recordApiMetric: jest.fn(),
 }));
 
+const apiKeys = require("../apiKeys");
+const mockVerifyApiKey = jest.spyOn(apiKeys, "verifyApiKey");
 const app = require("../server");
 
 function jsonResponse(body, ok = true, status = ok ? 200 : 400) {
@@ -134,6 +136,19 @@ function signupRequest(ip = null) {
   return request(app)
     .post("/auth/signup")
     .set("X-Forwarded-For", ip || `203.0.113.${signupIpCounter}`);
+}
+
+function mockValidNoraApiKey() {
+  mockVerifyApiKey.mockResolvedValueOnce({
+    user: {
+      id: "api-key-user",
+      email: "api-key-user@example.com",
+      role: "user",
+      name: "API Key User",
+    },
+    key: { id: "key-1", scopes: ["agents:read"] },
+    workspace: { id: "workspace-1", name: "Test Workspace" },
+  });
 }
 
 beforeEach(() => {
@@ -155,6 +170,11 @@ beforeEach(() => {
   delete process.env.SIGNUP_RECAPTCHA_SITE_KEY;
   delete process.env.NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY;
   global.fetch = jest.fn();
+  mockVerifyApiKey.mockReset();
+});
+
+afterAll(() => {
+  mockVerifyApiKey.mockRestore();
 });
 
 describe("POST /auth/signup", () => {
@@ -459,6 +479,173 @@ describe("POST /auth/login", () => {
   });
 });
 
+describe("POST /auth/session-upgrade", () => {
+  it("sets an HttpOnly cookie for a valid HS256 bearer JWT", async () => {
+    const token = jwt.sign({ id: "user-1", email: "user@example.com", role: "user" }, JWT_SECRET, {
+      algorithm: "HS256",
+      expiresIn: "1h",
+    });
+
+    const res = await request(app)
+      .post("/auth/session-upgrade")
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+    const setCookie = res.headers["set-cookie"] || [];
+    const authCookie = setCookie.find((cookie) => cookie.startsWith("nora_auth="));
+    expect(authCookie).toBeDefined();
+    expect(authCookie).toMatch(/HttpOnly/i);
+    expect(authCookie).toMatch(/SameSite=Lax/i);
+    expect(decodeURIComponent(authCookie.match(/nora_auth=([^;]+)/)?.[1])).toBe(token);
+  });
+
+  it("rejects correctly signed JWTs that do not match the historical session contract", async () => {
+    const tokens = [
+      jwt.sign({ id: "user-1", arbitrary: true }, JWT_SECRET, {
+        algorithm: "HS256",
+        expiresIn: "1h",
+      }),
+      jwt.sign({ id: "user-1", agentId: "agent-1", scope: "gateway-embed" }, JWT_SECRET, {
+        algorithm: "HS256",
+        expiresIn: "15m",
+      }),
+      jwt.sign({ id: "user-1", role: "user" }, JWT_SECRET, {
+        algorithm: "HS256",
+        expiresIn: "1h",
+      }),
+      jwt.sign({ id: "user-1", email: "user@example.com", role: "owner" }, JWT_SECRET, {
+        algorithm: "HS256",
+        expiresIn: "1h",
+      }),
+      jwt.sign(
+        { id: "user-1", email: "user@example.com", role: "user", unexpected: true },
+        JWT_SECRET,
+        { algorithm: "HS256", expiresIn: "1h" },
+      ),
+      jwt.sign({ id: "user-1", email: "user@example.com", role: "user" }, JWT_SECRET, {
+        algorithm: "HS256",
+        noTimestamp: true,
+      }),
+    ];
+
+    for (const token of tokens) {
+      const res = await request(app)
+        .post("/auth/session-upgrade")
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(401);
+      expect(res.headers["set-cookie"]).toBeUndefined();
+    }
+  });
+
+  it("rejects a forged bearer JWT even when a valid auth cookie is present", async () => {
+    const cookieToken = jwt.sign(
+      { id: "user-1", email: "user@example.com", role: "user" },
+      JWT_SECRET,
+      { algorithm: "HS256", expiresIn: "1h" },
+    );
+    const forgedBearer = jwt.sign(
+      { id: "attacker", email: "attacker@example.com", role: "admin" },
+      "wrong-secret",
+      { algorithm: "HS256", expiresIn: "1h" },
+    );
+
+    const res = await request(app)
+      .post("/auth/session-upgrade")
+      .set("Cookie", `nora_auth=${cookieToken}`)
+      .set("Authorization", `Bearer ${forgedBearer}`);
+
+    expect(res.status).toBe(401);
+    expect(res.headers["set-cookie"]).toBeUndefined();
+  });
+
+  it("rejects a Nora API key even when a valid auth cookie is present", async () => {
+    const cookieToken = jwt.sign(
+      { id: "user-1", email: "user@example.com", role: "user" },
+      JWT_SECRET,
+      { algorithm: "HS256", expiresIn: "1h" },
+    );
+
+    const res = await request(app)
+      .post("/auth/session-upgrade")
+      .set("Cookie", `nora_auth=${cookieToken}`)
+      .set("Authorization", "Bearer nora_test_api_key");
+
+    expect(res.status).toBe(401);
+    expect(res.headers["set-cookie"]).toBeUndefined();
+  });
+
+  it("rejects expired bearer JWTs without setting a cookie", async () => {
+    const expiredToken = jwt.sign(
+      { id: "user-1", email: "user@example.com", role: "user" },
+      JWT_SECRET,
+      { algorithm: "HS256", expiresIn: -1 },
+    );
+
+    const res = await request(app)
+      .post("/auth/session-upgrade")
+      .set("Authorization", `Bearer ${expiredToken}`);
+
+    expect(res.status).toBe(401);
+    expect(res.headers["set-cookie"]).toBeUndefined();
+  });
+
+  it("rejects JWTs signed with a non-HS256 algorithm", async () => {
+    const token = jwt.sign({ id: "user-1", email: "user@example.com", role: "user" }, JWT_SECRET, {
+      algorithm: "HS384",
+      expiresIn: "1h",
+    });
+
+    const res = await request(app)
+      .post("/auth/session-upgrade")
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(401);
+    expect(res.headers["set-cookie"]).toBeUndefined();
+  });
+
+  it("rejects signed JWTs without a non-empty string user id", async () => {
+    const tokens = [
+      jwt.sign("not-a-session", JWT_SECRET, { algorithm: "HS256" }),
+      jwt.sign({ email: "user@example.com", role: "user" }, JWT_SECRET, {
+        algorithm: "HS256",
+        expiresIn: "1h",
+      }),
+      jwt.sign({ id: "   ", email: "user@example.com", role: "user" }, JWT_SECRET, {
+        algorithm: "HS256",
+        expiresIn: "1h",
+      }),
+    ];
+
+    for (const token of tokens) {
+      const res = await request(app)
+        .post("/auth/session-upgrade")
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(401);
+      expect(res.headers["set-cookie"]).toBeUndefined();
+    }
+  });
+
+  it("rejects missing and malformed bearer headers without setting a cookie", async () => {
+    const token = jwt.sign({ id: "user-1", email: "user@example.com", role: "user" }, JWT_SECRET, {
+      algorithm: "HS256",
+      expiresIn: "1h",
+    });
+    const headers = [null, `Basic ${token}`, "Bearer", `Bearer ${token} trailing`];
+
+    for (const authorization of headers) {
+      let pendingRequest = request(app).post("/auth/session-upgrade");
+      if (authorization) pendingRequest = pendingRequest.set("Authorization", authorization);
+      const res = await pendingRequest;
+
+      expect(res.status).toBe(400);
+      expect(res.headers["set-cookie"]).toBeUndefined();
+    }
+  });
+});
+
 describe("Cookie-based authentication", () => {
   it("authenticates protected routes via the nora_auth cookie", async () => {
     const token = jwt.sign({ id: "user-1", role: "user" }, JWT_SECRET, { expiresIn: "1h" });
@@ -501,6 +688,42 @@ describe("Cookie-based authentication", () => {
 });
 
 describe("Protected auth routes", () => {
+  it("rejects API-key authentication on profile mutation before any DB access", async () => {
+    mockValidNoraApiKey();
+
+    const res = await request(app)
+      .patch("/auth/profile")
+      .set("Authorization", "Bearer nora_valid_profile_key")
+      .send({ name: "Changed Name" });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "session_required" });
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
+  it("rejects API-key authentication on password mutation before any DB access", async () => {
+    mockValidNoraApiKey();
+
+    const res = await request(app)
+      .patch("/auth/password")
+      .set("Authorization", "Bearer nora_valid_password_key")
+      .send({ currentPassword: "currentpassword123", newPassword: "newpassword123" });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "session_required" });
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
+  it("rejects API-key authentication on the current-user endpoint before any DB access", async () => {
+    mockValidNoraApiKey();
+
+    const res = await request(app).get("/auth/me").set("Authorization", "Bearer nora_valid_me_key");
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "session_required" });
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
   it("rejects password changes that do not meet the signup password policy", async () => {
     const token = jwt.sign({ id: "user-1", role: "user" }, JWT_SECRET, { expiresIn: "1h" });
 

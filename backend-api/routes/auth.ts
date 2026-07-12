@@ -4,7 +4,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const db = require("../db");
-const { authenticateToken } = require("../middleware/auth");
+const { authenticateToken, requireSession } = require("../middleware/auth");
 const { setAuthCookie, clearAuthCookie } = require("../authCookie");
 const { normalizeEmail, normalizeProvider, verifyOAuthIdentity } = require("../oauthProviders");
 const {
@@ -257,6 +257,29 @@ function validatePassword(pw) {
   return null;
 }
 
+const LEGACY_SESSION_CLAIMS = new Set(["id", "email", "role", "iat", "exp"]);
+
+function isLegacySessionPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+
+  // Backend-issued browser sessions have always contained exactly these
+  // custom claims plus jsonwebtoken's iat/exp timestamps. Other JWTs share the
+  // signing secret (for example short-lived gateway embed tokens), so a valid
+  // signature alone is not enough to promote a token into the primary cookie.
+  if (Object.keys(payload).some((claim) => !LEGACY_SESSION_CLAIMS.has(claim))) return false;
+
+  return (
+    typeof payload.id === "string" &&
+    Boolean(payload.id.trim()) &&
+    typeof payload.email === "string" &&
+    !validateEmail(payload.email) &&
+    (payload.role === "user" || payload.role === "admin") &&
+    Number.isInteger(payload.iat) &&
+    Number.isInteger(payload.exp) &&
+    payload.exp > payload.iat
+  );
+}
+
 async function withUserCreationLock(work) {
   const client = await db.connect();
 
@@ -499,9 +522,9 @@ router.post("/oauth-login", authLimiter, async (req, res, next) => {
   }
 });
 
-// ─── Protected routes (require authenticateToken) ─────────────────
+// ─── Protected routes (require a user session) ────────────────────
 
-router.patch("/password", authenticateToken, async (req, res, next) => {
+router.patch("/password", authenticateToken, requireSession, async (req, res, next) => {
   try {
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword || !newPassword)
@@ -522,7 +545,7 @@ router.patch("/password", authenticateToken, async (req, res, next) => {
   }
 });
 
-router.get("/me", authenticateToken, async (req, res, next) => {
+router.get("/me", authenticateToken, requireSession, async (req, res, next) => {
   try {
     const [result, languageSettings] = await Promise.all([
       db.query(
@@ -552,7 +575,7 @@ router.get("/me", authenticateToken, async (req, res, next) => {
   }
 });
 
-router.patch("/profile", authenticateToken, async (req, res) => {
+router.patch("/profile", authenticateToken, requireSession, async (req, res) => {
   try {
     const body = req.body || {};
     const { name, avatar } = body;
@@ -628,10 +651,25 @@ router.patch("/profile", authenticateToken, async (req, res) => {
 //
 // Path avoids /auth/session to remain compatible with older deployments that
 // routed that path through the marketing app.
-router.post("/session-upgrade", authenticateToken, (req, res) => {
-  const authHeader = req.headers["authorization"] || "";
-  const [, token] = authHeader.split(" ");
-  if (!token) return res.status(400).json({ error: "Bearer token required" });
+router.post("/session-upgrade", (req, res) => {
+  const authHeader = req.headers["authorization"];
+  const bearerMatch = typeof authHeader === "string" ? /^Bearer ([^\s]+)$/i.exec(authHeader) : null;
+  if (!bearerMatch) return res.status(400).json({ error: "Bearer token required" });
+
+  const token = bearerMatch[1];
+  if (token.startsWith("nora_")) {
+    return res.status(401).json({ error: "Invalid or expired Bearer token" });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
+    if (!isLegacySessionPayload(decoded)) {
+      return res.status(401).json({ error: "Invalid or expired Bearer token" });
+    }
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired Bearer token" });
+  }
+
   setAuthCookie(res, token, req);
   res.json({ success: true });
 });
