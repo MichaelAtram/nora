@@ -9,6 +9,15 @@ claude mcp add nora \
   -- npx -y @noraai/mcp-server
 ```
 
+The repository also ships a Claude Code plugin manifest under
+[`claude-plugin/`](./claude-plugin). Validate and load it from a Nora checkout
+with:
+
+```bash
+claude plugin validate ./mcp-server/claude-plugin --strict
+claude --plugin-dir ./mcp-server/claude-plugin
+```
+
 Or in any MCP client's JSON config:
 
 ```json
