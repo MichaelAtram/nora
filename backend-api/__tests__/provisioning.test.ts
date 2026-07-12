@@ -1671,6 +1671,7 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
         },
       }),
     };
+    const removeVolume = jest.fn().mockResolvedValue({});
     backend.docker = {
       getImage: jest.fn().mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) }),
       getContainer: jest
@@ -1679,16 +1680,25 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
       createVolume: jest.fn().mockResolvedValue({}),
       createContainer: jest.fn().mockResolvedValue(createdContainer),
       getNetwork: jest.fn().mockReturnValue({ connect: jest.fn().mockResolvedValue({}) }),
-      getVolume: jest.fn().mockReturnValue({ remove: jest.fn().mockResolvedValue({}) }),
+      getVolume: jest.fn().mockReturnValue({ remove: removeVolume }),
     };
+    backend._testCreatedContainer = createdContainer;
+    backend._testRemoveVolume = removeVolume;
     return backend;
   }
 
   it("publishes the worker-allocated host port", async () => {
     const backend = mockDockerBackend();
-    await backend.create({ id: "999", name: "Port QA", gatewayHostPort: 19500, env: {} });
+    await backend.create({
+      id: "999",
+      name: "Port QA",
+      gatewayHostPort: 19500,
+      runtimeHostPort: 19501,
+      env: {},
+    });
     const config = backend.docker.createContainer.mock.calls[0][0];
     expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([{ HostPort: "19500" }]);
+    expect(config.HostConfig.PortBindings["9090/tcp"]).toEqual([{ HostPort: "19501" }]);
   });
 
   it("falls back to the deterministic hash when no port is allocated", async () => {
@@ -1697,5 +1707,19 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
     await backend.create({ id: "999", name: "Port QA", env: {} });
     const config = backend.docker.createContainer.mock.calls[0][0];
     expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([{ HostPort: "19999" }]);
+  });
+
+  it("preserves durable volumes when a bind conflict will be retried", async () => {
+    const backend = mockDockerBackend();
+    backend._testCreatedContainer.start.mockRejectedValueOnce(
+      new Error("Bind for 127.0.0.1:19500 failed: port is already allocated"),
+    );
+
+    await expect(
+      backend.create({ id: "999", name: "Port QA", gatewayHostPort: 19500, env: {} }),
+    ).rejects.toThrow(/port is already allocated/);
+
+    expect(backend._testCreatedContainer.remove).toHaveBeenCalledWith({ force: true });
+    expect(backend._testRemoveVolume).not.toHaveBeenCalled();
   });
 });

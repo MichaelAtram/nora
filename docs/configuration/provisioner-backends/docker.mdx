@@ -16,6 +16,8 @@ ENABLED_SANDBOX_PROFILES=standard
 
 No backend-specific credentials are required. The default `docker-compose.yml` mounts the host Docker socket into `backend-api`, `worker-provisioner`, and `worker-backup` so lifecycle operations can create, stop, restart, inspect, and delete agent containers.
 
+Nora reserves each agent's published gateway port in PostgreSQL. Local deployments also inspect ports published by running Docker containers and retry bounded bind conflicts, so an unrelated workload already using the first port in the configured `19000-19999` range does not leave an agent stuck on every queue retry. See [Environment variables](/configuration/environment-variables#docker-agent-published-ports) to narrow the allocation range.
+
 ## Resource limits
 
 Self-hosted resource ceilings apply to Docker-backed deployments:
