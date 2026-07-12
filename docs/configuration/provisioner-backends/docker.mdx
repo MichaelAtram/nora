@@ -18,6 +18,8 @@ No backend-specific credentials are required. The default `docker-compose.yml` m
 
 Docker-published agent gateway and runtime ports bind to `127.0.0.1` by default. This keeps the unauthenticated host-port surface off the LAN while Nora's control-plane proxy remains available through the normal application origin. If a trusted remote client must connect directly, set `DOCKER_AGENT_BIND_IP` to a specific host interface and protect that interface with a firewall or authenticated reverse proxy. Avoid `0.0.0.0` on internet-reachable hosts.
 
+Nora reserves each agent's published gateway port in PostgreSQL. Local deployments also inspect ports published by running Docker containers and retry bounded bind conflicts, so an unrelated workload already using the first port in the configured `19000-19999` range does not leave an agent stuck on every queue retry. See [Environment variables](/configuration/environment-variables#docker-agent-published-ports) to narrow the allocation range.
+
 ## Resource limits
 
 Self-hosted resource ceilings apply to Docker-backed deployments:

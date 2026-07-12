@@ -2329,7 +2329,7 @@ describe("POST /agents/activate-demo", () => {
       );
       expect(options).toEqual({ jobId: "demo-activation-agent-demo" });
     }
-    expect(mockDockerPing).toHaveBeenCalledTimes(1);
+    expect(mockDockerPing).toHaveBeenCalledTimes(2);
     const insertCalls = clients
       .flatMap((client) => client.query.mock.calls)
       .filter(([sql]) => sql.includes("INSERT INTO agents"));
@@ -2548,6 +2548,64 @@ describe("POST /agents/activate-demo", () => {
     expect(mockEnsureDemoProvider).not.toHaveBeenCalled();
     expect(mockAddDeploymentJob).not.toHaveBeenCalled();
     expect(client.query.mock.calls.some(([sql]) => sql.includes("INSERT INTO agents"))).toBe(false);
+  });
+
+  it("does not let a durable demo row bypass the local Docker availability gate", async () => {
+    const existingAgent = {
+      id: "agent-demo-restored",
+      user_id: "user-1",
+      name: "Demo Agent",
+      status: "error",
+      backend_type: "docker",
+      runtime_family: "openclaw",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      container_id: "restored-container",
+    };
+    const client = {
+      release: jest.fn(),
+      query: jest.fn(async (sql) =>
+        sql.includes("FROM agents") && sql.includes("template_payload @>")
+          ? { rows: [existingAgent] }
+          : { rows: [] },
+      ),
+    };
+    mockDb.connect.mockResolvedValue(client);
+    mockDockerPing.mockImplementationOnce((callback) =>
+      callback(new Error("connect ENOENT /var/run/docker.sock")),
+    );
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/start Docker/i);
+    expect(mockEnsureDemoProvider).not.toHaveBeenCalled();
+    expect(mockCancelDeploymentJobsForAgent).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
+  it("rejects durable demo activation when the Docker deploy target is disabled", async () => {
+    process.env.ENABLED_BACKENDS = "k8s";
+    const client = {
+      release: jest.fn(),
+      query: jest.fn().mockResolvedValue({ rows: [] }),
+    };
+    mockDb.connect.mockResolvedValue(client);
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/docker/i);
+    expect(response.body.error).toMatch(/not enabled/i);
+    expect(mockDockerPing).not.toHaveBeenCalled();
+    expect(mockEnsureDemoProvider).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    expect(
+      client.query.mock.calls.some(
+        ([sql]) => sql.includes("FROM agents") && sql.includes("template_payload @>"),
+      ),
+    ).toBe(false);
   });
 });
 

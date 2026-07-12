@@ -73,13 +73,16 @@ secrets:
 
 # Extra non-secret environment variables applied to backend-api and both
 # workers (the control-plane processes). See .env.example for the catalog.
+# Canonical chart fields such as ENABLED_BACKENDS, PLATFORM_MODE, DB_HOST, and
+# REDIS_HOST are reserved and fail rendering if repeated here.
 backendEnv: {}
 
 # Extra environment variables applied to backend-api and both workers after the
 # nora-env ConfigMap. Do not put secrets here; use secrets.existingSecret or
 # frontendMarketing.oauthExistingSecret. For upgrade compatibility only, the
 # five legacy OAuth keys are forwarded selectively to marketing when that
-# dedicated Secret is not configured.
+# dedicated Secret is not configured. Canonical chart fields are reserved and
+# cannot be overridden through this compatibility map.
 commonEnv: {}
 
 # Explicit non-secret frontend allowlist. Frontends never inherit commonEnv or

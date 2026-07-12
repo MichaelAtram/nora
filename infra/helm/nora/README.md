@@ -81,6 +81,10 @@ admin.
   at `/run/secrets` for backend-api, workers, database-wait init containers, and
   bundled PostgreSQL. The Nora entrypoint loads valid env-named files; frontend
   pods receive only their explicit `frontendEnv`/component `env` allowlists.
+- **Typed deployment invariants cannot be shadowed.** `backendEnv` and `commonEnv`
+  reject canonical keys such as `ENABLED_BACKENDS`, `PLATFORM_MODE`, database,
+  and Redis coordinates. Configure those through their typed chart values so a
+  Kubernetes install cannot silently re-enable the unavailable local Docker target.
 - **Dedicated marketing OAuth Secret.** Set
   `frontendMarketing.oauthExistingSecret` to a Secret containing any of
   `OAUTH_LOGIN_ENABLED`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,

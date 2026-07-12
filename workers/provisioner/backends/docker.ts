@@ -29,6 +29,7 @@ const {
   DOCKER_CAPABILITIES,
   uptimeFromContainerInfo,
 } = require("./telemetry");
+const { isDockerPortBindConflict } = require("./dockerPublishedPorts");
 
 const pendingImageBuilds = new Map();
 const DEFAULT_AGENT_PIDS_LIMIT = 512;
@@ -625,7 +626,6 @@ class DockerBackend extends ProvisionerBackend {
         ? allocatedRuntimePortNumber
         : null;
     const publishedPortHostIp = this._publishedPortHostIp(config);
-
     const allowedOrigins = new Set([
       "http://localhost:8080",
       "http://127.0.0.1:8080",
@@ -838,11 +838,17 @@ class DockerBackend extends ProvisionerBackend {
           // Best effort cleanup only.
         }
       }
-      for (const volume of [volumeName, homeVolumeName]) {
-        try {
-          await this.docker.getVolume(volume).remove({ force: true });
-        } catch {
-          // Best effort cleanup only.
+      // A bind conflict is recoverable locally: the worker can persist a
+      // replacement reservation and retry create(). Keep named volumes on every
+      // bind conflict, including remote Docker failures, so a port collision
+      // never erases durable agent state while the operator resolves it.
+      if (!isDockerPortBindConflict(error)) {
+        for (const volume of [volumeName, homeVolumeName]) {
+          try {
+            await this.docker.getVolume(volume).remove({ force: true });
+          } catch {
+            // Best effort cleanup only.
+          }
         }
       }
       throw error;

@@ -267,6 +267,45 @@ test("Helm rejects a local Docker backend when no socket is mounted", () => {
   const configMap = read("infra/helm/nora/templates/configmap-env.yaml");
   assert.match(configMap, /enabledBackends must include k8s/);
   assert.match(configMap, /enabledBackends must not include docker/);
+  assert.match(configMap, /normalizedBackend := trim/);
+
+  for (const mapName of ["backendEnv", "commonEnv"]) {
+    const result = spawnSync(
+      "helm",
+      [
+        "template",
+        "nora-security-test",
+        "infra/helm/nora",
+        ...helmSecretArgs,
+        "--set-string",
+        `${mapName}.ENABLED_BACKENDS=docker`,
+      ],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(
+      `${result.stderr}${result.stdout}`,
+      new RegExp(`${mapName}\\.ENABLED_BACKENDS is reserved`),
+    );
+  }
+
+  const spacedDocker = spawnSync(
+    "helm",
+    [
+      "template",
+      "nora-security-test",
+      "infra/helm/nora",
+      ...helmSecretArgs,
+      "--set-string",
+      "enabledBackends=k8s\\, docker",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+  assert.notEqual(spacedDocker.status, 0);
+  assert.match(
+    `${spacedDocker.stderr}${spacedDocker.stdout}`,
+    /enabledBackends must not include docker/,
+  );
 });
 
 test("setup requires Compose 2.24.4+ and rejects standalone v1", () => {

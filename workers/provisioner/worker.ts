@@ -39,11 +39,16 @@ const {
   allocateGatewayPort,
   DEFAULT_RANGE_MIN,
   DEFAULT_RANGE_MAX,
+  reallocateGatewayPort,
   LOCAL_HOST_KEY,
   GATEWAY_PORT_PURPOSE,
   DASHBOARD_PORT_PURPOSE,
   RUNTIME_PORT_PURPOSE,
 } = require("../../backend-api/portAllocations");
+const {
+  createWithDockerPortRetry,
+  getOccupiedDockerPublishedPorts,
+} = require("./backends/dockerPublishedPorts");
 const {
   buildIntegrationSyncEntry,
   decryptSensitiveConfig,
@@ -2403,53 +2408,50 @@ const worker = new Worker(
         let allocatedGatewayPort;
         let allocatedRuntimePort;
         let allocatedDashboardPort;
-        {
-          const deployTarget = resolvedRuntimeFields.deploy_target;
-          const allocationHostKey =
-            deployTarget === "remote-docker"
-              ? String(resolvedRuntimeFields.execution_target_id || "")
-                  .trim()
-                  .toLowerCase() || null
-              : deployTarget === "docker"
-                ? LOCAL_HOST_KEY
-                : null;
-          if (allocationHostKey) {
-            allocatedGatewayPort =
-              deployTarget === "docker"
-                ? await allocateAvailableLocalDockerGatewayPort({
-                    agentId: id,
-                    containerName: container_name,
-                    provisioner,
-                  })
-                : await allocateGatewayPort({
-                    hostKey: allocationHostKey,
-                    agentId: id,
-                  });
-            // Remote Hermes needs a SECOND published host port for its dashboard
-            // UI (9119), distinct from the runtime API port (8642 = the 'gateway'
-            // slot used for the readiness probe). Local Hermes reaches the
-            // dashboard on the compose network (no host publish), and OpenClaw has
-            // no separate dashboard, so neither allocates this slot.
-            if (
-              deployTarget === "remote-docker" &&
-              resolvedRuntimeFields.runtime_family === "hermes"
-            ) {
-              allocatedDashboardPort = await allocateGatewayPort({
-                hostKey: allocationHostKey,
-                agentId: id,
-                purpose: DASHBOARD_PORT_PURPOSE,
-              });
-            }
-            if (
-              deployTarget === "remote-docker" &&
-              resolvedRuntimeFields.runtime_family === "openclaw"
-            ) {
-              allocatedRuntimePort = await allocateGatewayPort({
-                hostKey: allocationHostKey,
-                agentId: id,
-                purpose: RUNTIME_PORT_PURPOSE,
-              });
-            }
+        const deployTarget = resolvedRuntimeFields.deploy_target;
+        const allocationHostKey =
+          deployTarget === "remote-docker"
+            ? String(resolvedRuntimeFields.execution_target_id || "")
+                .trim()
+                .toLowerCase() || null
+            : deployTarget === "docker"
+              ? LOCAL_HOST_KEY
+              : null;
+        const usesLocalDockerPublishedPort =
+          deployTarget === "docker" && resolvedRuntimeFields.runtime_family === "openclaw";
+        if (allocationHostKey) {
+          const unavailableGatewayPorts = usesLocalDockerPublishedPort
+            ? await getOccupiedDockerPublishedPorts(provisioner, { agentId: id })
+            : new Set();
+          allocatedGatewayPort = await allocateGatewayPort({
+            hostKey: allocationHostKey,
+            agentId: id,
+            unavailablePorts: unavailableGatewayPorts,
+          });
+          // Remote Hermes needs a SECOND published host port for its dashboard
+          // UI (9119), distinct from the runtime API port (8642 = the 'gateway'
+          // slot used for the readiness probe). Local Hermes reaches the
+          // dashboard on the compose network (no host publish), and OpenClaw has
+          // no separate dashboard, so neither allocates this slot.
+          if (
+            deployTarget === "remote-docker" &&
+            resolvedRuntimeFields.runtime_family === "hermes"
+          ) {
+            allocatedDashboardPort = await allocateGatewayPort({
+              hostKey: allocationHostKey,
+              agentId: id,
+              purpose: DASHBOARD_PORT_PURPOSE,
+            });
+          }
+          if (
+            deployTarget === "remote-docker" &&
+            resolvedRuntimeFields.runtime_family === "openclaw"
+          ) {
+            allocatedRuntimePort = await allocateGatewayPort({
+              hostKey: allocationHostKey,
+              agentId: id,
+              purpose: RUNTIME_PORT_PURPOSE,
+            });
           }
         }
         const currentAgent = await db.query("SELECT status FROM agents WHERE id = $1", [id]);
@@ -2459,48 +2461,70 @@ const worker = new Worker(
           );
           return { canceled: true, reason: "agent-deleted-before-create" };
         }
-        const createPromise = provisioner.create({
-          id,
-          name,
-          image: resolvedImage,
-          vcpu,
-          ram_mb,
-          disk_gb,
-          container_name,
-          gatewayHostPort: allocatedGatewayPort,
-          runtimeHostPort: allocatedRuntimePort,
-          dashboardHostPort: allocatedDashboardPort,
-          gatewayToken: agentRow.gateway_token || undefined,
-          templatePayload,
-          mcpServers: mcpServerEntries,
-          runtimeFamily: resolvedRuntimeFields.runtime_family,
-          deployTarget: resolvedRuntimeFields.deploy_target,
-          executionTargetId: resolvedRuntimeFields.execution_target_id,
-          sandboxProfile: resolvedRuntimeFields.sandbox_profile,
-          abortSignal: abortController.signal,
-          env: {
-            AGENT_ID: String(id),
-            AGENT_NAME: name || "",
-            NORA_INTEGRATIONS_CONFIG:
-              resolvedRuntimeFields.runtime_family === "hermes"
-                ? HERMES_INTEGRATIONS_CONFIG_FILE
-                : NORA_SYNC_INTEGRATIONS_CATALOG_FILE,
-            NORA_INTEGRATIONS_DIR:
-              resolvedRuntimeFields.runtime_family === "hermes"
-                ? HERMES_INTEGRATIONS_DIR
-                : NORA_SYNC_INTEGRATIONS_DIR,
-            ...(resolvedRuntimeFields.sandbox_profile === "nemoclaw" && model
-              ? { NEMOCLAW_MODEL: model }
-              : {}),
-            ...(defaultOpenClawModel && resolvedRuntimeFields.runtime_family === "openclaw"
-              ? { NORA_DEFAULT_OPENCLAW_MODEL: defaultOpenClawModel }
-              : {}),
-            ...hermesRuntimeBootstrapEnv,
-            ...agentSecretEnvVars,
-            ...integrationEnvVars,
-            ...llmEnvVars,
-          },
-        });
+        const createOnce = (gatewayHostPort) =>
+          provisioner.create({
+            id,
+            name,
+            image: resolvedImage,
+            vcpu,
+            ram_mb,
+            disk_gb,
+            container_name,
+            gatewayHostPort,
+            runtimeHostPort: allocatedRuntimePort,
+            dashboardHostPort: allocatedDashboardPort,
+            gatewayToken: agentRow.gateway_token || undefined,
+            templatePayload,
+            mcpServers: mcpServerEntries,
+            runtimeFamily: resolvedRuntimeFields.runtime_family,
+            deployTarget: resolvedRuntimeFields.deploy_target,
+            executionTargetId: resolvedRuntimeFields.execution_target_id,
+            sandboxProfile: resolvedRuntimeFields.sandbox_profile,
+            abortSignal: abortController.signal,
+            env: {
+              AGENT_ID: String(id),
+              AGENT_NAME: name || "",
+              NORA_INTEGRATIONS_CONFIG:
+                resolvedRuntimeFields.runtime_family === "hermes"
+                  ? HERMES_INTEGRATIONS_CONFIG_FILE
+                  : NORA_SYNC_INTEGRATIONS_CATALOG_FILE,
+              NORA_INTEGRATIONS_DIR:
+                resolvedRuntimeFields.runtime_family === "hermes"
+                  ? HERMES_INTEGRATIONS_DIR
+                  : NORA_SYNC_INTEGRATIONS_DIR,
+              ...(resolvedRuntimeFields.sandbox_profile === "nemoclaw" && model
+                ? { NEMOCLAW_MODEL: model }
+                : {}),
+              ...(defaultOpenClawModel && resolvedRuntimeFields.runtime_family === "openclaw"
+                ? { NORA_DEFAULT_OPENCLAW_MODEL: defaultOpenClawModel }
+                : {}),
+              ...hermesRuntimeBootstrapEnv,
+              ...agentSecretEnvVars,
+              ...integrationEnvVars,
+              ...llmEnvVars,
+            },
+          });
+        const createPromise = usesLocalDockerPublishedPort
+          ? createWithDockerPortRetry({
+              create: createOnce,
+              initialPort: allocatedGatewayPort,
+              getOccupiedPorts: () => getOccupiedDockerPublishedPorts(provisioner, { agentId: id }),
+              reallocate: async ({ previousPort, unavailablePorts }) => {
+                allocatedGatewayPort = await reallocateGatewayPort({
+                  hostKey: allocationHostKey,
+                  agentId: id,
+                  previousPort,
+                  unavailablePorts,
+                });
+                return allocatedGatewayPort;
+              },
+              onRetry: ({ retry, previousPort, nextPort }) => {
+                console.warn(
+                  `[provisioner] Docker port ${previousPort} was unavailable for agent ${id}; retry ${retry} will use persisted port ${nextPort}`,
+                );
+              },
+            })
+          : createOnce(allocatedGatewayPort);
         const timeoutPromise = new Promise((_, reject) => {
           provisionTimeoutHandle = setTimeout(() => {
             const timeoutError = new Error(

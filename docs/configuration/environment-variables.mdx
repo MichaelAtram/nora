@@ -260,6 +260,15 @@ For more than one cluster, put multiple kubeconfig files under `NORA_KUBECONFIGS
 
 Admin-registered encrypted kubeconfigs require `ENCRYPTION_KEY` because Nora stores pasted kubeconfig content encrypted at rest.
 
+## Docker agent published ports
+
+Docker and remote-Docker agents reserve their published gateway ports in PostgreSQL. The configurable subrange must remain inside `19000-19999`, which is already allowed by the gateway proxy's default SSRF guard. Local Docker deployments skip ports published by running containers and retry a bounded number of bind conflicts, including conflicts caused by non-Docker listeners.
+
+| Variable                      | Required | Default | Description                                                                                    |
+| ----------------------------- | -------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `DOCKER_AGENT_PORT_RANGE_MIN` | No       | `19000` | Lowest published gateway port. Must be between `19000` and `19999`.                            |
+| `DOCKER_AGENT_PORT_RANGE_MAX` | No       | `19999` | Highest published gateway port. Must be between `19000` and `19999` and not below the minimum. |
+
 ## Gateway proxy SSRF guard
 
 Defaults allow OpenClaw's internal gateway port, Docker-published 19000-19999, and Kubernetes NodePort 30000-32767. Override only if you publish gateways on non-default ports or hosts.

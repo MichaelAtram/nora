@@ -1470,6 +1470,20 @@ router.post("/activate-demo", async (req, res) => {
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [lockKey]);
     lockHeld = true;
 
+    // Validate the hard-coded local-Docker demo target before returning or
+    // requeueing any durable demo row. This prevents restored demo metadata
+    // from bypassing a Kubernetes-only Helm deployment's target policy.
+    const runtimeFields = resolveRequestedRuntimeFields({
+      request: {
+        runtime_family: "openclaw",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+        sandbox_profile: "standard",
+      },
+    });
+    const runtimeSelectionStatus = await assertRuntimeTargetAvailable(runtimeFields, userId);
+    await assertLocalDockerAvailable();
+
     const existingAgent = await findDemoActivationAgent(client, userId);
     if (existingAgent) {
       const demoProvider = await llmProviders.ensureDemoProvider(userId, client);
@@ -1482,17 +1496,6 @@ router.post("/activate-demo", async (req, res) => {
       );
       return res.json(serializeAgent(activatedAgent));
     }
-
-    const runtimeFields = resolveRequestedRuntimeFields({
-      request: {
-        runtime_family: "openclaw",
-        deploy_target: "docker",
-        execution_target_id: "docker",
-        sandbox_profile: "standard",
-      },
-    });
-    const runtimeSelectionStatus = await assertRuntimeTargetAvailable(runtimeFields, userId);
-    await assertLocalDockerAvailable();
 
     const limits = await billing.enforceLimits(userId);
     if (!limits.allowed) {

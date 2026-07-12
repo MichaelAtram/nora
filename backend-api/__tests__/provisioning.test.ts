@@ -1741,6 +1741,7 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
         },
       }),
     };
+    const removeVolume = jest.fn().mockResolvedValue({});
     backend.docker = {
       getImage: jest.fn().mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) }),
       getContainer: jest
@@ -1750,8 +1751,10 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
       createVolume: jest.fn().mockResolvedValue({}),
       createContainer: jest.fn().mockResolvedValue(createdContainer),
       getNetwork: jest.fn().mockReturnValue({ connect: jest.fn().mockResolvedValue({}) }),
-      getVolume: jest.fn().mockReturnValue({ remove: jest.fn().mockResolvedValue({}) }),
+      getVolume: jest.fn().mockReturnValue({ remove: removeVolume }),
     };
+    backend._testCreatedContainer = createdContainer;
+    backend._testRemoveVolume = removeVolume;
     return backend;
   }
 
@@ -1860,5 +1863,19 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
     expect(backend.docker.getVolume).toHaveBeenNthCalledWith(1, "nora_agent_state_agent-1");
     expect(backend.docker.getVolume).toHaveBeenNthCalledWith(2, "nora_agent_home_agent-1");
     expect(removeVolume).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves durable volumes when a bind conflict will be retried", async () => {
+    const backend = mockDockerBackend();
+    backend._testCreatedContainer.start.mockRejectedValueOnce(
+      new Error("Bind for 127.0.0.1:19500 failed: port is already allocated"),
+    );
+
+    await expect(
+      backend.create({ id: "999", name: "Port QA", gatewayHostPort: 19500, env: {} }),
+    ).rejects.toThrow(/port is already allocated/);
+
+    expect(backend._testCreatedContainer.remove).toHaveBeenCalledWith({ force: true });
+    expect(backend._testRemoveVolume).not.toHaveBeenCalled();
   });
 });
