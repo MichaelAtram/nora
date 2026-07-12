@@ -8,13 +8,13 @@ Nora is self-hosted by design. You run the full stack — Nginx, Next.js fronten
 
 Before you install, make sure your host meets the following requirements.
 
-| Requirement          | Details                                                                            |
-| -------------------- | ---------------------------------------------------------------------------------- |
-| **Operating system** | macOS 12+, Linux (Ubuntu 20.04+, Debian 11+, Fedora 38+), or Windows 10+ with WSL2 |
-| **Permissions**      | Admin or sudo access for initial setup                                             |
+| Requirement          | Details                                                                                |
+| -------------------- | -------------------------------------------------------------------------------------- |
+| **Operating system** | macOS 12+, Linux (Ubuntu 20.04+, Debian 11+, Fedora 38+), or Windows 10+ with WSL2     |
+| **Permissions**      | Admin or sudo access for initial setup                                                 |
 | **Docker**           | Docker Engine with Compose 2.24.4+ (the installer can install Docker if it is missing) |
-| **Git**              | Git (the installer can install Git if it is missing)                               |
-| **OpenSSL**          | OpenSSL (used to generate secrets; the installer can install it if missing)        |
+| **Git**              | Git (the installer can install Git if it is missing)                                   |
+| **OpenSSL**          | OpenSSL (used to generate secrets; the installer can install it if missing)            |
 
 <Note>
   The setup script checks for Docker, Docker Compose 2.24.4 or newer, Git, and OpenSSL and installs
@@ -122,20 +122,26 @@ Use manual setup when you want full control over every configuration value befor
   </Step>
 
   <Step title="Start the stack">
-    Once `.env` is configured, start all services in the background:
+    Once `.env` is configured, run the non-interactive update path once. It materializes the
+    gitignored Compose secret files, refreshes the hardened overlay, and starts all services:
 
     ```bash theme={null}
-    docker compose up -d
+    ./setup.sh --update
     ```
 
-    Docker Compose pulls and starts all Nora services: the reverse proxy, frontend dashboards, backend API, database, and queue.
+    On Windows, use `pwsh -File .\setup.ps1 -Update`. After this first materialization, ordinary
+    `docker compose up -d` commands reuse the protected files.
+
+    Advanced Linux/macOS operators who intentionally bypass setup can run
+    `bash scripts/materialize-compose-secrets.sh .env` before `docker compose up -d`. Re-run the
+    helper whenever any of the six core values changes.
 
     The production overlay materializes the core JWT, encryption, Agent Hub, backup, and database
     credentials as read-only files under `/run/secrets` for backend and worker containers. Marketing
     receives an explicit allowlist of only its runtime/OAuth values, not the complete deploy env.
 
     <Warning>
-      Do not start the stack with placeholder values for `JWT_SECRET` or `ENCRYPTION_KEY`. Generate each with `openssl rand -hex 32` before running `docker compose up -d`.
+      Do not start the stack with placeholder values for `JWT_SECRET` or `ENCRYPTION_KEY`. Generate each with `openssl rand -hex 32` before running the update command.
     </Warning>
 
   </Step>

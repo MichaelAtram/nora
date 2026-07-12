@@ -280,11 +280,6 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
   return status;
 }
 
-function isIgnorableStopError(error) {
-  const message = String(error?.message || "");
-  return message.includes("already stopped") || message.includes("not running");
-}
-
 async function assertRuntimeTargetAvailable(runtimeFields, ownerUserId) {
   const status = assertRuntimeSelectionAvailable(runtimeFields);
   await assertKubernetesExecutionTargetAvailable(runtimeFields);
@@ -2112,7 +2107,8 @@ router.post("/:id/start", async (req, res, next) => {
     if (!containerManager.canMutate(agent))
       return res.status(400).json({ error: "No container — redeploy the agent first" });
 
-    await containerManager.start(agent);
+    const lifecycleResult = await containerManager.start(agent);
+    await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
 
     // Manual start is an explicit operator override of a budget pause; the
     // budget sweep re-pauses on its next cycle if the agent is still over cap.
@@ -2159,11 +2155,9 @@ router.post("/:id/stop", async (req, res, next) => {
       try {
         await containerManager.stop(agent);
       } catch (e) {
-        if (!isIgnorableStopError(e)) {
+        if (!containerManager.isIgnorableStopError(e)) {
           console.error("Container stop error:", e.message);
-          if (containerManager.isKubernetesAgent(agent)) {
-            return res.status(e.statusCode || 500).json({ error: e.message });
-          }
+          return res.status(e.statusCode || 500).json({ error: e.message });
         }
       }
     }
@@ -2206,15 +2200,12 @@ async function destroyAgent(agentId, userId, req, res) {
   if (containerManager.canDestroy(agent)) {
     try {
       await containerManager.destroy(agent);
-    } catch (e) {
-      console.error("Container cleanup error:", e.message);
-      if (containerManager.isKubernetesAgent(agent)) {
-        return res.status(e.statusCode || 500).json({
-          error:
-            e.message ||
-            "Failed to delete Kubernetes runtime resources; agent record was kept for retry.",
-        });
-      }
+    } catch (error) {
+      console.error("Container cleanup error:", error.message);
+      return res.status(error.statusCode || 500).json({
+        error:
+          error.message || "Failed to delete runtime resources; agent record was kept for retry.",
+      });
     }
   }
 
@@ -2259,7 +2250,8 @@ router.post("/:id/restart", async (req, res, next) => {
     if (!containerManager.canMutate(agent))
       return res.status(400).json({ error: "No container — redeploy the agent first" });
 
-    await containerManager.restart(agent);
+    const lifecycleResult = await containerManager.restart(agent);
+    await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
 
     await db.query("UPDATE agents SET status = 'running' WHERE id = $1", [agent.id]);
     await monitoring.logEvent(

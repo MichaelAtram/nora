@@ -15,9 +15,18 @@ import {
 
 type DemoAvailability = "loading" | "available" | "unavailable" | "error";
 
+const LOCAL_DOCKER_DEMO_FALLBACK =
+  "The zero-key demo requires the OpenClaw runtime, local Docker execution target, and standard sandbox profile to be enabled together.";
+
 // One-click zero-key demo: the backend atomically enables the built-in provider
 // and queues one local-Docker agent, then we land on the agent page for chat.
-function TryDemoButton({ availability }: { availability: DemoAvailability }) {
+function TryDemoButton({
+  availability,
+  unavailableReason,
+}: {
+  availability: DemoAvailability;
+  unavailableReason: string | null;
+}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const demoAvailable = availability === "available";
@@ -71,8 +80,8 @@ function TryDemoButton({ availability }: { availability: DemoAvailability }) {
           role="status"
           data-testid="demo-activation-unavailable"
         >
-          This Nora deployment does not enable the local Docker target. Add a provider in Settings
-          and deploy to one of the targets enabled by your operator.
+          {unavailableReason || LOCAL_DOCKER_DEMO_FALLBACK} Add a provider in Settings and deploy to
+          one of the targets enabled by your operator.
         </p>
       ) : null}
       {availability === "error" ? (
@@ -110,6 +119,7 @@ const bestFit = [
 
 export default function GettingStartedPage() {
   const [demoAvailability, setDemoAvailability] = useState<DemoAvailability>("loading");
+  const [demoCapabilityIssue, setDemoCapabilityIssue] = useState<string | null>(null);
   const demoAvailable = demoAvailability === "available";
   const launchSignals =
     demoAvailability === "loading"
@@ -121,10 +131,10 @@ export default function GettingStartedPage() {
         ]
       : demoAvailable
         ? [
-        "The first proof needs no external API key or model spend.",
-        "The built-in demo provider and local Docker agent launch in one action.",
-        "A real provider can be added only after the operator loop is validated.",
-        "Chat, logs, and terminal are all reachable from the same operator surface.",
+            "The first proof needs no external API key or model spend.",
+            "The built-in demo provider and local Docker agent launch in one action.",
+            "A real provider can be added only after the operator loop is validated.",
+            "Chat, logs, and terminal are all reachable from the same operator surface.",
           ]
         : [
             "Nora shows only activation paths supported by this deployment.",
@@ -143,13 +153,15 @@ export default function GettingStartedPage() {
         });
         if (!response.ok) throw new Error(`Platform config failed with ${response.status}`);
         const config = await response.json();
-        const enabledDeployTargets = Array.isArray(config?.enabledDeployTargets)
-          ? config.enabledDeployTargets
-          : [];
-        setDemoAvailability(enabledDeployTargets.includes("docker") ? "available" : "unavailable");
+        const capability = config?.capabilities?.localDockerDemo;
+        const enabled = capability?.enabled === true;
+        const issue = typeof capability?.issue === "string" ? capability.issue.trim() : "";
+        setDemoCapabilityIssue(enabled ? null : issue || null);
+        setDemoAvailability(enabled ? "available" : "unavailable");
       } catch (availabilityError) {
         if (controller.signal.aborted) return;
         console.error(availabilityError);
+        setDemoCapabilityIssue(null);
         setDemoAvailability("error");
       }
     }
@@ -249,7 +261,10 @@ export default function GettingStartedPage() {
             </div>
 
             <div className="flex flex-wrap gap-3 mt-8">
-              <TryDemoButton availability={demoAvailability} />
+              <TryDemoButton
+                availability={demoAvailability}
+                unavailableReason={demoCapabilityIssue}
+              />
               <a
                 href="/app/settings"
                 className="inline-flex items-center gap-2 rounded-xl border border-brand-cyan/40 bg-brand-cyan/15 px-4 py-3 text-sm font-bold text-brand-ink hover:bg-brand-cyan/25 transition-all"

@@ -114,6 +114,55 @@ function canDestroy(agent = {}) {
   return canMutate(agent);
 }
 
+function normalizeLifecycleHost(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized || null;
+}
+
+function lifecycleRuntimeAddress(result = {}) {
+  if (!result || typeof result !== "object") return null;
+  const host = normalizeLifecycleHost(result.host);
+  const runtimeHost =
+    normalizeLifecycleHost(result.runtimeHost ?? result.runtime_host) || host || null;
+  if (!host && !runtimeHost) return null;
+  return { host, runtimeHost };
+}
+
+async function persistLifecycleRuntimeAddress(queryable, agent, result) {
+  const address = lifecycleRuntimeAddress(result);
+  if (!address) return agent;
+  if (!queryable || typeof queryable.query !== "function") {
+    throw new TypeError("Lifecycle runtime address persistence requires a database client");
+  }
+  if (!agent?.id) {
+    throw new TypeError("Lifecycle runtime address persistence requires an agent id");
+  }
+
+  const updated = await queryable.query(
+    `UPDATE agents
+        SET host = COALESCE($2, host),
+            runtime_host = COALESCE($3, runtime_host)
+      WHERE id = $1
+      RETURNING host, runtime_host`,
+    [agent.id, address.host, address.runtimeHost],
+  );
+  if (!updated.rows[0]) {
+    const error = new Error(`Agent ${agent.id} no longer exists after lifecycle operation`);
+    error.statusCode = 404;
+    error.code = "AGENT_NOT_FOUND";
+    throw error;
+  }
+
+  agent.host = updated.rows[0].host;
+  agent.runtime_host = updated.rows[0].runtime_host;
+  return agent;
+}
+
+function isIgnorableStopError(error) {
+  return /already stopped|not running/i.test(String(error?.message || ""));
+}
+
 /**
  * Resolve the path to a backend module.
  * In Docker: backends are mounted at /app/backends/ via docker-compose.
@@ -354,4 +403,7 @@ module.exports = {
   canMutate,
   canDestroy,
   isKubernetesAgent,
+  lifecycleRuntimeAddress,
+  persistLifecycleRuntimeAddress,
+  isIgnorableStopError,
 };

@@ -63,7 +63,8 @@ describe("Proxmox real-hardware release gate", () => {
     expect(workflow).toMatch(/workflow_dispatch:/);
     expect(workflow).toMatch(/runs-on: \[self-hosted, linux, x64, nora-proxmox\]/);
     expect(workflow).toMatch(/environment: proxmox-real-hardware/);
-    expect(workflow).toMatch(/run: e2e\/scripts\/run-proxmox-smoke\.sh/);
+    expect(workflow).toContain("- name: Run destructive real-hardware lifecycle gate");
+    expect(workflow).toMatch(/^\s+e2e\/scripts\/run-proxmox-smoke\.sh\s*$/m);
     expect(workflow).not.toMatch(/^\s+push:/m);
     expect(workflow).not.toMatch(/^\s+pull_request:/m);
   });

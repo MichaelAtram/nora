@@ -45,13 +45,12 @@ export default function ActivationChecklist({
     ])
       .then(([providers, agentData, platformConfig]) => {
         if (cancelled) return;
-        const enabledDeployTargets = (platformConfig as { enabledDeployTargets?: unknown })
-          .enabledDeployTargets;
+        const localDockerDemoEnabled = (
+          platformConfig as { capabilities?: { localDockerDemo?: { enabled?: unknown } } }
+        ).capabilities?.localDockerDemo?.enabled;
         setProviderCount(Array.isArray(providers) ? providers.length : 0);
         setAgents(Array.isArray(agentData) ? agentData : []);
-        setDemoAvailable(
-          Array.isArray(enabledDeployTargets) && enabledDeployTargets.includes("docker"),
-        );
+        setDemoAvailable(localDockerDemoEnabled === true);
         setLoading(false);
       })
       .catch(() => {

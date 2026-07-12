@@ -46,6 +46,16 @@ precedence; custom orchestrators can use these conventional aliases:
 
 The setup scripts keep `.env` owner-only: mode `0600` on macOS/Linux/WSL and a protected,
 non-inherited ACL on Windows. Treat timestamped `.env.backup-*` files with the same sensitivity.
+For Compose, setup also materializes the six core values as individual files under
+`NORA_COMPOSE_SECRETS_DIR` (default `.secrets/compose`). The directory is gitignored and restricted
+to the owner; Compose mounts only the requested files read-only into control-plane containers.
+Operators who bypass setup must run `bash scripts/materialize-compose-secrets.sh <env-file>` before
+Compose startup and after rotating any core value.
+
+| Variable                   | Default            | Description                                                                                                   |
+| -------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `NORA_COMPOSE_SECRETS_DIR` | `.secrets/compose` | Host directory for installer-materialized Compose secret files. Must be a dedicated, non-symlinked directory. |
+| `COMPOSE_PROJECT_NAME`     | `nora`             | Stable Compose namespace used to scope setup, upgrade, and clean-reinstall container/volume operations.       |
 
 ## Bootstrap admin account
 

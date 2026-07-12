@@ -9,6 +9,7 @@ const mockIsKubernetesAgent = jest.fn();
 const mockUpdateEnv = jest.fn();
 const mockRestart = jest.fn();
 const mockWaitForAgentReadiness = jest.fn();
+const mockPersistLifecycleRuntimeAddress = jest.fn();
 
 jest.mock("../db", () => mockDb);
 
@@ -22,6 +23,7 @@ jest.mock("../containerManager", () => ({
   restart: mockRestart,
   isKubernetesAgent: mockIsKubernetesAgent,
   updateEnv: mockUpdateEnv,
+  persistLifecycleRuntimeAddress: mockPersistLifecycleRuntimeAddress,
 }));
 
 jest.mock("../healthChecks", () => ({
@@ -51,6 +53,16 @@ describe("Hermes helper execution", () => {
     mockIsKubernetesAgent.mockReset().mockReturnValue(false);
     mockUpdateEnv.mockReset().mockResolvedValue(undefined);
     mockRestart.mockReset().mockResolvedValue(undefined);
+    mockPersistLifecycleRuntimeAddress
+      .mockReset()
+      .mockImplementation(async (_db, agent, result) => {
+        const host = typeof result?.host === "string" ? result.host.trim() : "";
+        const runtimeHost =
+          typeof result?.runtimeHost === "string" ? result.runtimeHost.trim() : host;
+        if (host) agent.host = host;
+        if (runtimeHost) agent.runtime_host = runtimeHost;
+        return agent;
+      });
     mockWaitForAgentReadiness.mockReset().mockResolvedValue({
       ok: true,
       runtime: { ok: true },
@@ -99,6 +111,38 @@ describe("Hermes helper execution", () => {
     const execCommands = mockRunContainerCommand.mock.calls.map((call) => String(call[1] || ""));
     expect(execCommands.some((command) => command.includes("save_env_value"))).toBe(false);
     expect(mockRestart).toHaveBeenCalled();
+  });
+
+  it("uses a refreshed Proxmox address for readiness after a Hermes restart", async () => {
+    mockRestart.mockResolvedValueOnce({
+      host: "10.100.110.71",
+      runtimeHost: "10.100.110.71",
+    });
+    const agent = {
+      id: "agent-hermes-proxmox",
+      user_id: "user-1",
+      container_id: "601",
+      backend_type: "proxmox",
+      runtime_family: "hermes",
+      host: "10.100.110.10",
+      runtime_host: "10.100.110.10",
+      runtime_port: 8642,
+    };
+
+    await saveHermesChannel(agent, "telegram", { TELEGRAM_BOT_TOKEN: "tok-proxmox" });
+
+    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ id: "agent-hermes-proxmox" }),
+      { host: "10.100.110.71", runtimeHost: "10.100.110.71" },
+    );
+    expect(mockWaitForAgentReadiness).toHaveBeenCalledWith(
+      expect.objectContaining({
+        host: "10.100.110.71",
+        runtimeHost: "10.100.110.71",
+      }),
+      expect.any(Object),
+    );
   });
 
   it("runs helper scripts from /opt/hermes inside the Hermes virtualenv", async () => {

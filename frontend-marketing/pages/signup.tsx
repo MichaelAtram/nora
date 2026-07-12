@@ -5,10 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, CheckCircle2, Loader2, Lock, Mail, Server, Shield, Zap } from "lucide-react";
 import LanguageSwitcher from "../components/LanguageSwitcher";
 import SeoHead from "../components/SeoHead";
-import {
-  fetchAuthBootstrapStatus,
-  type AuthBootstrapStatus,
-} from "../lib/authBootstrap";
+import { fetchAuthBootstrapStatus, type AuthBootstrapStatus } from "../lib/authBootstrap";
 import { normalizeLocale, useI18n } from "../lib/i18n";
 import { trackEvent } from "../lib/analytics";
 

@@ -68,6 +68,7 @@ const {
   getEnabledSandboxProfiles,
   getExecutionTargetCatalog,
   getRuntimeCatalog,
+  getRuntimeSelectionStatus,
   getSandboxProfileCatalog,
 } = require("../agent-runtime/lib/backendCatalog");
 
@@ -678,6 +679,24 @@ function defaultExecutionTargetFromCatalog(executionTargets = []) {
   );
 }
 
+function localDockerDemoCapability() {
+  const status = getRuntimeSelectionStatus({
+    runtime_family: "openclaw",
+    deploy_target: "docker",
+    execution_target_id: "docker",
+    sandbox_profile: "standard",
+  });
+  return {
+    enabled: status.available === true,
+    runtimeFamily: status.runtimeFamily,
+    deployTarget: status.deployTarget,
+    executionTargetId: status.executionTargetId,
+    sandboxProfile: status.sandboxProfile,
+    requiresLiveDocker: true,
+    issue: status.available ? null : status.issue || "Local Docker demo is not enabled.",
+  };
+}
+
 app.get("/config/platform", async (_req, res) => {
   try {
     const kubernetesClusters = await listKubernetesExecutionTargets();
@@ -716,6 +735,9 @@ app.get("/config/platform", async (_req, res) => {
       systemBanner,
       language,
       release,
+      capabilities: {
+        localDockerDemo: localDockerDemoCapability(),
+      },
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

@@ -5,12 +5,22 @@ const mockWorkerDb = {
 };
 const mockGetDeploymentProvider = jest.fn();
 const mockWorkerOn = jest.fn();
+let mockDeploymentProcessor;
 
 jest.mock("../../workers/provisioner/node_modules/bullmq", () => ({
-  Worker: jest.fn().mockImplementation(() => ({
-    on: mockWorkerOn,
-    isRunning: jest.fn().mockReturnValue(true),
-  })),
+  UnrecoverableError: class UnrecoverableError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "UnrecoverableError";
+    }
+  },
+  Worker: jest.fn().mockImplementation((queueName, processor) => {
+    if (queueName === "deployments") mockDeploymentProcessor = processor;
+    return {
+      on: mockWorkerOn,
+      isRunning: jest.fn().mockReturnValue(true),
+    };
+  }),
 }));
 jest.mock("../../workers/provisioner/node_modules/ioredis", () => jest.fn());
 jest.mock("../../workers/provisioner/node_modules/pg", () => ({
@@ -40,6 +50,7 @@ jest.mock("http", () => ({
 
 const {
   allocateAvailableLocalDockerGatewayPort,
+  buildUnresolvedRuntimeError,
   cleanupProvisionedRuntimeAfterFailure,
   fetchDeploymentProvider,
   fetchUserLlmEnvVars,
@@ -146,6 +157,21 @@ describe("provisioner deployment lifecycle", () => {
     expect(isFinalDeploymentAttempt({ attemptsMade: 4, opts: { attempts: 5 } })).toBe(true);
   });
 
+  it("uses BullMQ's unrecoverable error contract for unresolved runtime identity", () => {
+    const error = buildUnresolvedRuntimeError({
+      agentId: "agent-1",
+      containerId: "108",
+      error: new Error("destroy failed"),
+    });
+
+    expect(error).toMatchObject({
+      name: "UnrecoverableError",
+      code: "UNRESOLVED_RUNTIME_IDENTITY",
+      containerId: "108",
+    });
+    expect(error.message).toMatch(/automatic retry disabled/i);
+  });
+
   it("returns retryable failures to queued without exposing terminal error state", async () => {
     const queryable = {
       query: jest
@@ -206,6 +232,35 @@ describe("provisioner deployment lifecycle", () => {
     );
   });
 
+  it("forces terminal state on the first attempt when a prior runtime cannot be reconciled", async () => {
+    const queryable = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [{ id: "agent-1" }] })
+        .mockResolvedValue({ rows: [] }),
+    };
+
+    await expect(
+      persistProvisioningFailure({
+        queryable,
+        job: { attemptsMade: 0, opts: { attempts: 5 } },
+        agentId: "agent-1",
+        name: "Demo Agent",
+        error: Object.assign(new Error("runtime cleanup failed"), { containerId: "108" }),
+        forceTerminal: true,
+      }),
+    ).resolves.toEqual({ canceled: false, terminal: true });
+
+    expect(queryable.query).toHaveBeenCalledWith(
+      "UPDATE agents SET status = 'error' WHERE id = $1",
+      ["agent-1"],
+    );
+    expect(queryable.query).not.toHaveBeenCalledWith(
+      expect.stringMatching(/status = 'queued'/),
+      expect.anything(),
+    );
+  });
+
   it("makes an active job harmless after the agent row was deleted", async () => {
     const queryable = { query: jest.fn().mockResolvedValue({ rows: [] }) };
 
@@ -236,7 +291,7 @@ describe("provisioner deployment lifecycle", () => {
         agentId: "agent-1",
         containerId: "nora-oclaw-agent-1",
       }),
-    ).resolves.toEqual({ destroyed: true });
+    ).resolves.toEqual({ destroyed: true, retrySafe: true });
 
     expect(provisioner.destroy).toHaveBeenCalledWith("nora-oclaw-agent-1", {
       agentId: "agent-1",
@@ -251,7 +306,11 @@ describe("provisioner deployment lifecycle", () => {
   });
 
   it("preserves runtime identity when cleanup cannot destroy the container", async () => {
-    const queryable = { query: jest.fn() };
+    const queryable = {
+      query: jest.fn().mockResolvedValue({
+        rows: [{ id: "agent-1", container_id: "nora-oclaw-agent-1" }],
+      }),
+    };
     const provisioner = { destroy: jest.fn().mockRejectedValue(new Error("Docker unavailable")) };
 
     await expect(
@@ -261,8 +320,106 @@ describe("provisioner deployment lifecycle", () => {
         agentId: "agent-1",
         containerId: "nora-oclaw-agent-1",
       }),
-    ).resolves.toEqual(expect.objectContaining({ destroyed: false, reason: "destroy-failed" }));
+    ).resolves.toEqual(
+      expect.objectContaining({
+        destroyed: false,
+        reason: "destroy-failed",
+        retrySafe: false,
+        identityPersisted: true,
+      }),
+    );
 
+    expect(queryable.query).toHaveBeenCalledWith(
+      expect.stringMatching(/container_id = COALESCE\(container_id, \$2\)/),
+      ["agent-1", "nora-oclaw-agent-1", null],
+    );
+  });
+
+  it("never destroys a runtime whose ownership was not verified and suppresses retry", async () => {
+    const queryable = { query: jest.fn() };
+    const provisioner = { destroy: jest.fn() };
+
+    await expect(
+      cleanupProvisionedRuntimeAfterFailure({
+        queryable,
+        provisioner,
+        agentId: "agent-1",
+        containerId: "108",
+        destroyAllowed: false,
+        persistIdentity: false,
+      }),
+    ).resolves.toEqual({
+      destroyed: false,
+      reason: "destroy-not-authorized",
+      retrySafe: false,
+      identityPersisted: false,
+    });
+
+    expect(provisioner.destroy).not.toHaveBeenCalled();
     expect(queryable.query).not.toHaveBeenCalled();
+  });
+
+  it("refuses to provision a replacement while a prior runtime identity remains", async () => {
+    const lockClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [{ locked: true }] })
+        .mockResolvedValueOnce({ rows: [{ pg_advisory_unlock: true }] }),
+      release: jest.fn(),
+    };
+    mockWorkerDb.connect.mockResolvedValue(lockClient);
+    mockWorkerDb.query.mockImplementation(async (sql) => {
+      if (sql.includes("SELECT image, template_payload")) {
+        return {
+          rows: [
+            {
+              image: "ghcr.io/example/openclaw:latest",
+              template_payload: {},
+              sandbox_type: "standard",
+              backend_type: "proxmox",
+              runtime_family: "openclaw",
+              deploy_target: "proxmox",
+              execution_target_id: "proxmox",
+              sandbox_profile: "standard",
+              gateway_token: null,
+              mcp_servers: [],
+              status: "queued",
+              container_id: "108",
+            },
+          ],
+        };
+      }
+      if (sql === "SELECT id FROM agents WHERE id = $1") {
+        return { rows: [{ id: "agent-1" }] };
+      }
+      return { rows: [] };
+    });
+
+    await expect(
+      mockDeploymentProcessor({
+        id: "deploy-agent-1",
+        data: {
+          id: "agent-1",
+          name: "Demo Agent",
+          userId: "user-1",
+          specs: { vcpu: 2, ram_mb: 2048, disk_gb: 20 },
+        },
+        attemptsMade: 1,
+        opts: { attempts: 5 },
+      }),
+    ).rejects.toMatchObject({
+      name: "UnrecoverableError",
+      code: "UNRESOLVED_RUNTIME_IDENTITY",
+      containerId: "108",
+    });
+
+    expect(mockWorkerDb.query).toHaveBeenCalledWith(
+      "UPDATE agents SET status = 'error' WHERE id = $1",
+      ["agent-1"],
+    );
+    expect(
+      mockWorkerDb.query.mock.calls.some(([sql]) => String(sql).includes("status = 'deploying'")),
+    ).toBe(false);
+    expect(lockClient.release).toHaveBeenCalledTimes(1);
   });
 });

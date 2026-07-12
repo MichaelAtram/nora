@@ -18,6 +18,7 @@ const mockContainer = {
   restart: jest.fn().mockResolvedValue(undefined),
   stop: jest.fn().mockResolvedValue(undefined),
   start: jest.fn().mockResolvedValue(undefined),
+  persistLifecycleRuntimeAddress: jest.fn().mockResolvedValue(undefined),
 };
 jest.mock("../containerManager", () => mockContainer);
 
@@ -45,6 +46,7 @@ const OPENCLAW_AGENT = { id: "a1", name: "Op", user_id: "u1", runtime_family: "o
 beforeEach(() => {
   jest.clearAllMocks();
   mockDb.query.mockResolvedValue({ rows: [OPENCLAW_AGENT] });
+  mockContainer.persistLifecycleRuntimeAddress.mockResolvedValue(undefined);
 });
 
 it("delivers a prompt to an OpenClaw agent via rpcCall and records the run", async () => {
@@ -79,6 +81,23 @@ it.each([
   expect(out.ok).toBe(true);
   expect(mockContainer[fn]).toHaveBeenCalledWith(OPENCLAW_AGENT);
 });
+
+it.each(["start", "restart"])(
+  "persists a refreshed runtime address after scheduled %s",
+  async (action) => {
+    const lifecycleResult = { host: "10.60.70.81", runtimeHost: "10.60.70.81" };
+    mockContainer[action].mockResolvedValueOnce(lifecycleResult);
+
+    const out = await runScheduledAction({ scheduleId: "s1", agentId: "a1", actionType: action });
+
+    expect(out.ok).toBe(true);
+    expect(mockContainer.persistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      OPENCLAW_AGENT,
+      lifecycleResult,
+    );
+  },
+);
 
 it("redeploy enqueues a deployment job", async () => {
   await runScheduledAction({ scheduleId: "s1", agentId: "a1", actionType: "redeploy" });

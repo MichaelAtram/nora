@@ -46,6 +46,16 @@ $LEGACY_HEALTHCHECK_INTERVAL_SECONDS = 3
 $MAX_HEALTHCHECK_WINDOW_SECONDS = 3900
 $DEFAULT_HEALTHCHECK_WINDOW_SECONDS = ($DEFAULT_HEALTHCHECK_ATTEMPTS - 1) * $DEFAULT_HEALTHCHECK_INTERVAL_SECONDS
 $MIN_COMPOSE_VERSION = [version]"2.24.4"
+$DEFAULT_COMPOSE_SECRETS_DIR = ".secrets/compose"
+$DEFAULT_COMPOSE_PROJECT_NAME = "nora"
+$COMPOSE_SECRET_NAMES = @(
+    "JWT_SECRET",
+    "ENCRYPTION_KEY",
+    "NORA_BACKUP_ENCRYPTION_KEY",
+    "NORA_AGENT_HUB_API_KEY_HASH_SECRET",
+    "NORA_API_KEY_HASH_SECRET",
+    "DB_PASSWORD"
+)
 
 $selectedModes = @($Install.IsPresent, $Update.IsPresent, $CleanReinstall.IsPresent) | Where-Object { $_ }
 if ($selectedModes.Count -gt 1) {
@@ -321,20 +331,20 @@ function Resolve-CurrentReleaseVersion {
         return ""
     }
 
-    $exactTag = git describe --tags --exact-match 2>$null | Select-Object -First 1
-    if ($LASTEXITCODE -eq 0 -and $exactTag) {
-        return $exactTag.Trim()
-    }
-
-    $latestTag = git describe --tags --abbrev=0 2>$null | Select-Object -First 1
-    if ($LASTEXITCODE -ne 0 -or -not $latestTag) {
+    $productVersionPattern = '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+    $tagsAtHead = @(git tag --points-at HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0) {
         return ""
     }
 
-    $latestTag = $latestTag.Trim()
-    $null = git merge-base --is-ancestor $latestTag HEAD 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        return $latestTag
+    $productTags = @(
+        $tagsAtHead |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match $productVersionPattern } |
+            Sort-Object { [version]$_.Substring(1) }
+    )
+    if ($productTags.Count -gt 0) {
+        return $productTags[-1]
     }
 
     return ""
@@ -537,20 +547,155 @@ function Ensure-BackupEncryptionKeyEnv {
     Write-Ok "NORA_BACKUP_ENCRYPTION_KEY generated (64-char hex)"
 }
 
+function Protect-ComposeSecretsDirectory {
+    param([string]$SecretsDirectory)
+
+    if (-not $SecretsDirectory -or $SecretsDirectory -in @("/", ".", "..", "./", "../")) {
+        throw "NORA_COMPOSE_SECRETS_DIR must point to a dedicated non-root directory."
+    }
+    $candidatePath = if ([System.IO.Path]::IsPathRooted($SecretsDirectory)) {
+        [System.IO.Path]::GetFullPath($SecretsDirectory)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $SecretsDirectory))
+    }
+    $currentPath = [System.IO.Path]::GetFullPath((Get-Location).Path)
+    $rootPath = [System.IO.Path]::GetPathRoot($candidatePath)
+    if ($candidatePath -eq $currentPath -or $candidatePath -eq $rootPath) {
+        throw "NORA_COMPOSE_SECRETS_DIR must not be the filesystem or repository root: $candidatePath"
+    }
+    $segments = $SecretsDirectory -split '[\\/]'
+    if ($segments | Where-Object { $_ -in @(".", "..") }) {
+        throw "NORA_COMPOSE_SECRETS_DIR must not contain '.' or '..' path segments."
+    }
+
+    $pathProbe = $candidatePath
+    while ($pathProbe) {
+        if (Test-Path -LiteralPath $pathProbe) {
+            $probeItem = Get-Item -LiteralPath $pathProbe -Force
+            if (($probeItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Refusing NORA_COMPOSE_SECRETS_DIR with symlinked path component: $pathProbe"
+            }
+        }
+        $parent = [System.IO.Directory]::GetParent($pathProbe)
+        if (-not $parent) { break }
+        $pathProbe = $parent.FullName
+    }
+
+    if (Test-Path -LiteralPath $candidatePath) {
+        $existingItem = Get-Item -LiteralPath $candidatePath -Force
+        if (-not $existingItem.PSIsContainer) {
+            throw "NORA_COMPOSE_SECRETS_DIR is not a directory: $candidatePath"
+        }
+        $unexpectedEntry = Get-ChildItem -LiteralPath $candidatePath -Force | Where-Object {
+            $_.Name -notin $COMPOSE_SECRET_NAMES
+        } | Select-Object -First 1
+        if ($unexpectedEntry) {
+            throw "Refusing non-dedicated NORA_COMPOSE_SECRETS_DIR; unexpected entry: $($unexpectedEntry.FullName)"
+        }
+    }
+    New-Item -ItemType Directory -Path $candidatePath -Force | Out-Null
+    $resolvedPath = (Resolve-Path -LiteralPath $candidatePath).Path
+
+    if ($IsWindows) {
+        $icacls = Get-Command icacls.exe -ErrorAction SilentlyContinue
+        if (-not $icacls) {
+            throw "Cannot secure $SecretsDirectory because icacls.exe is unavailable."
+        }
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $arguments = @(
+            $resolvedPath,
+            "/inheritance:r",
+            "/grant:r",
+            "${identity}:(OI)(CI)(F)",
+            "*S-1-5-18:(OI)(CI)(F)",
+            "*S-1-5-32-544:(OI)(CI)(F)",
+            "/remove:g",
+            "*S-1-1-0",
+            "*S-1-5-32-545"
+        )
+        & $icacls.Source @arguments *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to restrict the Windows ACL on $SecretsDirectory."
+        }
+        return
+    }
+
+    $chmod = Get-Command chmod -ErrorAction SilentlyContinue
+    if (-not $chmod) { throw "Cannot secure $SecretsDirectory because chmod is unavailable." }
+    & $chmod.Source 700 $resolvedPath
+    if ($LASTEXITCODE -ne 0) { throw "Failed to set mode 0700 on $SecretsDirectory." }
+
+    $mode = (& stat -c '%a' $resolvedPath 2>$null)
+    if ($LASTEXITCODE -ne 0) { $mode = (& stat -f '%Lp' $resolvedPath 2>$null) }
+    if ($LASTEXITCODE -ne 0 -or "$mode".Trim() -ne "700") {
+        throw "Refusing to continue because $SecretsDirectory is not mode 0700."
+    }
+}
+
+function Write-ComposeSecretFiles {
+    param([string]$EnvPath)
+
+    $secretsDirectory = Read-EnvValue -EnvPath $EnvPath -Name "NORA_COMPOSE_SECRETS_DIR" -Default $DEFAULT_COMPOSE_SECRETS_DIR
+    Protect-ComposeSecretsDirectory -SecretsDirectory $secretsDirectory
+    foreach ($secretName in $COMPOSE_SECRET_NAMES) {
+        $value = Read-EnvValue -EnvPath $EnvPath -Name $secretName -Default ""
+        if (-not $value) {
+            throw "Cannot materialize Compose secrets because $secretName is empty in $EnvPath."
+        }
+        $target = Join-Path $secretsDirectory $secretName
+        $temporary = Join-Path $secretsDirectory (".$secretName." + [guid]::NewGuid().ToString("N"))
+        try {
+            [System.IO.File]::WriteAllText($temporary, "$value`n", [System.Text.UTF8Encoding]::new($false))
+            if (-not $IsWindows) {
+                & chmod 444 $temporary
+                if ($LASTEXITCODE -ne 0) { throw "Failed to set mode 0444 on $temporary." }
+            }
+            Move-Item -LiteralPath $temporary -Destination $target -Force
+            if ($IsWindows) {
+                Protect-EnvFile -EnvPath $target
+            } else {
+                $mode = (& stat -c '%a' $target 2>$null)
+                if ($LASTEXITCODE -ne 0) { $mode = (& stat -f '%Lp' $target 2>$null) }
+                if ($LASTEXITCODE -ne 0 -or "$mode".Trim() -ne "444") {
+                    throw "Refusing to continue because $target is not mode 0444."
+                }
+            }
+        } finally {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Set-EnvValue -EnvPath $EnvPath -Name "NORA_COMPOSE_SECRETS_DIR" -Value $secretsDirectory
+    Write-Ok "Compose secret files refreshed under $secretsDirectory (owner-only directory)"
+}
+
+function Get-ComposeProjectName {
+    param([string]$EnvPath = $ENV_FILE)
+
+    $projectName = Read-EnvValue -EnvPath $EnvPath -Name "COMPOSE_PROJECT_NAME" -Default $DEFAULT_COMPOSE_PROJECT_NAME
+    if ($projectName -notmatch '^[a-z0-9][a-z0-9_-]*$') {
+        throw "Invalid COMPOSE_PROJECT_NAME '$projectName'; use lowercase letters, digits, hyphens, or underscores."
+    }
+    return $projectName
+}
+
 function Remove-LocalAgentContainers {
+    param([string]$ProjectName)
+
+    $composeNetwork = "${ProjectName}_default"
     $containerIds = @()
     foreach ($label in @("openclaw.agent.id", "nora.agent.id")) {
-        $ids = docker ps -a --filter "label=$label" -q 2>$null
+        $ids = docker ps -a --filter "label=$label" --filter "network=$composeNetwork" -q 2>$null
         if ($ids) { $containerIds += $ids }
     }
 
     $containerIds = $containerIds | Where-Object { $_ } | Sort-Object -Unique
     if (-not $containerIds) {
-        Write-Info "No local Nora agent containers found."
+        Write-Info "No local Nora agent containers found on $composeNetwork."
         return
     }
 
-    Write-Info "Removing local Nora agent containers..."
+    Write-Info "Removing local Nora agent containers attached to $composeNetwork..."
     foreach ($containerId in $containerIds) {
         docker rm -f $containerId 2>$null | Out-Null
     }
@@ -558,11 +703,12 @@ function Remove-LocalAgentContainers {
 }
 
 function Invoke-CleanReinstallState {
+    $projectName = Get-ComposeProjectName -EnvPath $ENV_FILE
     Write-Warn "Clean reinstall selected: local compose containers and volumes will be removed."
     Write-Info "External Kubernetes, Proxmox, NemoClaw, and other VM resources will not be touched."
-    docker compose down -v --remove-orphans 2>$null
-    Remove-LocalAgentContainers
-    Write-Ok "Local Nora compose state cleaned"
+    Remove-LocalAgentContainers -ProjectName $projectName
+    docker compose -p $projectName down -v --remove-orphans 2>$null
+    Write-Ok "Local Nora compose state cleaned for project $projectName"
 }
 
 function Start-NoraComposeStack {
@@ -1220,6 +1366,7 @@ if ($SETUP_MODE -eq "update") {
     }
     Set-EnvValue -EnvPath $ENV_FILE -Name "COMPOSE_PATH_SEPARATOR" -Value ":"
     Set-EnvValue -EnvPath $ENV_FILE -Name "COMPOSE_FILE" -Value $composeFileValue
+    Set-EnvValue -EnvPath $ENV_FILE -Name "COMPOSE_PROJECT_NAME" -Value (Get-ComposeProjectName -EnvPath $ENV_FILE)
     Set-EnvValue -EnvPath $ENV_FILE -Name "NORA_UPGRADE_COMPOSE_FILES" -Value $composeFileValue
     Update-NoraHealthcheckDefaults -EnvPath $ENV_FILE
     Update-SignupProtectionEnv -EnvPath $ENV_FILE
@@ -1233,6 +1380,7 @@ if ($SETUP_MODE -eq "update") {
     Ensure-AgentHubHashSecretEnv -EnvPath $ENV_FILE
     Ensure-ApiKeyHashSecretEnv -EnvPath $ENV_FILE
     Ensure-BackupEncryptionKeyEnv -EnvPath $ENV_FILE
+    Write-ComposeSecretFiles -EnvPath $ENV_FILE
     Update-ReleaseTrackingEnv -EnvPath $ENV_FILE
     Assert-NoraHostPortsAvailable -Checks (Get-NoraHostPortChecks -EnvPath $ENV_FILE)
     Start-NoraComposeStack
@@ -1607,6 +1755,7 @@ $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 $NORA_CURRENT_VERSION = Resolve-CurrentReleaseVersion
 $NORA_CURRENT_COMMIT = Resolve-CurrentReleaseCommit
 $DOCKER_GID = Get-DockerSocketGid
+$COMPOSE_PROJECT_NAME = Get-ComposeProjectName -EnvPath $ENV_FILE
 $DOCKER_AGENT_BIND_IP = Read-EnvValue -EnvPath $ENV_FILE -Name "DOCKER_AGENT_BIND_IP" -Default "127.0.0.1"
 $DATABASE_URL = Read-EnvValue -EnvPath $ENV_FILE -Name "DATABASE_URL" -Default ""
 $DB_SSL_MODE = Read-EnvValue -EnvPath $ENV_FILE -Name "DB_SSL_MODE" -Default ""
@@ -1709,6 +1858,7 @@ REDIS_CONNECT_TIMEOUT_MS=$REDIS_CONNECT_TIMEOUT_MS
 PORT=4000
 BACKEND_API_PORT=$BACKEND_API_PORT
 DOCKER_GID=$DOCKER_GID
+COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME
 
 # ── Access / URL ─────────────────────────────────────────────
 NGINX_CONFIG_FILE=$NGINX_CONFIG_FILE
@@ -1805,6 +1955,7 @@ NORA_UPGRADE_REF=master
 NORA_UPGRADE_RUNNER_IMAGE=docker:29-cli
 NORA_UPGRADE_STATE_VOLUME=nora_upgrade_state
 NORA_ENV_FILE=.env
+NORA_COMPOSE_SECRETS_DIR=$DEFAULT_COMPOSE_SECRETS_DIR
 COMPOSE_PATH_SEPARATOR=:
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml
 NORA_UPGRADE_COMPOSE_FILES=docker-compose.yml:docker-compose.override.yml
@@ -1877,6 +2028,7 @@ KEY_STORAGE=database
 $envContent | Out-File -FilePath $ENV_FILE -Encoding utf8NoBOM
 
 Protect-EnvFile -EnvPath $ENV_FILE
+Write-ComposeSecretFiles -EnvPath $ENV_FILE
 Write-Ok ".env created successfully"
 $env:COMPOSE_PATH_SEPARATOR = ":"
 $env:COMPOSE_FILE = "docker-compose.yml:docker-compose.override.yml"

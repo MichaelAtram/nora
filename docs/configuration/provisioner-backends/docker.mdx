@@ -48,7 +48,7 @@ Check that Docker is enabled:
 curl -fsS http://localhost:8080/api/config/platform
 ```
 
-The response should include `docker` in `enabledBackends` or `enabledDeployTargets`.
+The response should include `docker` in `enabledDeployTargets`. The one-click zero-key path additionally requires `capabilities.localDockerDemo.enabled` to be `true`, which confirms the exact `openclaw` + `docker` + `standard` tuple is enabled; the activation endpoint still performs a live Docker-daemon check before queueing work.
 
 ## When to use Docker
 

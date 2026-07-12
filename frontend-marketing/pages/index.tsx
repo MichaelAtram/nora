@@ -21,6 +21,7 @@ import { useEffect, useState } from "react";
 import LanguageSwitcher from "../components/LanguageSwitcher";
 import SeoHead from "../components/SeoHead";
 import { trackEvent } from "../lib/analytics";
+import { useI18n } from "../lib/i18n";
 
 const OSS_REPO_URL = "https://github.com/solomon2773/nora";
 const STAR_URL = OSS_REPO_URL;
@@ -133,6 +134,9 @@ const TRUST_SURFACES = [
 
 export default function Home() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const { t } = useI18n();
+  const localizedSeoTitle = t(SEO_TITLE);
+  const localizedSeoDescription = t(SEO_DESCRIPTION);
 
   useEffect(() => {
     if (!mobileMenuOpen) return undefined;
@@ -146,11 +150,14 @@ export default function Home() {
   return (
     <>
       <SeoHead
-        title={SEO_TITLE}
-        description={SEO_DESCRIPTION}
+        title={localizedSeoTitle}
+        description={localizedSeoDescription}
         path="/"
-        imageAlt="Nora operator dashboard for OpenClaw and Hermes fleets"
-        structuredData={HOMEPAGE_STRUCTURED_DATA}
+        imageAlt={t("Nora operator dashboard for OpenClaw and Hermes fleets")}
+        structuredData={{
+          ...HOMEPAGE_STRUCTURED_DATA,
+          description: localizedSeoDescription,
+        }}
       />
 
       <div className="site-shell min-h-screen text-brand-ink">
@@ -162,7 +169,7 @@ export default function Home() {
                 <div className="text-sm font-black uppercase tracking-[0.28em] text-brand-ink">
                   Nora
                 </div>
-                <div className="text-xs text-slate-600">Deploy intelligence anywhere.</div>
+                <div className="text-xs text-slate-600">{t("Deploy intelligence anywhere.")}</div>
               </div>
             </Link>
 
@@ -171,10 +178,10 @@ export default function Home() {
               className="hidden items-center gap-5 text-sm font-semibold text-slate-600 lg:flex"
             >
               <a href="#platform" className="transition-colors hover:text-brand-ink">
-                Platform
+                {t("Platform")}
               </a>
               <a href="#workflow" className="transition-colors hover:text-brand-ink">
-                Workflow
+                {t("Workflow")}
               </a>
               <a
                 href={DOCS_URL}
@@ -182,7 +189,7 @@ export default function Home() {
                 rel="noopener noreferrer"
                 className="transition-colors hover:text-brand-ink"
               >
-                Docs
+                {t("Docs")}
               </a>
               <a
                 href={CONTRIBUTING_URL}
@@ -190,7 +197,7 @@ export default function Home() {
                 rel="noopener noreferrer"
                 className="transition-colors hover:text-brand-ink"
               >
-                Contribute
+                {t("Contribute")}
               </a>
             </nav>
 
@@ -202,19 +209,19 @@ export default function Home() {
                 rel="noopener noreferrer"
                 className="link-chip bg-transparent"
               >
-                <Star size={15} /> Star
+                <Star size={15} /> {t("Star")}
               </a>
               <Link
                 href="/login"
                 className="px-2 py-2 text-sm font-bold text-brand-ink transition-colors hover:text-slate-600"
               >
-                Log In
+                {t("Log In")}
               </Link>
               <Link
                 href={DEMO_SIGNUP_PATH}
                 className="rounded-full bg-brand-gold px-4 py-2 text-sm font-black text-brand-ink shadow-lg shadow-brand-gold/25 transition-transform hover:-translate-y-0.5"
               >
-                Try Demo
+                {t("Try Demo")}
               </Link>
             </div>
 
@@ -242,10 +249,10 @@ export default function Home() {
             >
               <div className="flex flex-col gap-4">
                 <a href="#platform" onClick={() => setMobileMenuOpen(false)}>
-                  Platform
+                  {t("Platform")}
                 </a>
                 <a href="#workflow" onClick={() => setMobileMenuOpen(false)}>
-                  Workflow
+                  {t("Workflow")}
                 </a>
                 <a
                   href={DOCS_URL}
@@ -253,7 +260,7 @@ export default function Home() {
                   rel="noopener noreferrer"
                   onClick={() => setMobileMenuOpen(false)}
                 >
-                  Docs
+                  {t("Docs")}
                 </a>
                 <a
                   href={CONTRIBUTING_URL}
@@ -261,7 +268,7 @@ export default function Home() {
                   rel="noopener noreferrer"
                   onClick={() => setMobileMenuOpen(false)}
                 >
-                  Contribute
+                  {t("Contribute")}
                 </a>
                 <a
                   href={COMMUNITY_URL}
@@ -269,15 +276,15 @@ export default function Home() {
                   rel="noopener noreferrer"
                   onClick={() => setMobileMenuOpen(false)}
                 >
-                  Community
+                  {t("Community")}
                 </a>
                 <div className="soft-rule" />
                 <LanguageSwitcher className="w-full justify-between" />
                 <Link href={DEMO_SIGNUP_PATH} onClick={() => setMobileMenuOpen(false)}>
-                  Try the zero-key demo
+                  {t("Try the zero-key demo")}
                 </Link>
                 <Link href="/login" onClick={() => setMobileMenuOpen(false)}>
-                  Log In
+                  {t("Log In")}
                 </Link>
                 <a
                   href={STAR_URL}
@@ -285,7 +292,7 @@ export default function Home() {
                   rel="noopener noreferrer"
                   onClick={() => setMobileMenuOpen(false)}
                 >
-                  Star Nora on GitHub
+                  {t("Star Nora on GitHub")}
                 </a>
               </div>
             </nav>
@@ -297,17 +304,17 @@ export default function Home() {
             <div className="max-w-2xl">
               <div className="eyebrow mb-6">
                 <Boxes size={14} />
-                Apache-2.0 control plane for agent runtimes
+                {t("Apache-2.0 control plane for agent runtimes")}
               </div>
 
               <h1 className="max-w-4xl text-5xl font-black leading-[0.95] text-brand-ink sm:text-6xl lg:text-7xl">
-                Run OpenClaw and Hermes on infrastructure you control.
+                {t("Run OpenClaw and Hermes on infrastructure you control.")}
               </h1>
 
               <p className="mt-6 max-w-xl text-base leading-7 text-slate-700 sm:text-lg">
-                Nora gives operators one place to deploy, observe, and control agent runtimes on GA
-                Docker and Kubernetes targets. Start with a zero-key demo, then connect providers,
-                inspect logs and metrics, open terminals, and operate the fleet from one dashboard.
+                {t(
+                  "Nora gives operators one place to deploy, observe, and control agent runtimes on GA Docker and Kubernetes targets. Start with a zero-key demo, then connect providers, inspect logs and metrics, open terminals, and operate the fleet from one dashboard.",
+                )}
               </p>
 
               <div className="mt-10 flex flex-col gap-3 sm:flex-row sm:flex-wrap">
@@ -316,7 +323,7 @@ export default function Home() {
                   onClick={() => trackEvent("Demo CTA", { location: "hero" })}
                   className="inline-flex items-center justify-center gap-2 rounded-full bg-brand-gold px-6 py-3 text-base font-black text-brand-ink shadow-lg shadow-brand-gold/25 transition-transform hover:-translate-y-0.5"
                 >
-                  Try the zero-key demo <ArrowRight size={18} />
+                  {t("Try the zero-key demo")} <ArrowRight size={18} />
                 </Link>
                 <a
                   href={STAR_URL}
@@ -325,7 +332,7 @@ export default function Home() {
                   onClick={() => trackEvent("GitHub", { location: "hero-cta" })}
                   className="inline-flex items-center justify-center gap-2 rounded-full border border-brand-cyan/40 bg-brand-cyan/20 px-6 py-3 text-base font-bold text-brand-ink transition-colors hover:bg-brand-cyan/30"
                 >
-                  <Star size={17} /> Star on GitHub
+                  <Star size={17} /> {t("Star on GitHub")}
                 </a>
                 <a
                   href={QUICKSTART_URL}
@@ -334,7 +341,7 @@ export default function Home() {
                   onClick={() => trackEvent("Self-host CTA", { location: "hero" })}
                   className="inline-flex items-center justify-center gap-2 rounded-full border border-brand-ink/10 bg-white/75 px-6 py-3 text-base font-bold text-brand-ink transition-colors hover:bg-brand-cyan/16"
                 >
-                  Self-host Nora <ArrowUpRight size={18} />
+                  {t("Self-host Nora")} <ArrowUpRight size={18} />
                 </a>
               </div>
 
@@ -343,7 +350,7 @@ export default function Home() {
                   <Scale size={14} /> Apache-2.0
                 </span>
                 <span className="inline-flex items-center gap-2 rounded-full border border-brand-cyan/35 bg-brand-cyan/16 px-3.5 py-1.5 text-sm font-bold text-brand-ink">
-                  Docker + Kubernetes GA
+                  {t("Docker + Kubernetes GA")}
                 </span>
                 <a
                   href={RELEASES_URL}
@@ -351,7 +358,7 @@ export default function Home() {
                   rel="noopener noreferrer"
                   className="inline-flex items-center gap-2 rounded-full border border-brand-ink/10 bg-white/70 px-3.5 py-1.5 text-sm font-bold text-slate-700 transition-colors hover:text-brand-ink"
                 >
-                  Latest release <ArrowUpRight size={14} />
+                  {t("Latest release")} <ArrowUpRight size={14} />
                 </a>
               </div>
 
@@ -362,7 +369,7 @@ export default function Home() {
                   rel="noopener noreferrer"
                   className="hover:text-brand-ink"
                 >
-                  Read the docs
+                  {t("Read the docs")}
                 </a>
                 <a
                   href={CONTRIBUTING_URL}
@@ -370,7 +377,7 @@ export default function Home() {
                   rel="noopener noreferrer"
                   className="hover:text-brand-ink"
                 >
-                  Contribute
+                  {t("Contribute")}
                 </a>
                 <a
                   href={COMMUNITY_URL}
@@ -378,7 +385,7 @@ export default function Home() {
                   rel="noopener noreferrer"
                   className="hover:text-brand-ink"
                 >
-                  Join the community
+                  {t("Join the community")}
                 </a>
               </div>
             </div>
@@ -391,7 +398,7 @@ export default function Home() {
                   <div>
                     <div className="eyebrow border-[#8ae6ff]/20 bg-[#8ae6ff]/8 text-[#eef4fb]">
                       <Zap size={14} />
-                      Real product capture
+                      {t("Real product capture")}
                     </div>
                   </div>
                   <span className="text-xs font-bold text-slate-400">/app/dashboard</span>
@@ -399,7 +406,7 @@ export default function Home() {
                 <div className="overflow-hidden rounded-[26px] border border-white/10 bg-[#eef4fb] shadow-2xl shadow-black/30">
                   <Image
                     src="/operator-dashboard.png"
-                    alt="Nora operator dashboard showing active agents and recent deployments"
+                    alt={t("Nora operator dashboard showing active agents and recent deployments")}
                     width={1512}
                     height={1080}
                     priority
@@ -409,14 +416,14 @@ export default function Home() {
                   />
                 </div>
                 <div className="flex flex-col gap-3 px-2 pb-1 pt-4 text-sm text-slate-300 sm:flex-row sm:items-center sm:justify-between sm:px-3">
-                  <p>Seeded local capture: fleet health, queues, and deployment status.</p>
+                  <p>{t("Seeded local capture: fleet health, queues, and deployment status.")}</p>
                   <a
                     href="/walkthrough.mp4"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="inline-flex shrink-0 items-center gap-2 font-bold text-brand-cyan hover:text-white"
                   >
-                    Watch 37s walkthrough <ArrowUpRight size={15} />
+                    {t("Watch 37s walkthrough")} <ArrowUpRight size={15} />
                   </a>
                 </div>
               </div>
@@ -432,9 +439,9 @@ export default function Home() {
                     className={`${index !== TRUST_ITEMS.length - 1 ? "xl:border-r xl:border-white/10 xl:pr-6" : ""}`}
                   >
                     <div className="text-xs font-black uppercase tracking-[0.28em] text-[#f2d7a1]">
-                      {item.label}
+                      {t(item.label)}
                     </div>
-                    <p className="mt-3 text-sm leading-7 text-slate-300">{item.text}</p>
+                    <p className="mt-3 text-sm leading-7 text-slate-300">{t(item.text)}</p>
                   </div>
                 ))}
               </div>

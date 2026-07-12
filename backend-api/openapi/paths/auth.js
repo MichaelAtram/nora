@@ -22,6 +22,25 @@ const credentialsBody = {
   },
 };
 
+const signupBody = {
+  required: true,
+  content: {
+    "application/json": {
+      schema: {
+        ...credentialsBody.content["application/json"].schema,
+        properties: {
+          ...credentialsBody.content["application/json"].schema.properties,
+          botProtectionToken: {
+            type: "string",
+            description:
+              "Turnstile or reCAPTCHA token when signup bot protection is enabled by the operator.",
+          },
+        },
+      },
+    },
+  },
+};
+
 module.exports = {
   "/auth/bootstrap-status": {
     get: {
@@ -32,12 +51,7 @@ module.exports = {
       security: [],
       responses: ok("Status", {
         type: "object",
-        required: [
-          "needsFirstAdmin",
-          "oauthLoginEnabled",
-          "platformMode",
-          "signupBotProtection",
-        ],
+        required: ["needsFirstAdmin", "oauthLoginEnabled", "platformMode", "signupBotProtection"],
         properties: {
           needsFirstAdmin: { type: "boolean" },
           oauthLoginEnabled: { type: "boolean" },
@@ -67,7 +81,7 @@ module.exports = {
       description:
         "The first registered user becomes the platform admin. Rate-limited; optional bot-protection token when the operator configured Turnstile/reCAPTCHA.",
       security: [],
-      requestBody: credentialsBody,
+      requestBody: signupBody,
       responses: ok("Created user"),
     },
   },

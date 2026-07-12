@@ -992,7 +992,8 @@ print(json.dumps({
 }
 
 async function restartHermesRuntime(agent) {
-  await containerManager.restart(agent);
+  const lifecycleResult = await containerManager.restart(agent);
+  await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
   const readiness = await waitForAgentReadiness(
     {
       host: agent.host,

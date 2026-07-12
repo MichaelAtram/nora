@@ -40,36 +40,72 @@ export function parseAuthBootstrapStatus(value: unknown): AuthBootstrapStatus {
   }
 
   const rawProtection = protection as Record<string, unknown>;
+  if (typeof rawProtection.enabled !== "boolean") {
+    throw new Error("Signup protection enabled metadata is invalid");
+  }
+  if (typeof rawProtection.configured !== "boolean") {
+    throw new Error("Signup protection configured metadata is invalid");
+  }
   const rawProvider = rawProtection.provider;
-  const provider =
-    rawProvider === "none" || rawProvider === "turnstile" || rawProvider === "recaptcha"
-      ? rawProvider
+  if (
+    rawProvider !== null &&
+    rawProvider !== "none" &&
+    rawProvider !== "turnstile" &&
+    rawProvider !== "recaptcha"
+  ) {
+    throw new Error("Signup protection provider metadata is invalid");
+  }
+  const provider = rawProvider as BotProtectionProvider | null;
+
+  const rawSiteKey = rawProtection.siteKey;
+  if (rawSiteKey !== null && typeof rawSiteKey !== "string") {
+    throw new Error("Signup protection site-key metadata is invalid");
+  }
+  const siteKey = typeof rawSiteKey === "string" && rawSiteKey.trim() ? rawSiteKey.trim() : null;
+
+  const rawConfigurationError = rawProtection.configurationError;
+  if (rawConfigurationError !== null && typeof rawConfigurationError !== "string") {
+    throw new Error("Signup protection error metadata is invalid");
+  }
+  const configurationError =
+    typeof rawConfigurationError === "string" && rawConfigurationError.trim()
+      ? rawConfigurationError.trim()
       : null;
+
+  const enabled = rawProtection.enabled;
+  const configured = rawProtection.configured;
+  if (!enabled && (provider !== "none" || !configured || siteKey || configurationError)) {
+    throw new Error("Disabled signup protection metadata is inconsistent");
+  }
+  if (enabled && provider === "none") {
+    throw new Error("Enabled signup protection metadata is inconsistent");
+  }
+  if (
+    enabled &&
+    configured &&
+    ((provider !== "turnstile" && provider !== "recaptcha") || !siteKey || configurationError)
+  ) {
+    throw new Error("Configured signup protection metadata is incomplete");
+  }
+  if (enabled && !configured && !configurationError) {
+    throw new Error("Misconfigured signup protection metadata is missing an error");
+  }
 
   return {
     needsFirstAdmin: raw.needsFirstAdmin,
     oauthLoginEnabled: raw.oauthLoginEnabled,
     platformMode: parsePlatformMode(raw.platformMode),
     signupBotProtection: {
-      enabled: rawProtection.enabled === true,
+      enabled,
       provider,
-      siteKey:
-        typeof rawProtection.siteKey === "string" && rawProtection.siteKey.trim()
-          ? rawProtection.siteKey.trim()
-          : null,
-      configured: rawProtection.configured === true,
-      configurationError:
-        typeof rawProtection.configurationError === "string" &&
-        rawProtection.configurationError.trim()
-          ? rawProtection.configurationError.trim()
-          : null,
+      siteKey,
+      configured,
+      configurationError,
     },
   };
 }
 
-export async function fetchAuthBootstrapStatus(
-  signal?: AbortSignal,
-): Promise<AuthBootstrapStatus> {
+export async function fetchAuthBootstrapStatus(signal?: AbortSignal): Promise<AuthBootstrapStatus> {
   const response = await fetch("/api/auth/bootstrap-status", {
     headers: { Accept: "application/json" },
     signal,

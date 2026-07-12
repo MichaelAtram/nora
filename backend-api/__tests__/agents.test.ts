@@ -18,6 +18,7 @@ const mockDockerPing = jest.fn((callback) => callback(null));
 const mockDockerInspect = jest.fn();
 const mockStats = jest.fn();
 const mockSyncAuthToUserAgents = jest.fn().mockResolvedValue([]);
+const mockPersistLifecycleRuntimeAddress = jest.fn();
 const mockRunContainerCommand = jest.fn();
 const mockListHermesChannels = jest.fn();
 const mockSaveHermesChannel = jest.fn();
@@ -102,6 +103,10 @@ jest.mock("../containerManager", () => ({
   stop: jest.fn().mockResolvedValue({}),
   restart: jest.fn().mockResolvedValue({}),
   destroy: jest.fn().mockResolvedValue({}),
+  persistLifecycleRuntimeAddress: mockPersistLifecycleRuntimeAddress,
+  isIgnorableStopError: jest.fn((error) =>
+    /already stopped|not running/i.test(String(error?.message || "")),
+  ),
   canMutate: jest.fn(
     (agent) =>
       Boolean(agent?.container_id) ||
@@ -363,6 +368,13 @@ beforeEach(() => {
   mockDockerPing.mockReset().mockImplementation((callback) => callback(null));
   mockDockerInspect.mockReset();
   mockSyncAuthToUserAgents.mockReset().mockResolvedValue([]);
+  mockPersistLifecycleRuntimeAddress.mockReset().mockImplementation(async (_db, agent, result) => {
+    const host = typeof result?.host === "string" ? result.host.trim() : "";
+    const runtimeHost = typeof result?.runtimeHost === "string" ? result.runtimeHost.trim() : host;
+    if (host) agent.host = host;
+    if (runtimeHost) agent.runtime_host = runtimeHost;
+    return agent;
+  });
   mockRunContainerCommand.mockReset();
   mockListHermesChannels.mockReset().mockResolvedValue({
     channels: [],
@@ -1855,6 +1867,91 @@ describe("agent audit logging", () => {
           ownerEmail: "user@nora.test",
         }),
       }),
+    );
+  });
+});
+
+describe("agent lifecycle address persistence", () => {
+  it("persists a refreshed runtime address before start auth sync", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.start.mockResolvedValueOnce({
+      host: "10.20.30.41",
+      runtimeHost: "10.20.30.41",
+    });
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-address",
+            name: "Start Address Agent",
+            user_id: "user-1",
+            backend_type: "proxmox",
+            container_id: "201",
+            host: "10.20.30.10",
+            runtime_host: "10.20.30.10",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-address",
+            name: "Start Address Agent",
+            user_id: "user-1",
+            backend_type: "proxmox",
+            container_id: "201",
+            status: "running",
+            host: "10.20.30.41",
+            runtime_host: "10.20.30.41",
+          },
+        ],
+      });
+
+    const res = await auth(request(app).post("/agents/agent-start-address/start"));
+
+    expect(res.status).toBe(200);
+    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ id: "agent-start-address" }),
+      { host: "10.20.30.41", runtimeHost: "10.20.30.41" },
+    );
+    expect(res.body).toEqual(
+      expect.objectContaining({ host: "10.20.30.41", runtime_host: "10.20.30.41" }),
+    );
+    expect(mockPersistLifecycleRuntimeAddress.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSyncAuthToUserAgents.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("persists a refreshed runtime address after restart", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.restart.mockResolvedValueOnce({
+      host: "10.20.30.42",
+      runtimeHost: "10.20.30.42",
+    });
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-restart-address",
+            name: "Restart Address Agent",
+            user_id: "user-1",
+            backend_type: "proxmox",
+            container_id: "202",
+            host: "10.20.30.11",
+            runtime_host: "10.20.30.11",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(request(app).post("/agents/agent-restart-address/restart"));
+
+    expect(res.status).toBe(200);
+    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({ id: "agent-restart-address" }),
+      { host: "10.20.30.42", runtimeHost: "10.20.30.42" },
     );
   });
 });
@@ -4607,6 +4704,57 @@ describe("POST /agents/:id/stop", () => {
     expect(res.body.error).toMatch(/Kubernetes patch failed/i);
     expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps a Proxmox agent running when shutdown fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.stop.mockRejectedValueOnce(new Error("Proxmox shutdown task failed"));
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-proxmox-stop-fail",
+          name: "Proxmox Stop Fail",
+          status: "running",
+          user_id: "user-1",
+          runtime_family: "openclaw",
+          backend_type: "proxmox",
+          deploy_target: "proxmox",
+          execution_target_id: "proxmox",
+          sandbox_profile: "standard",
+          container_id: "301",
+        },
+      ],
+    });
+
+    const res = await auth(request(app).post("/agents/a-proxmox-stop-fail/stop"));
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/Proxmox shutdown task failed/i);
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks an already stopped runtime as stopped idempotently", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.stop.mockRejectedValueOnce(new Error("Container is not running"));
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-already-stopped",
+            name: "Already Stopped",
+            status: "running",
+            user_id: "user-1",
+            backend_type: "docker",
+            container_id: "container-stopped",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [{ id: "a-already-stopped", status: "stopped" }] });
+
+    const res = await auth(request(app).post("/agents/a-already-stopped/stop"));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expect.objectContaining({ status: "stopped" }));
+  });
 });
 
 describe("POST /agents/:id/redeploy", () => {
@@ -4990,6 +5138,32 @@ describe("POST /agents/:id/delete", () => {
 
     expect(res.status).toBe(500);
     expect(res.body.error).toMatch(/Kubernetes API unreachable/i);
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a Proxmox agent record when runtime cleanup fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.destroy.mockRejectedValueOnce(new Error("Proxmox destroy task failed"));
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-proxmox-delete-fail",
+          name: "Proxmox Delete Fail",
+          user_id: "user-1",
+          runtime_family: "openclaw",
+          backend_type: "proxmox",
+          deploy_target: "proxmox",
+          execution_target_id: "proxmox",
+          sandbox_profile: "standard",
+          container_id: "302",
+        },
+      ],
+    });
+
+    const res = await auth(request(app).delete("/agents/a-proxmox-delete-fail"));
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/Proxmox destroy task failed/i);
     expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
 

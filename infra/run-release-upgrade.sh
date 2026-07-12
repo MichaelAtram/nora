@@ -303,6 +303,11 @@ run_upgrade() {
     bash setup.sh --update
     compose_files="$(resolve_compose_files_from_env "$env_file")"
   else
+    if [ ! -f scripts/materialize-compose-secrets.sh ]; then
+      fail_step 25 "Missing scripts/materialize-compose-secrets.sh; cannot prepare read-only Compose secrets"
+      return $?
+    fi
+    bash scripts/materialize-compose-secrets.sh "$env_file"
     echo "Rebuilding and restarting Nora services..."
   fi
 

@@ -159,4 +159,25 @@ describe("OpenAPI document", () => {
     expect(doc.paths["/agent-hub/catalog"].get.security).toEqual([{ agentHubApiKey: [] }]);
     expect(doc.paths["/agent-hub/submissions"].post.security).toEqual([{ agentHubApiKey: [] }]);
   });
+
+  it("documents runtime auth bootstrap fields and the optional signup challenge token", () => {
+    const bootstrapSchema =
+      doc.paths["/auth/bootstrap-status"].get.responses[200].content["application/json"].schema;
+    expect(bootstrapSchema.required).toEqual(
+      expect.arrayContaining([
+        "needsFirstAdmin",
+        "oauthLoginEnabled",
+        "platformMode",
+        "signupBotProtection",
+      ]),
+    );
+    expect(bootstrapSchema.properties.platformMode.enum).toEqual(["selfhosted", "paas"]);
+
+    const signupSchema =
+      doc.paths["/auth/signup"].post.requestBody.content["application/json"].schema;
+    expect(signupSchema.required).toEqual(["email", "password"]);
+    expect(signupSchema.properties.botProtectionToken).toEqual(
+      expect.objectContaining({ type: "string" }),
+    );
+  });
 });

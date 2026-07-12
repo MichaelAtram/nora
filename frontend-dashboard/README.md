@@ -12,7 +12,7 @@ Runs on `/app/*` behind nginx. Users manage their AI agents, configure LLM provi
 | --------------------------- | ------------------------------------------------------------------------------------- |
 | `/app`                      | Redirects to `/app/agents`                                                            |
 | `/app/dashboard`            | Dashboard home: fleet roll-up, quick stats, and activation checklist                  |
-| `/app/getting-started`      | First-run activation checklist; zero-key demo when local Docker is enabled             |
+| `/app/getting-started`      | First-run activation checklist; zero-key demo when local Docker is enabled            |
 | `/app/agents`               | Agent fleet list with status indicators                                               |
 | `/app/agents/[id]`          | Agent detail with runtime-filtered tab interface (up to 10 tabs)                      |
 | `/app/agents/[id]/versions` | Agent deploy-draft version history                                                    |

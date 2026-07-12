@@ -629,4 +629,58 @@ describe("containerManager NemoClaw routing", () => {
     expect(logs).toBe("k8s-log-stream");
     expect(exec).toEqual({ exec: "k8s-exec", stream: "k8s-stream" });
   });
+
+  it("persists non-empty lifecycle runtime addresses without clearing existing fields", async () => {
+    const containerManager = require("../containerManager");
+    const queryable = {
+      query: jest.fn().mockResolvedValue({
+        rows: [{ host: "10.120.130.81", runtime_host: "10.120.130.81" }],
+      }),
+    };
+    const agent = {
+      id: "agent-lifecycle-address",
+      host: "10.120.130.10",
+      runtime_host: "10.120.130.10",
+    };
+
+    const updated = await containerManager.persistLifecycleRuntimeAddress(queryable, agent, {
+      host: " 10.120.130.81 ",
+      runtimeHost: "10.120.130.81",
+    });
+
+    expect(queryable.query).toHaveBeenCalledWith(expect.stringContaining("COALESCE($2, host)"), [
+      "agent-lifecycle-address",
+      "10.120.130.81",
+      "10.120.130.81",
+    ]);
+    expect(updated).toBe(agent);
+    expect(agent).toEqual(
+      expect.objectContaining({
+        host: "10.120.130.81",
+        runtime_host: "10.120.130.81",
+      }),
+    );
+  });
+
+  it("skips lifecycle address persistence when an adapter returns no address", async () => {
+    const containerManager = require("../containerManager");
+    const queryable = { query: jest.fn() };
+    const agent = { id: "agent-no-lifecycle-address", host: "10.0.0.1" };
+
+    await expect(
+      containerManager.persistLifecycleRuntimeAddress(queryable, agent, {}),
+    ).resolves.toBe(agent);
+    expect(queryable.query).not.toHaveBeenCalled();
+  });
+
+  it("recognizes only explicit idempotent stop errors", () => {
+    const containerManager = require("../containerManager");
+    expect(containerManager.isIgnorableStopError(new Error("Container is already stopped"))).toBe(
+      true,
+    );
+    expect(containerManager.isIgnorableStopError(new Error("runtime is not running"))).toBe(true);
+    expect(containerManager.isIgnorableStopError(new Error("Proxmox shutdown task failed"))).toBe(
+      false,
+    );
+  });
 });

@@ -105,6 +105,8 @@ const HELM_CI_VALUES = [
   "--set",
   "secrets.apiKeyHashSecret=ci-validate-dummy-hash-secret-0000000000",
   "--set",
+  "secrets.agentHubApiKeyHashSecret=ci-validate-dummy-agent-hub-hash-secret-0000",
+  "--set",
   "secrets.dbPassword=ci-validate-dummy-db-password",
 ];
 

@@ -82,17 +82,26 @@ jobs:
         run: |
           set -euo pipefail
           commit="$(git rev-parse HEAD)"
-          exact_tag="$(git tag --points-at HEAD | head -n 1 || true)"
+          product_version_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          product_tags=()
+          while IFS= read -r candidate_tag; do
+            if [[ "$candidate_tag" =~ $product_version_pattern ]]; then
+              product_tags+=("$candidate_tag")
+            fi
+          done < <(git tag --points-at HEAD)
+
+          exact_tag=""
+          if [ "${#product_tags[@]}" -gt 0 ]; then
+            exact_tag="$(printf '%s\n' "${product_tags[@]}" | sort -V | tail -n 1)"
+          fi
 
           version="${INPUT_VERSION:-}"
+          if [ -n "$version" ] && [[ ! "$version" =~ $product_version_pattern ]]; then
+            echo "::error::Version override must be an exact Nora product tag such as v1.16.0; got '$version'."
+            exit 1
+          fi
           if [ -z "$version" ] && [ -n "$exact_tag" ]; then
             version="$exact_tag"
-          fi
-          if [ -z "$version" ]; then
-            latest_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
-            if [ -n "$latest_tag" ] && git merge-base --is-ancestor "$latest_tag" HEAD; then
-              version="$latest_tag"
-            fi
           fi
           if [ -z "$version" ]; then
             version=""
@@ -184,6 +193,8 @@ jobs:
             "$TARGET_COMMIT" \
             "$NORA_GITHUB_REPO"
 
+          bash scripts/materialize-compose-secrets.sh "$DEPLOY_ENV_FILE"
+
           compose_args=(--env-file "$DEPLOY_ENV_FILE")
           IFS=':' read -r -a compose_files <<< "$DEPLOY_COMPOSE_FILES"
           for compose_file in "${compose_files[@]}"; do
@@ -197,22 +208,25 @@ jobs:
           docker compose "${compose_args[@]}" up -d --build
           docker compose "${compose_args[@]}" ps
 
-          echo "Waiting for backend-api health..."
-          for attempt in $(seq 1 30); do
+          health_attempts=221
+          health_interval_seconds=3
+          health_window_seconds=$(( (health_attempts - 1) * health_interval_seconds ))
+          echo "Waiting for backend-api health: ${health_attempts} attempts every ${health_interval_seconds}s (${health_window_seconds}s from first to final attempt)."
+          for attempt in $(seq 1 "$health_attempts"); do
             if docker compose "${compose_args[@]}" exec -T backend-api \
               node -e "require('http').get('http://localhost:4000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"; then
               echo "backend-api is healthy."
               break
             fi
 
-            if [ "$attempt" -eq 30 ]; then
-              echo "backend-api did not become healthy after deploy." >&2
+            if [ "$attempt" -eq "$health_attempts" ]; then
+              echo "backend-api did not become healthy after ${health_attempts} attempts every ${health_interval_seconds}s (${health_window_seconds}s first-to-final window)." >&2
               docker compose "${compose_args[@]}" ps >&2 || true
               docker compose "${compose_args[@]}" logs --tail=120 backend-api >&2 || true
               exit 1
             fi
 
-            sleep 3
+            sleep "$health_interval_seconds"
           done
           REMOTE
 

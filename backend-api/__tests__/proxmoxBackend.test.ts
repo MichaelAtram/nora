@@ -193,12 +193,14 @@ describe("ProxmoxBackend", () => {
       .mockResolvedValueOnce("UPID:create")
       .mockResolvedValueOnce("UPID:start");
     jest.spyOn(backend, "_waitForTask").mockResolvedValue(undefined);
+    jest.spyOn(backend, "_ownsCreatedLxc").mockResolvedValue(true);
     jest.spyOn(backend, "_waitForIp").mockResolvedValue("10.20.30.41");
     jest.spyOn(backend, "_bootstrapOpenClaw").mockResolvedValue({
       gatewayToken: "gateway-token",
       runtimePort: 9090,
       gatewayPort: 18789,
     });
+    const onRuntimeIdentity = jest.fn().mockResolvedValue(undefined);
 
     const result = await backend.create({
       id: "agent-1",
@@ -210,6 +212,7 @@ describe("ProxmoxBackend", () => {
       runtimeFamily: "openclaw",
       sandboxProfile: "standard",
       env: { AGENT_ID: "agent-1" },
+      onRuntimeIdentity,
     });
 
     expect(requestData.mock.calls[0]).toEqual([
@@ -221,6 +224,7 @@ describe("ProxmoxBackend", () => {
         ostemplate: "local:vztmpl/ubuntu-22.04-standard.tar.zst",
         unprivileged: 1,
         start: 0,
+        description: expect.stringMatching(/\nnora-owner:[a-f0-9]{32}$/),
       }),
       expect.any(Object),
     ]);
@@ -233,12 +237,29 @@ describe("ProxmoxBackend", () => {
         runtimePort: 9090,
       }),
     );
+    expect(onRuntimeIdentity).toHaveBeenCalledWith({
+      containerId: "101",
+      containerName: "promo-agent",
+    });
   });
 
   it("cleans up a partially created LXC and honors an already-aborted create", async () => {
     const backend = new ProxmoxBackend();
     jest.spyOn(backend, "_getNextVmid").mockResolvedValue("102");
-    jest.spyOn(backend, "_requestData").mockResolvedValue("UPID");
+    let description;
+    jest.spyOn(backend, "_requestData").mockImplementation(async (method, requestPath, payload) => {
+      if (method === "POST" && requestPath === "/nodes/pve-a/lxc") {
+        description = payload.description;
+        return "UPID:create";
+      }
+      if (method === "POST" && requestPath === "/nodes/pve-a/lxc/102/status/start") {
+        return "UPID:start";
+      }
+      if (method === "GET" && requestPath === "/nodes/pve-a/lxc/102/config") {
+        return { description };
+      }
+      throw new Error(`Unexpected Proxmox request: ${method} ${requestPath}`);
+    });
     jest.spyOn(backend, "_waitForTask").mockResolvedValue(undefined);
     jest.spyOn(backend, "_waitForIp").mockResolvedValue("10.20.30.42");
     jest.spyOn(backend, "_bootstrapOpenClaw").mockRejectedValue(new Error("bootstrap failed"));
@@ -261,6 +282,78 @@ describe("ProxmoxBackend", () => {
         abortSignal: controller.signal,
       }),
     ).rejects.toThrow("operator cancelled");
+  });
+
+  it("does not destroy an unrelated LXC when nextid races and the create POST loses", async () => {
+    const backend = new ProxmoxBackend();
+    jest.spyOn(backend, "_getNextVmid").mockResolvedValue("102");
+    const collision = Object.assign(new Error("VM 102 already exists"), { statusCode: 400 });
+    const requestData = jest
+      .spyOn(backend, "_requestData")
+      .mockImplementation(async (method, requestPath) => {
+        if (method === "POST" && requestPath === "/nodes/pve-a/lxc") throw collision;
+        if (method === "GET" && requestPath === "/nodes/pve-a/lxc/102/config") {
+          return { description: "Unrelated operator-managed LXC" };
+        }
+        throw new Error(`Unexpected Proxmox request: ${method} ${requestPath}`);
+      });
+    const destroy = jest.spyOn(backend, "destroy").mockResolvedValue(undefined);
+    const onRuntimeIdentity = jest.fn();
+
+    await expect(
+      backend.create({
+        id: "agent-collision",
+        image: "local:vztmpl/ubuntu-22.04-standard.tar.zst",
+        onRuntimeIdentity,
+      }),
+    ).rejects.toThrow("VM 102 already exists");
+
+    expect(requestData).toHaveBeenCalledWith("GET", "/nodes/pve-a/lxc/102/config", null, {});
+    expect(destroy).not.toHaveBeenCalled();
+    expect(onRuntimeIdentity).not.toHaveBeenCalled();
+  });
+
+  it("reports unresolved identity without deleting when cleanup ownership cannot be reverified", async () => {
+    const backend = new ProxmoxBackend();
+    jest.spyOn(backend, "_getNextVmid").mockResolvedValue("103");
+    let description;
+    let configReads = 0;
+    jest.spyOn(backend, "_requestData").mockImplementation(async (method, requestPath, payload) => {
+      if (method === "POST" && requestPath === "/nodes/pve-a/lxc") {
+        description = payload.description;
+        return "UPID:create";
+      }
+      if (method === "POST" && requestPath === "/nodes/pve-a/lxc/103/status/start") {
+        return "UPID:start";
+      }
+      if (method === "GET" && requestPath === "/nodes/pve-a/lxc/103/config") {
+        configReads += 1;
+        if (configReads === 1) return { description };
+        throw new Error("Proxmox API unavailable during cleanup verification");
+      }
+      throw new Error(`Unexpected Proxmox request: ${method} ${requestPath}`);
+    });
+    jest.spyOn(backend, "_waitForTask").mockResolvedValue(undefined);
+    jest.spyOn(backend, "_waitForIp").mockResolvedValue("10.20.30.43");
+    jest.spyOn(backend, "_bootstrapOpenClaw").mockRejectedValue(new Error("bootstrap failed"));
+    const destroy = jest.spyOn(backend, "destroy").mockResolvedValue(undefined);
+
+    await expect(
+      backend.create({
+        id: "agent-cleanup-uncertain",
+        image: "local:vztmpl/ubuntu-22.04-standard.tar.zst",
+      }),
+    ).rejects.toMatchObject({
+      code: "PROXMOX_RUNTIME_CLEANUP_FAILED",
+      containerId: "103",
+      runtimeIdentity: {
+        containerId: "103",
+        destroyAllowed: false,
+        persistIdentity: true,
+      },
+    });
+
+    expect(destroy).not.toHaveBeenCalled();
   });
 
   it("refuses to advertise NemoClaw when no enforced sandbox exists", async () => {

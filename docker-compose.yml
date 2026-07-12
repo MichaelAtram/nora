@@ -273,13 +273,17 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${DB_USER:-nora}
-      PGPASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set (run ./setup.sh or edit .env)}
+      PGPASSWORD: ""
+      PGPASSWORD_FILE: /run/secrets/DB_PASSWORD
       PGDATABASE: ${DB_NAME:-nora}
       AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     volumes:
       - backups:/backups
+    secrets:
+      - source: nora_db_password
+        target: DB_PASSWORD
     depends_on:
       postgres:
         condition: service_healthy
@@ -295,14 +299,14 @@ volumes:
 
 secrets:
   nora_jwt_secret:
-    environment: JWT_SECRET
+    file: ${NORA_COMPOSE_SECRETS_DIR:-.secrets/compose}/JWT_SECRET
   nora_encryption_key:
-    environment: ENCRYPTION_KEY
+    file: ${NORA_COMPOSE_SECRETS_DIR:-.secrets/compose}/ENCRYPTION_KEY
   nora_backup_encryption_key:
-    environment: NORA_BACKUP_ENCRYPTION_KEY
+    file: ${NORA_COMPOSE_SECRETS_DIR:-.secrets/compose}/NORA_BACKUP_ENCRYPTION_KEY
   nora_agent_hub_hash_secret:
-    environment: NORA_AGENT_HUB_API_KEY_HASH_SECRET
+    file: ${NORA_COMPOSE_SECRETS_DIR:-.secrets/compose}/NORA_AGENT_HUB_API_KEY_HASH_SECRET
   nora_api_key_hash_secret:
-    environment: NORA_API_KEY_HASH_SECRET
+    file: ${NORA_COMPOSE_SECRETS_DIR:-.secrets/compose}/NORA_API_KEY_HASH_SECRET
   nora_db_password:
-    environment: DB_PASSWORD
+    file: ${NORA_COMPOSE_SECRETS_DIR:-.secrets/compose}/DB_PASSWORD

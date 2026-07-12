@@ -32,6 +32,8 @@ LEGACY_HEALTHCHECK_INTERVAL_SECONDS=3
 MAX_HEALTHCHECK_WINDOW_SECONDS=3900
 DEFAULT_HEALTHCHECK_WINDOW_SECONDS=$(((DEFAULT_HEALTHCHECK_ATTEMPTS - 1) * DEFAULT_HEALTHCHECK_INTERVAL_SECONDS))
 MIN_COMPOSE_VERSION="2.24.4"
+DEFAULT_COMPOSE_SECRETS_DIR=".secrets/compose"
+DEFAULT_COMPOSE_PROJECT_NAME="nora"
 
 # ── Color helpers ────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -312,21 +314,22 @@ resolve_current_release_commit() {
 }
 
 resolve_current_release_version() {
-  local exact_tag latest_tag
+  local candidate_tag exact_tag product_version_pattern
 
   if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     return 0
   fi
 
-  exact_tag="$(git describe --tags --exact-match 2>/dev/null || true)"
+  product_version_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+  exact_tag=""
+  while IFS= read -r candidate_tag; do
+    if [[ "$candidate_tag" =~ $product_version_pattern ]]; then
+      exact_tag="$(printf '%s\n%s\n' "$exact_tag" "$candidate_tag" | sed '/^$/d' | sort -V | tail -n 1)"
+    fi
+  done < <(git tag --points-at HEAD 2>/dev/null || true)
+
   if [ -n "$exact_tag" ]; then
     printf "%s\n" "$exact_tag"
-    return 0
-  fi
-
-  latest_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
-  if [ -n "$latest_tag" ] && git merge-base --is-ancestor "$latest_tag" HEAD >/dev/null 2>&1; then
-    printf "%s\n" "$latest_tag"
   fi
 }
 
@@ -498,21 +501,43 @@ ensure_backup_encryption_key_env() {
   ok "NORA_BACKUP_ENCRYPTION_KEY generated (64-char hex)"
 }
 
+materialize_compose_secret_files() {
+  local env_path="$1" secrets_dir
+  secrets_dir="$(read_env_value "$env_path" "NORA_COMPOSE_SECRETS_DIR" "$DEFAULT_COMPOSE_SECRETS_DIR")"
+  if [ ! -f "scripts/materialize-compose-secrets.sh" ]; then
+    error "Missing scripts/materialize-compose-secrets.sh; cannot prepare read-only Compose secrets."
+    return 1
+  fi
+  NORA_MATERIALIZE_QUIET=true bash scripts/materialize-compose-secrets.sh "$env_path"
+  set_env_value "$env_path" "NORA_COMPOSE_SECRETS_DIR" "$secrets_dir"
+  ok "Compose secret files refreshed under $secrets_dir (owner-only directory)"
+}
+
+resolve_compose_project_name() {
+  local env_path="${1:-$ENV_FILE}" project_name
+  project_name="$(read_env_value "$env_path" "COMPOSE_PROJECT_NAME" "$DEFAULT_COMPOSE_PROJECT_NAME")"
+  if [[ ! "$project_name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    error "Invalid COMPOSE_PROJECT_NAME '$project_name'; use lowercase letters, digits, hyphens, or underscores."
+    return 1
+  fi
+  printf '%s\n' "$project_name"
+}
+
 remove_local_agent_containers() {
-  local containers
+  local project_name="$1" compose_network="${1}_default" containers
   containers="$(
     {
-      docker ps -a --filter "label=openclaw.agent.id" -q 2>/dev/null || true
-      docker ps -a --filter "label=nora.agent.id" -q 2>/dev/null || true
+      docker ps -a --filter "label=openclaw.agent.id" --filter "network=$compose_network" -q 2>/dev/null || true
+      docker ps -a --filter "label=nora.agent.id" --filter "network=$compose_network" -q 2>/dev/null || true
     } | sort -u
   )"
 
   if [ -z "$containers" ]; then
-    info "No local Nora agent containers found."
+    info "No local Nora agent containers found on $compose_network."
     return 0
   fi
 
-  info "Removing local Nora agent containers..."
+  info "Removing local Nora agent containers attached to $compose_network..."
   while IFS= read -r container_id; do
     [ -z "$container_id" ] && continue
     docker rm -f "$container_id" >/dev/null 2>&1 || true
@@ -523,11 +548,13 @@ EOF
 }
 
 clean_reinstall_state() {
+  local project_name
+  project_name="$(resolve_compose_project_name "$ENV_FILE")"
   warn "Clean reinstall selected: local compose containers and volumes will be removed."
   info "External Kubernetes, Proxmox, NemoClaw, and other VM resources will not be touched."
-  docker compose down -v --remove-orphans 2>/dev/null || true
-  remove_local_agent_containers
-  ok "Local Nora compose state cleaned"
+  remove_local_agent_containers "$project_name"
+  docker compose -p "$project_name" down -v --remove-orphans 2>/dev/null || true
+  ok "Local Nora compose state cleaned for project $project_name"
 }
 
 start_compose_stack() {
@@ -1259,6 +1286,7 @@ if [ "$SETUP_MODE" = "update" ]; then
   fi
   set_env_value "$ENV_FILE" "COMPOSE_PATH_SEPARATOR" ":"
   set_env_value "$ENV_FILE" "COMPOSE_FILE" "$compose_file_value"
+  set_env_value "$ENV_FILE" "COMPOSE_PROJECT_NAME" "$(resolve_compose_project_name "$ENV_FILE")"
   set_env_value "$ENV_FILE" "NORA_UPGRADE_COMPOSE_FILES" "$compose_file_value"
   migrate_legacy_healthcheck_defaults "$ENV_FILE"
   ensure_signup_protection_env "$ENV_FILE"
@@ -1272,6 +1300,7 @@ if [ "$SETUP_MODE" = "update" ]; then
   ensure_agent_hub_hash_secret_env "$ENV_FILE"
   ensure_api_key_hash_secret_env "$ENV_FILE"
   ensure_backup_encryption_key_env "$ENV_FILE"
+  materialize_compose_secret_files "$ENV_FILE"
   stamp_release_tracking_env "$ENV_FILE"
   assert_nora_host_ports_available "$ENV_FILE"
   start_compose_stack
@@ -1664,6 +1693,7 @@ info "Writing $ENV_FILE..."
 NORA_CURRENT_VERSION="$(resolve_current_release_version)"
 NORA_CURRENT_COMMIT="$(resolve_current_release_commit)"
 DOCKER_GID="$(resolve_docker_gid)"
+COMPOSE_PROJECT_NAME="$(resolve_compose_project_name "$ENV_FILE")"
 DOCKER_AGENT_BIND_IP="$(read_env_value "$ENV_FILE" "DOCKER_AGENT_BIND_IP" "127.0.0.1")"
 DATABASE_URL="$(read_env_value "$ENV_FILE" "DATABASE_URL" "")"
 DB_SSL_MODE="$(read_env_value "$ENV_FILE" "DB_SSL_MODE" "")"
@@ -1765,6 +1795,7 @@ REDIS_CONNECT_TIMEOUT_MS=${REDIS_CONNECT_TIMEOUT_MS}
 PORT=4000
 BACKEND_API_PORT=${BACKEND_API_PORT}
 DOCKER_GID=${DOCKER_GID}
+COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
 
 # ── Access / URL ─────────────────────────────────────────────
 NGINX_CONFIG_FILE=${NGINX_CONFIG_FILE}
@@ -1861,6 +1892,7 @@ NORA_UPGRADE_REF=master
 NORA_UPGRADE_RUNNER_IMAGE=docker:29-cli
 NORA_UPGRADE_STATE_VOLUME=nora_upgrade_state
 NORA_ENV_FILE=.env
+NORA_COMPOSE_SECRETS_DIR=${DEFAULT_COMPOSE_SECRETS_DIR}
 COMPOSE_PATH_SEPARATOR=:
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml
 NORA_UPGRADE_COMPOSE_FILES=docker-compose.yml:docker-compose.override.yml
@@ -1931,6 +1963,7 @@ KEY_STORAGE=database
 EOF
 
 secure_env_file_permissions "$ENV_FILE"
+materialize_compose_secret_files "$ENV_FILE"
 ok ".env created successfully"
 export COMPOSE_PATH_SEPARATOR=":"
 export COMPOSE_FILE="docker-compose.yml:docker-compose.override.yml"

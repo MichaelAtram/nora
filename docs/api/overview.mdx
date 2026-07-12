@@ -122,7 +122,7 @@ Returns `{"status":"ok"}` after the server has finished its startup sequence, in
 GET /config/platform
 ```
 
-Returns the platform mode and, in self-hosted deployments, the operator-configured resource limits.
+Returns the platform mode, runtime/deploy catalogs, safe public feature capabilities, and, in self-hosted deployments, the operator-configured resource limits.
 
 <ResponseField name="mode" type="string">
   Platform mode. One of `selfhosted` or `paas`.
@@ -140,6 +140,12 @@ Returns the platform mode and, in self-hosted deployments, the operator-configur
 
 <ResponseField name="billingEnabled" type="boolean">
   Whether Stripe billing is active.
+</ResponseField>
+
+<ResponseField name="capabilities.localDockerDemo" type="object">
+  Whether the exact `openclaw` + local `docker` + `standard` runtime tuple required by one-click
+  demo activation is enabled. Includes the tuple, `requiresLiveDocker: true`, and a public `issue`
+  when unavailable. The mutation still checks the Docker daemon live before queueing work.
 </ResponseField>
 
 ### NemoClaw config

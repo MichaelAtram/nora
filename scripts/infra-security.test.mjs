@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import test from "node:test";
@@ -115,10 +116,19 @@ test("production Compose mounts core secrets and fails closed on ownership migra
   assert.match(rootCompose, /target: JWT_SECRET/);
   assert.match(rootCompose, /target: NORA_API_KEY_HASH_SECRET/);
   assert.match(rootCompose, /target: DB_PASSWORD/);
+  assert.match(rootCompose, /file: \$\{NORA_COMPOSE_SECRETS_DIR:-\.secrets\/compose\}\/JWT_SECRET/);
+  assert.doesNotMatch(rootCompose.slice(rootCompose.indexOf("\nsecrets:")), /environment:/);
   assert.match(
     serviceSection(rootCompose, "postgres"),
     /POSTGRES_PASSWORD_FILE: \/run\/secrets\/DB_PASSWORD/,
   );
+  const onDemandBackup = serviceSection(rootCompose, "backup");
+  assert.match(onDemandBackup, /PGPASSWORD: ""/);
+  assert.match(onDemandBackup, /PGPASSWORD_FILE: \/run\/secrets\/DB_PASSWORD/);
+  assert.match(onDemandBackup, /source: nora_db_password/);
+  const backupScript = read("infra/backup.sh");
+  assert.match(backupScript, /PGPASSWORD_FILE/);
+  assert.match(backupScript, /PGPASSWORD or a readable PGPASSWORD_FILE is required/);
   for (const overlay of [
     "infra/docker-compose.public-prod.yml",
     "infra/docker-compose.public-tls.yml",
@@ -163,10 +173,7 @@ test("Helm separates API hash secrets for new installs and preserves the upgrade
     "templates/secret-env.yaml",
     ...helmSecretArgs,
   ]);
-  assert.match(
-    rendered,
-    /NORA_API_KEY_HASH_SECRET: "ci-hash-key-00000000000000000000000000"/,
-  );
+  assert.match(rendered, /NORA_API_KEY_HASH_SECRET: "ci-hash-key-00000000000000000000000000"/);
   assert.match(
     rendered,
     /NORA_AGENT_HUB_API_KEY_HASH_SECRET: "ci-agent-hub-hash-key-0000000000000000000"/,
@@ -427,10 +434,32 @@ test("setup and entrypoint retain fail-closed secret handling contracts", () => 
   const bashSetup = read("setup.sh");
   const powershellSetup = read("setup.ps1");
   const entrypoint = read("infra/container-entrypoint.sh");
+  const composeSecretMaterializer = read("scripts/materialize-compose-secrets.sh");
+  const deployWorkflow = read(".github/workflows/deploy-production.yml");
+  const proxmoxWorkflow = read(".github/workflows/proxmox-real-hardware.yml");
+  const releaseUpgrade = read("infra/run-release-upgrade.sh");
+  const gitignore = read(".gitignore");
 
   assert.match(bashSetup, /secure_env_file_permissions/);
   assert.match(bashSetup, /chmod 600/);
+  assert.match(bashSetup, /materialize_compose_secret_files/);
+  assert.match(bashSetup, /scripts\/materialize-compose-secrets\.sh/);
+  assert.match(bashSetup, /docker compose -p "\$project_name" down -v --remove-orphans/);
+  assert.match(bashSetup, /--filter "network=\$compose_network"/);
+  assert.match(composeSecretMaterializer, /chmod 700 "\$secrets_dir"/);
+  assert.match(composeSecretMaterializer, /chmod 444 "\$tmp_file"/);
+  assert.match(composeSecretMaterializer, /symlinked path component/);
+  assert.match(powershellSetup, /unexpected entry/);
+  assert.match(deployWorkflow, /bash scripts\/materialize-compose-secrets\.sh "\$DEPLOY_ENV_FILE"/);
+  assert.match(proxmoxWorkflow, /NORA_COMPOSE_SECRETS_DIR=%s/);
+  assert.match(proxmoxWorkflow, /bash scripts\/materialize-compose-secrets\.sh "\$env_file"/);
+  assert.match(proxmoxWorkflow, /rm -rf "\$secrets_dir"/);
+  assert.match(releaseUpgrade, /bash scripts\/materialize-compose-secrets\.sh "\$env_file"/);
+  assert.match(gitignore, /docker-compose\.override\.yml\.legacy-\*/);
   assert.match(powershellSetup, /function Protect-EnvFile/);
+  assert.match(powershellSetup, /function Write-ComposeSecretFiles/);
+  assert.match(powershellSetup, /docker compose -p \$projectName down -v --remove-orphans/);
+  assert.match(powershellSetup, /--filter "network=\$composeNetwork"/);
   assert.match(powershellSetup, /\/inheritance:r/);
   assert.match(powershellSetup, /Failed to restrict the Windows ACL/);
   assert.match(entrypoint, /NORA_SECRETS_DIR:-\/run\/secrets/);
@@ -452,4 +481,185 @@ test("setup and entrypoint retain fail-closed secret handling contracts", () => 
     { cwd: repoRoot, encoding: "utf8" },
   );
   assert.equal(bashCheck.status, 0, bashCheck.stderr || bashCheck.stdout);
+
+  runChecked("bash", [
+    "-c",
+    `set -euo pipefail
+     error() { printf '%s\\n' "$*" >&2; }
+     fixture_dir="$(mktemp -d /tmp/nora-compose-secrets.XXXXXX)"
+     trap 'rm -rf "$fixture_dir"' EXIT
+     env_file="$fixture_dir/.env"
+     secrets_dir="$fixture_dir/secrets"
+     printf '%s\\n' \
+       'JWT_SECRET=jwt-secret' \
+       'ENCRYPTION_KEY=encryption-secret' \
+       'NORA_BACKUP_ENCRYPTION_KEY=backup-secret' \
+       'NORA_AGENT_HUB_API_KEY_HASH_SECRET=agent-hub-secret' \
+       'NORA_API_KEY_HASH_SECRET=api-secret' \
+       'DB_PASSWORD=db-secret' \
+       "NORA_COMPOSE_SECRETS_DIR=$secrets_dir" > "$env_file"
+     chmod 600 "$env_file"
+     bash scripts/materialize-compose-secrets.sh "$env_file"
+     test "$(stat -c '%a' "$secrets_dir")" = 700
+     test "$(stat -c '%a' "$secrets_dir/JWT_SECRET")" = 444
+     test "$(tr -d '\\n' < "$secrets_dir/JWT_SECRET")" = jwt-secret
+     test "$(find "$secrets_dir" -maxdepth 1 -type f | wc -l)" -eq 6
+     unsafe_dir="$fixture_dir/unsafe"
+     mkdir -p "$unsafe_dir"
+     printf '%s\\n' keep > "$unsafe_dir/existing"
+     chmod 755 "$unsafe_dir"
+     sed "s#^NORA_COMPOSE_SECRETS_DIR=.*#NORA_COMPOSE_SECRETS_DIR=$unsafe_dir#" "$env_file" > "$fixture_dir/unsafe.env"
+     ! bash scripts/materialize-compose-secrets.sh "$fixture_dir/unsafe.env"
+     real_parent="$fixture_dir/real-parent"
+     mkdir -p "$real_parent"
+     ln -s "$real_parent" "$fixture_dir/linked-parent"
+     sed "s#^NORA_COMPOSE_SECRETS_DIR=.*#NORA_COMPOSE_SECRETS_DIR=$fixture_dir/linked-parent/secrets#" "$env_file" > "$fixture_dir/symlink.env"
+     ! bash scripts/materialize-compose-secrets.sh "$fixture_dir/symlink.env"`,
+  ]);
+});
+
+test("production deploy accepts only exact Nora product release tags", () => {
+  const workflow = read(".github/workflows/deploy-production.yml");
+  const setupBash = read("setup.sh");
+  const setupPowerShell = read("setup.ps1");
+  const patternMatch = workflow.match(/product_version_pattern='([^']+)'/);
+  assert.ok(patternMatch, "deploy workflow must declare the Nora product-version pattern");
+
+  const productVersionPattern = new RegExp(patternMatch[1]);
+  for (const accepted of ["v0.0.0", "v1.16.0", "v12.34.56"]) {
+    assert.match(accepted, productVersionPattern);
+  }
+  for (const rejected of [
+    "nora-copilot-plugin-v0.1.3",
+    "nora-mcp-v1.16.0",
+    "1.16.0",
+    "v01.16.0",
+    "v1.16.0-rc.1",
+  ]) {
+    assert.doesNotMatch(rejected, productVersionPattern);
+  }
+
+  assert.match(workflow, /git tag --points-at HEAD/);
+  assert.match(workflow, /Version override must be an exact Nora product tag/);
+  assert.doesNotMatch(workflow, /git describe --tags/);
+  assert.doesNotMatch(workflow, /latest_tag=/);
+  assert.match(setupBash, /resolve_current_release_version\(\)/);
+  assert.match(setupBash, /git tag --points-at HEAD/);
+  assert.doesNotMatch(setupBash, /git describe --tags/);
+  assert.match(setupPowerShell, /function Resolve-CurrentReleaseVersion/);
+  assert.match(setupPowerShell, /git tag --points-at HEAD/);
+  assert.doesNotMatch(setupPowerShell, /git describe --tags/);
+  assert.match(workflow, /health_attempts=221/);
+  assert.match(workflow, /health_interval_seconds=3/);
+
+  const stepMatch = workflow.match(
+    / {6}- name: Compute deployed version metadata\n {8}id: release_meta\n {8}run: \|\n([\s\S]*?)(?=\n {6}- uses:)/,
+  );
+  assert.ok(stepMatch, "deploy workflow must keep the release metadata step executable in tests");
+  const releaseMetadataScript = stepMatch[1].replace(/^ {10}/gm, "");
+  const setupFunctionMatch = setupBash.match(
+    /resolve_current_release_version\(\) \{\n([\s\S]*?)\n\}/,
+  );
+  assert.ok(setupFunctionMatch, "setup.sh must expose executable product-version resolution");
+  const setupVersionScript = `resolve_current_release_version() {\n${setupFunctionMatch[1]}\n}\nresolve_current_release_version\n`;
+  const fixtureRepo = mkdtempSync(path.join(tmpdir(), "nora-release-metadata-"));
+
+  try {
+    writeFileSync(path.join(fixtureRepo, "fixture.txt"), "release metadata fixture\n");
+    runChecked("git", ["init", "-q"], { cwd: fixtureRepo });
+    runChecked("git", ["add", "fixture.txt"], { cwd: fixtureRepo });
+    runChecked(
+      "git",
+      [
+        "-c",
+        "user.name=Nora CI",
+        "-c",
+        "user.email=ci@example.invalid",
+        "commit",
+        "-qm",
+        "fixture",
+      ],
+      { cwd: fixtureRepo },
+    );
+
+    const runMetadata = (inputVersion = "") => {
+      const outputFile = path.join(fixtureRepo, `github-output-${Date.now()}-${Math.random()}`);
+      writeFileSync(outputFile, "");
+      const result = spawnSync("bash", ["-c", releaseMetadataScript], {
+        cwd: fixtureRepo,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GITHUB_OUTPUT: outputFile,
+          INPUT_VERSION: inputVersion,
+        },
+      });
+      return { result, output: readFileSync(outputFile, "utf8") };
+    };
+    const runSetupVersion = () =>
+      spawnSync("bash", ["-c", setupVersionScript], {
+        cwd: fixtureRepo,
+        encoding: "utf8",
+        env: process.env,
+      });
+
+    runChecked(
+      "git",
+      [
+        "-c",
+        "user.name=Nora CI",
+        "-c",
+        "user.email=ci@example.invalid",
+        "tag",
+        "-a",
+        "nora-copilot-plugin-v0.1.3",
+        "-m",
+        "component release",
+      ],
+      { cwd: fixtureRepo },
+    );
+    const componentOnly = runMetadata();
+    assert.equal(componentOnly.result.status, 0, componentOnly.result.stderr);
+    assert.match(componentOnly.output, /^version=$/m);
+    assert.doesNotMatch(componentOnly.output, /nora-copilot-plugin/);
+    assert.match(componentOnly.output, /^commit=[0-9a-f]{40}$/m);
+    const componentOnlySetup = runSetupVersion();
+    assert.equal(componentOnlySetup.status, 0, componentOnlySetup.stderr);
+    assert.equal(componentOnlySetup.stdout, "");
+
+    runChecked(
+      "git",
+      [
+        "-c",
+        "user.name=Nora CI",
+        "-c",
+        "user.email=ci@example.invalid",
+        "tag",
+        "-a",
+        "v1.16.0",
+        "-m",
+        "product release",
+      ],
+      { cwd: fixtureRepo },
+    );
+    const automaticProductVersion = runMetadata();
+    assert.equal(automaticProductVersion.result.status, 0, automaticProductVersion.result.stderr);
+    assert.match(automaticProductVersion.output, /^version=v1\.16\.0$/m);
+    const automaticSetupVersion = runSetupVersion();
+    assert.equal(automaticSetupVersion.status, 0, automaticSetupVersion.stderr);
+    assert.equal(automaticSetupVersion.stdout.trim(), "v1.16.0");
+
+    const manualProductVersion = runMetadata("v2.3.4");
+    assert.equal(manualProductVersion.result.status, 0, manualProductVersion.result.stderr);
+    assert.match(manualProductVersion.output, /^version=v2\.3\.4$/m);
+
+    const invalidManualVersion = runMetadata("nora-copilot-plugin-v0.1.3");
+    assert.notEqual(invalidManualVersion.result.status, 0);
+    assert.match(
+      `${invalidManualVersion.result.stderr}${invalidManualVersion.result.stdout}`,
+      /Version override must be an exact Nora product tag/,
+    );
+  } finally {
+    rmSync(fixtureRepo, { recursive: true, force: true });
+  }
 });

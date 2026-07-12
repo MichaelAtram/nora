@@ -1,12 +1,9 @@
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, CheckCircle2, Loader2, Lock, Mail, Shield, Zap } from "lucide-react";
 import LanguageSwitcher from "../components/LanguageSwitcher";
 import SeoHead from "../components/SeoHead";
-import {
-  fetchAuthBootstrapStatus,
-  type AuthBootstrapStatus,
-} from "../lib/authBootstrap";
+import { fetchAuthBootstrapStatus, type AuthBootstrapStatus } from "../lib/authBootstrap";
 import { normalizeLocale, useI18n } from "../lib/i18n";
 
 const OSS_REPO_URL = "https://github.com/solomon2773/nora";
@@ -23,6 +20,22 @@ type LanguageProfile = {
   defaultLocale?: string;
 };
 
+function readLegacyToken() {
+  try {
+    return localStorage.getItem("token");
+  } catch {
+    return null;
+  }
+}
+
+function clearLegacyToken() {
+  try {
+    localStorage.removeItem("token");
+  } catch {
+    // A valid HttpOnly cookie session should still proceed when storage is unavailable.
+  }
+}
+
 export default function Login() {
   const { localizePath, t } = useI18n();
   const [email, setEmail] = useState("");
@@ -35,25 +48,7 @@ export default function Login() {
   const oauthLoginEnabled = bootstrapStatus?.oauthLoginEnabled === true;
   const platformMode = bootstrapStatus?.platformMode || null;
 
-  useEffect(() => {
-    const controller = new AbortController();
-    async function loadBootstrapStatus() {
-      try {
-        setBootstrapStatus(await fetchAuthBootstrapStatus(controller.signal));
-        setBootstrapError("");
-      } catch (bootstrapStatusError) {
-        if (controller.signal.aborted) return;
-        console.error(bootstrapStatusError);
-        setBootstrapError(
-          "OAuth availability could not be checked. Email and password login remains available.",
-        );
-      }
-    }
-    void loadBootstrapStatus();
-    return () => controller.abort();
-  }, []);
-
-  async function routeAfterLogin() {
+  const routeAfterLogin = useCallback(async () => {
     try {
       const [profileRes, providersRes, agentsRes] = await Promise.all([
         fetch("/api/auth/me", { credentials: "include" }),
@@ -83,7 +78,81 @@ export default function Login() {
       console.error(routeErr);
       window.location.assign(localizePath("/app/dashboard"));
     }
-  }
+  }, [localizePath]);
+  const routeAfterLoginRef = useRef(routeAfterLogin);
+
+  useEffect(() => {
+    routeAfterLoginRef.current = routeAfterLogin;
+  }, [routeAfterLogin]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function loadBootstrapStatus() {
+      try {
+        setBootstrapStatus(await fetchAuthBootstrapStatus(controller.signal));
+        setBootstrapError("");
+      } catch (bootstrapStatusError) {
+        if (controller.signal.aborted) return;
+        console.error(bootstrapStatusError);
+        setBootstrapError(
+          "OAuth availability could not be checked. Email and password login remains available.",
+        );
+      }
+    }
+    void loadBootstrapStatus();
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function redirectAuthenticatedSession() {
+      let sessionResponse;
+      try {
+        sessionResponse = await fetch("/api/auth/me", { credentials: "include" });
+      } catch {
+        return;
+      }
+      if (cancelled) return;
+      if (sessionResponse.ok) {
+        clearLegacyToken();
+        await routeAfterLoginRef.current();
+        return;
+      }
+      if (sessionResponse.status !== 401) return;
+
+      // Legacy migration: clear any stale HttpOnly cookie first because backend
+      // auth deliberately prefers cookies over bearer headers. Then upgrade the
+      // legacy bearer into a fresh HttpOnly cookie before deleting localStorage.
+      const legacyToken = readLegacyToken();
+      if (!legacyToken) return;
+      try {
+        const logoutResponse = await fetch("/api/auth/logout", {
+          method: "POST",
+          credentials: "include",
+        });
+        if (cancelled || !logoutResponse.ok) return;
+
+        const upgradeResponse = await fetch("/api/auth/session-upgrade", {
+          method: "POST",
+          credentials: "include",
+          headers: { Authorization: `Bearer ${legacyToken}` },
+        });
+        if (cancelled || !upgradeResponse.ok) return;
+
+        clearLegacyToken();
+        await routeAfterLoginRef.current();
+      } catch {
+        // Preserve the bearer token so a transient network or backend failure
+        // cannot strand an otherwise valid legacy session.
+      }
+    }
+
+    void redirectAuthenticatedSession();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function handleLogin(event) {
     event.preventDefault();
@@ -104,7 +173,7 @@ export default function Login() {
         // The backend set an HttpOnly nora_auth cookie in the response — the
         // JWT is no longer stored client-side, which keeps it out of reach of
         // any script (including XSS payloads). Clear any stale legacy token.
-        localStorage.removeItem("token");
+        clearLegacyToken();
         await routeAfterLogin();
         return;
       }

@@ -14,8 +14,8 @@ This guide takes you from a fresh machine to a running, validated agent runtime.
 <Note>
   The installer can install Docker, Docker Compose 2.24.4+, Git, and OpenSSL for you if they are not
   already present on your machine. Standalone `docker-compose` v1 is unsupported. You need macOS
-  12+, Linux (Ubuntu 20.04+, Debian 11+, or Fedora 38+), or Windows 10+ with WSL2, plus admin or sudo
-  access.
+  12+, Linux (Ubuntu 20.04+, Debian 11+, or Fedora 38+), or Windows 10+ with WSL2, plus admin or
+  sudo access.
 </Note>
 
 <Steps>
@@ -40,8 +40,9 @@ This guide takes you from a fresh machine to a running, validated agent runtime.
     git clone https://github.com/solomon2773/nora.git
     cd nora
     cp .env.example .env
-    # Edit .env with your secrets, then:
-    docker compose up -d
+    # Edit .env with your secrets, then materialize the read-only Compose
+    # secret files and start the hardened stack:
+    ./setup.sh --update
     ```
 
     When the installer or Docker Compose finishes, it prints the base URL it configured. Local mode uses `http://localhost:8080` by default, but the installer automatically offers another free web port such as `8081` if `8080` is already in use.
@@ -77,7 +78,7 @@ created — go to `/login` and use those credentials instead.
 </Step>
 
   <Step title="Choose the first-proof path">
-    When `/api/config/platform` lists `docker` as an enabled deploy target, click **Launch local Docker demo — no API key** on **Getting Started**. Nora enables its built-in deterministic provider and deploys a demo agent in one action. If the page reports that the local Docker demo is unavailable, add a real provider and deploy to one of the targets enabled by your operator.
+    When `/api/config/platform` reports `capabilities.localDockerDemo.enabled: true`, click **Launch local Docker demo — no API key** on **Getting Started**. Nora enables its built-in deterministic provider and deploys a demo agent in one action. If the page reports that the local Docker demo is unavailable, add a real provider and deploy to one of the targets enabled by your operator.
 
     <Tip>
       The demo proves Nora's deployment and operator workflow; it does not represent the quality of a production model. Use it to validate chat, logs, metrics, terminal access, and lifecycle controls without model spend.

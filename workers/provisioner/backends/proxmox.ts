@@ -50,6 +50,7 @@ const OPENCLAW_CUSTOM_PROVIDERS_FILE = "/etc/nora/openclaw-custom-providers.json
 const HERMES_ENV_FILE = `${HERMES_HOME}/.nora-system-env.b64`;
 const PROXMOX_NEMOCLAW_UNSUPPORTED =
   "NemoClaw on Proxmox is not supported: writing a policy file inside an LXC does not provide the enforced OpenShell sandbox contract.";
+const PROXMOX_OWNERSHIP_MARKER_PREFIX = "nora-owner:";
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PROXMOX_TEMPLATE_RE = /^[A-Za-z0-9_.-]+:vztmpl\/[A-Za-z0-9._+~:-]+$/;
 
@@ -201,6 +202,16 @@ function isMissingResourceError(error) {
       String(error?.message || ""),
     )
   );
+}
+
+function buildOwnershipMarker() {
+  return `${PROXMOX_OWNERSHIP_MARKER_PREFIX}${crypto.randomBytes(16).toString("hex")}`;
+}
+
+function descriptionHasOwnershipMarker(description, ownershipMarker) {
+  return String(description || "")
+    .split(/\r?\n/)
+    .some((line) => line.trim() === ownershipMarker);
 }
 
 function safeHostname(name, fallback) {
@@ -627,6 +638,7 @@ class ProxmoxBackend extends ProvisionerBackend {
       runtimeFamily = "openclaw",
       sandboxProfile = "standard",
       abortSignal,
+      onRuntimeIdentity,
     } = config;
     this._assertConfigured();
     throwIfAborted(abortSignal, "Proxmox create");
@@ -640,9 +652,16 @@ class ProxmoxBackend extends ProvisionerBackend {
     const vmid = await this._getNextVmid({ signal: abortSignal });
     const hostname = safeHostname(container_name || name, `nora-${runtimeFamily}-${id}`);
     const rootfsSize = Math.max(1, Number.parseInt(disk_gb || "20", 10) || 20);
+    const ownershipMarker = buildOwnershipMarker();
+    const description = [
+      `Nora ${normalizedRuntimeFamily} agent ${name || id}`,
+      ownershipMarker,
+    ].join("\n");
 
     console.log(`[proxmox] Creating LXC ${hostname} (vmid=${vmid}) on node ${this.node}`);
     let createAttempted = false;
+    let createTaskCompleted = false;
+    let ownershipConfirmed = false;
     try {
       createAttempted = true;
       const createTask = await this._requestData(
@@ -659,11 +678,26 @@ class ProxmoxBackend extends ProvisionerBackend {
           net0: `name=eth0,bridge=${this.bridge},ip=dhcp`,
           start: 0,
           unprivileged: 1,
-          description: `Nora ${normalizedRuntimeFamily} agent ${name || id}`,
+          description,
         },
         { signal: abortSignal },
       );
       await this._waitForTask(createTask, { signal: abortSignal });
+      createTaskCompleted = true;
+      ownershipConfirmed = await this._ownsCreatedLxc(String(vmid), ownershipMarker, {
+        signal: abortSignal,
+      });
+      if (!ownershipConfirmed) {
+        throw new Error(
+          `Proxmox LXC ${vmid} was created but its Nora ownership marker could not be verified`,
+        );
+      }
+      if (typeof onRuntimeIdentity === "function") {
+        await onRuntimeIdentity({
+          containerId: String(vmid),
+          containerName: hostname,
+        });
+      }
       throwIfAborted(abortSignal, "Proxmox create");
       const startTask = await this._requestData(
         "POST",
@@ -693,24 +727,79 @@ class ProxmoxBackend extends ProvisionerBackend {
     } catch (error) {
       if (createAttempted) {
         try {
-          await this._cleanupFailedCreate(String(vmid));
+          const cleanup = await this._cleanupFailedCreate(String(vmid), ownershipMarker);
+          if (createTaskCompleted && !cleanup.destroyed) {
+            const cleanupError = new Error(
+              `Refusing to delete Proxmox LXC ${vmid} because its Nora ownership marker is no longer present`,
+            );
+            cleanupError.code = "PROXMOX_RUNTIME_OWNERSHIP_UNVERIFIED";
+            cleanupError.containerId = String(vmid);
+            cleanupError.runtimeIdentity = {
+              containerId: String(vmid),
+              destroyAllowed: false,
+              persistIdentity: true,
+            };
+            cleanupError.cause = error;
+            throw cleanupError;
+          }
         } catch (cleanupError) {
           console.warn(
             `[proxmox] Failed to clean up LXC ${vmid} after create error: ${cleanupError.message}`,
           );
+          if (cleanupError?.runtimeIdentity) throw cleanupError;
+          const unresolvedError = new Error(
+            `Proxmox LXC ${vmid} may still exist after provisioning failed: ${cleanupError.message}`,
+          );
+          unresolvedError.code = "PROXMOX_RUNTIME_CLEANUP_FAILED";
+          unresolvedError.containerId = String(vmid);
+          unresolvedError.runtimeIdentity = {
+            containerId: String(vmid),
+            destroyAllowed: cleanupError?.proxmoxOwnershipVerified === true,
+            persistIdentity: ownershipConfirmed || createTaskCompleted,
+          };
+          unresolvedError.cause = error;
+          unresolvedError.cleanupError = cleanupError;
+          throw unresolvedError;
         }
       }
       throw error;
     }
   }
 
-  async _cleanupFailedCreate(vmid) {
+  async _ownsCreatedLxc(vmid, ownershipMarker, options = {}) {
+    const normalizedVmid = normalizeVmid(vmid);
+    try {
+      const config = await this._requestData(
+        "GET",
+        `/nodes/${this.node}/lxc/${normalizedVmid}/config`,
+        null,
+        options,
+      );
+      return descriptionHasOwnershipMarker(config?.description, ownershipMarker);
+    } catch (error) {
+      if (isMissingResourceError(error)) return false;
+      throw error;
+    }
+  }
+
+  async _cleanupFailedCreate(vmid, ownershipMarker) {
+    let owned = false;
+    try {
+      owned = await this._ownsCreatedLxc(vmid, ownershipMarker);
+    } catch (error) {
+      error.proxmoxOwnershipVerified = false;
+      throw error;
+    }
+    if (!owned) {
+      return { destroyed: false, reason: "not-owned" };
+    }
     let lastError = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
       try {
         await this.destroy(vmid);
-        return;
+        return { destroyed: true };
       } catch (error) {
+        error.proxmoxOwnershipVerified = true;
         lastError = error;
         if (error?.statusCode === 401 || error?.statusCode === 403) throw error;
         if (attempt < 5) await sleep(2000);

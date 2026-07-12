@@ -1,5 +1,5 @@
 // @ts-nocheck
-const { Worker } = require("bullmq");
+const { UnrecoverableError, Worker } = require("bullmq");
 const IORedis = require("ioredis");
 const { Pool } = require("pg");
 const {
@@ -232,14 +232,21 @@ async function allocateAvailableLocalDockerGatewayPort({
   throw error;
 }
 
-async function persistProvisioningFailure({ queryable = db, job, agentId, name, error } = {}) {
+async function persistProvisioningFailure({
+  queryable = db,
+  job,
+  agentId,
+  name,
+  error,
+  forceTerminal = false,
+} = {}) {
   const existing = await queryable.query("SELECT id FROM agents WHERE id = $1", [agentId]);
   if (!existing.rows[0]) {
     return { canceled: true, terminal: false };
   }
 
   const { attempt, maxAttempts } = deploymentAttemptInfo(job);
-  const terminal = isFinalDeploymentAttempt(job);
+  const terminal = forceTerminal || isFinalDeploymentAttempt(job);
   if (!terminal) {
     await queryable.query(
       "UPDATE agents SET status = 'queued' WHERE id = $1 AND status IN ('deploying', 'running', 'warning')",
@@ -257,9 +264,87 @@ async function persistProvisioningFailure({ queryable = db, job, agentId, name, 
   await queryable.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
     "agent_deploy_failed",
     `Agent "${name}" failed to deploy: ${error?.message || "Unknown provisioning error"}`,
-    JSON.stringify({ agentId, attempt, maxAttempts }),
+    JSON.stringify({
+      agentId,
+      attempt,
+      maxAttempts,
+      ...(forceTerminal ? { retrySuppressed: true } : {}),
+      ...(error?.containerId ? { containerId: String(error.containerId) } : {}),
+    }),
   ]);
   return { canceled: false, terminal: true };
+}
+
+async function persistProvisionedRuntimeIdentity({
+  queryable = db,
+  agentId,
+  containerId,
+  containerName = null,
+} = {}) {
+  const result = await queryable.query(
+    `UPDATE agents
+        SET container_id = COALESCE(container_id, $2),
+            container_name = COALESCE($3, container_name)
+      WHERE id = $1
+        AND (container_id IS NULL OR container_id = $2)
+      RETURNING id, container_id`,
+    [agentId, containerId, containerName],
+  );
+  return {
+    persisted: Boolean(result.rows[0]),
+    containerId: result.rows[0]?.container_id || null,
+  };
+}
+
+async function preserveUnresolvedRuntimeIdentity({ queryable, agentId, containerId } = {}) {
+  try {
+    return await persistProvisionedRuntimeIdentity({ queryable, agentId, containerId });
+  } catch (error) {
+    console.error(
+      `[provisioner] Failed to persist unresolved runtime ${containerId} for agent ${agentId}: ${error.message}`,
+    );
+    return { persisted: false, containerId: null, error };
+  }
+}
+
+function buildUnresolvedRuntimeError({ agentId, containerId, error } = {}) {
+  const runtimeLabel = containerId ? `runtime ${containerId}` : "a possibly created runtime";
+  const unresolvedError = new UnrecoverableError(
+    `Automatic retry disabled for agent ${agentId}: ${runtimeLabel} could not be safely reconciled after provisioning failed. Resolve the existing runtime before retrying. ${error?.message || "Unknown provisioning error"}`,
+  );
+  unresolvedError.code = "UNRESOLVED_RUNTIME_IDENTITY";
+  unresolvedError.containerId = containerId || null;
+  if (error) unresolvedError.cause = error;
+  return unresolvedError;
+}
+
+async function failDeploymentForUnresolvedRuntime({
+  queryable = db,
+  job,
+  agentId,
+  name,
+  containerId,
+  error,
+} = {}) {
+  const unresolvedError = buildUnresolvedRuntimeError({ agentId, containerId, error });
+  try {
+    const failure = await persistProvisioningFailure({
+      queryable,
+      job,
+      agentId,
+      name,
+      error: unresolvedError,
+      forceTerminal: true,
+    });
+    if (failure.canceled) {
+      return { canceled: true, reason: "agent-deleted-with-unresolved-runtime" };
+    }
+  } catch (persistError) {
+    console.error(
+      `[provisioner] Failed to persist terminal state for unresolved runtime ${containerId || "unknown"} on agent ${agentId}: ${persistError.message}`,
+    );
+  }
+  throw unresolvedError;
 }
 
 async function cleanupProvisionedRuntimeAfterFailure({
@@ -267,9 +352,36 @@ async function cleanupProvisionedRuntimeAfterFailure({
   provisioner,
   agentId,
   containerId,
+  destroyAllowed = true,
+  persistIdentity = true,
 } = {}) {
-  if (!containerId || typeof provisioner?.destroy !== "function") {
-    return { destroyed: false, reason: "no-runtime" };
+  if (!containerId) {
+    return { destroyed: false, reason: "no-runtime", retrySafe: true };
+  }
+
+  if (typeof provisioner?.destroy !== "function") {
+    const identity = persistIdentity
+      ? await preserveUnresolvedRuntimeIdentity({ queryable, agentId, containerId })
+      : { persisted: false, containerId: null };
+    return {
+      destroyed: false,
+      reason: "destroy-unavailable",
+      retrySafe: false,
+      identityPersisted: identity.persisted,
+    };
+  }
+
+  if (!destroyAllowed) {
+    const identity = persistIdentity
+      ? await preserveUnresolvedRuntimeIdentity({ queryable, agentId, containerId })
+      : { persisted: false, containerId: null };
+    return {
+      destroyed: false,
+      reason: "destroy-not-authorized",
+      retrySafe: false,
+      identityPersisted: identity.persisted,
+      ...(identity.error ? { error: identity.error } : {}),
+    };
   }
 
   try {
@@ -278,7 +390,16 @@ async function cleanupProvisionedRuntimeAfterFailure({
     console.error(
       `[provisioner] Failed to clean runtime ${containerId} for agent ${agentId}: ${error.message}`,
     );
-    return { destroyed: false, reason: "destroy-failed", error };
+    const identity = persistIdentity
+      ? await preserveUnresolvedRuntimeIdentity({ queryable, agentId, containerId })
+      : { persisted: false, containerId: null };
+    return {
+      destroyed: false,
+      reason: "destroy-failed",
+      retrySafe: false,
+      identityPersisted: identity.persisted,
+      error,
+    };
   }
 
   try {
@@ -297,14 +418,41 @@ async function cleanupProvisionedRuntimeAfterFailure({
       [agentId, containerId],
     );
   } catch (error) {
-    // The runtime is already gone, so stale identity is recoverable and safer
-    // than keeping a live orphan. A retry or activation reset clears it later.
     console.warn(
       `[provisioner] Runtime ${containerId} was destroyed but identity cleanup failed for agent ${agentId}: ${error.message}`,
     );
+    return {
+      destroyed: true,
+      reason: "identity-clear-failed",
+      retrySafe: false,
+      error,
+    };
   }
 
-  return { destroyed: true };
+  return { destroyed: true, retrySafe: true };
+}
+
+async function reconcileProvisioningFailureRuntime({
+  queryable = db,
+  provisioner,
+  agentId,
+  containerId,
+  error,
+} = {}) {
+  const runtimeIdentity = error?.runtimeIdentity || null;
+  const unresolvedContainerId = containerId || runtimeIdentity?.containerId || null;
+  if (!unresolvedContainerId) {
+    return { destroyed: false, reason: "no-runtime", retrySafe: true, containerId: null };
+  }
+  const cleanup = await cleanupProvisionedRuntimeAfterFailure({
+    queryable,
+    provisioner,
+    agentId,
+    containerId: unresolvedContainerId,
+    destroyAllowed: runtimeIdentity?.destroyAllowed !== false,
+    persistIdentity: runtimeIdentity?.persistIdentity !== false,
+  });
+  return { ...cleanup, containerId: unresolvedContainerId };
 }
 
 const OPENCLAW_WORKSPACE_PATH = "/root/.openclaw/workspace";
@@ -2042,7 +2190,8 @@ const worker = new Worker(
     try {
       const agentRowResult = await db.query(
         `SELECT image, template_payload, sandbox_type, backend_type, runtime_family,
-            deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers, status
+            deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers, status,
+            container_id
        FROM agents
       WHERE id = $1`,
         [id],
@@ -2057,6 +2206,19 @@ const worker = new Worker(
           `[provisioner] Skipping deployment job ${job.id}; agent ${id} is ${agentRow.status}`,
         );
         return { canceled: true, reason: `agent-${agentRow.status}` };
+      }
+      if (agentRow.container_id) {
+        console.error(
+          `[provisioner] Refusing to create a replacement runtime for agent ${id}; unresolved runtime ${agentRow.container_id} is still persisted`,
+        );
+        return await failDeploymentForUnresolvedRuntime({
+          queryable: db,
+          job,
+          agentId: id,
+          name,
+          containerId: agentRow.container_id,
+          error: new Error("A previous provisioning attempt left runtime identity in place"),
+        });
       }
       // gateway_token is encrypted at rest. Decrypt the stored value in place so
       // the reuse path (k8s/Hermes pass it back into the container as the runtime
@@ -2399,6 +2561,7 @@ const worker = new Worker(
       try {
         const abortController = new AbortController();
         let provisionTimeoutHandle = null;
+        let runtimeIdentityPersisted = false;
         if (resolvedBackend === "k8s" && container_name) {
           containerId = container_name;
         }
@@ -2461,6 +2624,29 @@ const worker = new Worker(
           );
           return { canceled: true, reason: "agent-deleted-before-create" };
         }
+        const onRuntimeIdentity = async (identity = {}) => {
+          const createdContainerId = String(identity.containerId || "").trim();
+          if (!createdContainerId) {
+            throw new Error("Provisioner reported an empty runtime identity");
+          }
+          containerId = createdContainerId;
+          containerName = identity.containerName || containerName || container_name;
+          const persisted = await persistProvisionedRuntimeIdentity({
+            queryable: db,
+            agentId: id,
+            containerId,
+            containerName: containerName || null,
+          });
+          if (!persisted.persisted) {
+            const identityError = new Error(
+              `Agent ${id} was deleted or already references another runtime while ${containerId} was being created`,
+            );
+            identityError.code = "RUNTIME_IDENTITY_PERSIST_FAILED";
+            identityError.containerId = containerId;
+            throw identityError;
+          }
+          runtimeIdentityPersisted = true;
+        };
         const createOnce = (gatewayHostPort) =>
           provisioner.create({
             id,
@@ -2481,6 +2667,7 @@ const worker = new Worker(
             executionTargetId: resolvedRuntimeFields.execution_target_id,
             sandboxProfile: resolvedRuntimeFields.sandbox_profile,
             abortSignal: abortController.signal,
+            onRuntimeIdentity,
             env: {
               AGENT_ID: String(id),
               AGENT_NAME: name || "",
@@ -2573,17 +2760,15 @@ const worker = new Worker(
         // and cleaned up by the failure catch, a reconciler, or a retry. Without
         // this, a crash between create() and the final UPDATE leaves an orphan
         // container that no DB row references.
-        if (containerId) {
+        if (containerId && !runtimeIdentityPersisted) {
           try {
-            const persistedContainer = await db.query(
-              `UPDATE agents
-                SET container_id = $2,
-                    container_name = COALESCE($3, container_name)
-              WHERE id = $1
-              RETURNING id`,
-              [id, containerId, containerName || null],
-            );
-            if (!persistedContainer.rows[0]) {
+            const persistedContainer = await persistProvisionedRuntimeIdentity({
+              queryable: db,
+              agentId: id,
+              containerId,
+              containerName: containerName || null,
+            });
+            if (!persistedContainer.persisted) {
               console.warn(
                 `[provisioner] Agent ${id} was deleted during create; removing runtime ${containerId}`,
               );
@@ -2691,13 +2876,23 @@ const worker = new Worker(
           `[${resolvedBackend}] Provisioning failed for agent ${id} (attempt ${job.attemptsMade + 1}/${job.opts?.attempts || 1}):`,
           err.message,
         );
-        if (containerId) {
-          await cleanupProvisionedRuntimeAfterFailure({
+        const cleanup = await reconcileProvisioningFailureRuntime({
+          queryable: db,
+          provisioner,
+          agentId: id,
+          containerId,
+          error: err,
+        });
+        if (!cleanup.retrySafe) {
+          const unresolved = await failDeploymentForUnresolvedRuntime({
             queryable: db,
-            provisioner,
+            job,
             agentId: id,
-            containerId,
+            name,
+            containerId: cleanup.containerId,
+            error: cleanup.error || err,
           });
+          if (unresolved.canceled) return unresolved;
         }
         const failure = await persistProvisioningFailure({
           queryable: db,
@@ -2920,12 +3115,24 @@ const worker = new Worker(
         }
       } catch (err) {
         console.error("Failed to update agent status:", err.message);
-        await cleanupProvisionedRuntimeAfterFailure({
+        const cleanup = await reconcileProvisioningFailureRuntime({
           queryable: db,
           provisioner,
           agentId: id,
           containerId,
+          error: err,
         });
+        if (!cleanup.retrySafe) {
+          const unresolved = await failDeploymentForUnresolvedRuntime({
+            queryable: db,
+            job,
+            agentId: id,
+            name,
+            containerId: cleanup.containerId,
+            error: cleanup.error || err,
+          });
+          if (unresolved.canceled) return unresolved;
+        }
         const failure = await persistProvisioningFailure({
           queryable: db,
           job,
@@ -3185,9 +3392,13 @@ healthServer.listen(HEALTH_PORT, () => {
 
 module.exports = {
   allocateAvailableLocalDockerGatewayPort,
+  buildUnresolvedRuntimeError,
   cleanupProvisionedRuntimeAfterFailure,
+  failDeploymentForUnresolvedRuntime,
   fetchDeploymentProvider,
   fetchUserLlmEnvVars,
   isFinalDeploymentAttempt,
+  persistProvisionedRuntimeIdentity,
   persistProvisioningFailure,
+  reconcileProvisioningFailureRuntime,
 };
