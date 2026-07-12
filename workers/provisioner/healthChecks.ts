@@ -60,7 +60,7 @@ async function waitForAgentReadiness(
     runtimePort = AGENT_RUNTIME_PORT,
     gatewayHostPort = null,
     gatewayHost = null,
-    gatewayPort = OPENCLAW_GATEWAY_PORT,
+    gatewayPort = null,
     checkGateway = true,
   } = {},
   options = {},
@@ -81,10 +81,18 @@ async function waitForAgentReadiness(
 
   let gateway = null;
   if (checkGateway) {
-    const resolvedGatewayHost = gatewayHostPort
-      ? gatewayHost || process.env.GATEWAY_HOST || "host.docker.internal"
-      : gatewayHost || host;
-    const resolvedGatewayPort = gatewayHostPort || gatewayPort || OPENCLAW_GATEWAY_PORT;
+    // Prefer an explicit runtime-internal endpoint when the backend supplies
+    // one. Local Docker can then bind its optional host-published port to
+    // loopback without breaking readiness from the provisioner container.
+    const hasExplicitGatewayEndpoint = Boolean(gatewayHost && gatewayPort);
+    const resolvedGatewayHost = hasExplicitGatewayEndpoint
+      ? gatewayHost
+      : gatewayHostPort
+        ? gatewayHost || process.env.GATEWAY_HOST || "host.docker.internal"
+        : gatewayHost || host;
+    const resolvedGatewayPort = hasExplicitGatewayEndpoint
+      ? gatewayPort
+      : gatewayHostPort || gatewayPort || OPENCLAW_GATEWAY_PORT;
 
     gateway = await waitForHttpReady(gatewayUrl(resolvedGatewayHost, resolvedGatewayPort, "/"), {
       attempts: 15,

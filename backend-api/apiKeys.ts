@@ -26,6 +26,10 @@ const SCOPE_DEFINITIONS = [
   { value: "monitoring:read", description: "Read monitoring metrics and events" },
   { value: "integrations:read", description: "Read integration configurations" },
   { value: "integrations:write", description: "Create and remove integrations" },
+  {
+    value: "admin:read",
+    description: "Run read-only platform diagnostics as an issuing platform admin",
+  },
 ];
 
 const KNOWN_SCOPES = new Set(SCOPE_DEFINITIONS.map((entry) => entry.value));

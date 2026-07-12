@@ -14,8 +14,8 @@ export type Locale = (typeof LOCALES)[number];
 export const DEFAULT_LOCALE: Locale = "en";
 export const LOCALE_LABELS: Record<Locale, string> = {
   en: "English",
-  es: "Espanol",
-  fr: "Francais",
+  es: "Español",
+  fr: "Français",
   "zh-Hans": "简体中文",
   "zh-Hant": "繁體中文",
 };
@@ -370,31 +370,7 @@ function setAnonymousPreferredLocale(locale: Locale | null) {
   }
 }
 
-function legacyAuthHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
-  const token = window.localStorage.getItem("token");
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
 async function fetchLanguagePreference() {
-  try {
-    const userResponse = await fetch("/api/auth/me", {
-      credentials: "include",
-      headers: legacyAuthHeaders(),
-    });
-    if (userResponse.ok) {
-      const user = await userResponse.json().catch(() => ({}));
-      setAnonymousPreferredLocale(null);
-      return {
-        defaultLocale: normalizeLocale(user.defaultLocale),
-        preferredLocale: user.preferredLocale ? normalizeLocale(user.preferredLocale) : null,
-        effectiveLocale: normalizeLocale(user.effectiveLocale || user.defaultLocale),
-      };
-    }
-  } catch {
-    // Fall back to the public platform config below.
-  }
-
   const anonymousLocale = getAnonymousPreferredLocale();
 
   try {
@@ -417,24 +393,6 @@ async function fetchLanguagePreference() {
     preferredLocale: anonymousLocale,
     effectiveLocale: anonymousLocale || DEFAULT_LOCALE,
   };
-}
-
-async function persistPreferredLocale(locale: Locale | null) {
-  try {
-    const response = await fetch("/api/auth/profile", {
-      method: "PATCH",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        ...legacyAuthHeaders(),
-      },
-      body: JSON.stringify({ preferredLocale: locale }),
-    });
-    if (!response.ok) return null;
-    return response.json().catch(() => null);
-  } catch {
-    return null;
-  }
 }
 
 export function translateText(value: string, locale: Locale): string {
@@ -630,28 +588,20 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   const setLocale = useCallback(
     async (nextLocale: Locale) => {
       const normalized = normalizeLocale(nextLocale);
-      const persisted = await persistPreferredLocale(normalized);
-      setAnonymousPreferredLocale(persisted ? null : normalized);
-      setPreferredLocale(
-        persisted?.preferredLocale ? normalizeLocale(persisted.preferredLocale) : normalized,
-      );
-      setDefaultLocale(normalizeLocale(persisted?.defaultLocale || defaultLocale));
+      setAnonymousPreferredLocale(normalized);
+      setPreferredLocale(normalized);
       setResolvedLocale(normalized);
       await router.push(router.pathname, router.asPath, { locale: normalized });
     },
-    [defaultLocale, router],
+    [router],
   );
 
   const clearLocalePreference = useCallback(async () => {
-    const persisted = await persistPreferredLocale(null);
     setAnonymousPreferredLocale(null);
-    const nextDefaultLocale = normalizeLocale(persisted?.defaultLocale || defaultLocale);
-    const nextEffectiveLocale = normalizeLocale(persisted?.effectiveLocale || nextDefaultLocale);
     setPreferredLocale(null);
-    setDefaultLocale(nextDefaultLocale);
-    setResolvedLocale(nextEffectiveLocale);
-    await router.push(router.pathname, router.asPath, { locale: nextEffectiveLocale });
-    return nextEffectiveLocale;
+    setResolvedLocale(defaultLocale);
+    await router.push(router.pathname, router.asPath, { locale: defaultLocale });
+    return defaultLocale;
   }, [defaultLocale, router]);
 
   const value = useMemo<I18nValue>(

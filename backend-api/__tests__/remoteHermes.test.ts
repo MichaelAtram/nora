@@ -55,22 +55,22 @@ describe("RemoteHermesBackend port publishing", () => {
       dashboardHostPort: 19044,
     });
     expect(bindings).toEqual({
-      [`${HERMES_RUNTIME_PORT}/tcp`]: [{ HostPort: "19500" }],
-      [`${HERMES_DASHBOARD_PORT}/tcp`]: [{ HostPort: "19044" }],
+      [`${HERMES_RUNTIME_PORT}/tcp`]: [{ HostIp: "0.0.0.0", HostPort: "19500" }],
+      [`${HERMES_DASHBOARD_PORT}/tcp`]: [{ HostIp: "0.0.0.0", HostPort: "19044" }],
     });
   });
 
   it("publishes only the runtime port when no dashboard port is allocated", () => {
     const backend = new RemoteHermesBackend(hermesProfile());
     expect(backend._hermesPortBindings({ gatewayHostPort: 19500 })).toEqual({
-      [`${HERMES_RUNTIME_PORT}/tcp`]: [{ HostPort: "19500" }],
+      [`${HERMES_RUNTIME_PORT}/tcp`]: [{ HostIp: "0.0.0.0", HostPort: "19500" }],
     });
   });
 
   it("publishes only the dashboard port when no runtime port is allocated", () => {
     const backend = new RemoteHermesBackend(hermesProfile());
     expect(backend._hermesPortBindings({ dashboardHostPort: 19044 })).toEqual({
-      [`${HERMES_DASHBOARD_PORT}/tcp`]: [{ HostPort: "19044" }],
+      [`${HERMES_DASHBOARD_PORT}/tcp`]: [{ HostIp: "0.0.0.0", HostPort: "19044" }],
     });
   });
 

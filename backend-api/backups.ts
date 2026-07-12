@@ -1,6 +1,7 @@
 // @ts-nocheck
 const crypto = require("crypto");
 const fs = require("fs/promises");
+const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const { promisify } = require("util");
@@ -31,6 +32,7 @@ const { getRuntimeSelectionStatus } = require("../agent-runtime/lib/backendCatal
 const { assertKubernetesExecutionTargetAvailable } = require("./kubernetesClusters");
 const { assertRemoteHostExecutionTargetAvailable } = require("./remoteHosts");
 const { buildAgentRuntimeFields, resolveRequestedRuntimeFields } = require("./agentRuntimeFields");
+const { buildPostgresCliConfig } = require("./lib/connectionConfig");
 
 const gzipAsync = promisify(gzip);
 
@@ -1122,19 +1124,26 @@ async function buildAgentBackupArchive(backup, { signal } = {}) {
 
 async function buildPostgresDump({ signal } = {}) {
   throwIfAborted(signal, "pg_dump");
-  const args = [
-    "-h",
-    process.env.DB_HOST || "postgres",
-    "-p",
-    String(process.env.DB_PORT || "5432"),
-    "-U",
-    process.env.DB_USER || "nora",
-    "--no-owner",
-    "--no-privileges",
-    "--clean",
-    "--if-exists",
-    process.env.DB_NAME || "nora",
-  ];
+  const dumpConfig = buildPostgresCliConfig(process.env);
+  let tlsDirectory = null;
+  const cleanupTls = async () => {
+    if (!tlsDirectory) return;
+    await fs.rm(tlsDirectory, { recursive: true, force: true });
+    tlsDirectory = null;
+  };
+  try {
+    if (dumpConfig.tlsFiles.length > 0) {
+      tlsDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "nora-pg-dump-"));
+      for (const file of dumpConfig.tlsFiles) {
+        const filePath = path.join(tlsDirectory, file.filename);
+        await fs.writeFile(filePath, file.contents, { mode: 0o600 });
+        dumpConfig.env[file.envKey] = filePath;
+      }
+    }
+  } catch (error) {
+    await cleanupTls();
+    throw error;
+  }
 
   // Stream pg_dump stdout straight into gzip so we don't buffer the raw SQL
   // dump in memory. Real installations exceeded the prior 1 GiB execFile cap.
@@ -1143,10 +1152,10 @@ async function buildPostgresDump({ signal } = {}) {
     // the child receives SIGTERM automatically. We still set up our own
     // settle-error path so callers see the abort reason rather than a
     // generic "Command failed" message.
-    const child = spawn("pg_dump", args, {
+    const child = spawn("pg_dump", dumpConfig.args, {
       env: {
         ...process.env,
-        PGPASSWORD: process.env.DB_PASSWORD || "nora",
+        ...dumpConfig.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
       signal,
@@ -1172,10 +1181,14 @@ async function buildPostgresDump({ signal } = {}) {
         } catch {
           /* ignore — best effort */
         }
-        reject(err);
-      } else {
-        resolve(value);
       }
+      cleanupTls()
+        .catch((cleanupError) => {
+          console.warn(
+            `[backups] failed to remove temporary PostgreSQL TLS files: ${cleanupError.message}`,
+          );
+        })
+        .finally(() => (err ? reject(err) : resolve(value)));
     };
 
     const tryFinish = () => {

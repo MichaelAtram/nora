@@ -38,6 +38,7 @@ jobs:
           - frontend-marketing
           - backend-api
           - agent-runtime
+          - workers/backup
           - workers/provisioner
           - e2e
           - mcp-server
@@ -68,6 +69,7 @@ jobs:
           - frontend-marketing
           - backend-api
           - agent-runtime
+          - workers/backup
           - workers/provisioner
           - e2e
           - mcp-server

@@ -5,6 +5,12 @@
     "node": ">=24 <25"
   },
   "scripts": {
+    "contributor:setup": "node scripts/contributor.mjs setup",
+    "contributor:check": "node scripts/contributor.mjs check",
+    "scaffold:integration": "node scripts/scaffold-integration-provider.mjs",
+    "scaffold:backend": "node scripts/scaffold-backend-adapter.mjs",
+    "test:scaffolds": "node --test scripts/extension-scaffolds.test.mjs",
+    "validate:extensions": "node scripts/validate-extension-scaffolds.mjs",
     "ci:format:check": "prettier --check",
     "ci:format:write": "prettier --write",
     "ci:license-check": "node .github/workflows/scripts/license-check.mjs",

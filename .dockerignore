@@ -12,4 +12,5 @@ node_modules
 !.github/readme-assets/
 .github/readme-assets/*
 !.github/readme-assets/walkthrough.mp4
-infra
+infra/*
+!infra/container-entrypoint.sh

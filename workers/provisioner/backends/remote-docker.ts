@@ -98,6 +98,12 @@ class RemoteDockerBackend extends DockerBackend {
     return null;
   }
 
+  // Remote-host agents are intentionally reachable through the registered
+  // host. Keep this explicit so the local backend can remain loopback-only.
+  _publishedPortHostIp() {
+    return "0.0.0.0";
+  }
+
   async create(config = {}) {
     const result = await super.create(config);
     // The gateway port is published on the REMOTE host's interface, so point

@@ -2,8 +2,9 @@
 const express = require("express");
 const db = require("../db");
 const { encrypt, decrypt } = require("../crypto");
-const { addDeploymentJob } = require("../redisQueue");
+const { addDeploymentJob, cancelDeploymentJobsForAgent } = require("../redisQueue");
 const billing = require("../billing");
+const llmProviders = require("../llmProviders");
 const {
   clampDeploymentDefaults,
   getDeploymentDefaults,
@@ -85,6 +86,145 @@ router.use(createMutationFailureAuditMiddleware("agent"));
 // API-key requests need agents:read for GET/HEAD, agents:write for everything
 // else. Session-authenticated requests skip this check (req.apiKey is unset).
 router.use(scopeByMethod("agents:read", "agents:write"));
+
+const DEMO_ACTIVATION_MARKER = "local-docker-demo-v1";
+
+function demoActivationJobId(agentId) {
+  return `demo-activation-${agentId}`;
+}
+
+function buildDemoDeploymentJob(agent, userId, demoProviderId, plan = "selfhosted") {
+  return {
+    id: agent.id,
+    name: agent.name,
+    userId,
+    plan,
+    backend: agent.backend_type || agent.deploy_target || "docker",
+    execution_target_id: agent.execution_target_id || "docker",
+    sandbox: agent.sandbox_profile || agent.sandbox_type || "standard",
+    specs: {
+      vcpu: agent.vcpu,
+      ram_mb: agent.ram_mb,
+      disk_gb: agent.disk_gb,
+    },
+    container_name: agent.container_name,
+    image: agent.image,
+    model: null,
+    migration_draft_id: null,
+    clawhub_skills: [],
+    llm_provider_id: demoProviderId,
+  };
+}
+
+async function ensureDemoDeploymentQueued(agent, userId, demoProviderId, plan, queryable = db) {
+  if (!agent) return agent;
+
+  let deploymentAgent = agent;
+  if (agent.status === "error") {
+    const canceledJobs = await cancelDeploymentJobsForAgent(agent.id);
+    if (canceledJobs.active > 0) {
+      const error = new Error(
+        "The previous demo deployment is still finishing. Try again shortly.",
+      );
+      error.statusCode = 409;
+      throw error;
+    }
+    if (containerManager.canDestroy(agent)) {
+      await containerManager.destroy(agent);
+    }
+    const reset = await queryable.query(
+      `UPDATE agents
+          SET status = 'queued',
+              container_id = NULL,
+              host = NULL,
+              runtime_host = NULL,
+              runtime_port = NULL,
+              gateway_host = NULL,
+              gateway_port = NULL,
+              gateway_host_port = NULL,
+              gateway_token = NULL
+        WHERE id = $1
+        RETURNING *`,
+      [agent.id],
+    );
+    deploymentAgent = reset.rows[0] || { ...agent, status: "queued" };
+    await queryable.query("UPDATE deployments SET status = 'queued' WHERE agent_id = $1", [
+      agent.id,
+    ]);
+  }
+
+  if (!["queued", "deploying"].includes(deploymentAgent.status)) return deploymentAgent;
+  await addDeploymentJob(buildDemoDeploymentJob(deploymentAgent, userId, demoProviderId, plan), {
+    jobId: demoActivationJobId(deploymentAgent.id),
+  });
+  return deploymentAgent;
+}
+
+function demoActivationMarkerPayload() {
+  return JSON.stringify({ metadata: { activation: DEMO_ACTIVATION_MARKER } });
+}
+
+async function findDemoActivationAgent(queryable, userId) {
+  const result = await queryable.query(
+    `SELECT *
+       FROM agents
+      WHERE user_id = $1
+        AND template_payload @> $2::jsonb
+      ORDER BY created_at, id
+      LIMIT 1`,
+    [userId, demoActivationMarkerPayload()],
+  );
+  return result.rows[0] || null;
+}
+
+async function assertLocalDockerAvailable() {
+  try {
+    const Docker = require("dockerode");
+    const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+    if (typeof docker.ping !== "function") {
+      throw new Error("Docker client does not expose ping()");
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (error) reject(error);
+        else resolve();
+      };
+      const timeout = setTimeout(
+        () => finish(new Error("Timed out while checking the local Docker daemon")),
+        3000,
+      );
+      try {
+        docker.ping((error) => finish(error));
+      } catch (error) {
+        finish(error);
+      }
+    });
+  } catch (error) {
+    console.warn("[agents.activate-demo] Local Docker is unavailable:", error.message);
+    const unavailable = new Error(
+      "Local Docker is unavailable. Start Docker and make sure Nora can access /var/run/docker.sock, then try again.",
+    );
+    unavailable.statusCode = 503;
+    unavailable.code = "LOCAL_DOCKER_UNAVAILABLE";
+    throw unavailable;
+  }
+}
+
+async function removeFailedDemoActivation(queryable, agentId, userId) {
+  await queryable.query("BEGIN");
+  try {
+    await queryable.query("DELETE FROM deployments WHERE agent_id = $1", [agentId]);
+    await queryable.query("DELETE FROM agents WHERE id = $1 AND user_id = $2", [agentId, userId]);
+    await queryable.query("COMMIT");
+  } catch (error) {
+    await queryable.query("ROLLBACK").catch(() => {});
+    throw error;
+  }
+}
 
 function resolveRequestedImage({
   requestedImage,
@@ -1318,6 +1458,175 @@ router.get(
   }),
 );
 
+router.post("/activate-demo", async (req, res) => {
+  const userId = req.user.id;
+  const lockKey = llmProviders.providerMutationLockKey(userId);
+  let client;
+  let lockHeld = false;
+  let transactionOpen = false;
+
+  try {
+    client = await db.connect();
+    await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [lockKey]);
+    lockHeld = true;
+
+    const existingAgent = await findDemoActivationAgent(client, userId);
+    if (existingAgent) {
+      const demoProvider = await llmProviders.ensureDemoProvider(userId, client);
+      const activatedAgent = await ensureDemoDeploymentQueued(
+        existingAgent,
+        userId,
+        demoProvider.id,
+        undefined,
+        client,
+      );
+      return res.json(serializeAgent(activatedAgent));
+    }
+
+    const runtimeFields = resolveRequestedRuntimeFields({
+      request: {
+        runtime_family: "openclaw",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+        sandbox_profile: "standard",
+      },
+    });
+    const runtimeSelectionStatus = await assertRuntimeTargetAvailable(runtimeFields, userId);
+    await assertLocalDockerAvailable();
+
+    const limits = await billing.enforceLimits(userId);
+    if (!limits.allowed) {
+      return res.status(402).json({
+        error: limits.error,
+        subscription: limits.subscription,
+      });
+    }
+
+    const name = "Demo Agent";
+    const deploymentDefaults = await getDeploymentDefaults();
+    const specs = billing.IS_PAAS
+      ? deploymentDefaults
+      : clampDeploymentDefaults(
+          normalizeDeploymentDefaults({}, deploymentDefaults),
+          billing.SELFHOSTED_LIMITS,
+        );
+    const node = await scheduler.selectNode({ fallback: runtimeFields.deploy_target });
+    const nodeName = node ? node.name : runtimeFields.deploy_target;
+    const containerName = resolveContainerName({
+      agentName: name,
+      runtimeSelection: runtimeFields,
+    });
+    const image = resolveRequestedImage({ runtimeFields });
+    const templatePayload = ensureCoreTemplateFiles(
+      createEmptyTemplatePayload({
+        source: "demo-activation",
+        activation: DEMO_ACTIVATION_MARKER,
+      }),
+      {
+        name,
+        sourceType: "platform",
+        includeBootstrap: true,
+      },
+    );
+
+    await client.query("BEGIN");
+    transactionOpen = true;
+    const demoProvider = await llmProviders.ensureDemoProvider(userId, client);
+    const result = await client.query(
+      `INSERT INTO agents(
+         user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
+         container_name, image, template_payload, clawhub_skills, runtime_family, deploy_target,
+         execution_target_id, sandbox_profile
+       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, '[]'::jsonb, $12, $13, $14, $15)
+       RETURNING *`,
+      [
+        userId,
+        name,
+        nodeName,
+        runtimeFields.backend_type,
+        runtimeFields.sandbox_type,
+        specs.vcpu,
+        specs.ram_mb,
+        specs.disk_gb,
+        containerName,
+        image,
+        JSON.stringify(templatePayload),
+        runtimeFields.runtime_family,
+        runtimeFields.deploy_target,
+        runtimeFields.execution_target_id,
+        runtimeFields.sandbox_profile,
+      ],
+    );
+    const agent = result.rows[0];
+    await client.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [
+      agent.id,
+    ]);
+    await client.query("COMMIT");
+    transactionOpen = false;
+
+    try {
+      await ensureDemoDeploymentQueued(
+        agent,
+        userId,
+        demoProvider.id,
+        limits.subscription?.plan || "selfhosted",
+      );
+    } catch (queueError) {
+      try {
+        await removeFailedDemoActivation(client, agent.id, userId);
+      } catch (cleanupError) {
+        console.error(
+          `[agents.activate-demo] Failed to remove agent ${agent.id} after queue failure:`,
+          cleanupError.message,
+        );
+      }
+      throw queueError;
+    }
+
+    try {
+      const deployType = `${runtimeSelectionStatus.runtimeFamily}/${runtimeSelectionStatus.deployTarget}/${runtimeSelectionStatus.sandboxProfile}`;
+      await monitoring.logEvent(
+        "agent_deployed",
+        `Agent "${name}" (${deployType}) queued for demo deployment`,
+        agentAuditMetadata(req, agent, {
+          deploy: {
+            runtimeFamily: runtimeFields.runtime_family,
+            deployTarget: runtimeFields.deploy_target,
+            executionTargetId: runtimeFields.execution_target_id,
+            sandboxProfile: runtimeFields.sandbox_profile,
+            backend: runtimeFields.backend_type,
+            type: deployType,
+            specs,
+            image,
+            containerName,
+            llmProviderId: demoProvider.id,
+          },
+        }),
+      );
+    } catch (auditError) {
+      console.warn("[agents.activate-demo] Failed to record deploy event:", auditError.message);
+    }
+
+    return res.json(serializeAgent(agent));
+  } catch (error) {
+    if (transactionOpen && client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+    return res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    if (client) {
+      if (lockHeld) {
+        await client
+          .query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey])
+          .catch((error) =>
+            console.warn("[agents.activate-demo] Advisory unlock failed:", error.message),
+          );
+      }
+      client.release();
+    }
+  }
+});
+
 router.post("/deploy", async (req, res) => {
   try {
     const requestBody = req.body || {};
@@ -1885,6 +2194,11 @@ async function destroyAgent(agentId, userId, req, res) {
   res.locals.auditContext = buildAgentContext(agent, {
     ownerEmail: req.user.email || null,
   });
+
+  // Remove waiting/delayed retries before deleting the durable row. Active
+  // BullMQ jobs cannot be removed while locked; the provisioner rechecks the
+  // row and cleans up any just-created runtime, making those jobs harmless.
+  await cancelDeploymentJobsForAgent(agent.id);
 
   if (containerManager.canDestroy(agent)) {
     try {

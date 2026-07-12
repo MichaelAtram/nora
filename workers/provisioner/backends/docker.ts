@@ -31,6 +31,8 @@ const {
 } = require("./telemetry");
 
 const pendingImageBuilds = new Map();
+const DEFAULT_AGENT_PIDS_LIMIT = 512;
+const DEFAULT_LOCAL_PUBLISH_HOST_IP = "127.0.0.1";
 
 function loadDockerCtor() {
   return require(
@@ -61,6 +63,12 @@ function throwIfAborted(abortSignal, stage = "docker create") {
   throw reason;
 }
 
+function isDockerNotFound(error) {
+  return (
+    error?.statusCode === 404 || /no such container|not found/i.test(String(error?.message || ""))
+  );
+}
+
 function safeContainerName(prefix, name, id) {
   const suffix =
     String(id || Date.now().toString(36))
@@ -84,6 +92,40 @@ class DockerBackend extends ProvisionerBackend {
     const Docker = loadDockerCtor();
     this.docker = new Docker({ socketPath: "/var/run/docker.sock" });
     this._composeNetwork = null; // cached
+  }
+
+  // Local Docker ports are intentionally host-loopback-only by default. An
+  // operator can opt into another concrete host interface for a standalone
+  // install, while remote Docker overrides this hook because its published
+  // ports must be reachable across the registered host network.
+  _publishedPortHostIp() {
+    const configured = String(process.env.DOCKER_AGENT_BIND_IP || "").trim();
+    if (!configured) return DEFAULT_LOCAL_PUBLISH_HOST_IP;
+
+    const net = require("node:net");
+    if (net.isIP(configured)) return configured;
+
+    console.warn(
+      `[docker] Ignoring invalid DOCKER_AGENT_BIND_IP=${configured}; using ${DEFAULT_LOCAL_PUBLISH_HOST_IP}`,
+    );
+    return DEFAULT_LOCAL_PUBLISH_HOST_IP;
+  }
+
+  async isHostPortBound(port, { ignoreContainerName } = {}) {
+    const candidate = Number(port);
+    if (!Number.isInteger(candidate) || candidate < 1 || candidate > 65535) return false;
+
+    const ignoredName = String(ignoreContainerName || "").trim();
+    const containers = await this.docker.listContainers({ all: false });
+    return containers.some((container) => {
+      const names = Array.isArray(container?.Names)
+        ? container.Names.map((name) => String(name || "").replace(/^\//, ""))
+        : [];
+      if (ignoredName && names.includes(ignoredName)) return false;
+      return Array.isArray(container?.Ports)
+        ? container.Ports.some((binding) => Number(binding?.PublicPort) === candidate)
+        : false;
+    });
   }
 
   /**
@@ -582,6 +624,7 @@ class DockerBackend extends ProvisionerBackend {
       allocatedRuntimePortNumber <= 65535
         ? allocatedRuntimePortNumber
         : null;
+    const publishedPortHostIp = this._publishedPortHostIp(config);
 
     const allowedOrigins = new Set([
       "http://localhost:8080",
@@ -711,11 +754,20 @@ class DockerBackend extends ProvisionerBackend {
           Memory: (ram_mb || 2048) * 1024 * 1024,
           // Restart policy
           RestartPolicy: { Name: "unless-stopped" },
+          // Standard agents do not need ambient Linux capabilities. Bound the
+          // process tree as well so a runaway tool cannot exhaust host PIDs.
+          CapDrop: ["ALL"],
+          SecurityOpt: ["no-new-privileges:true"],
+          PidsLimit: DEFAULT_AGENT_PIDS_LIMIT,
           // Publish gateway port for direct browser access (control UI).
           // Use a deterministic port based on agent ID to survive container restarts.
           PortBindings: {
-            "18789/tcp": [{ HostPort: String(hostPort) }],
-            ...(runtimeHostPort ? { "9090/tcp": [{ HostPort: String(runtimeHostPort) }] } : {}),
+            "18789/tcp": [{ HostIp: publishedPortHostIp, HostPort: String(hostPort) }],
+            ...(runtimeHostPort
+              ? {
+                  "9090/tcp": [{ HostIp: publishedPortHostIp, HostPort: String(runtimeHostPort) }],
+                }
+              : {}),
           },
           // DNS servers for internet access from within the container
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
@@ -772,6 +824,10 @@ class DockerBackend extends ProvisionerBackend {
         gatewayToken,
         containerName,
         gatewayHostPort,
+        // Keep control-plane and worker traffic on the container network even
+        // though the optional direct browser port is host-loopback-only.
+        gatewayHost: host,
+        gatewayPort: OPENCLAW_GATEWAY_PORT,
         runtimeHostPort: publishedRuntimeHostPort,
       };
     } catch (error) {
@@ -793,25 +849,35 @@ class DockerBackend extends ProvisionerBackend {
     }
   }
 
-  async destroy(containerId) {
+  async destroy(containerId, { agentId: requestedAgentId } = {}) {
     console.log(`[docker] Destroying container ${containerId}`);
     const container = this.docker.getContainer(containerId);
 
-    let agentId = null;
+    let agentId = requestedAgentId || null;
+    let containerExists = true;
     try {
       const info = await container.inspect();
-      agentId = info.Config?.Labels?.["openclaw.agent.id"];
-    } catch {
-      // Container may already be gone; proceed to volume cleanup using what we have.
+      agentId = info.Config?.Labels?.["openclaw.agent.id"] || agentId;
+    } catch (error) {
+      if (!isDockerNotFound(error)) throw error;
+      containerExists = false;
     }
 
-    try {
-      await container.stop({ t: 10 });
-    } catch (e) {
-      // Already stopped
+    if (containerExists) {
+      try {
+        await container.stop({ t: 10 });
+      } catch (e) {
+        // Already stopped
+      }
+      try {
+        await container.remove({ force: true });
+        console.log(`[docker] Container ${containerId} removed`);
+      } catch (error) {
+        if (!isDockerNotFound(error)) throw error;
+      }
+    } else {
+      console.log(`[docker] Container ${containerId} already absent`);
     }
-    await container.remove({ force: true });
-    console.log(`[docker] Container ${containerId} removed`);
 
     if (agentId) {
       for (const volume of [`nora_agent_state_${agentId}`, `nora_agent_home_${agentId}`]) {

@@ -2,6 +2,10 @@
 const { Worker } = require("bullmq");
 const IORedis = require("ioredis");
 const { Pool } = require("pg");
+const {
+  buildPostgresConfig,
+  createRedisClient,
+} = require("../../backend-api/lib/connectionConfig");
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
 const { NEMOCLAW_DEFAULT_MODEL } = require("../../agent-runtime/lib/nemoclawDefaults");
 const {
@@ -16,6 +20,7 @@ const {
 } = require("../../agent-runtime/lib/backendCatalog");
 const { buildAgentRuntimeFields } = require("../../agent-runtime/lib/agentRuntimeFields");
 const { getAgentSecretEnvVars } = require("../../backend-api/agentSecretOverrides");
+const { getDeploymentProvider } = require("../../backend-api/llmProviders");
 const {
   buildHermesSeedArchive,
   getMigrationManifestForAgent,
@@ -32,7 +37,10 @@ const {
 const { getRemoteHostProfile } = require("../../backend-api/remoteHosts");
 const {
   allocateGatewayPort,
+  DEFAULT_RANGE_MIN,
+  DEFAULT_RANGE_MAX,
   LOCAL_HOST_KEY,
+  GATEWAY_PORT_PURPOSE,
   DASHBOARD_PORT_PURPOSE,
   RUNTIME_PORT_PURPOSE,
 } = require("../../backend-api/portAllocations");
@@ -71,19 +79,16 @@ const {
 } = require("../../agent-runtime/lib/clawhubReconciliation");
 
 // ── Connections ──────────────────────────────────────────
-const connection = new IORedis({
-  host: process.env.REDIS_HOST || "redis",
-  port: parseInt(process.env.REDIS_PORT || "6379"),
+const connection = createRedisClient(IORedis, process.env, {
   maxRetriesPerRequest: null,
 });
 
-const db = new Pool({
-  user: process.env.DB_USER || "nora",
-  password: process.env.DB_PASSWORD || "nora",
-  host: process.env.DB_HOST || "postgres",
-  database: process.env.DB_NAME || "nora",
-  port: parseInt(process.env.DB_PORT || "5432"),
-});
+const db = new Pool(
+  buildPostgresConfig({
+    ...process.env,
+    DB_APPLICATION_NAME: process.env.DB_APPLICATION_NAME || "nora-worker-provisioner",
+  }),
+);
 
 // Hash any agent ID (uuid string or integer) to a signed 64-bit BigInt suitable
 // for pg_try_advisory_lock(bigint). Uses FNV-1a over the string form. The lock
@@ -164,6 +169,137 @@ function parsePositiveInteger(rawValue, fallbackValue, { min = 1, max = 32 } = {
   const parsed = Number.parseInt(rawValue, 10);
   if (!Number.isFinite(parsed)) return fallbackValue;
   return Math.min(max, Math.max(min, parsed));
+}
+
+function deploymentAttemptInfo(job = {}) {
+  const attemptsMade = Number.isFinite(Number(job?.attemptsMade))
+    ? Math.max(0, Number(job.attemptsMade))
+    : 0;
+  const maxAttempts = Number.isFinite(Number(job?.opts?.attempts))
+    ? Math.max(1, Number(job.opts.attempts))
+    : 1;
+  return { attempt: attemptsMade + 1, maxAttempts };
+}
+
+function isFinalDeploymentAttempt(job) {
+  const { attempt, maxAttempts } = deploymentAttemptInfo(job);
+  return attempt >= maxAttempts;
+}
+
+async function allocateAvailableLocalDockerGatewayPort({
+  agentId,
+  containerName,
+  provisioner,
+  allocatePort = allocateGatewayPort,
+  queryable = db,
+} = {}) {
+  let rangeMin = DEFAULT_RANGE_MIN;
+
+  while (rangeMin <= DEFAULT_RANGE_MAX) {
+    const port = await allocatePort({
+      hostKey: LOCAL_HOST_KEY,
+      agentId,
+      purpose: GATEWAY_PORT_PURPOSE,
+      rangeMin,
+      rangeMax: DEFAULT_RANGE_MAX,
+    });
+    const bound =
+      typeof provisioner?.isHostPortBound === "function"
+        ? await provisioner.isHostPortBound(port, { ignoreContainerName: containerName })
+        : false;
+    if (!bound) return port;
+
+    console.warn(
+      `[provisioner] Local Docker host port ${port} is already published outside Nora's allocation table; trying the next slot`,
+    );
+    await queryable.query(
+      `DELETE FROM gateway_port_allocations
+        WHERE host_key = $1 AND agent_id = $2 AND purpose = $3 AND port = $4`,
+      [LOCAL_HOST_KEY, agentId, GATEWAY_PORT_PURPOSE, port],
+    );
+    rangeMin = Number(port) + 1;
+  }
+
+  const error = new Error(
+    `No Docker-publishable gateway port available on ${LOCAL_HOST_KEY} (range ${DEFAULT_RANGE_MIN}-${DEFAULT_RANGE_MAX}).`,
+  );
+  error.statusCode = 503;
+  throw error;
+}
+
+async function persistProvisioningFailure({ queryable = db, job, agentId, name, error } = {}) {
+  const existing = await queryable.query("SELECT id FROM agents WHERE id = $1", [agentId]);
+  if (!existing.rows[0]) {
+    return { canceled: true, terminal: false };
+  }
+
+  const { attempt, maxAttempts } = deploymentAttemptInfo(job);
+  const terminal = isFinalDeploymentAttempt(job);
+  if (!terminal) {
+    await queryable.query(
+      "UPDATE agents SET status = 'queued' WHERE id = $1 AND status IN ('deploying', 'running', 'warning')",
+      [agentId],
+    );
+    await queryable.query(
+      "UPDATE deployments SET status = 'queued' WHERE agent_id = $1 AND status IN ('deploying', 'completed')",
+      [agentId],
+    );
+    return { canceled: false, terminal: false };
+  }
+
+  await queryable.query("UPDATE agents SET status = 'error' WHERE id = $1", [agentId]);
+  await queryable.query("UPDATE deployments SET status = 'failed' WHERE agent_id = $1", [agentId]);
+  await queryable.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
+    "agent_deploy_failed",
+    `Agent "${name}" failed to deploy: ${error?.message || "Unknown provisioning error"}`,
+    JSON.stringify({ agentId, attempt, maxAttempts }),
+  ]);
+  return { canceled: false, terminal: true };
+}
+
+async function cleanupProvisionedRuntimeAfterFailure({
+  queryable = db,
+  provisioner,
+  agentId,
+  containerId,
+} = {}) {
+  if (!containerId || typeof provisioner?.destroy !== "function") {
+    return { destroyed: false, reason: "no-runtime" };
+  }
+
+  try {
+    await provisioner.destroy(containerId, { agentId });
+  } catch (error) {
+    console.error(
+      `[provisioner] Failed to clean runtime ${containerId} for agent ${agentId}: ${error.message}`,
+    );
+    return { destroyed: false, reason: "destroy-failed", error };
+  }
+
+  try {
+    await queryable.query(
+      `UPDATE agents
+          SET container_id = NULL,
+              host = NULL,
+              runtime_host = NULL,
+              runtime_port = NULL,
+              gateway_host = NULL,
+              gateway_port = NULL,
+              gateway_host_port = NULL,
+              gateway_token = NULL,
+              dashboard_port = NULL
+        WHERE id = $1 AND container_id = $2`,
+      [agentId, containerId],
+    );
+  } catch (error) {
+    // The runtime is already gone, so stale identity is recoverable and safer
+    // than keeping a live orphan. A retry or activation reset clears it later.
+    console.warn(
+      `[provisioner] Runtime ${containerId} was destroyed but identity cleanup failed for agent ${agentId}: ${error.message}`,
+    );
+  }
+
+  return { destroyed: true };
 }
 
 const OPENCLAW_WORKSPACE_PATH = "/root/.openclaw/workspace";
@@ -605,15 +741,20 @@ function pickProviderDeployment(config = {}, model = "") {
   return typeof model === "string" ? model.trim() : "";
 }
 
-async function fetchUserLlmEnvVars(userId) {
+async function fetchUserLlmEnvVars(userId, providerId = null) {
   if (!userId || (process.env.KEY_STORAGE || "database") !== "database") {
     return {};
   }
 
   try {
+    const params = [userId];
+    const providerFilter = providerId ? " AND id = $2" : "";
+    if (providerId) params.push(providerId);
     const keysResult = await db.query(
-      "SELECT provider, api_key, model, config FROM llm_providers WHERE user_id = $1",
-      [userId],
+      `SELECT provider, api_key, model, config
+         FROM llm_providers
+        WHERE user_id = $1${providerFilter}`,
+      params,
     );
     const { decrypt } = require("./crypto");
     const llmEnvVars = {};
@@ -652,18 +793,24 @@ async function fetchUserLlmEnvVars(userId) {
   }
 }
 
-async function fetchDefaultProvider(userId) {
+async function fetchDeploymentProvider(userId, providerId = null) {
   if (!userId || (process.env.KEY_STORAGE || "database") !== "database") {
+    if (providerId) {
+      throw new Error("Explicit deployment LLM providers require KEY_STORAGE=database");
+    }
     return null;
   }
 
   try {
-    const result = await db.query(
-      "SELECT id, provider, model, config FROM llm_providers WHERE user_id = $1 AND is_default = true LIMIT 1",
-      [userId],
-    );
-    return result.rows[0] || null;
+    return await getDeploymentProvider(userId, providerId, db);
   } catch (error) {
+    if (providerId) {
+      console.warn(
+        `[provisioner] Failed to fetch explicit LLM provider ${providerId} for user ${userId}:`,
+        error.message,
+      );
+      throw error;
+    }
     console.warn(
       `[provisioner] Failed to fetch default LLM provider for user ${userId}:`,
       error.message,
@@ -880,6 +1027,7 @@ function wrapCommandWithContainerTimeout(command, timeoutMs) {
  * @param {object} params Reconciliation inputs for the live runtime.
  * @param {string} params.agentId Agent id used for persisted Hermes lookups.
  * @param {string} params.userId User id whose provider credentials are read.
+ * @param {string} params.llmProviderId Explicit provider selected when this deployment was queued.
  * @param {string} params.runtimeFamily Runtime family, e.g. `hermes` or `openclaw`.
  * @param {string} params.resolvedBackend Normalized backend name for exec fallback behavior.
  * @param {string} params.containerId Runtime container identifier.
@@ -897,6 +1045,7 @@ function wrapCommandWithContainerTimeout(command, timeoutMs) {
 async function reconcileRuntimeLlmAuth({
   agentId,
   userId,
+  llmProviderId,
   runtimeFamily,
   resolvedBackend,
   containerId,
@@ -909,8 +1058,8 @@ async function reconcileRuntimeLlmAuth({
   gatewayPort,
   gatewayToken,
 } = {}) {
-  const llmEnvVars = await fetchUserLlmEnvVars(userId);
-  const defaultProvider = await fetchDefaultProvider(userId);
+  const llmEnvVars = await fetchUserLlmEnvVars(userId, llmProviderId);
+  const defaultProvider = await fetchDeploymentProvider(userId, llmProviderId);
   const hasLlmKeys = Object.keys(llmEnvVars).length > 0;
   if (!hasLlmKeys && !defaultProvider) {
     return { status: "skipped" };
@@ -1865,7 +2014,18 @@ console.log(
 const worker = new Worker(
   "deployments",
   async (job) => {
-    const { id, name, image, specs, userId, sandbox, backend, container_name, model } = job.data;
+    const {
+      id,
+      name,
+      image,
+      specs,
+      userId,
+      sandbox,
+      backend,
+      container_name,
+      model,
+      llm_provider_id: llmProviderId,
+    } = job.data;
     const vcpu = specs?.vcpu || 1;
     const ram_mb = specs?.ram_mb || 1024;
     const disk_gb = specs?.disk_gb || 10;
@@ -1877,12 +2037,22 @@ const worker = new Worker(
     try {
       const agentRowResult = await db.query(
         `SELECT image, template_payload, sandbox_type, backend_type, runtime_family,
-            deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers
+            deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers, status
        FROM agents
       WHERE id = $1`,
         [id],
       );
-      const agentRow = agentRowResult.rows[0] || {};
+      const agentRow = agentRowResult.rows[0];
+      if (!agentRow) {
+        console.warn(`[provisioner] Skipping deployment job ${job.id}; agent ${id} was deleted`);
+        return { canceled: true, reason: "agent-deleted" };
+      }
+      if (!["queued", "deploying", "error"].includes(agentRow.status)) {
+        console.warn(
+          `[provisioner] Skipping deployment job ${job.id}; agent ${id} is ${agentRow.status}`,
+        );
+        return { canceled: true, reason: `agent-${agentRow.status}` };
+      }
       // gateway_token is encrypted at rest. Decrypt the stored value in place so
       // the reuse path (k8s/Hermes pass it back into the container as the runtime
       // password) gets plaintext. A rotated/corrupted key → treat as no reusable
@@ -1943,8 +2113,8 @@ const worker = new Worker(
       });
 
       // Fetch user's LLM provider keys from DB for injection into container
-      const llmEnvVars = await fetchUserLlmEnvVars(userId);
-      const defaultLlmProvider = await fetchDefaultProvider(userId);
+      const llmEnvVars = await fetchUserLlmEnvVars(userId, llmProviderId);
+      const defaultLlmProvider = await fetchDeploymentProvider(userId, llmProviderId);
       const defaultOpenClawModel = buildDefaultOpenClawModel(defaultLlmProvider);
       const hermesRuntimeBootstrapEnv =
         resolvedRuntimeFields.runtime_family === "hermes"
@@ -2244,10 +2414,17 @@ const worker = new Worker(
                 ? LOCAL_HOST_KEY
                 : null;
           if (allocationHostKey) {
-            allocatedGatewayPort = await allocateGatewayPort({
-              hostKey: allocationHostKey,
-              agentId: id,
-            });
+            allocatedGatewayPort =
+              deployTarget === "docker"
+                ? await allocateAvailableLocalDockerGatewayPort({
+                    agentId: id,
+                    containerName: container_name,
+                    provisioner,
+                  })
+                : await allocateGatewayPort({
+                    hostKey: allocationHostKey,
+                    agentId: id,
+                  });
             // Remote Hermes needs a SECOND published host port for its dashboard
             // UI (9119), distinct from the runtime API port (8642 = the 'gateway'
             // slot used for the readiness probe). Local Hermes reaches the
@@ -2274,6 +2451,13 @@ const worker = new Worker(
               });
             }
           }
+        }
+        const currentAgent = await db.query("SELECT status FROM agents WHERE id = $1", [id]);
+        if (!currentAgent.rows[0]) {
+          console.warn(
+            `[provisioner] Canceling deployment job ${job.id}; agent ${id} was deleted before create`,
+          );
+          return { canceled: true, reason: "agent-deleted-before-create" };
         }
         const createPromise = provisioner.create({
           id,
@@ -2367,13 +2551,21 @@ const worker = new Worker(
         // container that no DB row references.
         if (containerId) {
           try {
-            await db.query(
+            const persistedContainer = await db.query(
               `UPDATE agents
                 SET container_id = $2,
                     container_name = COALESCE($3, container_name)
-              WHERE id = $1`,
+              WHERE id = $1
+              RETURNING id`,
               [id, containerId, containerName || null],
             );
+            if (!persistedContainer.rows[0]) {
+              console.warn(
+                `[provisioner] Agent ${id} was deleted during create; removing runtime ${containerId}`,
+              );
+              await provisioner.destroy(containerId).catch(() => {});
+              return { canceled: true, reason: "agent-deleted-during-create" };
+            }
           } catch (e) {
             console.error(
               `[provisioner] Failed to persist container_id for agent ${id} (will still attempt final update): ${e.message}`,
@@ -2476,20 +2668,26 @@ const worker = new Worker(
           err.message,
         );
         if (containerId) {
-          try {
-            await provisioner.destroy(containerId);
-          } catch {
-            // Best-effort cleanup only.
-          }
+          await cleanupProvisionedRuntimeAfterFailure({
+            queryable: db,
+            provisioner,
+            agentId: id,
+            containerId,
+          });
         }
-        // Mark as failed in DB
-        await db.query("UPDATE agents SET status = 'error' WHERE id = $1", [id]);
-        await db.query("UPDATE deployments SET status = 'failed' WHERE agent_id = $1", [id]);
-        await db.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
-          "agent_deploy_failed",
-          `Agent "${name}" failed to deploy: ${err.message}`,
-          JSON.stringify({ agentId: id, attempt: job.attemptsMade + 1 }),
-        ]);
+        const failure = await persistProvisioningFailure({
+          queryable: db,
+          job,
+          agentId: id,
+          name,
+          error: err,
+        });
+        if (failure.canceled) {
+          console.warn(
+            `[provisioner] Suppressing retry for deployment job ${job.id}; agent ${id} was deleted`,
+          );
+          return { canceled: true, reason: "agent-deleted-after-failure" };
+        }
         throw err;
       }
 
@@ -2499,7 +2697,7 @@ const worker = new Worker(
       const { encrypt } = require("./crypto");
       const gatewayTokenForStorage = gatewayToken ? encrypt(gatewayToken) : gatewayToken;
       try {
-        await db.query(
+        const finalUpdate = await db.query(
           `UPDATE agents
           SET status = 'running',
               container_id = $2,
@@ -2520,7 +2718,8 @@ const worker = new Worker(
               sandbox_type = $17,
               network_policy_status = $18,
               dashboard_port = $19
-        WHERE id = $1`,
+        WHERE id = $1
+        RETURNING id`,
           [
             id,
             containerId,
@@ -2543,6 +2742,15 @@ const worker = new Worker(
             dashboardPort ? parseInt(dashboardPort, 10) : null,
           ],
         );
+        if (!finalUpdate.rows[0]) {
+          console.warn(
+            `[provisioner] Agent ${id} was deleted before final persistence; removing runtime ${containerId}`,
+          );
+          if (containerId) {
+            await provisioner.destroy(containerId).catch(() => {});
+          }
+          return { canceled: true, reason: "agent-deleted-before-final-update" };
+        }
         await db.query("UPDATE deployments SET status = 'completed' WHERE agent_id = $1", [id]);
         await db.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
           "agent_deployed",
@@ -2576,6 +2784,7 @@ const worker = new Worker(
             const authSyncResult = await reconcileRuntimeLlmAuth({
               agentId: id,
               userId,
+              llmProviderId,
               runtimeFamily: resolvedRuntimeFields.runtime_family,
               resolvedBackend,
               containerId,
@@ -2687,6 +2896,22 @@ const worker = new Worker(
         }
       } catch (err) {
         console.error("Failed to update agent status:", err.message);
+        await cleanupProvisionedRuntimeAfterFailure({
+          queryable: db,
+          provisioner,
+          agentId: id,
+          containerId,
+        });
+        const failure = await persistProvisioningFailure({
+          queryable: db,
+          job,
+          agentId: id,
+          name,
+          error: err,
+        });
+        if (failure.canceled) {
+          return { canceled: true, reason: "agent-deleted-after-persistence-failure" };
+        }
         throw err;
       }
     } finally {
@@ -2933,3 +3158,12 @@ const healthServer = http.createServer((req, res) => {
 healthServer.listen(HEALTH_PORT, () => {
   console.log(`Worker health check listening on port ${HEALTH_PORT}`);
 });
+
+module.exports = {
+  allocateAvailableLocalDockerGatewayPort,
+  cleanupProvisionedRuntimeAfterFailure,
+  fetchDeploymentProvider,
+  fetchUserLlmEnvVars,
+  isFinalDeploymentAttempt,
+  persistProvisioningFailure,
+};

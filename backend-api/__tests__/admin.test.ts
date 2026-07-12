@@ -280,6 +280,7 @@ jest.mock("dockerode", () =>
 );
 
 const app = require("../server");
+const { normalizeHealthcheckBudget } = require("../releaseUpgrade");
 
 const adminToken = jwt.sign(
   { id: "admin-1", email: "admin@nora.test", role: "admin" },
@@ -912,6 +913,85 @@ describe("admin routes", () => {
     expect(res.body.runnerReachable).toBe(true);
   });
 
+  it("uses the migration-aware release upgrade health-check defaults", () => {
+    const warn = jest.fn();
+
+    expect(normalizeHealthcheckBudget({}, warn)).toEqual({
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("upgrades the former 40x3 built-in health-check budget", () => {
+    const warn = jest.fn();
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "40",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual({
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("preserves valid release upgrade health-check overrides", () => {
+    const warn = jest.fn();
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "101",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "6",
+        },
+        warn,
+      ),
+    ).toEqual({
+      attempts: 101,
+      intervalSeconds: 6,
+      firstToFinalWindowSeconds: 600,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("falls back safely for invalid or over-budget release upgrade health checks", () => {
+    const warn = jest.fn();
+    const defaults = {
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    };
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "not-a-number",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual(defaults);
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "1302",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual(defaults);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenLastCalledWith(expect.stringContaining("no greater than 3900s"));
+  });
+
   it("starts a direct GitHub release upgrade runner for admins", async () => {
     const monitoringModule = require("../monitoring");
     process.env.NORA_CURRENT_VERSION = "1.0.0";
@@ -942,6 +1022,8 @@ describe("admin routes", () => {
           "NORA_HOST_REPO_DIR=/srv/nora",
           "NORA_ENV_FILE=deploy.env",
           "NORA_UPGRADE_COMPOSE_FILES=docker-compose.yml:infra/docker-compose.public-tls.yml:docker-compose.kubernetes.yml",
+          "NORA_UPGRADE_HEALTHCHECK_ATTEMPTS=221",
+          "NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS=3",
           "NORA_UPGRADE_PUBLIC_HEALTH_URL=https://nora.test/api/health",
         ]),
         Cmd: expect.arrayContaining([

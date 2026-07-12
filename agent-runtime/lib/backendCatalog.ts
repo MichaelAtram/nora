@@ -15,8 +15,8 @@ const KNOWN_BACKENDS = KNOWN_DEPLOY_TARGETS;
 // a maturity tier for an existing agent row.
 const EXTERNAL_DEPLOY_TARGET = "external";
 const KNOWN_SANDBOX_PROFILES = Object.freeze(["standard", "nemoclaw"]);
-const PROXMOX_RELEASE_BLOCKER_ISSUE =
-  "Proxmox execution target is not supported in this Nora release.";
+const PROXMOX_NEMOCLAW_BLOCKER_ISSUE =
+  "NemoClaw on Proxmox is not supported yet because the LXC adapter does not provide the enforced OpenShell sandbox contract.";
 
 const OPENCLAW_OPERATOR_CONTRACT = Object.freeze([
   "deploy/redeploy",
@@ -127,10 +127,10 @@ const EXECUTION_TARGET_METADATA = Object.freeze({
     label: "Proxmox",
     shortLabel: "Proxmox",
     summary:
-      "Planned Proxmox LXC runtime placement for operators whose infrastructure standard is VM and LXC orchestration through the Proxmox API.",
+      "Run OpenClaw or a prepared Hermes image in an unprivileged Proxmox LXC managed through the Proxmox API and SSH.",
     detail:
-      "Proxmox is tracked as a roadmap execution target. Current releases keep it visible for operator awareness, but block normal onboarding and deploy selection.",
-    badges: ["Roadmap", "LXC", "Proxmox API"],
+      "Proxmox is an experimental, opt-in execution target. Nora creates an unprivileged LXC through the API, bootstraps it through pinned SSH host verification, and exposes the same lifecycle, logs, terminal, readiness, auth, and integration surfaces as other managed targets. Run the live Proxmox smoke before production use.",
+    badges: ["Experimental", "Unprivileged LXC", "API + SSH"],
   }),
   external: Object.freeze({
     id: "external",
@@ -427,7 +427,13 @@ function buildMaturityFields(maturityTier) {
 function resolveMaturityTier({ deployTarget, sandboxProfile }) {
   const normalizedDeployTarget = normalizeDeployTargetName(deployTarget);
 
-  if (normalizedDeployTarget === "proxmox") return "blocked";
+  if (
+    normalizedDeployTarget === "proxmox" &&
+    normalizeSandboxProfileName(sandboxProfile) === "nemoclaw"
+  ) {
+    return "blocked";
+  }
+  if (normalizedDeployTarget === "proxmox") return "experimental";
   if (normalizedDeployTarget === "remote-docker") return "experimental";
   if (normalizedDeployTarget === EXTERNAL_DEPLOY_TARGET) return "experimental";
   if (normalizeSandboxProfileName(sandboxProfile) === "nemoclaw") return "experimental";
@@ -454,7 +460,7 @@ function parseEnabledBackendList(rawValue) {
   return parseList(
     rawValue,
     (value) =>
-      ["docker", "proxmox"].includes(
+      ["docker", "k8s", "proxmox"].includes(
         String(value || "")
           .trim()
           .toLowerCase(),
@@ -513,9 +519,121 @@ function getEnabledDeployTargets(env = process.env, options = {}) {
 
 function isProxmoxApiTokenId(value) {
   const tokenId = String(value || "").trim();
-  if (!tokenId.includes("!")) return false;
-  const [userPart, tokenName, ...rest] = tokenId.split("!");
-  return Boolean(userPart && tokenName && rest.length === 0);
+  return /^[^@!\s]+@[^@!\s]+![^!\s]+$/.test(tokenId);
+}
+
+function isEnvFlag(value, expected) {
+  return (
+    String(value ?? "")
+      .trim()
+      .toLowerCase() === expected
+  );
+}
+
+function getProxmoxProductionSecurityIssue(env = process.env) {
+  if (!isEnvFlag(env.NODE_ENV, "production")) return null;
+  if (isEnvFlag(env.PROXMOX_ALLOW_INSECURE_HTTP, "true")) {
+    return "PROXMOX_ALLOW_INSECURE_HTTP=true is not allowed when NODE_ENV=production.";
+  }
+  if (isEnvFlag(env.PROXMOX_VERIFY_TLS, "false")) {
+    return "PROXMOX_VERIFY_TLS=false is not allowed when NODE_ENV=production.";
+  }
+  if (isEnvFlag(env.PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY, "true")) {
+    return "PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY=true is not allowed when NODE_ENV=production.";
+  }
+  return null;
+}
+
+function validateProxmoxFile(filePath, label, options = {}) {
+  const readFileSync = options.readFileSync || require("fs").readFileSync;
+  try {
+    const contents = readFileSync(filePath, "utf8");
+    if (!String(contents || "").trim()) return `${label} is empty.`;
+  } catch (error) {
+    return `${label} could not be read: ${error.message}`;
+  }
+  return null;
+}
+
+function getProxmoxConfigIssue(env = process.env, options = {}) {
+  const rawApiUrl = String(env.PROXMOX_API_URL || "").trim();
+  if (!rawApiUrl) return "Proxmox requires PROXMOX_API_URL.";
+
+  let apiUrl;
+  try {
+    apiUrl = new URL(rawApiUrl);
+  } catch {
+    return "PROXMOX_API_URL must be a valid URL.";
+  }
+  const productionSecurityIssue = getProxmoxProductionSecurityIssue(env);
+  if (productionSecurityIssue) return productionSecurityIssue;
+  const allowInsecureHttp = isEnvFlag(env.PROXMOX_ALLOW_INSECURE_HTTP, "true");
+  if (apiUrl.protocol !== "https:" && !(apiUrl.protocol === "http:" && allowInsecureHttp)) {
+    return "PROXMOX_API_URL must use HTTPS (or explicitly set PROXMOX_ALLOW_INSECURE_HTTP=true for an isolated test environment).";
+  }
+  if (apiUrl.username || apiUrl.password || apiUrl.search || apiUrl.hash) {
+    return "PROXMOX_API_URL must not contain credentials, query parameters, or a fragment.";
+  }
+  const apiPath = apiUrl.pathname.replace(/\/+$/, "");
+  if (apiPath && apiPath !== "/api2/json") {
+    return "PROXMOX_API_URL must point to the Proxmox origin or end in /api2/json.";
+  }
+
+  const inlineCa = String(env.PROXMOX_CA_CERT || "");
+  const caPath = String(env.PROXMOX_CA_CERT_PATH || "").trim();
+  if (!inlineCa && caPath) {
+    const caIssue = validateProxmoxFile(caPath, "Proxmox CA certificate", options);
+    if (caIssue) return caIssue;
+  }
+
+  if (!isProxmoxApiTokenId(env.PROXMOX_TOKEN_ID)) {
+    return "PROXMOX_TOKEN_ID must use user@realm!tokenname API-token format.";
+  }
+  if (!String(env.PROXMOX_TOKEN_SECRET || "").trim()) {
+    return "Proxmox requires PROXMOX_TOKEN_SECRET.";
+  }
+  if (!String(env.PROXMOX_SSH_HOST || "").trim()) {
+    return "Proxmox requires PROXMOX_SSH_HOST.";
+  }
+  if (!String(env.PROXMOX_SSH_USER || "").trim()) {
+    return "Proxmox requires PROXMOX_SSH_USER.";
+  }
+
+  const node = String(env.PROXMOX_NODE || "pve").trim();
+  if (!/^[A-Za-z0-9_.-]+$/.test(node)) {
+    return "PROXMOX_NODE contains unsupported characters.";
+  }
+  const rawSshPort = String(env.PROXMOX_SSH_PORT || "22").trim();
+  const sshPort = Number(rawSshPort);
+  if (!/^\d+$/.test(rawSshPort) || !Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) {
+    return "PROXMOX_SSH_PORT must be between 1 and 65535.";
+  }
+
+  const inlinePrivateKey = String(env.PROXMOX_SSH_PRIVATE_KEY || "");
+  const privateKeyPath = String(env.PROXMOX_SSH_PRIVATE_KEY_PATH || "").trim();
+  const password = String(env.PROXMOX_SSH_PASSWORD || "");
+  if (!inlinePrivateKey.trim() && !privateKeyPath && !password) {
+    return "Proxmox SSH requires PROXMOX_SSH_PRIVATE_KEY, PROXMOX_SSH_PRIVATE_KEY_PATH, or PROXMOX_SSH_PASSWORD.";
+  }
+  if (!inlinePrivateKey.trim() && privateKeyPath) {
+    const keyIssue = validateProxmoxFile(privateKeyPath, "Proxmox SSH private key", options);
+    if (keyIssue) return keyIssue;
+  }
+
+  if (
+    !String(env.PROXMOX_SSH_HOST_FINGERPRINT || "").trim() &&
+    !isEnvFlag(env.PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY, "true")
+  ) {
+    return "Proxmox SSH requires PROXMOX_SSH_HOST_FINGERPRINT (or the explicit test-only PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY=true override).";
+  }
+  const fingerprint = String(env.PROXMOX_SSH_HOST_FINGERPRINT || "")
+    .trim()
+    .replace(/^SHA256:/i, "")
+    .replace(/=+$/, "");
+  if (fingerprint && !/^[A-Za-z0-9+/]{43}$/.test(fingerprint)) {
+    return "PROXMOX_SSH_HOST_FINGERPRINT must be an OpenSSH SHA256 fingerprint.";
+  }
+  return null;
 }
 
 function baseDeployTargetIssue(deployTarget, env = process.env, selection = {}) {
@@ -539,7 +657,7 @@ function baseDeployTargetIssue(deployTarget, env = process.env, selection = {}) 
       }
       return "Remote Docker execution target requires a registered host such as remote:my-laptop.";
     case "proxmox":
-      return PROXMOX_RELEASE_BLOCKER_ISSUE;
+      return getProxmoxConfigIssue(env);
     default:
       return null;
   }
@@ -557,6 +675,10 @@ function runtimeSelectionIssue(selection = {}, env = process.env) {
 
   if (!executionTargetsForRuntimeFamily(normalizedRuntimeFamily).includes(normalizedDeployTarget)) {
     return `${getRuntimeFamilyMetadata(normalizedRuntimeFamily).label} does not support the ${getExecutionTargetMetadata(normalizedDeployTarget, env).label} execution target.`;
+  }
+
+  if (normalizedDeployTarget === "proxmox" && normalizedSandboxProfile === "nemoclaw") {
+    return PROXMOX_NEMOCLAW_BLOCKER_ISSUE;
   }
 
   if (
@@ -583,14 +705,6 @@ function runtimeSelectionIssue(selection = {}, env = process.env) {
     !env.PROXMOX_HERMES_TEMPLATE
   ) {
     return "Hermes on Proxmox requires PROXMOX_HERMES_TEMPLATE.";
-  }
-
-  if (
-    normalizedDeployTarget === "proxmox" &&
-    normalizedSandboxProfile === "nemoclaw" &&
-    !env.PROXMOX_NEMOCLAW_TEMPLATE
-  ) {
-    return "NemoClaw on Proxmox requires PROXMOX_NEMOCLAW_TEMPLATE.";
   }
 
   return null;
@@ -1149,7 +1263,7 @@ module.exports = {
   KNOWN_DEPLOY_TARGETS,
   KNOWN_SANDBOX_PROFILES,
   NEMOCLAW_MODELS,
-  PROXMOX_RELEASE_BLOCKER_ISSUE,
+  PROXMOX_NEMOCLAW_BLOCKER_ISSUE,
   RUNTIME_FAMILY_METADATA,
   backendConfigIssue,
   backendForRuntimeSelection,
@@ -1170,6 +1284,8 @@ module.exports = {
   getEnabledSandboxProfiles,
   getExecutionTargetCatalog,
   getExecutionTargetMetadata,
+  getProxmoxConfigIssue,
+  getProxmoxProductionSecurityIssue,
   getRuntimeCatalog,
   getRuntimeFamilyMetadata,
   getRuntimeSelectionStatus,

@@ -16,6 +16,8 @@ ENABLED_SANDBOX_PROFILES=standard
 
 No backend-specific credentials are required. The default `docker-compose.yml` mounts the host Docker socket into `backend-api`, `worker-provisioner`, and `worker-backup` so lifecycle operations can create, stop, restart, inspect, and delete agent containers.
 
+Docker-published agent gateway and runtime ports bind to `127.0.0.1` by default. This keeps the unauthenticated host-port surface off the LAN while Nora's control-plane proxy remains available through the normal application origin. If a trusted remote client must connect directly, set `DOCKER_AGENT_BIND_IP` to a specific host interface and protect that interface with a firewall or authenticated reverse proxy. Avoid `0.0.0.0` on internet-reachable hosts.
+
 ## Resource limits
 
 Self-hosted resource ceilings apply to Docker-backed deployments:

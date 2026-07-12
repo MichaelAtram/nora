@@ -1,12 +1,203 @@
 // @ts-nocheck
-jest.mock("../db", () => ({ query: jest.fn() }));
+const mockDbClient = { query: jest.fn(), release: jest.fn() };
+const mockDb = { query: jest.fn(), connect: jest.fn() };
+const mockEncrypt = jest.fn((value) => `enc(${value})`);
+
+jest.mock("../db", () => mockDb);
 jest.mock("../crypto", () => ({
-  encrypt: jest.fn(),
+  encrypt: mockEncrypt,
   decrypt: jest.fn(),
   ensureEncryptionConfigured: jest.fn(),
 }));
 
-const { buildAuthProfiles } = require("../llmProviders");
+const {
+  addProvider,
+  buildAuthProfiles,
+  ensureDemoProvider,
+  getDeploymentProvider,
+} = require("../llmProviders");
+
+beforeEach(() => {
+  mockDb.query.mockReset();
+  mockDb.connect.mockReset().mockResolvedValue(mockDbClient);
+  mockDbClient.query.mockReset();
+  mockDbClient.release.mockReset();
+  mockEncrypt.mockClear();
+});
+
+describe("llmProviders demo/default transitions", () => {
+  it("reuses one demo provider across repeated activation attempts", async () => {
+    let persisted = null;
+    mockDbClient.query.mockImplementation(async (sql, params) => {
+      if (sql.includes("FROM llm_providers") && sql.includes("provider = $2")) {
+        return { rows: persisted ? [persisted] : [] };
+      }
+      if (sql.includes("COUNT(*)::int AS provider_count")) {
+        return { rows: [{ provider_count: persisted ? 1 : 0 }] };
+      }
+      if (sql.includes("INSERT INTO llm_providers")) {
+        persisted = {
+          id: "provider-demo",
+          provider: "demo",
+          model: "nora-demo-1",
+          is_default: true,
+          created_at: "2026-07-12T00:00:00.000Z",
+        };
+        return { rows: [persisted] };
+      }
+      if (sql.includes("UPDATE llm_providers")) {
+        return { rows: [persisted] };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+
+    const first = await ensureDemoProvider("user-1", mockDbClient);
+    const second = await ensureDemoProvider("user-1", mockDbClient);
+
+    expect(first.id).toBe("provider-demo");
+    expect(second.id).toBe("provider-demo");
+    expect(
+      mockDbClient.query.mock.calls.filter(([sql]) => sql.includes("INSERT INTO llm_providers")),
+    ).toHaveLength(1);
+  });
+
+  it("reconciles legacy duplicate demo providers to one canonical row", async () => {
+    mockDbClient.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "provider-demo-default",
+            provider: "demo",
+            model: "nora-demo-1",
+            is_default: true,
+          },
+          {
+            id: "provider-demo-duplicate",
+            provider: "demo",
+            model: "nora-demo-1",
+            is_default: false,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "provider-demo-default",
+            provider: "demo",
+            model: "nora-demo-1",
+            is_default: true,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const result = await ensureDemoProvider("user-1", mockDbClient);
+
+    expect(result.id).toBe("provider-demo-default");
+    expect(mockDbClient.query).toHaveBeenCalledWith(
+      "DELETE FROM llm_providers WHERE user_id = $1 AND provider = $2 AND id <> $3",
+      ["user-1", "demo", "provider-demo-default"],
+    );
+  });
+
+  it("promotes the first real provider when demo is the current default", async () => {
+    mockDbClient.query
+      .mockResolvedValueOnce({ rows: [] }) // BEGIN
+      .mockResolvedValueOnce({ rows: [] }) // advisory lock
+      .mockResolvedValueOnce({ rows: [{ provider_count: 1, demo_is_default: true }] })
+      .mockResolvedValueOnce({ rows: [] }) // clear demo default
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "provider-openai",
+            provider: "openai",
+            model: "gpt-5.5",
+            is_default: true,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] }); // COMMIT
+
+    const result = await addProvider("user-1", "openai", "sk-live", "gpt-5.5");
+
+    expect(result).toEqual(expect.objectContaining({ id: "provider-openai", is_default: true }));
+    expect(mockDbClient.query).toHaveBeenCalledWith(
+      "UPDATE llm_providers SET is_default = false WHERE user_id = $1",
+      ["user-1"],
+    );
+    expect(mockDbClient.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not replace an existing real default when ensuring demo", async () => {
+    mockDbClient.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ provider_count: 1 }] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "provider-demo",
+            provider: "demo",
+            model: "nora-demo-1",
+            is_default: false,
+          },
+        ],
+      });
+
+    const result = await ensureDemoProvider("user-1", mockDbClient);
+
+    expect(result.is_default).toBe(false);
+    const insertCall = mockDbClient.query.mock.calls.find(([sql]) =>
+      sql.includes("INSERT INTO llm_providers"),
+    );
+    expect(insertCall[1][5]).toBe(false);
+  });
+
+  it("keeps a new real provider non-default when a real default already exists", async () => {
+    mockDbClient.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ provider_count: 2, demo_is_default: false }] })
+      .mockResolvedValueOnce({
+        rows: [{ id: "provider-groq", provider: "groq", model: null, is_default: false }],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await addProvider("user-1", "groq", "gsk-live");
+
+    const insertCall = mockDbClient.query.mock.calls.find(([sql]) =>
+      sql.includes("INSERT INTO llm_providers"),
+    );
+    expect(insertCall[1][5]).toBe(false);
+    expect(mockDbClient.query).not.toHaveBeenCalledWith(
+      "UPDATE llm_providers SET is_default = false WHERE user_id = $1",
+      expect.anything(),
+    );
+  });
+
+  it("selects an explicit owned provider instead of the global default", async () => {
+    const queryable = {
+      query: jest.fn().mockResolvedValue({
+        rows: [
+          {
+            id: "provider-demo",
+            provider: "demo",
+            model: "nora-demo-1",
+            config: { baseUrl: "http://backend-api:4000/demo-llm/v1" },
+          },
+        ],
+      }),
+    };
+
+    const result = await getDeploymentProvider("user-1", "provider-demo", queryable);
+
+    expect(result.provider).toBe("demo");
+    expect(queryable.query).toHaveBeenCalledWith(expect.stringContaining("id = $2"), [
+      "user-1",
+      "provider-demo",
+    ]);
+    expect(queryable.query).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("llmProviders.buildAuthProfiles", () => {
   it("builds a persisted OpenClaw auth profile store", () => {

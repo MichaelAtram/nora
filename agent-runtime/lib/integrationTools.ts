@@ -833,6 +833,12 @@ function getEmailConfig(integration = {}) {
   };
 }
 
+export function assertEmailTransportSecurity(email = {}) {
+  if (email?.imap?.secure !== true) {
+    throw new Error("Email IMAP TLS is required; enable TLS and use a TLS-capable endpoint");
+  }
+}
+
 function getEmailStateDbPath(integration = {}) {
   const id = sanitizeIntegrationFilePart(
     integration.id || integrationProviderId(integration) || "email",
@@ -1058,6 +1064,7 @@ function parseFetchLiteral(responseText = "") {
 
 async function openImapSession(integration = {}) {
   const email = getEmailConfig(integration);
+  assertEmailTransportSecurity(email);
   const { host, port, secure } = email.imap;
   const username = email.auth.username;
   const password = email.auth.password;
@@ -1066,9 +1073,7 @@ async function openImapSession(integration = {}) {
     throw new Error("Email IMAP host, username, and password are required");
   }
 
-  const socket = secure
-    ? tls.connect({ host, port, servername: host, rejectUnauthorized: true })
-    : net.connect({ host, port });
+  const socket = tls.connect({ host, port, servername: host, rejectUnauthorized: true });
 
   let buffer = "";
   let tagCounter = 0;
@@ -3129,6 +3134,7 @@ module.exports = {
   buildSafeIntegrationSummary,
   buildIntegrationSkillMarkdown,
   buildIntegrationToolExecutionMetadata,
+  assertEmailTransportSecurity,
   executeIntegrationToolInvocation,
   getExecutableIntegrationTools,
   getIntegrationToolSpecs,

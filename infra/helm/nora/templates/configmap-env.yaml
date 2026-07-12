@@ -1,3 +1,10 @@
+{{- $enabledBackends := splitList "," (lower .Values.enabledBackends) -}}
+{{- if not (has "k8s" $enabledBackends) -}}
+{{- fail "enabledBackends must include k8s for the Helm deployment; in-cluster Nora has no local Docker socket" -}}
+{{- end -}}
+{{- if has "docker" $enabledBackends -}}
+{{- fail "enabledBackends must not include docker for the Helm deployment; no Docker socket is mounted in-cluster" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

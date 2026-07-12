@@ -16,6 +16,7 @@ on:
       - "frontend-marketing/**"
       - "backend-api/**"
       - "agent-runtime/**"
+      - "workers/backup/**"
       - "workers/provisioner/**"
   workflow_dispatch:
     inputs:

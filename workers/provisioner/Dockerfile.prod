@@ -1,6 +1,11 @@
 FROM node:24-alpine
 WORKDIR /app
 ENV NODE_PATH=/app/node_modules
+ENV NODE_ENV=production
+ENV HOME=/tmp/nora-home
+ENV NPM_CONFIG_CACHE=/tmp/npm-cache
+
+RUN apk add --no-cache su-exec
 
 COPY workers/provisioner/package.json workers/provisioner/package-lock.json* ./
 RUN npm ci --omit=dev || npm install --omit=dev
@@ -9,10 +14,16 @@ COPY tsconfig.base.json /tsconfig.base.json
 COPY workers/provisioner/ ./
 COPY agent-runtime /agent-runtime
 COPY backend-api /backend-api
+COPY --chown=root:root infra/container-entrypoint.sh /usr/local/bin/nora-container-entrypoint
 # Install backend-api's runtime deps inside the image so worker.ts's
 # `require("../../backend-api/{agentSecretOverrides,agentMigrations,hermesUi}")`
 # can resolve transitive deps (notably `pg`) without depending on the host
 # having backend-api/node_modules populated.
 RUN cd /backend-api && (npm ci --omit=dev || npm install --omit=dev)
+RUN mkdir -p /tmp/nora-home /tmp/npm-cache \
+  && chmod 0755 /usr/local/bin/nora-container-entrypoint \
+  && chown -R node:node /tmp/nora-home /tmp/npm-cache
 
+USER node
+ENTRYPOINT ["/usr/local/bin/nora-container-entrypoint"]
 CMD ["npm", "start"]

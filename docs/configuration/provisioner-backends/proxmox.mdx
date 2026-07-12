@@ -1,66 +1,139 @@
 # Proxmox provisioner backend
 
-> Track the planned Proxmox execution target. Proxmox is not supported for normal Nora deployments in the current release.
+> Run OpenClaw or a prepared Hermes image in an unprivileged Proxmox LXC. This execution target is experimental and requires an operator-run smoke test on real hardware before production use.
 
-Proxmox is a roadmap execution target for Nora agents. The adapter work is present for continued development, but current releases keep Proxmox release-blocked in the runtime catalog. Use Docker or Admin-registered Kubernetes for supported deployments today. NemoClaw is available only as an experimental sandbox profile on supported targets.
+Proxmox is an opt-in execution target for private infrastructure operators. Nora creates an unprivileged LXC through the Proxmox HTTPS API, then uses SSH with pinned host-key verification to bootstrap and operate the runtime through `pct`.
 
-![Deploy wizard — Execution Target picker with execution target options](/images/configuration/deploy-backend-picker.png)
+Docker and Kubernetes remain the GA onboarding paths. Proxmox is visible only when `proxmox` is included in `ENABLED_BACKENDS` and every required security setting is valid.
 
-## Current status
+<Warning>
+  Proxmox support is experimental. The automated suite covers adapter behavior, but the repository
+  cannot emulate your node, storage, bridge, DHCP, template, API permissions, or SSH policy. Run the
+  live smoke script against the exact target environment before placing production workloads there.
+</Warning>
 
-Even if `ENABLED_BACKENDS` includes `proxmox`, Nora marks Proxmox as blocked and returns:
+## Supported runtime paths
 
-```text theme={null}
-Proxmox execution target is not supported in this Nora release.
-```
+| Runtime path        | Status       | Template requirement                                                                  |
+| ------------------- | ------------ | ------------------------------------------------------------------------------------- |
+| OpenClaw + standard | Experimental | A stock Ubuntu LXC template; Nora installs Node 24+, OpenClaw, and runtime files.     |
+| Hermes + standard   | Experimental | A prepared template with systemd, base64, a `hermes` user, and the Hermes executable. |
+| OpenClaw + NemoClaw | Blocked      | Proxmox LXC does not provide the enforced OpenShell sandbox contract.                 |
 
-The blocked target can stay visible for operator awareness, but it is excluded from normal onboarding and should not be used for production agent placement.
+Hermes defaults to `/opt/hermes/.venv/bin/hermes`. Override `PROXMOX_HERMES_BIN` when your prepared image installs the executable elsewhere. Its dashboard binds to loopback by default; the lifecycle and runtime API remain available to Nora without exposing the dashboard on the LXC network.
 
-## Adapter configuration reference
+## Secure configuration
 
-These settings are retained for adapter development and future validation. They do not make Proxmox a supported execution target in the current release.
+Enable Proxmox alongside Docker while you validate it:
 
 ```bash theme={null}
-ENABLED_BACKENDS=proxmox
+ENABLED_BACKENDS=docker,proxmox
 
 PROXMOX_API_URL=https://proxmox.local:8006/api2/json
-PROXMOX_TOKEN_ID=user@pam!tokenname
-PROXMOX_TOKEN_SECRET=<your-token-secret>
+PROXMOX_TOKEN_ID=nora@pve!provisioner
+PROXMOX_TOKEN_SECRET=<token-secret>
+PROXMOX_VERIFY_TLS=true
+# Use this when the API is signed by a private CA:
+PROXMOX_CA_CERT_PATH=/run/secrets/proxmox-ca.pem
+
 PROXMOX_NODE=pve
 PROXMOX_TEMPLATE=local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst
 PROXMOX_ROOTFS_STORAGE=local-lvm
 PROXMOX_BRIDGE=vmbr0
+
 PROXMOX_SSH_HOST=proxmox.local
 PROXMOX_SSH_USER=root
-PROXMOX_SSH_PRIVATE_KEY_PATH=/run/secrets/proxmox_key
+PROXMOX_SSH_PORT=22
+PROXMOX_SSH_PRIVATE_KEY_PATH=/run/secrets/proxmox-key
+PROXMOX_SSH_HOST_FINGERPRINT=SHA256:<43-character-base64-fingerprint>
 ```
 
-`PROXMOX_TOKEN_ID` must use Proxmox API token format: `user@realm!tokenname`.
+`PROXMOX_TOKEN_ID` must use `user@realm!tokenname` API-token syntax. The API URL must use HTTPS and must not contain embedded credentials, query parameters, or a fragment. `PROXMOX_NODE` accepts letters, numbers, dots, underscores, and hyphens; `PROXMOX_SSH_PORT` must be an integer from 1 through 65535. Nora reads the configured CA and private-key files during catalog preflight, so an unreadable or empty file keeps the target unavailable instead of failing after a deployment is queued.
 
-## Future required access
-
-The API token and SSH user must be able to:
-
-- Clone or create containers from the configured template.
-- Start, stop, restart, and delete the runtime target.
-- Run bootstrap commands through `pct` during first deploy.
-
-## Future runtime-specific templates
-
-OpenClaw uses `PROXMOX_TEMPLATE`. Hermes and NemoClaw need explicit templates when those runtime paths are enabled:
+Get the SSH host-key fingerprint from a trusted network or console path, verify it out of band, and then copy the `SHA256:...` value:
 
 ```bash theme={null}
-PROXMOX_HERMES_TEMPLATE=
-PROXMOX_NEMOCLAW_TEMPLATE=
+ssh-keyscan -p 22 proxmox.local | ssh-keygen -lf - -E sha256
 ```
+
+You may provide `PROXMOX_CA_CERT` and `PROXMOX_SSH_PRIVATE_KEY` inline instead of file paths. File mounts are usually easier to rotate and keep out of process listings and shell history. Password-based SSH is supported as a fallback, but key authentication plus a pinned host fingerprint is preferred.
+
+<Warning>
+  The stock Compose files do not create a `/run/secrets` mount for Proxmox material. If you use the
+  example file paths, add an operator-owned read-only override that mounts the same CA and private
+  key into both `backend-api` and `worker-provisioner`. The backend builds catalog and lifecycle
+  adapters too; mounting the files into only the worker leaves logs, terminal, and other API-side
+  operations unable to authenticate. Use inline values if you cannot provide identical mounts.
+</Warning>
+
+<Warning>
+  `PROXMOX_ALLOW_INSECURE_HTTP=true`, `PROXMOX_VERIFY_TLS=false`, and
+  `PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY=true` are test-only escape hatches. Nora rejects all three
+  when `NODE_ENV=production`; they are accepted only by an explicitly configured development or test
+  process on an isolated network.
+</Warning>
+
+## Required access
+
+The API token must be authorized on the selected node, storage, and bridge to create, inspect, start, stop, restart, configure, and delete LXCs. The SSH account must be allowed to run `pct` non-interactively. When the SSH user is not `root`, configure passwordless, narrowly scoped sudo and set `PROXMOX_SUDO` if the default `sudo -n ` prefix is not appropriate.
+
+Created containers are unprivileged and use DHCP on `PROXMOX_BRIDGE`. Ensure the bridge can provide an address and that the LXC can reach the package registries and providers required by the selected runtime.
+
+## Prepared Hermes template
+
+Set the explicit template reference after building and validating it:
+
+```bash theme={null}
+ENABLED_RUNTIME_FAMILIES=openclaw,hermes
+PROXMOX_HERMES_TEMPLATE=local:vztmpl/nora-hermes-2026.7.tar.zst
+PROXMOX_HERMES_BIN=/opt/hermes/.venv/bin/hermes
+```
+
+The template must include:
+
+- systemd and `base64`;
+- an unprivileged `hermes` user and group;
+- an executable Hermes installation at `PROXMOX_HERMES_BIN` or on `PATH`;
+- network access required by the configured model and integrations.
+
+Nora creates the runtime directories, writes managed environment state with restricted permissions, and runs the service as `hermes`. Setting `PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD=true` changes the dashboard bind from `127.0.0.1` to `0.0.0.0`; leave it false unless you have a separate authenticated network boundary.
 
 ## Verification
 
-Confirm the backend reports as blocked:
+First verify that the control plane reports the target as enabled, configured, available, and experimental:
 
 ```bash theme={null}
 docker compose up -d --build backend-api worker-provisioner
 curl -fsS http://localhost:8080/api/config/platform
 ```
 
-The response should show Proxmox as unavailable or blocked, while Docker and any Admin-registered Kubernetes targets remain the supported deployment paths.
+Then run the destructive real-host lifecycle smoke. It creates and destroys an LXC:
+
+```bash theme={null}
+PROXMOX_SMOKE_RUNTIME_FAMILIES=openclaw \
+  e2e/scripts/run-proxmox-smoke.sh
+```
+
+Use `PROXMOX_SMOKE_RUNTIME_FAMILIES=openclaw,hermes` only after `PROXMOX_HERMES_TEMPLATE` is ready. The smoke verifies create, readiness, exec, environment rotation, restart, logs, stop, start, and destroy. Set `PROXMOX_SMOKE_KEEP_ON_FAILURE=true` only when you intentionally want to preserve a failed LXC for diagnosis.
+
+The wrapper forwards host-side `PROXMOX_*` and `PROXMOX_SMOKE_*` values into the one-off process in `worker-provisioner`. This means the command-prefix overrides above take effect even when the running container was created earlier, and credential values do not need to be appended to the control-plane `.env` file.
+
+## External real-hardware release gate
+
+The repository includes the manually dispatched **Proxmox Real Hardware** workflow. It runs only on a self-hosted Linux x64 runner labeled `nora-proxmox`, uses the protected `proxmox-real-hardware` GitHub Environment, and creates and destroys real LXCs. It is intentionally not a pull-request or GitHub-hosted CI job: the runner must have Docker Compose plus network access to the target Proxmox node.
+
+Configure these GitHub Environment secrets:
+
+- `PROXMOX_API_URL`, `PROXMOX_TOKEN_ID`, and `PROXMOX_TOKEN_SECRET`;
+- `PROXMOX_SSH_HOST`, `PROXMOX_SSH_USER`, and `PROXMOX_SSH_HOST_FINGERPRINT`;
+- either `PROXMOX_SSH_PRIVATE_KEY` (plus optional `PROXMOX_SSH_PRIVATE_KEY_PASSPHRASE`) or `PROXMOX_SSH_PASSWORD`;
+- optional `PROXMOX_CA_CERT` when the API uses a private CA.
+
+Configure these non-secret GitHub Environment variables for the exact hardware target:
+
+- `PROXMOX_NODE`, `PROXMOX_TEMPLATE`, `PROXMOX_ROOTFS_STORAGE`, and `PROXMOX_BRIDGE`;
+- a pinned `PROXMOX_OPENCLAW_PACKAGE` value;
+- `PROXMOX_HERMES_TEMPLATE` when dispatching the `openclaw,hermes` matrix;
+- optional SSH port, sudo/pct command, Node major, and Hermes binary overrides.
+
+The workflow hard-codes verified TLS and pinned SSH transport, validates that the required external values exist without printing them, starts an isolated Nora control-plane project, and then calls the same destructive smoke script. A passing run is evidence for that exact commit, templates, node, storage, bridge, and network. It does not automatically promote Proxmox beyond **Experimental**, and no release should claim this gate passed unless the corresponding workflow run is green.

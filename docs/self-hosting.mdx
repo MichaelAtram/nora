@@ -12,13 +12,14 @@ Before you install, make sure your host meets the following requirements.
 | -------------------- | ---------------------------------------------------------------------------------- |
 | **Operating system** | macOS 12+, Linux (Ubuntu 20.04+, Debian 11+, Fedora 38+), or Windows 10+ with WSL2 |
 | **Permissions**      | Admin or sudo access for initial setup                                             |
-| **Docker**           | Docker Engine with Compose v2+ (the installer can install Docker if it is missing) |
+| **Docker**           | Docker Engine with Compose 2.24.4+ (the installer can install Docker if it is missing) |
 | **Git**              | Git (the installer can install Git if it is missing)                               |
 | **OpenSSL**          | OpenSSL (used to generate secrets; the installer can install it if missing)        |
 
 <Note>
-  The setup script checks for Docker, Docker Compose, Git, and OpenSSL and installs any that are
-  missing before proceeding.
+  The setup script checks for Docker, Docker Compose 2.24.4 or newer, Git, and OpenSSL and installs
+  missing prerequisites before proceeding. Standalone `docker-compose` v1 is not supported because
+  Nora's hardened overlays use modern Compose merge tags.
 </Note>
 
 ## Recommended install
@@ -48,12 +49,15 @@ The installer script is the fastest path to a running Nora instance. It handles 
     2. Clone the repository (if running via the curl pipe)
     3. Generate or preserve secrets for JWTs, AES encryption, managed backups, Agent Hub keys, and the database
     4. Choose platform mode: **self-hosted** (operator-defined resource limits) or **PaaS** (Stripe billing)
-    5. Choose whether to keep the GA **Docker** backend enabled. Kubernetes clusters are registered after setup in **Admin -> Kubernetes**. Proxmox is planned but release-blocked in the current release, so setup does not enable it.
+    5. Choose whether to keep the GA **Docker** backend enabled and whether to opt into the experimental **Proxmox LXC** target. Kubernetes clusters are registered after setup in **Admin -> Kubernetes**. Proxmox stays disabled by default and requires secure API/SSH configuration plus the real-host smoke test.
     6. Choose access mode: **local only** (`http://localhost:8080`), **public domain behind a proxy**, or **public domain with TLS at Nginx**
     7. Optionally create a bootstrap admin account
     8. Start the stack; after login, add your LLM provider key in **Settings**
 
     When the installer finishes, it writes `.env` and starts the stack with `docker compose up -d`.
+    On macOS, Linux, and WSL the file is restricted to mode `0600`. On Windows, setup removes
+    inherited access and grants access only to the current user, SYSTEM, and local Administrators;
+    setup stops if it cannot secure the file.
 
     <Note>
       In local mode, setup checks host ports before startup. If `8080` is busy, it offers a free web port such as `8081` and updates `NEXTAUTH_URL`. If `127.0.0.1:4100` is busy, it offers a free backend API port and writes `BACKEND_API_PORT`.
@@ -126,6 +130,10 @@ Use manual setup when you want full control over every configuration value befor
 
     Docker Compose pulls and starts all Nora services: the reverse proxy, frontend dashboards, backend API, database, and queue.
 
+    The production overlay materializes the core JWT, encryption, Agent Hub, backup, and database
+    credentials as read-only files under `/run/secrets` for backend and worker containers. Marketing
+    receives an explicit allowlist of only its runtime/OAuth values, not the complete deploy env.
+
     <Warning>
       Do not start the stack with placeholder values for `JWT_SECRET` or `ENCRYPTION_KEY`. Generate each with `openssl rand -hex 32` before running `docker compose up -d`.
     </Warning>
@@ -149,11 +157,17 @@ helm install nora oci://ghcr.io/solomon2773/nora \
   --set secrets.encryptionKey="$(openssl rand -hex 32)" \
   --set secrets.backupEncryptionKey="$(openssl rand -hex 32)" \
   --set secrets.apiKeyHashSecret="$(openssl rand -hex 32)" \
+  --set secrets.agentHubApiKeyHashSecret="$(openssl rand -hex 32)" \
   --set secrets.dbPassword="$(openssl rand -hex 24)"
 kubectl -n nora port-forward svc/nora-nginx 8080:80
 ```
 
-The chart refuses to install without real secrets — there are no insecure defaults. For a public deployment set `publicUrl`, enable `ingress.*`, and terminate TLS at your Ingress controller.
+The chart refuses to install without real secrets — there are no insecure defaults. New installs
+also require distinct workspace/API and Agent Hub hash secrets; older upgrades retain their shared
+hash-key fallback until you provide the dedicated Agent Hub value. The selected
+Secret is mounted at `/run/secrets` only in control-plane and PostgreSQL pods; frontend pods do not
+inherit it. For a public deployment set `publicUrl`, enable `ingress.*`, and terminate TLS at your
+Ingress controller.
 
 <Warning>
   A cluster-hosted control plane deploys agents to **Kubernetes targets only** (`ENABLED_BACKENDS=k8s`): pods have no Docker socket, so the Docker deploy target is unavailable. Register agent clusters under Admin → Kubernetes and mount their kubeconfigs with `kubeconfigs.existingSecret`. In-place release upgrades from the Admin UI are a Docker Compose feature — upgrade with `helm upgrade nora oci://ghcr.io/solomon2773/nora --version <chart-version> --reuse-values` instead.

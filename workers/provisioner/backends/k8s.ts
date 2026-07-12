@@ -42,6 +42,14 @@ const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
 const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
+const HERMES_INIT_CAPABILITIES = Object.freeze([
+  "CHOWN",
+  "DAC_OVERRIDE",
+  "FOWNER",
+  "KILL",
+  "SETGID",
+  "SETUID",
+]);
 const BOOTSTRAP_CONFIGMAP_KEY = "bootstrap.sh";
 const BOOTSTRAP_MOUNT_PATH = "/opt/nora-bootstrap";
 const BOOTSTRAP_SCRIPT_PATH = `${BOOTSTRAP_MOUNT_PATH}/${BOOTSTRAP_CONFIGMAP_KEY}`;
@@ -173,6 +181,22 @@ function safeHostname(name, fallback) {
       .replace(/^-|-$/g, "")
       .slice(0, 63) || fallback
   );
+}
+
+function podSecurityContext() {
+  return {
+    seccompProfile: { type: "RuntimeDefault" },
+  };
+}
+
+function containerSecurityContext({ hermesInit = false } = {}) {
+  const capabilities = { drop: ["ALL"] };
+  if (hermesInit) capabilities.add = [...HERMES_INIT_CAPABILITIES];
+
+  return {
+    allowPrivilegeEscalation: false,
+    capabilities,
+  };
 }
 
 function safeK8sName(name, fallback) {
@@ -1865,6 +1889,7 @@ class K8sBackend extends ProvisionerBackend {
           },
           spec: {
             hostname: safeHostname(name || deployName, `hermes-${id}`),
+            securityContext: podSecurityContext(),
             containers: [
               {
                 name: "agent",
@@ -1872,6 +1897,7 @@ class K8sBackend extends ProvisionerBackend {
                 args: hermesLaunchArgs,
                 workingDir: HERMES_HOME,
                 env: envVars,
+                securityContext: containerSecurityContext({ hermesInit: true }),
                 lifecycle: {
                   postStart: {
                     exec: {
@@ -2208,6 +2234,7 @@ class K8sBackend extends ProvisionerBackend {
                 .replace(/-+/g, "-")
                 .replace(/^-|-$/g, "")
                 .slice(0, 63) || `agent-${id}`,
+            securityContext: podSecurityContext(),
             containers: [
               {
                 name: "agent",
@@ -2216,6 +2243,7 @@ class K8sBackend extends ProvisionerBackend {
                 args: gatewayLaunch.args,
                 workingDir: isNemoClaw ? "/sandbox" : undefined,
                 env: envVars,
+                securityContext: containerSecurityContext(),
                 volumeMounts: [
                   this._bootstrapVolumeMount(),
                   this._stateVolumeMount(stateMountPath),

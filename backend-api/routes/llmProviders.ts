@@ -6,6 +6,27 @@ const { syncAuthToUserAgents } = require("../authSync");
 
 const router = express.Router();
 
+async function syncAfterProviderSave(userId) {
+  try {
+    const results = await syncAuthToUserAgents(userId);
+    const failed = results.filter((result) => result.status === "failed");
+    return {
+      sync_results: results,
+      ...(failed.length > 0
+        ? {
+            sync_warning: `${failed.length} running agent${failed.length === 1 ? "" : "s"} could not be updated automatically`,
+          }
+        : {}),
+    };
+  } catch (error) {
+    console.warn("[llmProviders] Post-save auth sync failed:", error.message);
+    return {
+      sync_results: [],
+      sync_warning: "Provider saved, but running agents could not be updated automatically",
+    };
+  }
+}
+
 router.get("/available", (req, res) => {
   res.json(llmProviders.getAvailableProviders());
 });
@@ -26,10 +47,8 @@ router.post("/", async (req, res) => {
     if (!provider || (!apiKey && provider !== "demo"))
       return res.status(400).json({ error: "provider and apiKey required" });
     const result = await llmProviders.addProvider(req.user.id, provider, apiKey, model, config);
-    syncAuthToUserAgents(req.user.id).catch((error) =>
-      console.warn("[llmProviders] Post-save auth sync failed:", error.message),
-    );
-    res.json(result);
+    const sync = await syncAfterProviderSave(req.user.id);
+    res.json({ ...result, ...sync });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

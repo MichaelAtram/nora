@@ -46,6 +46,72 @@ const summarize = (tag, summary, params = [agentParam], scopes = null) => ({
   responses: ok("Success"),
 });
 
+const scheduleParam = {
+  name: "scheduleId",
+  in: "path",
+  required: true,
+  schema: { type: "string", format: "uuid" },
+};
+const scheduleSchema = {
+  type: "object",
+  required: ["id", "agent_id", "name", "cron", "timezone", "action_type", "enabled"],
+  properties: {
+    id: { type: "string", format: "uuid" },
+    agent_id: { type: "string", format: "uuid" },
+    name: { type: "string" },
+    cron: { type: "string" },
+    timezone: { type: "string" },
+    action_type: { type: "string", enum: ["prompt", "restart", "stop", "start", "redeploy"] },
+    prompt: { type: ["string", "null"] },
+    enabled: { type: "boolean" },
+    last_run_at: { type: ["string", "null"], format: "date-time" },
+    last_status: { type: ["string", "null"] },
+    next_run_at: { type: ["string", "null"], format: "date-time" },
+  },
+  additionalProperties: true,
+};
+const scheduleInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", minLength: 1, maxLength: 120 },
+    cron: { type: "string", minLength: 1 },
+    timezone: { type: "string", default: "UTC" },
+    action_type: {
+      type: "string",
+      enum: ["prompt", "restart", "stop", "start", "redeploy"],
+      default: "prompt",
+    },
+    actionType: { type: "string", description: "Alias for action_type." },
+    prompt: { type: ["string", "null"], maxLength: 8000 },
+    enabled: { type: "boolean" },
+  },
+  additionalProperties: false,
+};
+const versionParam = {
+  name: "versionId",
+  in: "path",
+  required: true,
+  schema: { type: "string", format: "uuid" },
+};
+const versionSchema = {
+  type: "object",
+  required: ["id", "agentId", "versionNumber", "config", "source", "createdAt"],
+  properties: {
+    id: { type: "string", format: "uuid" },
+    agentId: { type: "string", format: "uuid" },
+    versionNumber: { type: "integer", minimum: 1 },
+    config: { type: "object", additionalProperties: true },
+    createdBy: { type: ["string", "null"], format: "uuid" },
+    message: { type: ["string", "null"] },
+    source: {
+      type: "string",
+      enum: ["edit", "deploy", "redeploy", "duplicate", "hub-install", "restore", "rollback"],
+    },
+    createdAt: { type: "string", format: "date-time" },
+  },
+  additionalProperties: false,
+};
+
 module.exports = {
   "/agents": {
     get: {
@@ -94,6 +160,20 @@ module.exports = {
         },
       },
       responses: ok("The created agent (status 'queued')", agentSummary),
+    },
+  },
+  "/agents/activate-demo": {
+    post: {
+      tags: ["Agents"],
+      summary: "Activate or reuse the zero-key local Docker demo",
+      description:
+        "Serializes activation per user, ensures the built-in demo provider, repairs a missing durable queue handoff, and returns the same durably marked OpenClaw agent on retries. New activation requires a reachable local Docker daemon.",
+      "x-required-scopes": ["agents:write"],
+      responses: {
+        ...ok("The new or existing demo agent", agentSummary),
+        402: { description: "Agent quota or subscription does not allow activation" },
+        503: { description: "The local Docker daemon is unavailable" },
+      },
     },
   },
   "/agents/adopt": {
@@ -259,54 +339,137 @@ const tail = {
     ),
   },
   "/agents/{id}/schedules": {
-    get: summarize("Schedules", "List the agent's scheduled runs", [agentParam], ["agents:read"]),
-    post: summarize(
-      "Schedules",
-      "Create a scheduled run (cron prompt or lifecycle action)",
-      [agentParam],
-      ["agents:write"],
-    ),
+    get: {
+      tags: ["Schedules"],
+      summary: "List the agent's scheduled runs",
+      parameters: [agentParam],
+      "x-required-scopes": ["agents:read"],
+      "x-required-agent-role": "viewer",
+      responses: ok("Schedules", { type: "array", items: scheduleSchema }),
+    },
+    post: {
+      tags: ["Schedules"],
+      summary: "Create a recurring prompt or lifecycle schedule",
+      description:
+        "Cron expressions are evaluated in the supplied IANA timezone and must respect the server's minimum interval.",
+      parameters: [agentParam],
+      "x-required-scopes": ["agents:write"],
+      "x-required-agent-role": "editor",
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: {
+              ...scheduleInput,
+              required: ["name", "cron"],
+            },
+          },
+        },
+      },
+      responses: {
+        201: {
+          description: "Created schedule",
+          content: { "application/json": { schema: scheduleSchema } },
+        },
+      },
+    },
   },
   "/agents/{id}/schedules/{scheduleId}": {
-    put: summarize(
-      "Schedules",
-      "Update or enable/disable a schedule",
-      [agentParam, { name: "scheduleId", in: "path", required: true, schema: { type: "string" } }],
-      ["agents:write"],
-    ),
-    delete: summarize(
-      "Schedules",
-      "Delete a schedule",
-      [agentParam, { name: "scheduleId", in: "path", required: true, schema: { type: "string" } }],
-      ["agents:write"],
-    ),
+    put: {
+      tags: ["Schedules"],
+      summary: "Update or enable/disable a schedule",
+      parameters: [agentParam, scheduleParam],
+      "x-required-scopes": ["agents:write"],
+      "x-required-agent-role": "editor",
+      requestBody: {
+        required: true,
+        content: { "application/json": { schema: scheduleInput } },
+      },
+      responses: ok("Updated schedule", scheduleSchema),
+    },
+    delete: {
+      tags: ["Schedules"],
+      summary: "Delete a schedule",
+      parameters: [agentParam, scheduleParam],
+      "x-required-scopes": ["agents:write"],
+      "x-required-agent-role": "editor",
+      responses: ok("Schedule deleted", {
+        type: "object",
+        required: ["success"],
+        properties: { success: { type: "boolean" } },
+      }),
+    },
   },
   "/agents/{id}/schedules/{scheduleId}/runs": {
-    get: summarize(
-      "Schedules",
-      "List recent runs for a schedule",
-      [agentParam, { name: "scheduleId", in: "path", required: true, schema: { type: "string" } }],
-      ["agents:read"],
-    ),
+    get: {
+      tags: ["Schedules"],
+      summary: "List recent audit events for a schedule's runs",
+      parameters: [
+        agentParam,
+        scheduleParam,
+        {
+          name: "limit",
+          in: "query",
+          schema: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+        },
+      ],
+      "x-required-scopes": ["agents:read"],
+      "x-required-agent-role": "viewer",
+      responses: ok("Schedule run events", {
+        type: "array",
+        items: { type: "object", additionalProperties: true },
+      }),
+    },
   },
   "/agents/{id}/versions": {
-    get: summarize("Agents", "List configuration version history", [agentParam], ["agents:read"]),
+    get: {
+      tags: ["Agents"],
+      summary: "List configuration version history",
+      parameters: [
+        agentParam,
+        {
+          name: "limit",
+          in: "query",
+          schema: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        },
+      ],
+      "x-required-scopes": ["agents:read"],
+      "x-required-agent-role": "viewer",
+      responses: ok("Configuration versions, newest first", {
+        type: "array",
+        items: versionSchema,
+      }),
+    },
   },
   "/agents/{id}/versions/{versionId}": {
-    get: summarize(
-      "Agents",
-      "Get one configuration version",
-      [agentParam, { name: "versionId", in: "path", required: true, schema: { type: "string" } }],
-      ["agents:read"],
-    ),
+    get: {
+      tags: ["Agents"],
+      summary: "Get one configuration version",
+      parameters: [agentParam, versionParam],
+      "x-required-scopes": ["agents:read"],
+      "x-required-agent-role": "viewer",
+      responses: ok("Configuration version", versionSchema),
+    },
   },
   "/agents/{id}/rollback/{versionId}": {
-    post: summarize(
-      "Agents",
-      "Roll back to a configuration version (queues a redeploy)",
-      [agentParam, { name: "versionId", in: "path", required: true, schema: { type: "string" } }],
-      ["agents:write"],
-    ),
+    post: {
+      tags: ["Agents"],
+      summary: "Roll back to a configuration version and redeploy when needed",
+      description:
+        "Snapshots the current config first, restores the selected version, re-materializes template wiring, and queues a redeploy when the agent has a runtime.",
+      parameters: [agentParam, versionParam],
+      "x-required-scopes": ["agents:write"],
+      "x-required-agent-role": "editor",
+      responses: ok("Rollback result", {
+        type: "object",
+        required: ["success", "restored", "redeployed"],
+        properties: {
+          success: { type: "boolean" },
+          restored: versionSchema,
+          redeployed: { type: "boolean" },
+        },
+      }),
+    },
   },
   "/agents/{id}/stats": {
     get: summarize("Monitoring", "Live runtime stats snapshot", [agentParam], ["agents:read"]),

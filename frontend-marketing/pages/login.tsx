@@ -1,12 +1,14 @@
-import Head from "next/head";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { ArrowUpRight, CheckCircle2, Loader2, Lock, Mail, Shield, Zap } from "lucide-react";
 import LanguageSwitcher from "../components/LanguageSwitcher";
+import SeoHead from "../components/SeoHead";
+import {
+  fetchAuthBootstrapStatus,
+  type AuthBootstrapStatus,
+} from "../lib/authBootstrap";
 import { normalizeLocale, useI18n } from "../lib/i18n";
 
-const OAUTH_LOGIN_ENABLED = process.env.NEXT_PUBLIC_OAUTH_LOGIN_ENABLED === "true";
-const IS_SELF_HOSTED = process.env.NEXT_PUBLIC_PLATFORM_MODE === "selfhosted";
 const OSS_REPO_URL = "https://github.com/solomon2773/nora";
 const QUICKSTART_URL = `${OSS_REPO_URL}#quick-start`;
 
@@ -28,37 +30,28 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [oauthLoading, setOauthLoading] = useState("");
   const [error, setError] = useState("");
+  const [bootstrapStatus, setBootstrapStatus] = useState<AuthBootstrapStatus | null>(null);
+  const [bootstrapError, setBootstrapError] = useState("");
+  const oauthLoginEnabled = bootstrapStatus?.oauthLoginEnabled === true;
+  const platformMode = bootstrapStatus?.platformMode || null;
 
   useEffect(() => {
-    // Preferred path: session rides on the HttpOnly nora_auth cookie, so we
-    // just ask /auth/me with credentials included and see if the server
-    // recognizes us. This works without touching localStorage at all.
-    fetch("/api/auth/me", { credentials: "include" })
-      .then((res) => {
-        if (res.ok) {
-          window.location.assign(localizePath("/app/dashboard"));
-          return;
-        }
-        // Legacy migration: older sessions only have a token in localStorage
-        // and no cookie. Verify that token one last time; on success, let the
-        // user land in the app (their next login will set the cookie).
-        const legacy = localStorage.getItem("token");
-        if (!legacy) return;
-        fetch("/api/auth/me", {
-          credentials: "include",
-          headers: { Authorization: `Bearer ${legacy}` },
-        })
-          .then((res2) => {
-            if (res2.ok) {
-              window.location.assign(localizePath("/app/dashboard"));
-            } else {
-              localStorage.removeItem("token");
-            }
-          })
-          .catch(() => localStorage.removeItem("token"));
-      })
-      .catch(() => {});
-  }, [localizePath]);
+    const controller = new AbortController();
+    async function loadBootstrapStatus() {
+      try {
+        setBootstrapStatus(await fetchAuthBootstrapStatus(controller.signal));
+        setBootstrapError("");
+      } catch (bootstrapStatusError) {
+        if (controller.signal.aborted) return;
+        console.error(bootstrapStatusError);
+        setBootstrapError(
+          "OAuth availability could not be checked. Email and password login remains available.",
+        );
+      }
+    }
+    void loadBootstrapStatus();
+    return () => controller.abort();
+  }, []);
 
   async function routeAfterLogin() {
     try {
@@ -126,19 +119,18 @@ export default function Login() {
   }
 
   function handleOAuth(provider) {
+    if (!oauthLoginEnabled) return;
     setOauthLoading(provider);
     window.location.assign(localizePath(`/auth/oauth/${provider}`));
   }
 
   return (
     <>
-      <Head>
-        <title>Log In | Nora</title>
-        <meta
-          name="description"
-          content="Log in to Nora, the open-source platform for deploying and operating OpenClaw and Hermes runtimes. Public repo first, self-hostable, and commercially usable under Apache 2.0."
-        />
-      </Head>
+      <SeoHead
+        title="Log In | Nora"
+        description="Log in to your Nora operator account to deploy and operate OpenClaw and Hermes runtimes on infrastructure you control."
+        path="/login"
+      />
 
       <div className="site-shell min-h-screen px-4 pb-10 pt-4 text-brand-ink sm:px-6">
         <header className="mx-auto flex max-w-6xl items-center justify-between rounded-2xl border border-brand-cyan/25 bg-white/90 px-4 py-3 shadow-xl shadow-brand-ink/10 backdrop-blur-xl sm:px-5">
@@ -239,9 +231,11 @@ export default function Login() {
                 Instance note
               </div>
               <p className="mt-3 text-sm leading-7 text-slate-300">
-                {IS_SELF_HOSTED
+                {platformMode === "selfhosted"
                   ? "If this is a fresh self-hosted instance, use the operator account created during setup or create the first account before continuing into Settings and Deploy."
-                  : "If this hosted instance is new for you, create an account first and then come back here to continue into the operator surface."}
+                  : platformMode === "paas"
+                    ? "If this hosted instance is new for you, create an account first and then come back here to continue into the operator surface."
+                    : "Use the operator account created for this Nora instance, or create the first account if registration is still open."}
               </p>
             </div>
           </section>
@@ -259,7 +253,7 @@ export default function Login() {
               that too.
             </p>
 
-            {OAUTH_LOGIN_ENABLED && (
+            {oauthLoginEnabled && (
               <div className="mt-6 flex flex-col gap-3">
                 <button
                   type="button"
@@ -313,10 +307,20 @@ export default function Login() {
             <div className="my-6 flex items-center gap-4">
               <div className="h-px flex-1 bg-black/10" />
               <div className="text-[0.65rem] font-black uppercase tracking-[0.28em] text-slate-500">
-                {OAUTH_LOGIN_ENABLED ? "or use email" : "email login"}
+                {oauthLoginEnabled ? "or use email" : "email login"}
               </div>
               <div className="h-px flex-1 bg-black/10" />
             </div>
+
+            {bootstrapError && (
+              <div
+                role="status"
+                data-testid="auth-bootstrap-warning"
+                className="mb-4 rounded-[22px] border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm font-semibold text-amber-800"
+              >
+                {bootstrapError}
+              </div>
+            )}
 
             <form onSubmit={handleLogin} className="flex flex-col gap-4">
               <label className="flex flex-col gap-2">

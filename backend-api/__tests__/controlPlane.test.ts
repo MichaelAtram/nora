@@ -403,9 +403,7 @@ describe("public platform config", () => {
     expect(proxmoxTarget).toEqual(
       expect.objectContaining({
         enabled: true,
-        available: false,
-        maturityTier: "blocked",
-        availableForOnboarding: false,
+        maturityTier: "experimental",
       }),
     );
   });
@@ -446,7 +444,7 @@ describe("public platform config", () => {
         expect.objectContaining({
           id: "proxmox",
           runtimeFamily: "hermes",
-          maturityTier: "blocked",
+          maturityTier: "experimental",
         }),
       ]),
     );

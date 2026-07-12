@@ -15,9 +15,11 @@ Every protected Nora API endpoint requires an authenticated identity — either 
 Check whether the server still needs its first admin. This drives the "claim
 this server" first-run flow: until the first user registers (that first account
 becomes the platform admin), `needsFirstAdmin` is `true`; afterward it is
-`false`. The endpoint deliberately exposes only the boolean — a user count or
-emails would aid account enumeration. See the
-[security overview](/concepts/security) for the broader claim flow.
+`false`. The response also contains runtime OAuth visibility, normalized platform
+mode, and signup-challenge metadata so published frontend images can render the
+correct auth surface without build-time replacement. Verification secrets are never
+returned. A user count or emails would aid account enumeration. See the [security
+overview](/concepts/security) for the broader claim flow.
 
 ```
 GET /auth/bootstrap-status
@@ -31,12 +33,37 @@ Public — no authentication required.
   `true` until the first user registers, `false` afterward.
 </ResponseField>
 
+<ResponseField name="oauthLoginEnabled" type="boolean">
+  Whether the running backend accepts OAuth login. Login and signup hide OAuth controls unless this
+  value is `true`.
+</ResponseField>
+
+<ResponseField name="platformMode" type="string">
+  Normalized deployment mode: `selfhosted` or `paas`.
+</ResponseField>
+
+<ResponseField name="signupBotProtection" type="object">
+  Safe public runtime configuration: `enabled`, `provider`, public `siteKey`, `configured`, and a
+  user-safe `configurationError`. Secret verification keys remain backend-only.
+</ResponseField>
+
 ```bash
 curl http://localhost:8080/api/auth/bootstrap-status
 ```
 
 ```json theme={null}
-{ "needsFirstAdmin": true }
+{
+  "needsFirstAdmin": true,
+  "oauthLoginEnabled": false,
+  "platformMode": "selfhosted",
+  "signupBotProtection": {
+    "enabled": true,
+    "provider": "turnstile",
+    "siteKey": "0x4AAAA...",
+    "configured": true,
+    "configurationError": null
+  }
+}
 ```
 
 ---
@@ -332,10 +359,10 @@ POST /auth/oauth-login
 ```
 
 <Note>
-  This endpoint is **disabled by default**. Unless `OAUTH_LOGIN_ENABLED=true`, it
-  returns `403` with `OAuth login is disabled until server-side provider
-  verification is implemented`. Like login, it is rate-limited to **20 requests
-  per 15-minute window** per IP.
+  This endpoint is **disabled by default**. Unless `OAUTH_LOGIN_ENABLED=true`, it returns `403`.
+  Google or GitHub credentials must also be configured in the marketing OAuth bridge. Provider
+  tokens are verified server-side before Nora issues a session. Like password login, this endpoint
+  is rate-limited to **20 requests per 15-minute window** per IP.
 </Note>
 
 ### Request body

@@ -111,6 +111,11 @@ describe("RemoteDockerBackend construction", () => {
     expect(backend._composeNetwork).toBeNull();
     await expect(backend._findComposeNetwork()).resolves.toBeNull();
   });
+
+  it("explicitly publishes remote-host ports on all interfaces", () => {
+    const backend = new RemoteDockerBackend(keyProfile());
+    expect(backend._publishedPortHostIp()).toBe("0.0.0.0");
+  });
 });
 
 describe("RemoteDockerBackend.create", () => {

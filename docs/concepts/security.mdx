@@ -10,7 +10,7 @@ Nora is built to be trustworthy in real operator environments: you run it on you
 - **Key sync to runtimes is explicit.** Provider keys are pushed to a runtime on demand as part of provisioning or an operator-triggered sync, not broadcast.
 - **Setup generates strong secrets.** The installer creates `JWT_SECRET` and `ENCRYPTION_KEY` with OpenSSL and preserves existing secrets on re-runs.
 - **Production refuses weak secrets.** In production the backend will not boot when `JWT_SECRET` is missing, too short, or a placeholder, or when `ENCRYPTION_KEY` is missing or malformed — so a copy-pasted `.env.example` can never reach the internet. The only way around the encryption requirement is the explicit `NORA_ALLOW_PLAINTEXT_SECRETS=true` override.
-- **First-run claim flow.** Until the first user registers, the signup page runs in "claim this server" mode; the first account becomes the platform admin (`GET /api/auth/bootstrap-status` exposes only that boolean).
+- **First-run claim flow.** Until the first user registers, the signup page runs in "claim this server" mode; the first account becomes the platform admin. `GET /api/auth/bootstrap-status` exposes that boolean plus safe runtime OAuth visibility, platform mode, and signup-challenge metadata, never provider verification secrets.
 
 ## Authentication and authorization
 
@@ -40,7 +40,7 @@ Isolation strength is a property of the **deploy target + sandbox profile**, not
 ### Standard profile — Docker and Kubernetes (GA)
 
 - **Each agent runs in its own container** with its own namespaces (PID, mount, network, IPC, UTS) and **operator-set CPU, RAM, and disk limits** (Docker `NanoCpus`/`Memory`; Kubernetes `resources.limits`). The host kernel's default container protections apply (Docker's default seccomp profile, dropped ambient capabilities).
-- This is **shared-kernel** isolation: appropriate for first-party or trusted agent code, the same trust boundary you'd give any container you deploy. It is **not** intended as a hard boundary for arbitrary untrusted code — for that, use the NemoClaw profile or a VM-grade target.
+- This is **shared-kernel** isolation: appropriate for first-party or trusted agent code, the same trust boundary you'd give any container you deploy. It is **not** intended as a hard boundary for arbitrary untrusted code — for that, use the NemoClaw profile or an independently configured VM/microVM runtime.
 
 ### NemoClaw profile — hardened sandbox (experimental, OpenClaw only)
 
@@ -51,9 +51,9 @@ The `nemoclaw` profile is the hardened tier for running less-trusted agent code.
 - **`noexec,nosuid` tmpfs** for the sandbox's writable directories, so dropped payloads can't be executed from scratch space.
 - **Default-deny egress**: the sandbox runs with no general bridge network; outbound access is mediated by the OpenShell network policy (deny by default), not open to the internet.
 
-### VM-grade target — Proxmox (planned, release-blocked)
+### Proxmox LXC target (experimental)
 
-Proxmox VM placement is the planned **hardware-boundary** isolation tier (a separate kernel per agent), tracked but currently release-blocked. It is the future home for workloads that need a stronger boundary than a shared-kernel container.
+Proxmox places standard OpenClaw or a prepared Hermes image in an **unprivileged LXC** managed through verified API TLS and pinned SSH. LXC remains a shared-kernel container boundary; Nora does not claim VM-grade or separate-kernel isolation for this adapter. NemoClaw on Proxmox remains blocked because writing policy files inside an LXC would not enforce the OpenShell sandbox contract.
 
 ### Roadmap
 
@@ -62,7 +62,7 @@ Proxmox VM placement is the planned **hardware-boundary** isolation tier (a sepa
 
 ### Control-plane / worker separation
 
-**The control plane and workers are separate services**: the API coordinates state in PostgreSQL while provisioning runs in a dedicated worker over a Redis/BullMQ queue, so runtime credentials and Docker/Kubernetes access stay inside the worker boundary.
+**The control plane and workers are separate services**, but deployment access is not a worker-only security boundary. Provisioning runs in a dedicated worker over Redis/BullMQ; the backend API also mounts the Docker socket and shared backend-adapter code for runtime health checks and upgrade coordination. Treat both services as host-privileged components wherever those mounts are enabled.
 
 ## Standards and protocols
 
