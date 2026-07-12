@@ -134,6 +134,7 @@ jobs:
             CI Compose Pipeline
             CI Security
             CodeQL
+            Supply chain
           OPTIONAL_WORKFLOWS: |
             CodeQL
         run: node .github/workflows/scripts/require-workflow-success.mjs

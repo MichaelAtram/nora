@@ -104,6 +104,7 @@ jobs:
         CI Compose Pipeline
         CI Security
         CodeQL
+        Supply chain
       OPTIONAL_WORKFLOWS: |
         CodeQL
     steps:
