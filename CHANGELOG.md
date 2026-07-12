@@ -4,6 +4,59 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.16.0](https://github.com/solomon2773/nora/releases/tag/v1.16.0) — 2026-07-12
+
+Launch-readiness release: a deterministic first-run demo, safer production defaults,
+clearer contributor paths, extension scaffolding, broader MCP discovery, and an
+experimental Proxmox LXC backend with a protected real-hardware promotion gate.
+
+### Added
+
+- Contributor activation tooling: a Node 24 dev container, CODEOWNERS, structured issue
+  and pull-request templates, support guidance, a single contributor check command, and
+  tested scaffolds for new backend adapters and integration providers.
+- MCP distribution and discovery for Claude Code, Gemini CLI, GitHub Copilot CLI, Glama,
+  container users, and installable MCP bundles, alongside clearer CLI version and support
+  metadata.
+- Experimental Proxmox unprivileged-LXC lifecycle support for OpenClaw and prepared Hermes
+  images, including create/start/stop/restart/delete, exec, logs, environment rotation,
+  ownership markers, retry-safe VMID allocation, and a protected destructive hardware-smoke
+  workflow. NemoClaw on Proxmox remains blocked.
+- Transactional, checksummed database migrations; shared PostgreSQL/Redis connection
+  normalization; expanded OpenAPI coverage; and stronger Helm availability and pod-security
+  defaults.
+
+### Changed
+
+- The public site, auth entrypoints, docs, installer, and Getting Started flow now lead with
+  a zero-key demo, real product proof, current release links, contribution paths, localized
+  metadata, and an explicit post-install invitation to star the project.
+- Proxmox is visible only as an Experimental target and fails closed unless API TLS, pinned
+  SSH trust, templates, storage, and runtime prerequisites pass validation.
+- Production Compose services use non-root/read-only defaults and file-backed secrets, while
+  release upgrades and deploy automation validate exact product tags and materialize secrets
+  before rebuilding.
+
+### Fixed
+
+- OpenClaw auth bootstrap normalizes custom-provider IDs in `auth-profiles.json` for pinned
+  2026.4.x images and imports the same profiles into newer runtime auth stores, so the
+  deterministic demo produces a real assistant response after activation.
+- Gateway pooling coalesces concurrent cold connects and retires established or pending sockets
+  when an endpoint is reused or a token rotates, preventing stale authenticated sessions.
+- Session-upgrade tokens are verified before cookie migration; admin, workspace, API-key,
+  WebSocket, integration, and backup paths apply stricter authorization and safer failure
+  behavior.
+- OpenClaw channel IDs reject prototype-sensitive object keys before gateway/config access,
+  and development-tool lockfiles were refreshed to clear the repository's dependency alerts.
+- Provisioning retries occupied Docker ports, cancels or cleans stale jobs safely, preserves
+  runtime addresses across lifecycle operations, and fails closed when stop/delete cleanup
+  cannot be proven. Ambiguous Proxmox create outcomes preserve the VMID and stop retries until an
+  operator reconciles ownership instead of assuming a temporarily invisible LXC is absent.
+- Integration connection checks, email transport, backup handling, migration startup,
+  release metadata, and public navigation/activation E2E coverage were hardened against the
+  failure cases found during the launch audit.
+
 ## [v1.15.0](https://github.com/solomon2773/nora/releases/tag/v1.15.0) — 2026-07-06
 
 Reliability release: durability and honesty hardening across Kubernetes, Docker,
