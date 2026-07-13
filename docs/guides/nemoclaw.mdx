@@ -49,9 +49,17 @@ NemoClaw runs as an OpenClaw sandbox profile on these deploy targets:
 | K3s / Kubernetes | Supported    | Uses the Kubernetes adapter with `sandbox_profile=nemoclaw`; API keys are injected through per-agent Kubernetes Secrets.          |
 | AKS / GKE / EKS  | Supported    | Same Kubernetes adapter as K3s; use LoadBalancer exposure or the cluster exposure mode configured in Admin.                       |
 
-The default sandbox image is `ghcr.io/solomon2773/nora-nemoclaw-agent:latest`. For air-gapped
-hosts or private clusters, build `nora-nemoclaw-agent:local`, preload it onto the target nodes, and
-set `NEMOCLAW_SANDBOX_IMAGE=nora-nemoclaw-agent:local`.
+The default sandbox image is `ghcr.io/solomon2773/nora-nemoclaw-agent:latest`. Nora refreshes that
+mutable registry tag before Docker or Remote Docker creates a sandbox. Normal local setup and the
+official single-host production deploy rebuild the exact `nora-nemoclaw-agent:local` tag when it is
+selected. For Remote Docker hosts, air-gapped hosts, or private Kubernetes clusters, build and
+preload the image on each target yourself. Custom local tags, versioned tags, and digest references
+remain operator-owned and must be refreshed deliberately after a Nora OpenClaw pin changes.
+
+If you override `OPENCLAW_DOCKER_PACKAGE`, build or preload a NemoClaw image containing that exact
+OpenClaw version and point `NEMOCLAW_SANDBOX_IMAGE` at the matching pinned reference. NemoClaw runs
+non-root and deliberately fails closed rather than replacing a mismatched global OpenClaw install
+inside the sandbox.
 
 ## Deploy a NemoClaw agent
 

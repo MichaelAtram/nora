@@ -382,6 +382,9 @@ test("provider finalization retries drift and commits only while mutation state 
         providerFingerprint: reconcilePass === 1 ? "provider-v1" : "provider-v2",
       };
     },
+    verify: async ({ pass, providerFingerprint }) => {
+      order.push(`canary:${pass}:${providerFingerprint}`);
+    },
     readFingerprint: async () => {
       const fingerprint = fingerprints.shift();
       order.push(`verify:${fingerprint}`);
@@ -405,15 +408,50 @@ test("provider finalization retries drift and commits only while mutation state 
   assert.equal(result.finalization.finalized, true);
   assert.deepEqual(order, [
     "reconcile:provider-v1",
+    "canary:1:provider-v1",
     "lock",
     "verify:provider-v2",
     "unlock",
     "reconcile:provider-v1",
+    "canary:2:provider-v2",
     "lock",
     "verify:provider-v2",
     "finalize",
     "unlock",
   ]);
+});
+
+test("provider verification failure prevents mutation locking and finalization", async () => {
+  const order = [];
+
+  await assert.rejects(
+    reconcileProviderStateUntilStable({
+      bootstrappedFingerprint: "provider-v1",
+      reconcile: async () => {
+        order.push("reconcile");
+        return { status: "skipped", providerFingerprint: "provider-v1" };
+      },
+      verify: async () => {
+        order.push("canary");
+        throw new Error("activation reply missing");
+      },
+      readFingerprint: async () => {
+        order.push("fingerprint");
+        return "provider-v1";
+      },
+      withMutationLock: async (operation) => {
+        order.push("lock");
+        return operation();
+      },
+      finalize: async () => {
+        order.push("finalize");
+        return { finalized: true };
+      },
+    }),
+    /activation reply missing/,
+  );
+
+  assert.deepEqual(order, ["reconcile", "canary"]);
 });
 
 test("provider finalization fails closed when mutations never settle", async () => {

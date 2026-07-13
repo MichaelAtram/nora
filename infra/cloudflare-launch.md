@@ -90,6 +90,7 @@ first):
 - If **any** of:
   - URI Path starts with `/api/`
   - URI Path starts with `/app/`
+  - URI Path equals `/admin`
   - URI Path starts with `/admin/`
   - URI Path is in `/signup`, `/login`
   - Cookie contains your Nora session cookie name
@@ -99,6 +100,11 @@ This keeps the API (including the `/api/ws/` log/terminal sockets and the
 `/api/agents/*/gateway/chat` SSE stream), the operator app, the admin app, and every
 authenticated or cookie-setting response **off** the edge cache. Never cache a response
 that carries `Set-Cookie`.
+
+If you protect the Admin dashboard with **Cloudflare Access**, cover both the exact
+`/admin` path and `/admin/*`. The public nginx templates redirect `/admin` to `/admin/` as
+defense in depth, but the Access application should still include both paths so policy remains
+correct if routing changes or another origin serves the hostname.
 
 **Rule 2 — "Cache marketing" (priority 2):**
 
@@ -153,7 +159,10 @@ Run these against the live site **before** you post anywhere:
 - [ ] Sign up for a fresh account end-to-end (no cached/stale auth page; cookie sets).
 - [ ] `/api/auth/bootstrap-status` reports signup bot protection enabled and configured.
 - [ ] Log into `/app` and confirm the dashboard + a WebSocket log stream work.
-- [ ] Open an agent chat and confirm SSE streaming works (note the ~100s caveat).
+- [ ] When Cloudflare Access protects Admin, both `/admin` and `/admin/settings` enter the
+      Access login flow; `/admin` must not return a public shell whose `/_next` assets are blocked.
+- [ ] Open a freshly activated demo agent chat and confirm the first reply streams promptly over
+      SSE without an empty response, timeout, or loading stall.
 - [ ] OAuth login (Google/GitHub) round-trips (callbacks go through the marketing app).
 - [ ] `docker compose ... logs nginx` shows **real client IPs**, not Cloudflare IPs.
 - [ ] Trip the login rate limit intentionally and confirm a `429`/Block.

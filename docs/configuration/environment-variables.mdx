@@ -292,57 +292,61 @@ Defaults allow OpenClaw's internal gateway port, Docker-published 19000-19999, a
 
 Proxmox is an opt-in experimental LXC target for standard OpenClaw and prepared Hermes images. Keep Docker enabled while validating it, use verified API TLS and pinned SSH host keys, and run the real-host smoke before production use. NemoClaw on Proxmox remains blocked.
 
-| Variable                                   | Required            | Default                                                    | Description                                                                                           |
-| ------------------------------------------ | ------------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `PROXMOX_API_URL`                          | With target         | —                                                          | HTTPS Proxmox API origin or URL ending in `/api2/json`.                                               |
-| `PROXMOX_TOKEN_ID`                         | With target         | —                                                          | API token ID in `user@realm!tokenname` format.                                                        |
-| `PROXMOX_TOKEN_SECRET`                     | With target         | —                                                          | Secret associated with the API token.                                                                 |
-| `PROXMOX_VERIFY_TLS`                       | No                  | `true`                                                     | Verifies the Proxmox API certificate. `false` is test-only.                                           |
-| `PROXMOX_CA_CERT` / `PROXMOX_CA_CERT_PATH` | No                  | —                                                          | Inline or mounted private CA certificate.                                                             |
-| `PROXMOX_ALLOW_INSECURE_HTTP`              | No                  | `false`                                                    | Test-only opt-in for an isolated HTTP fixture.                                                        |
-| `PROXMOX_NODE`                             | No                  | `pve`                                                      | Proxmox node where LXCs are created.                                                                  |
-| `PROXMOX_TEMPLATE`                         | No                  | `local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst` | LXC template used for OpenClaw agents.                                                                |
-| `PROXMOX_HERMES_TEMPLATE`                  | For Hermes          | —                                                          | Prepared LXC template containing the Hermes executable and `hermes` user.                             |
-| `PROXMOX_ROOTFS_STORAGE`                   | No                  | `local-lvm`                                                | Storage pool used for the rootfs.                                                                     |
-| `PROXMOX_BRIDGE`                           | No                  | `vmbr0`                                                    | DHCP-capable network bridge attached to created LXCs.                                                 |
-| `PROXMOX_SSH_HOST` / `PROXMOX_SSH_USER`    | With target         | — / `root`                                                 | SSH endpoint used to run `pct`.                                                                       |
-| `PROXMOX_SSH_PORT`                         | No                  | `22`                                                       | SSH port.                                                                                             |
-| `PROXMOX_SSH_PRIVATE_KEY` / `_PATH`        | One SSH auth method | —                                                          | Inline or mounted SSH private key.                                                                    |
-| `PROXMOX_SSH_PRIVATE_KEY_PASSPHRASE`       | No                  | —                                                          | Passphrase for the configured private key.                                                            |
-| `PROXMOX_SSH_PASSWORD`                     | One SSH auth method | —                                                          | Password fallback when key auth is not configured.                                                    |
-| `PROXMOX_SSH_HOST_FINGERPRINT`             | With target         | —                                                          | Trusted OpenSSH SHA-256 host-key fingerprint.                                                         |
-| `PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY`     | No                  | `false`                                                    | Test-only bypass for pinned host verification.                                                        |
-| `PROXMOX_PCT_COMMAND` / `PROXMOX_SUDO`     | No                  | `pct` / auto                                               | Override the `pct` command or sudo prefix for a restricted SSH account.                               |
-| `PROXMOX_NODE_MAJOR`                       | No                  | `24`                                                       | Minimum Node.js major installed in stock OpenClaw templates.                                          |
-| `PROXMOX_OPENCLAW_PACKAGE`                 | No                  | `openclaw@latest`                                          | Package spec installed for OpenClaw. Pin for reproducible environments.                               |
-| `PROXMOX_HERMES_BIN`                       | No                  | `/opt/hermes/.venv/bin/hermes`                             | Hermes executable in the prepared template.                                                           |
-| `PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD` | No                  | `false`                                                    | Publishes the unauthenticated Hermes dashboard on `0.0.0.0`; leave false unless separately protected. |
+| Variable                                   | Required            | Default                                                    | Description                                                                                               |
+| ------------------------------------------ | ------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `PROXMOX_API_URL`                          | With target         | —                                                          | HTTPS Proxmox API origin or URL ending in `/api2/json`.                                                   |
+| `PROXMOX_TOKEN_ID`                         | With target         | —                                                          | API token ID in `user@realm!tokenname` format.                                                            |
+| `PROXMOX_TOKEN_SECRET`                     | With target         | —                                                          | Secret associated with the API token.                                                                     |
+| `PROXMOX_VERIFY_TLS`                       | No                  | `true`                                                     | Verifies the Proxmox API certificate. `false` is test-only.                                               |
+| `PROXMOX_CA_CERT` / `PROXMOX_CA_CERT_PATH` | No                  | —                                                          | Inline or mounted private CA certificate.                                                                 |
+| `PROXMOX_ALLOW_INSECURE_HTTP`              | No                  | `false`                                                    | Test-only opt-in for an isolated HTTP fixture.                                                            |
+| `PROXMOX_NODE`                             | No                  | `pve`                                                      | Proxmox node where LXCs are created.                                                                      |
+| `PROXMOX_TEMPLATE`                         | No                  | `local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst` | LXC template used for OpenClaw agents.                                                                    |
+| `PROXMOX_HERMES_TEMPLATE`                  | For Hermes          | —                                                          | Prepared LXC template containing the Hermes executable and `hermes` user.                                 |
+| `PROXMOX_ROOTFS_STORAGE`                   | No                  | `local-lvm`                                                | Storage pool used for the rootfs.                                                                         |
+| `PROXMOX_BRIDGE`                           | No                  | `vmbr0`                                                    | DHCP-capable network bridge attached to created LXCs.                                                     |
+| `PROXMOX_SSH_HOST` / `PROXMOX_SSH_USER`    | With target         | — / `root`                                                 | SSH endpoint used to run `pct`.                                                                           |
+| `PROXMOX_SSH_PORT`                         | No                  | `22`                                                       | SSH port.                                                                                                 |
+| `PROXMOX_SSH_PRIVATE_KEY` / `_PATH`        | One SSH auth method | —                                                          | Inline or mounted SSH private key.                                                                        |
+| `PROXMOX_SSH_PRIVATE_KEY_PASSPHRASE`       | No                  | —                                                          | Passphrase for the configured private key.                                                                |
+| `PROXMOX_SSH_PASSWORD`                     | One SSH auth method | —                                                          | Password fallback when key auth is not configured.                                                        |
+| `PROXMOX_SSH_HOST_FINGERPRINT`             | With target         | —                                                          | Trusted OpenSSH SHA-256 host-key fingerprint.                                                             |
+| `PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY`     | No                  | `false`                                                    | Test-only bypass for pinned host verification.                                                            |
+| `PROXMOX_PCT_COMMAND` / `PROXMOX_SUDO`     | No                  | `pct` / auto                                               | Override the `pct` command or sudo prefix for a restricted SSH account.                                   |
+| `PROXMOX_NODE_MAJOR`                       | No                  | `24`                                                       | Minimum Node.js major installed in stock OpenClaw templates.                                              |
+| `PROXMOX_OPENCLAW_PACKAGE`                 | No                  | `openclaw@2026.6.11`                                       | Package spec installed for OpenClaw. Override only after validating Gateway and activation compatibility. |
+| `PROXMOX_HERMES_BIN`                       | No                  | `/opt/hermes/.venv/bin/hermes`                             | Hermes executable in the prepared template.                                                               |
+| `PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD` | No                  | `false`                                                    | Publishes the unauthenticated Hermes dashboard on `0.0.0.0`; leave false unless separately protected.     |
 
 ## NemoClaw / NVIDIA
 
 Read when `ENABLED_SANDBOX_PROFILES` includes `nemoclaw`.
 
-| Variable                 | Required | Default                                          | Description                                                                                                                   |
-| ------------------------ | -------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| `NVIDIA_API_KEY`         | No       | —                                                | API key from [build.nvidia.com](https://build.nvidia.com) for accessing NVIDIA-hosted Nemotron models.                        |
-| `NEMOCLAW_DEFAULT_MODEL` | No       | `nvidia/nemotron-3-super-120b-a12b`              | Default Nemotron model used by NemoClaw agents.                                                                               |
-| `NEMOCLAW_SANDBOX_IMAGE` | No       | `ghcr.io/solomon2773/nora-nemoclaw-agent:latest` | Container image for NemoClaw sandbox runtime. Use `nora-nemoclaw-agent:local` only when you build/preload the image yourself. |
+| Variable                 | Required | Default                                          | Description                                                                                                                                                                                                                        |
+| ------------------------ | -------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NVIDIA_API_KEY`         | No       | —                                                | API key from [build.nvidia.com](https://build.nvidia.com) for accessing NVIDIA-hosted Nemotron models.                                                                                                                             |
+| `NEMOCLAW_DEFAULT_MODEL` | No       | `nvidia/nemotron-3-super-120b-a12b`              | Default Nemotron model used by NemoClaw agents.                                                                                                                                                                                    |
+| `NEMOCLAW_SANDBOX_IMAGE` | No       | `ghcr.io/solomon2773/nora-nemoclaw-agent:latest` | Container image for NemoClaw. Mutable registry tags refresh before Docker/Remote Docker create; normal local setup/deploy rebuilds Nora's exact local tag, while custom refs and remote/Kubernetes preloads remain operator-owned. |
 
 ## OpenClaw runtime
 
 These variables tune the OpenClaw runtime image and gateway. Most operators leave them at their defaults; override when running a forked OpenClaw build or pinning to a specific image.
 
-| Variable                   | Required | Default                  | Description                                                                              |
-| -------------------------- | -------- | ------------------------ | ---------------------------------------------------------------------------------------- |
-| `OPENCLAW_DOCKER_IMAGE`    | No       | OpenClaw default         | Container image used for OpenClaw agents.                                                |
-| `OPENCLAW_STANDARD_IMAGE`  | No       | OpenClaw default         | Image used specifically for the `standard` sandbox profile.                              |
-| `OPENCLAW_GATEWAY_PORT`    | No       | `18789`                  | Internal port the OpenClaw gateway listens on inside the agent container.                |
-| `OPENCLAW_GATEWAY_TOKEN`   | No       | auto-generated per agent | Static gateway token override. Most deployments rely on the per-agent token Nora issues. |
-| `OPENCLAW_DOCKER_PACKAGE`  | No       | OpenClaw default         | Override package name used when building images.                                         |
-| `OPENCLAW_TSX_BIN`         | No       | OpenClaw default         | Path to the `tsx` runner inside the OpenClaw image.                                      |
-| `OPENCLAW_TSX_PACKAGE`     | No       | OpenClaw default         | Override `tsx` package name.                                                             |
-| `OPENCLAW_CLI_PATH`        | No       | OpenClaw default         | Path to the OpenClaw CLI inside the image.                                               |
-| `OPENCLAW_DISABLE_BONJOUR` | No       | `false`                  | Disable Bonjour/mDNS inside OpenClaw containers when not needed.                         |
+| Variable                   | Required | Default                  | Description                                                                                |
+| -------------------------- | -------- | ------------------------ | ------------------------------------------------------------------------------------------ |
+| `OPENCLAW_DOCKER_IMAGE`    | No       | OpenClaw default         | Container image used for OpenClaw agents.                                                  |
+| `OPENCLAW_STANDARD_IMAGE`  | No       | OpenClaw default         | Image used specifically for the `standard` sandbox profile.                                |
+| `OPENCLAW_GATEWAY_PORT`    | No       | `18789`                  | Internal port the OpenClaw gateway listens on inside the agent container.                  |
+| `OPENCLAW_GATEWAY_TOKEN`   | No       | auto-generated per agent | Static gateway token override. Most deployments rely on the per-agent token Nora issues.   |
+| `OPENCLAW_DOCKER_PACKAGE`  | No       | `openclaw@2026.6.11`     | Validated package spec used across Docker, Kubernetes, and as the Proxmox fallback.        |
+| `OPENCLAW_TSX_BIN`         | No       | OpenClaw default         | Path to the `tsx` runner inside the OpenClaw image.                                        |
+| `OPENCLAW_TSX_PACKAGE`     | No       | OpenClaw default         | Override `tsx` package name.                                                               |
+| `OPENCLAW_CLI_PATH`        | No       | OpenClaw default         | Path to the OpenClaw CLI inside the image.                                                 |
+| `OPENCLAW_DISABLE_BONJOUR` | No       | `true`                   | Disable Bonjour/mDNS inside managed containers; set `0` only for deliberate LAN discovery. |
+
+When `OPENCLAW_DOCKER_PACKAGE` is overridden for NemoClaw, `NEMOCLAW_SANDBOX_IMAGE` must reference a
+prebuilt image containing the same exact OpenClaw version. The non-root NemoClaw runtime fails
+closed on a version mismatch instead of replacing the global package inside the sandbox.
 
 ## Hermes runtime
 

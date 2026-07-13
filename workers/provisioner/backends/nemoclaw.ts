@@ -5,6 +5,8 @@
 
 const Docker = require("dockerode");
 const ProvisionerBackend = require("./interface");
+const { demuxDockerExecStream } = require("./dockerExecStream");
+const { ensureNemoClawImage } = require("./nemoclawImage");
 const crypto = require("crypto");
 const path = require("path");
 const {
@@ -23,6 +25,7 @@ const {
   getNemoClawDefaultModel,
   getNemoClawSandboxImage,
 } = require("../../../agent-runtime/lib/nemoclawDefaults");
+const { getStandardDockerPackageSpec } = require("../../../agent-runtime/lib/agentImages");
 const {
   buildDockerTelemetry,
   buildUnavailableTelemetry,
@@ -36,6 +39,7 @@ const {
 const SANDBOX_IMAGE = getNemoClawSandboxImage(process.env);
 
 const DEFAULT_MODEL = getNemoClawDefaultModel(process.env);
+const sandboxImageRefreshStates = new Map();
 
 // Baseline network policy — only these endpoints are allowed.
 // Matches NemoClaw's openclaw-sandbox.yaml spec.
@@ -91,6 +95,28 @@ class NemoClawBackend extends ProvisionerBackend {
     super();
     this.docker = new Docker({ socketPath: "/var/run/docker.sock" });
     this._composeNetwork = null;
+  }
+
+  _sandboxImageRefreshKey() {
+    const target = this.executionTargetId
+      ? [this.executionTargetId, this.profile?.sshHost || "", this.profile?.sshPort || ""].join(":")
+      : "local";
+    return `${target}\0${SANDBOX_IMAGE}`;
+  }
+
+  async _ensureSandboxImage() {
+    const key = this._sandboxImageRefreshKey();
+    let state = sandboxImageRefreshStates.get(key);
+    if (!state) {
+      state = { pending: null, refreshed: false };
+      sandboxImageRefreshStates.set(key, state);
+    }
+    await ensureNemoClawImage({
+      docker: this.docker,
+      image: SANDBOX_IMAGE,
+      state,
+      log: (message) => console.log(`[nemoclaw] ${message}`),
+    });
   }
 
   async _findComposeNetwork() {
@@ -163,7 +189,10 @@ class NemoClawBackend extends ProvisionerBackend {
     const startupScript = [
       "#!/bin/sh",
       "set -eu",
-      buildOpenClawInstallCommand(["openclaw@latest", "nemoclaw@latest"]),
+      buildOpenClawInstallCommand([
+        getStandardDockerPackageSpec(),
+        process.env.NEMOCLAW_PACKAGE || "nemoclaw@latest",
+      ]),
       "mkdir -p ~/.openclaw/devices",
       "cat <<'__NORA_GATEWAY_CONFIG__' > ~/.openclaw/openclaw.json",
       JSON.stringify({ gateway: { port: OPENCLAW_GATEWAY_PORT, bind: "lan", mode: "local" } }),
@@ -268,23 +297,7 @@ class NemoClawBackend extends ProvisionerBackend {
 
     console.log(`[nemoclaw] Creating sandbox ${containerName} from ${SANDBOX_IMAGE}`);
 
-    // Pull the sandbox image
-    try {
-      await this.docker.getImage(SANDBOX_IMAGE).inspect();
-      console.log(`[nemoclaw] Image ${SANDBOX_IMAGE} already present`);
-    } catch {
-      console.log(`[nemoclaw] Pulling image ${SANDBOX_IMAGE}...`);
-      await new Promise((resolve, reject) => {
-        this.docker.pull(SANDBOX_IMAGE, (err, stream) => {
-          if (err) return reject(err);
-          this.docker.modem.followProgress(stream, (err) => {
-            if (err) return reject(err);
-            console.log(`[nemoclaw] Image ${SANDBOX_IMAGE} pulled successfully`);
-            resolve();
-          });
-        });
-      });
-    }
+    await this._ensureSandboxImage();
 
     // Remove orphaned containers
     try {
@@ -648,20 +661,24 @@ class NemoClawBackend extends ProvisionerBackend {
 
   async exec(containerId, opts = {}) {
     const container = this.docker.getContainer(containerId);
+    const tty = opts.tty !== false;
     const execInstance = await container.exec({
       Cmd: opts.cmd || ["/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"],
       AttachStdin: true,
       AttachStdout: true,
       AttachStderr: true,
-      Tty: opts.tty !== false,
+      Tty: tty,
       Env: opts.env || ["TERM=xterm-256color"],
     });
-    const stream = await execInstance.start({
+    const rawStream = await execInstance.start({
       hijack: true,
       stdin: true,
-      Tty: opts.tty !== false,
+      Tty: tty,
     });
-    return { exec: execInstance, stream };
+    return {
+      exec: execInstance,
+      stream: tty ? rawStream : demuxDockerExecStream(this.docker, rawStream),
+    };
   }
 
   /**
@@ -678,7 +695,8 @@ class NemoClawBackend extends ProvisionerBackend {
         AttachStdout: true,
         AttachStderr: true,
       });
-      const stream = await exec.start();
+      const rawStream = await exec.start();
+      const stream = demuxDockerExecStream(this.docker, rawStream);
       return new Promise((resolve) => {
         let output = "";
         stream.on("data", (chunk) => (output += chunk.toString()));

@@ -2,6 +2,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { PassThrough } = require("node:stream");
 const {
   buildOpenClawAuthProfilesWriteCommand,
   buildOpenClawConfigMergeScript,
@@ -16,6 +17,10 @@ const {
   FOUNDRY_OPENCLAW_PROVIDER_ID,
   resolveFoundryDeployment,
 } = require("../../workers/provisioner/runtimeBootstrap");
+const {
+  DEFAULT_OPENCLAW_PACKAGE_SPEC,
+  DEFAULT_OPENCLAW_VERSION,
+} = require("../../agent-runtime/lib/openclawDefaults");
 const DockerBackend = require("../../workers/provisioner/backends/docker");
 const tar = require(
   require.resolve("tar-stream", {
@@ -60,25 +65,28 @@ describe("OpenClaw bootstrap helpers", () => {
 
     expect(cmd).toContain("/opt/openclaw-runtime/lib/contracts.ts");
     expect(cmd).toContain("/opt/openclaw-runtime/lib/containerCommand.ts");
+    expect(cmd).toContain("/opt/openclaw-runtime/lib/openclawDefaults.ts");
     expect(cmd).toContain("/opt/openclaw-runtime/lib/server.ts");
     expect(cmd).toContain("/opt/openclaw-runtime/lib/execEndpoint.ts");
     expect(cmd).toContain("/opt/openclaw-runtime/lib/agent.ts");
   });
 
   it("verifies the OpenClaw CLI can execute before skipping installation", () => {
-    const cmd = buildOpenClawInstallCommand(["openclaw@latest"]);
+    const cmd = buildOpenClawInstallCommand();
 
     expect(cmd).toContain('OPENCLAW_BIN="${OPENCLAW_CLI_PATH:-/usr/local/bin/openclaw}"');
     expect(cmd).toContain('OPENCLAW_TSX_BIN="${OPENCLAW_TSX_BIN:-/usr/local/bin/tsx}"');
     expect(cmd).toContain('DETECTED_OPENCLAW_BIN="$(command -v openclaw 2>/dev/null || true)"');
     expect(cmd).toContain('DETECTED_OPENCLAW_TSX_BIN="$(command -v tsx 2>/dev/null || true)"');
     expect(cmd).toContain('[ -x "$OPENCLAW_BIN" ]');
-    expect(cmd).toContain('"$OPENCLAW_BIN" --version >/dev/null 2>&1');
+    expect(cmd).toContain(`EXPECTED_OPENCLAW_VERSION='${DEFAULT_OPENCLAW_VERSION}'`);
+    expect(cmd).toContain("OPENCLAW_VERSION_OK=1");
     expect(cmd).toContain('"$OPENCLAW_TSX_BIN" --version >/dev/null 2>&1');
     expect(cmd).toContain("npm uninstall -g openclaw tsx >/dev/null 2>&1 || true");
     expect(cmd).toContain(
-      "npm install -g openclaw@latest tsx@4.21.0 >/tmp/openclaw-install.log 2>&1",
+      `npm install -g ${DEFAULT_OPENCLAW_PACKAGE_SPEC} tsx@4.21.0 >/tmp/openclaw-install.log 2>&1`,
     );
+    expect(cmd).toContain("Installed OpenClaw version does not match");
     expect(cmd).toContain("hash -r 2>/dev/null || true");
     expect(cmd).toContain('export OPENCLAW_CLI_PATH="$OPENCLAW_BIN"');
     expect(cmd).toContain('export OPENCLAW_TSX_BIN="$OPENCLAW_TSX_BIN"');
@@ -497,6 +505,35 @@ exit 2
 });
 
 describe("Provisioner backends", () => {
+  it("demuxes non-TTY Docker exec output before command consumers read it", async () => {
+    const dockerBackend = new DockerBackend();
+    const rawStream = new PassThrough();
+    const payload = Buffer.from(`${'{"status":"ok"}'.padEnd(67, " ")}\n`);
+    const frame = Buffer.alloc(8 + payload.length);
+    frame[0] = 1;
+    frame.writeUInt32BE(payload.length, 4);
+    payload.copy(frame, 8);
+    const execInstance = {
+      start: jest.fn(async () => {
+        setImmediate(() => rawStream.end(frame));
+        return rawStream;
+      }),
+    };
+    dockerBackend.docker.getContainer = jest.fn(() => ({
+      exec: jest.fn(async () => execInstance),
+    }));
+
+    const result = await dockerBackend.exec("container-1", {
+      cmd: ["/bin/sh", "-lc", "printf json"],
+      tty: false,
+    });
+    const chunks = [];
+    for await (const chunk of result.stream) chunks.push(chunk);
+
+    expect(Buffer.concat(chunks).toString("utf8")).toBe(payload.toString("utf8"));
+    expect(execInstance.start).toHaveBeenCalledWith({ hijack: true, stdin: true, Tty: false });
+  });
+
   it("builds a Docker startup script with the executable guard and runtime bootstrap", () => {
     const dockerBackend = new DockerBackend();
     const files = dockerBackend._buildBootstrapFiles({
@@ -511,6 +548,7 @@ describe("Provisioner backends", () => {
       expect.arrayContaining([
         "opt/openclaw-runtime/lib/contracts.ts",
         "opt/openclaw-runtime/lib/containerCommand.ts",
+        "opt/openclaw-runtime/lib/openclawDefaults.ts",
         "opt/openclaw-runtime/lib/server.ts",
         "opt/openclaw-runtime/lib/execEndpoint.ts",
         "opt/openclaw-runtime/lib/agent.ts",
@@ -529,6 +567,7 @@ describe("Provisioner backends", () => {
     expect(startupScript.content).toContain(
       'DETECTED_OPENCLAW_BIN="$(command -v openclaw 2>/dev/null || true)"',
     );
+    expect(startupScript.content).toContain(DEFAULT_OPENCLAW_PACKAGE_SPEC);
     expect(startupScript.content).toContain('export OPENCLAW_CLI_PATH="$OPENCLAW_BIN"');
     expect(startupScript.content).toContain(
       "mkdir -p /var/log /root/.openclaw/workspace /root/.openclaw/agents/main/agent",
@@ -653,6 +692,7 @@ describe("Provisioner backends", () => {
     expect(k8sSource).toContain("getStandardDockerPackageSpec()");
     expect(k8sSource).toContain('"nemoclaw@latest"');
     expect(nemoclawSource).toContain("buildOpenClawInstallCommand([");
+    expect(nemoclawSource).toContain("getStandardDockerPackageSpec()");
 
     expect(k8sSource).toContain("ensureOpenClawCmd +");
     expect(nemoclawSource).toContain('Cmd: ["/opt/openclaw-runtime/start.sh"]');

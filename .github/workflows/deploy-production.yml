@@ -192,6 +192,26 @@ jobs:
             exit 1
           fi
 
+          read_deploy_env_value() {
+            local env_path="$1" name="$2" default_value="$3" line value first last
+            line="$(grep -E "^[[:space:]]*${name}[[:space:]]*=" "$env_path" 2>/dev/null | tail -n 1 || true)"
+            if [ -z "$line" ]; then
+              printf '%s\n' "$default_value"
+              return 0
+            fi
+            value="${line#*=}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            if [ "${#value}" -ge 2 ]; then
+              first="${value:0:1}"
+              last="${value: -1}"
+              if { [ "$first" = '"' ] && [ "$last" = '"' ]; } || { [ "$first" = "'" ] && [ "$last" = "'" ]; }; then
+                value="${value:1:${#value}-2}"
+              fi
+            fi
+            printf '%s\n' "$value"
+          }
+
           for required_key in JWT_SECRET ENCRYPTION_KEY DB_PASSWORD; do
             if ! grep -Eq "^${required_key}=.+" "$DEPLOY_ENV_FILE"; then
               echo "Deploy env file $DEPLOY_ENV_FILE is missing required key: $required_key" >&2
@@ -220,6 +240,25 @@ jobs:
           done
 
           export NORA_ENV_FILE="$DEPLOY_ENV_FILE"
+          echo "Rebuilding the pinned standard OpenClaw agent image."
+          docker build \
+            -f agent-runtime/Dockerfile.openclaw-agent \
+            -t nora-openclaw-agent:local \
+            agent-runtime/
+          enabled_sandbox_profiles="$(read_deploy_env_value "$DEPLOY_ENV_FILE" ENABLED_SANDBOX_PROFILES "")"
+          nemoclaw_sandbox_image="$(read_deploy_env_value "$DEPLOY_ENV_FILE" NEMOCLAW_SANDBOX_IMAGE "ghcr.io/solomon2773/nora-nemoclaw-agent:latest")"
+          normalized_sandbox_profiles="${enabled_sandbox_profiles//[[:space:]]/}"
+          case ",${normalized_sandbox_profiles}," in
+            *,nemoclaw,*)
+              if [ "$nemoclaw_sandbox_image" = "nora-nemoclaw-agent:local" ]; then
+                echo "Rebuilding the enabled local NemoClaw sandbox image."
+                docker build \
+                  -f agent-runtime/Dockerfile.nemoclaw-agent \
+                  -t nora-nemoclaw-agent:local \
+                  agent-runtime/
+              fi
+              ;;
+          esac
           echo "Pre-validating the generated nginx config before replacing services."
           docker compose "${compose_args[@]}" run --rm --no-deps --interactive=false -T nginx nginx -t
           echo "Code update only: preserving compose volumes and provisioned agent Docker/K8s/VM instances."

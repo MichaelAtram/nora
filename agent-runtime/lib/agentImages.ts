@@ -8,6 +8,7 @@ const {
   normalizeSandboxProfileName,
 } = require("./backendCatalog");
 const { getNemoClawSandboxImage } = require("./nemoclawDefaults");
+const { DEFAULT_OPENCLAW_PACKAGE_SPEC } = require("./openclawDefaults");
 
 function getProvisionerBackendName() {
   return getDefaultDeployTarget(process.env, {
@@ -21,7 +22,7 @@ function getStandardDockerAgentImage() {
 }
 
 function getStandardDockerPackageSpec() {
-  return process.env.OPENCLAW_DOCKER_PACKAGE || "openclaw@latest";
+  return process.env.OPENCLAW_DOCKER_PACKAGE || DEFAULT_OPENCLAW_PACKAGE_SPEC;
 }
 
 function getHermesDockerAgentImage() {

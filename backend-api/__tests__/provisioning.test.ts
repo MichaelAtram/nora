@@ -9,6 +9,7 @@ const {
   waitForAgentReadiness,
 } = require("../../workers/provisioner/healthChecks");
 const { waitForAgentReadiness: waitForBackendAgentReadiness } = require("../healthChecks");
+const { DEFAULT_OPENCLAW_PACKAGE_SPEC } = require("../../agent-runtime/lib/openclawDefaults");
 
 const mockReadNamespace = jest.fn();
 const mockCreateNamespace = jest.fn();
@@ -385,7 +386,7 @@ describe("provisioning runtime/gateway contracts", () => {
     const configMap = mockCreateNamespacedConfigMap.mock.calls[0][0].body;
     const container = deployment.spec.template.spec.containers[0];
 
-    expect(configMap.data["bootstrap.sh"]).toContain("openclaw@latest");
+    expect(configMap.data["bootstrap.sh"]).toContain(DEFAULT_OPENCLAW_PACKAGE_SPEC);
     expect(configMap.data["bootstrap.sh"]).toContain("__NORA_OPENCLAW_AUTH_SQLITE_IMPORT__");
     expect(configMap.data["bootstrap.sh"]).toContain("paste-api-key");
     expect(configMap.metadata.labels["nora.sandbox.profile"]).toBe("standard");

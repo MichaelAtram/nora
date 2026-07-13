@@ -28,6 +28,7 @@ const {
   getProxmoxConfigIssue,
   getProxmoxProductionSecurityIssue,
 } = require("../../../agent-runtime/lib/backendCatalog");
+const { getStandardDockerPackageSpec } = require("../../../agent-runtime/lib/agentImages");
 const {
   HERMES_MANAGED_ENV_ENV,
   buildHermesManagedEnvBlock,
@@ -1069,10 +1070,7 @@ class ProxmoxBackend extends ProvisionerBackend {
       "0600",
       { signal },
     );
-    const openClawPackage =
-      process.env.PROXMOX_OPENCLAW_PACKAGE ||
-      process.env.OPENCLAW_DOCKER_PACKAGE ||
-      "openclaw@latest";
+    const openClawPackage = process.env.PROXMOX_OPENCLAW_PACKAGE || getStandardDockerPackageSpec();
     const customProviders = buildOpenClawCustomProviders(env || {});
     if (Object.keys(customProviders).length > 0) {
       await this._writeFile(

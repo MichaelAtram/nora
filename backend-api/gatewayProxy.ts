@@ -28,6 +28,12 @@ const GATEWAY_PORT = OPENCLAW_GATEWAY_PORT;
 const CONNECT_TIMEOUT = 8000;
 const CALL_TIMEOUT = 30000;
 const CHAT_TIMEOUT = 120000;
+const SESSION_MESSAGE_SUBSCRIBE_TIMEOUT = 5000;
+const AGENT_TERMINAL_FALLBACK_GRACE_MS = 100;
+// OpenClaw 2026.6 keeps lifecycle errors retryable for 15 seconds while it
+// attempts provider/model fallback. Wait just beyond that upstream window
+// unless the gateway explicitly reports that fallback is exhausted.
+const AGENT_ERROR_FALLBACK_GRACE_MS = 16000;
 const RELAY_CONNECT_DELAY_MS = 750;
 const DOCKER_GATEWAY_HOST_PORT_MIN = 19000;
 const DOCKER_GATEWAY_HOST_PORT_MAX = 19999;
@@ -457,6 +463,9 @@ class GatewayConnection {
     this.connected = false;
     this.pending = new Map(); // id -> { resolve, reject, timer }
     this.eventListeners = new Map(); // event -> Set<callback>
+    this.sessionMessageSubscriptions = new Set(); // unique ref-counted subscription entries
+    this.sessionMessageSubscriptionAliases = new Map(); // requested/canonical key -> entry
+    this._sessionMessageSubscriptionOperation = Promise.resolve();
     this._reqId = 0;
     this._connectPromise = null;
     this._identity = deriveDeviceIdentity(token);
@@ -539,6 +548,7 @@ class GatewayConnection {
           if (msg.ok) {
             this.connected = true;
             resolve(this);
+            this._restoreSessionMessageSubscriptions();
           } else {
             reject(new Error(`Gateway handshake failed: ${msg.error?.message || "unknown"}`));
           }
@@ -572,6 +582,11 @@ class GatewayConnection {
         const wasConnected = this.connected;
         this.connected = false;
         this._connectPromise = null;
+        for (const entry of this.sessionMessageSubscriptions.values()) {
+          entry.subscribed = false;
+          entry.subscriptionAttempted = false;
+          entry.subscriptionSupported = null;
+        }
         // Reject all pending
         for (const [id, { reject: rej, timer: t }] of this.pending) {
           clearTimeout(t);
@@ -611,6 +626,191 @@ class GatewayConnection {
 
   off(event, callback) {
     this.eventListeners.get(event)?.delete(callback);
+  }
+
+  _sessionMessageSubscriptionTarget(key) {
+    const requestedKey = String(key || "").trim();
+    const scopedGlobal = requestedKey.match(/^agent:([^:]+):global$/);
+    if (scopedGlobal) {
+      const agentId = scopedGlobal[1];
+      return {
+        requestedKey,
+        subscriptionKey: "global",
+        agentId,
+        identityKey: `agent:${agentId}:global`,
+      };
+    }
+    if (requestedKey === "global") {
+      return {
+        requestedKey,
+        subscriptionKey: "global",
+        agentId: "main",
+        identityKey: "agent:main:global",
+      };
+    }
+    return {
+      requestedKey,
+      subscriptionKey: requestedKey,
+      agentId: null,
+      identityKey: requestedKey,
+    };
+  }
+
+  _sessionMessageSubscriptionIdentity(key, agentId) {
+    return key === "global" ? `agent:${agentId || "main"}:global` : key;
+  }
+
+  _queueSessionMessageSubscriptionOperation(operation) {
+    const next = this._sessionMessageSubscriptionOperation.then(operation, operation);
+    this._sessionMessageSubscriptionOperation = next.catch(() => {});
+    return next;
+  }
+
+  async _ensureSessionMessageSubscription(entry, timeout) {
+    if (
+      entry.refs <= 0 ||
+      entry.subscribed ||
+      entry.subscriptionSupported === false ||
+      !this.connected
+    ) {
+      return entry;
+    }
+    try {
+      entry.subscriptionAttempted = true;
+      const params = {
+        key: entry.subscriptionKey,
+        ...(entry.agentId ? { agentId: entry.agentId } : {}),
+      };
+      const msg = await this.call("sessions.messages.subscribe", params, timeout);
+      if (msg.ok === false) {
+        entry.subscriptionSupported = false;
+        return entry;
+      }
+      const result = msg.result ?? msg.payload ?? {};
+      entry.subscriptionSupported = true;
+      entry.subscribed = result.subscribed !== false;
+      if (typeof result.key === "string" && result.key.trim()) {
+        const canonicalKey = result.key.trim();
+        entry.subscriptionKey = canonicalKey;
+        const canonicalIdentity = this._sessionMessageSubscriptionIdentity(
+          canonicalKey,
+          entry.agentId,
+        );
+        const canonicalEntry = this.sessionMessageSubscriptionAliases.get(canonicalIdentity);
+        if (canonicalEntry && canonicalEntry !== entry) {
+          canonicalEntry.refs += entry.refs;
+          canonicalEntry.subscribed = canonicalEntry.subscribed || entry.subscribed;
+          canonicalEntry.subscriptionAttempted =
+            canonicalEntry.subscriptionAttempted || entry.subscriptionAttempted;
+          canonicalEntry.subscriptionSupported =
+            canonicalEntry.subscriptionSupported === true || entry.subscriptionSupported === true
+              ? true
+              : canonicalEntry.subscriptionSupported === false &&
+                  entry.subscriptionSupported === false
+                ? false
+                : null;
+          for (const alias of entry.aliases) {
+            canonicalEntry.aliases.add(alias);
+            this.sessionMessageSubscriptionAliases.set(alias, canonicalEntry);
+          }
+          canonicalEntry.aliases.add(canonicalIdentity);
+          this.sessionMessageSubscriptionAliases.set(canonicalIdentity, canonicalEntry);
+          this.sessionMessageSubscriptions.delete(entry);
+          entry = canonicalEntry;
+        } else {
+          entry.aliases.add(canonicalIdentity);
+          this.sessionMessageSubscriptionAliases.set(canonicalIdentity, entry);
+        }
+      }
+    } catch {
+      entry.subscribed = false;
+    }
+    return entry;
+  }
+
+  /** Acquire one pooled session-message subscription reference. */
+  acquireSessionMessageSubscription(key, timeout = SESSION_MESSAGE_SUBSCRIBE_TIMEOUT) {
+    const target = this._sessionMessageSubscriptionTarget(key);
+    const { requestedKey } = target;
+    if (!requestedKey) return Promise.resolve(false);
+    return this._queueSessionMessageSubscriptionOperation(async () => {
+      let entry =
+        this.sessionMessageSubscriptionAliases.get(requestedKey) ||
+        this.sessionMessageSubscriptionAliases.get(target.identityKey);
+      if (!entry) {
+        entry = {
+          refs: 0,
+          subscribed: false,
+          subscriptionAttempted: false,
+          subscriptionSupported: null,
+          subscriptionKey: target.subscriptionKey,
+          agentId: target.agentId,
+          aliases: new Set([requestedKey, target.identityKey]),
+          timeout,
+        };
+        this.sessionMessageSubscriptions.add(entry);
+        for (const alias of entry.aliases) {
+          this.sessionMessageSubscriptionAliases.set(alias, entry);
+        }
+      } else {
+        entry.aliases.add(requestedKey);
+        entry.aliases.add(target.identityKey);
+        this.sessionMessageSubscriptionAliases.set(requestedKey, entry);
+        this.sessionMessageSubscriptionAliases.set(target.identityKey, entry);
+      }
+      entry.refs += 1;
+      entry.timeout = timeout;
+      const canonicalEntry = await this._ensureSessionMessageSubscription(entry, timeout);
+      return canonicalEntry.subscribed;
+    });
+  }
+
+  /** Release one reference and unsubscribe after the final stream leaves. */
+  releaseSessionMessageSubscription(key, timeout = SESSION_MESSAGE_SUBSCRIBE_TIMEOUT) {
+    const requestedKey = String(key || "").trim();
+    if (!requestedKey) return Promise.resolve(false);
+    return this._queueSessionMessageSubscriptionOperation(async () => {
+      const entry = this.sessionMessageSubscriptionAliases.get(requestedKey);
+      if (!entry) return false;
+      entry.refs = Math.max(0, entry.refs - 1);
+      if (entry.refs > 0) return false;
+      const shouldUnsubscribe =
+        entry.subscribed || (entry.subscriptionAttempted && entry.subscriptionSupported !== false);
+      if (shouldUnsubscribe && this.connected) {
+        try {
+          await this.call(
+            "sessions.messages.unsubscribe",
+            {
+              key: entry.subscriptionKey,
+              ...(entry.agentId ? { agentId: entry.agentId } : {}),
+            },
+            timeout,
+          );
+        } catch {
+          // Best-effort cleanup; a closed socket drops its subscriptions too.
+        }
+      }
+      entry.subscribed = false;
+      entry.subscriptionAttempted = false;
+      if (entry.refs === 0) {
+        this.sessionMessageSubscriptions.delete(entry);
+        for (const alias of entry.aliases) {
+          if (this.sessionMessageSubscriptionAliases.get(alias) === entry) {
+            this.sessionMessageSubscriptionAliases.delete(alias);
+          }
+        }
+      }
+      return true;
+    });
+  }
+
+  _restoreSessionMessageSubscriptions() {
+    this._queueSessionMessageSubscriptionOperation(async () => {
+      for (const entry of [...this.sessionMessageSubscriptions]) {
+        if (entry.refs <= 0) continue;
+        await this._ensureSessionMessageSubscription(entry, entry.timeout);
+      }
+    });
   }
 
   /** Attempt reconnection with exponential backoff, respecting circuit breaker. */
@@ -691,6 +891,11 @@ class GatewayConnection {
   close() {
     this.connected = false;
     this._connectPromise = null;
+    for (const entry of this.sessionMessageSubscriptions.values()) {
+      entry.subscribed = false;
+      entry.subscriptionAttempted = false;
+      entry.subscriptionSupported = null;
+    }
     if (this.ws) {
       try {
         this.ws.close();
@@ -705,6 +910,8 @@ class GatewayConnection {
   retire() {
     this._retired = true;
     this.eventListeners.clear();
+    this.sessionMessageSubscriptions.clear();
+    this.sessionMessageSubscriptionAliases.clear();
     this.close();
   }
 
@@ -924,8 +1131,26 @@ function getToolName(tool, index) {
 
 // ─── HTTP Routes ─────────────────────────────────────────────────
 
-function createGatewayRouter() {
+function positiveTimeout(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function createGatewayRouter(options = {}) {
   const router = require("express").Router();
+  const chatTimeoutMs = positiveTimeout(options.chatTimeoutMs, CHAT_TIMEOUT);
+  const sessionMessageSubscribeTimeoutMs = positiveTimeout(
+    options.sessionMessageSubscribeTimeoutMs,
+    SESSION_MESSAGE_SUBSCRIBE_TIMEOUT,
+  );
+  const agentTerminalFallbackGraceMs = positiveTimeout(
+    options.agentTerminalFallbackGraceMs,
+    AGENT_TERMINAL_FALLBACK_GRACE_MS,
+  );
+  const agentErrorFallbackGraceMs = positiveTimeout(
+    options.agentErrorFallbackGraceMs,
+    AGENT_ERROR_FALLBACK_GRACE_MS,
+  );
 
   function normalizeCronScheduleInput(schedule) {
     if (!schedule) return null;
@@ -1043,8 +1268,9 @@ function createGatewayRouter() {
         text = typeof last === "string" ? last : last.content || "";
       }
 
+      const sessionKey = session_id || "main";
       const params = {
-        sessionKey: session_id || "main",
+        sessionKey,
         idempotencyKey,
         message: text,
       };
@@ -1062,71 +1288,318 @@ function createGatewayRouter() {
         // The actual response streams via "chat" events (state: "delta", "final", "error").
         // We must keep listening for events AFTER the RPC resolves.
 
-        let streamDone = false;
-        let sawAssistantContent = false;
+        let runId = null;
+        let chatAcknowledged = false;
+        let streamCompletion = null;
+        let resolveStreamCompletion;
+        let streamSettled = false;
+        let chatTerminalPayload = null;
+        let agentTerminalFallback = null;
+        let accumulatedAssistantText = "";
         let finalTokenPayload = null;
-        const streamHandler = (evt) => {
-          const payload = evt.payload || evt;
-          const state = payload.state;
+        let streamTimeout = null;
+        let agentTerminalFallbackTimer = null;
+        let sessionMessageSubscriptionHeld = false;
+        const pendingEvents = [];
+
+        const completeStream = (reason) => {
+          if (streamSettled) return;
+          streamSettled = true;
+          resolveStreamCompletion(reason);
+        };
+
+        const releaseSessionMessageSubscription = () => {
+          if (!sessionMessageSubscriptionHeld) return;
+          sessionMessageSubscriptionHeld = false;
+          conn
+            .releaseSessionMessageSubscription(sessionKey, sessionMessageSubscribeTimeoutMs)
+            .catch(() => {});
+        };
+
+        const extractMessageText = (message) => {
+          if (!message) return "";
+          if (typeof message === "string") return message;
+          const content = message.content;
+          if (typeof content === "string") return content;
+          if (!Array.isArray(content)) return "";
+          return content
+            .map((part) => {
+              if (typeof part === "string") return part;
+              return typeof part?.text === "string" ? part.text : "";
+            })
+            .join("");
+        };
+
+        // OpenClaw 2026.6 added incremental `deltaText`; older gateways mainly
+        // exposed accumulated text through message.content. Preserve the raw
+        // fields and add the older accumulated message shape only when absent,
+        // so existing browser clients keep rendering while newer clients can
+        // consume deltaText directly.
+        const normalizeChatPayload = (payload) => {
+          const messageText = extractMessageText(payload.message);
           const role = payload.message?.role;
+          const isUserEcho = role === "user" || role === "human";
+          if (!isUserEcho && messageText) accumulatedAssistantText = messageText;
 
-          // Forward every event to the client as SSE
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-
-          // Track when assistant content starts streaming
-          if (role === "assistant" || (!role && state === "delta" && sawAssistantContent)) {
-            sawAssistantContent = true;
+          if (!isUserEcho && payload.state === "delta" && typeof payload.deltaText === "string") {
+            accumulatedAssistantText = payload.replace
+              ? payload.deltaText
+              : messageText
+                ? messageText
+                : `${accumulatedAssistantText}${payload.deltaText}`;
           }
 
-          // Only mark done on the ASSISTANT's final/error — not the user message echo.
-          // The gateway sends a "final" for the user message before the assistant starts.
-          if (state === "final" || state === "error" || state === "aborted") {
-            if (role !== "user" && role !== "human" && sawAssistantContent) {
-              if (state === "final") finalTokenPayload = payload;
-              streamDone = true;
+          if (
+            (payload.state === "delta" || payload.state === "final") &&
+            !isUserEcho &&
+            !messageText &&
+            accumulatedAssistantText
+          ) {
+            const existingMessage =
+              payload.message &&
+              typeof payload.message === "object" &&
+              !Array.isArray(payload.message)
+                ? payload.message
+                : {};
+            return {
+              ...payload,
+              message: {
+                ...existingMessage,
+                role: existingMessage.role || "assistant",
+                content: [{ type: "text", text: accumulatedAssistantText }],
+              },
+            };
+          }
+
+          return payload;
+        };
+
+        const buildAgentTerminalFallback = (payload) => {
+          const phase = payload.data?.phase;
+          const errorMessage =
+            payload.data?.errorMessage ||
+            payload.data?.error ||
+            payload.errorMessage ||
+            payload.error;
+          if (phase === "error") {
+            return {
+              type: "error",
+              state: "error",
+              code: "AGENT_LIFECYCLE_ERROR",
+              runId: payload.runId || runId,
+              sessionKey: payload.sessionKey || sessionKey,
+              error: errorMessage || "Agent run failed",
+              errorMessage: errorMessage || "Agent run failed",
+            };
+          }
+          return {
+            state: "final",
+            runId: payload.runId || runId,
+            sessionKey: payload.sessionKey || sessionKey,
+            ...(accumulatedAssistantText
+              ? {
+                  message: {
+                    role: "assistant",
+                    content: [{ type: "text", text: accumulatedAssistantText }],
+                  },
+                }
+              : {}),
+          };
+        };
+
+        const cancelAgentTerminalFallback = () => {
+          if (agentTerminalFallbackTimer) clearTimeout(agentTerminalFallbackTimer);
+          agentTerminalFallbackTimer = null;
+          agentTerminalFallback = null;
+        };
+
+        const processStreamEvent = (eventName, evt) => {
+          const payload = evt.payload || evt;
+          const eventRunId =
+            typeof payload.runId === "string" && payload.runId.trim() ? payload.runId.trim() : null;
+
+          // Supported protocol-v3/v4 gateways require runId on chat and agent
+          // frames. Fail closed on malformed/runless events so pooled-socket
+          // traffic can never become a wildcard for this HTTP response.
+          if (!eventRunId || eventRunId !== runId) return;
+
+          if (res.writableEnded || res.destroyed) {
+            completeStream("client-close");
+            return;
+          }
+
+          // Any later matching activity means a pending lifecycle fallback is
+          // stale. Cancel it now; another terminal lifecycle event below will
+          // immediately schedule the appropriate short or retry-aware grace.
+          if (agentTerminalFallbackTimer) cancelAgentTerminalFallback();
+
+          if (eventName === "chat") {
+            const outboundPayload = normalizeChatPayload(payload);
+
+            // Forward matching events in their gateway-native shape (plus the
+            // additive message compatibility projection above).
+            res.write(`data: ${JSON.stringify(outboundPayload)}\n\n`);
+
+            const state = outboundPayload.state;
+            const role = outboundPayload.message?.role;
+            const isUserEcho = role === "user" || role === "human";
+            if (!isUserEcho && (state === "final" || state === "error" || state === "aborted")) {
+              chatTerminalPayload = outboundPayload;
+              if (state === "final") finalTokenPayload = outboundPayload;
+              completeStream("chat-terminal");
             }
+            return;
+          }
+
+          // Preserve agent sub-events for existing clients. A matching
+          // lifecycle end/error is also a terminal fallback because some
+          // gateway versions do not follow it with a chat terminal frame.
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
+          const lifecyclePhase = payload.stream === "lifecycle" ? payload.data?.phase : null;
+          if (lifecyclePhase === "error" || lifecyclePhase === "end") {
+            agentTerminalFallback = buildAgentTerminalFallback(payload);
+            const fallbackGraceMs =
+              lifecyclePhase === "error" && payload.data?.fallbackExhaustedFailure !== true
+                ? agentErrorFallbackGraceMs
+                : agentTerminalFallbackGraceMs;
+            agentTerminalFallbackTimer = setTimeout(
+              () => completeStream("agent-terminal"),
+              fallbackGraceMs,
+            );
           }
         };
 
-        conn.on("chat", streamHandler);
-        conn.on("agent", streamHandler);
+        const queueOrProcessStreamEvent = (eventName, evt) => {
+          if (!chatAcknowledged) {
+            // chat.send acknowledges before dispatching on current gateways;
+            // this small buffer also closes the theoretical ack/event race.
+            if (pendingEvents.length < 100) pendingEvents.push({ eventName, evt });
+            return;
+          }
+          processStreamEvent(eventName, evt);
+        };
+        const chatStreamHandler = (evt) => queueOrProcessStreamEvent("chat", evt);
+        const agentStreamHandler = (evt) => queueOrProcessStreamEvent("agent", evt);
+
+        streamCompletion = new Promise((resolve) => {
+          resolveStreamCompletion = resolve;
+        });
+        const handleClientClose = () => completeStream("client-close");
+        res.once("close", handleClientClose);
+        if (res.writableEnded || res.destroyed) completeStream("client-close");
+
+        // OpenClaw 2026.6 can scope live message events to explicit session
+        // subscribers. Older gateways reject this method, so it is deliberately
+        // best-effort and does not block chat when unsupported.
+        sessionMessageSubscriptionHeld = true;
+        const subscriptionAttempt = conn.acquireSessionMessageSubscription(
+          sessionKey,
+          sessionMessageSubscribeTimeoutMs,
+        );
+        await Promise.race([subscriptionAttempt, streamCompletion]);
+
+        // The response may have closed while the subscription RPC was in
+        // flight. Do not dispatch a new model turn for a client that is gone.
+        if (streamSettled) {
+          releaseSessionMessageSubscription();
+          res.off("close", handleClientClose);
+          return;
+        }
+
+        // Nothing for this request can stream before chat.send, so attach only
+        // after the best-effort subscription attempt. This avoids filling the
+        // pre-ack buffer with unrelated traffic from other pooled-socket runs.
+        conn.on("chat", chatStreamHandler);
+        conn.on("agent", agentStreamHandler);
 
         // Send the message — resolves immediately with { runId, status: "started" }
-        let runId = null;
         try {
           const result = await conn.call("chat.send", params, CALL_TIMEOUT);
-          runId = result.result?.runId || result.payload?.runId;
+          if (result?.ok === false) {
+            const rpcError = new Error(result.error?.message || "Gateway chat.send failed");
+            rpcError.code = result.error?.code || "GATEWAY_ERROR";
+            throw rpcError;
+          }
+          const acknowledgedRunId = result?.result?.runId ?? result?.payload?.runId;
+          if (typeof acknowledgedRunId !== "string" || !acknowledgedRunId.trim()) {
+            const acknowledgementError = new Error("Gateway chat.send returned no valid runId");
+            acknowledgementError.code = "INVALID_CHAT_ACK";
+            throw acknowledgementError;
+          }
+          runId = acknowledgedRunId.trim();
+          chatAcknowledged = true;
         } catch (err) {
-          res.write(`data: ${JSON.stringify({ type: "error", error: err.message })}\n\n`);
-          conn.off("chat", streamHandler);
-          conn.off("agent", streamHandler);
-          res.write("data: [DONE]\n\n");
-          res.end();
+          pendingEvents.length = 0;
+          conn.off("chat", chatStreamHandler);
+          conn.off("agent", agentStreamHandler);
+          releaseSessionMessageSubscription();
+          res.off("close", handleClientClose);
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(`data: ${JSON.stringify({ type: "error", error: err.message })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+          }
           metrics
             .recordMetric(req.agent.id, req.user.id, "error", 1, { error: err.message })
             .catch(() => {});
           return;
         }
 
-        // Wait for the stream to complete (chat:final / chat:error / timeout)
-        const streamTimeout = CHAT_TIMEOUT;
-        const startTime = Date.now();
-        await new Promise((resolve) => {
-          const check = setInterval(() => {
-            if (streamDone || Date.now() - startTime > streamTimeout) {
-              clearInterval(check);
-              resolve();
-            }
-          }, 200);
-          // Also resolve if the client disconnects
-          req.on("close", () => {
-            clearInterval(check);
-            resolve();
-          });
-        });
+        for (const pendingEvent of pendingEvents.splice(0)) {
+          processStreamEvent(pendingEvent.eventName, pendingEvent.evt);
+        }
 
-        conn.off("chat", streamHandler);
-        conn.off("agent", streamHandler);
+        streamTimeout = setTimeout(() => completeStream("timeout"), chatTimeoutMs);
+        // A disconnect can also race with chat.send acknowledgement; checking
+        // the state closes the tiny window between listener setup and now.
+        if (res.writableEnded || res.destroyed) completeStream("client-close");
+        const completionReason = await streamCompletion;
+        clearTimeout(streamTimeout);
+        if (agentTerminalFallbackTimer) {
+          clearTimeout(agentTerminalFallbackTimer);
+          agentTerminalFallbackTimer = null;
+        }
+        res.off("close", handleClientClose);
+
+        conn.off("chat", chatStreamHandler);
+        conn.off("agent", agentStreamHandler);
+        releaseSessionMessageSubscription();
+
+        if (
+          completionReason === "agent-terminal" &&
+          !chatTerminalPayload &&
+          agentTerminalFallback &&
+          !res.writableEnded &&
+          !res.destroyed
+        ) {
+          if (agentTerminalFallback.state === "final") {
+            finalTokenPayload = agentTerminalFallback;
+          }
+          res.write(`data: ${JSON.stringify(agentTerminalFallback)}\n\n`);
+        }
+
+        if (completionReason === "timeout") {
+          const timeoutMessage = `Chat stream timed out after ${chatTimeoutMs}ms`;
+          const timeoutPayload = {
+            type: "error",
+            state: "error",
+            code: "CHAT_TIMEOUT",
+            runId,
+            sessionKey,
+            error: timeoutMessage,
+            errorMessage: timeoutMessage,
+          };
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(`data: ${JSON.stringify(timeoutPayload)}\n\n`);
+          }
+          metrics
+            .recordMetric(req.agent.id, req.user.id, "error", 1, {
+              code: "CHAT_TIMEOUT",
+              error: timeoutMessage,
+              runId,
+            })
+            .catch(() => {});
+        }
 
         // Record metrics
         metrics.recordMetric(req.agent.id, req.user.id, "messages_sent", 1).catch(() => {});
@@ -1140,9 +1613,11 @@ function createGatewayRouter() {
           .then(() => agentBudgets.checkAndEnforce(req.agent))
           .catch(() => {});
 
-        res.write(`data: ${JSON.stringify({ type: "done", runId })}\n\n`);
-        res.write("data: [DONE]\n\n");
-        if (!res.writableEnded) res.end();
+        if (completionReason !== "client-close" && !res.writableEnded && !res.destroyed) {
+          res.write(`data: ${JSON.stringify({ type: "done", runId, sessionKey })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
       } else {
         // Non-streaming: wait for final response
         const result = await rpcCall(req.agent, "chat.send", params, CHAT_TIMEOUT);

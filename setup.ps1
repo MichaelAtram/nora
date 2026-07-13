@@ -925,6 +925,75 @@ function Read-EnvValueWithAlias {
     return $Default
 }
 
+function Test-NemoClawImageReferenceMutable {
+    param([string]$Image)
+
+    $reference = if ($null -eq $Image) { "" } else { $Image.Trim() }
+    if (-not $reference -or $reference.Contains("@")) {
+        return $false
+    }
+    $lastSlash = $reference.LastIndexOf("/")
+    $tagSeparator = $reference.LastIndexOf(":")
+    if ($tagSeparator -le $lastSlash) {
+        return $true
+    }
+    return $reference.Substring($tagSeparator + 1).ToLowerInvariant() -eq "latest"
+}
+
+function Test-CommaSeparatedValue {
+    param([string]$List, [string]$Value)
+
+    foreach ($item in ($List -split ',')) {
+        if ($item.Trim() -ieq $Value) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Ensure-NemoClawSandboxImage {
+    param([string]$Image)
+
+    $imageRef = if ($null -eq $Image) { "" } else { $Image.Trim() }
+    if (-not $imageRef) {
+        Write-Err "NEMOCLAW_SANDBOX_IMAGE must not be empty"
+        throw "NEMOCLAW_SANDBOX_IMAGE must not be empty"
+    }
+
+    if ($imageRef -eq "nora-nemoclaw-agent:local") {
+        Write-Host ""
+        Write-Info "Building nora-nemoclaw-agent:local (OpenShell sandbox + tsx)..."
+        Write-Host ""
+        docker build -f agent-runtime/Dockerfile.nemoclaw-agent -t nora-nemoclaw-agent:local agent-runtime/
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Failed to build nora-nemoclaw-agent:local"
+            throw "Failed to build nora-nemoclaw-agent:local"
+        }
+        Write-Ok "NemoClaw sandbox image ready"
+        return
+    }
+
+    docker image inspect $imageRef *> $null
+    $imagePresent = $LASTEXITCODE -eq 0
+    if ($imagePresent -and -not (Test-NemoClawImageReferenceMutable -Image $imageRef)) {
+        Write-Info "Using existing immutable NemoClaw sandbox image"
+        Write-Ok "NemoClaw sandbox image ready"
+        return
+    }
+
+    if ($imagePresent) {
+        Write-Info "Refreshing mutable NemoClaw sandbox image..."
+    } else {
+        Write-Info "Pulling missing NemoClaw sandbox image..."
+    }
+    docker pull $imageRef
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to pull configured NemoClaw sandbox image"
+        throw "Failed to pull configured NemoClaw sandbox image"
+    }
+    Write-Ok "NemoClaw sandbox image ready"
+}
+
 function Update-SignupProtectionEnv {
     param([string]$EnvPath)
 
@@ -1539,7 +1608,11 @@ $PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY = Read-EnvValue -EnvPath $ENV_FILE -Name "
 $PROXMOX_PCT_COMMAND = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_PCT_COMMAND" -Default "pct"
 $PROXMOX_SUDO = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_SUDO" -Default ""
 $PROXMOX_NODE_MAJOR = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_NODE_MAJOR" -Default "24"
-$PROXMOX_OPENCLAW_PACKAGE = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_OPENCLAW_PACKAGE" -Default "openclaw@latest"
+$PROXMOX_OPENCLAW_PACKAGE = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_OPENCLAW_PACKAGE" -Default "openclaw@2026.6.11"
+if ($PROXMOX_OPENCLAW_PACKAGE -eq "openclaw@latest") {
+    Write-Warn "Migrating legacy PROXMOX_OPENCLAW_PACKAGE=openclaw@latest to Nora's validated pin."
+    $PROXMOX_OPENCLAW_PACKAGE = "openclaw@2026.6.11"
+}
 $PROXMOX_HERMES_BIN = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_HERMES_BIN" -Default "/opt/hermes/.venv/bin/hermes"
 $PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD" -Default "false"
 $NVIDIA_API_KEY = ""
@@ -1787,6 +1860,12 @@ $NORA_CURRENT_COMMIT = Resolve-CurrentReleaseCommit
 $DOCKER_GID = Get-DockerSocketGid
 $COMPOSE_PROJECT_NAME = Get-ComposeProjectName -EnvPath $ENV_FILE
 $DOCKER_AGENT_BIND_IP = Read-EnvValue -EnvPath $ENV_FILE -Name "DOCKER_AGENT_BIND_IP" -Default "127.0.0.1"
+$OPENCLAW_DOCKER_PACKAGE = Read-EnvValue -EnvPath $ENV_FILE -Name "OPENCLAW_DOCKER_PACKAGE" -Default "openclaw@2026.6.11"
+if ($OPENCLAW_DOCKER_PACKAGE -eq "openclaw@latest") {
+    Write-Warn "Migrating legacy OPENCLAW_DOCKER_PACKAGE=openclaw@latest to Nora's validated pin."
+    $OPENCLAW_DOCKER_PACKAGE = "openclaw@2026.6.11"
+}
+$NEMOCLAW_SANDBOX_IMAGE = Read-EnvValue -EnvPath $ENV_FILE -Name "NEMOCLAW_SANDBOX_IMAGE" -Default "ghcr.io/solomon2773/nora-nemoclaw-agent:latest"
 $DATABASE_URL = Read-EnvValue -EnvPath $ENV_FILE -Name "DATABASE_URL" -Default ""
 $DB_SSL_MODE = Read-EnvValue -EnvPath $ENV_FILE -Name "DB_SSL_MODE" -Default ""
 $DB_SSL_CA = Read-EnvValue -EnvPath $ENV_FILE -Name "DB_SSL_CA" -Default ""
@@ -2004,6 +2083,7 @@ ENABLED_RUNTIME_FAMILIES=$ENABLED_RUNTIME_FAMILIES
 ENABLED_BACKENDS=$ENABLED_BACKENDS
 ENABLED_SANDBOX_PROFILES=$ENABLED_SANDBOX_PROFILES
 DOCKER_AGENT_BIND_IP=$DOCKER_AGENT_BIND_IP
+OPENCLAW_DOCKER_PACKAGE=$OPENCLAW_DOCKER_PACKAGE
 
 # ── Proxmox LXC (experimental; secure configuration required) ──────────
 PROXMOX_API_URL=$PROXMOX_API_URL
@@ -2039,7 +2119,7 @@ NVIDIA_API_KEY=$NVIDIA_API_KEY
 NEMOCLAW_DEFAULT_MODEL=nvidia/nemotron-3-super-120b-a12b
 # Defaults to the Nora-published GHCR image. For offline hosts or private
 # clusters, build/preload nora-nemoclaw-agent:local and override this value.
-NEMOCLAW_SANDBOX_IMAGE=ghcr.io/solomon2773/nora-nemoclaw-agent:latest
+NEMOCLAW_SANDBOX_IMAGE=$NEMOCLAW_SANDBOX_IMAGE
 
 # ── Security ─────────────────────────────────────────────────
 CORS_ORIGINS=$CORS_ORIGINS
@@ -2143,20 +2223,10 @@ docker build -f agent-runtime/Dockerfile.openclaw-agent -t nora-openclaw-agent:l
 if ($LASTEXITCODE -ne 0) { Write-Err "Failed to build nora-openclaw-agent:local"; exit 1 }
 Write-Ok "OpenClaw agent image ready"
 
-# Only build the NemoClaw fallback image when the operator enables the sandbox
-# and explicitly points NEMOCLAW_SANDBOX_IMAGE at the local tag.
-if (($ENABLED_SANDBOX_PROFILES -split ',') -contains 'nemoclaw') {
-    $nemoclawImageLine = Select-String -Path $ENV_FILE -Pattern '^NEMOCLAW_SANDBOX_IMAGE=nora-nemoclaw-agent:local$' -Quiet
-    if ($nemoclawImageLine) {
-        Write-Host ""
-        Write-Info "Building nora-nemoclaw-agent:local (OpenShell sandbox + tsx)..."
-        Write-Host ""
-        docker build -f agent-runtime/Dockerfile.nemoclaw-agent -t nora-nemoclaw-agent:local agent-runtime/
-        if ($LASTEXITCODE -ne 0) { Write-Err "Failed to build nora-nemoclaw-agent:local"; exit 1 }
-        Write-Ok "NemoClaw sandbox image ready"
-    } else {
-        Write-Info "Using GHCR NemoClaw sandbox image from NEMOCLAW_SANDBOX_IMAGE"
-    }
+# Build Nora's exact local NemoClaw tag. Other refs follow provisioner policy:
+# refresh mutable refs, reuse present immutable refs, and pull any missing ref.
+if (Test-CommaSeparatedValue -List $ENABLED_SANDBOX_PROFILES -Value "nemoclaw") {
+    Ensure-NemoClawSandboxImage -Image $NEMOCLAW_SANDBOX_IMAGE
 }
 Start-NoraComposeStack
 
