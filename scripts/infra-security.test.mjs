@@ -393,6 +393,61 @@ test("backup worker images include backend adapters for remote agent capture", (
   }
 });
 
+test("worker images cache bounded backend dependency installs before source copies", () => {
+  for (const file of [
+    "workers/provisioner/Dockerfile",
+    "workers/provisioner/Dockerfile.prod",
+    "workers/backup/Dockerfile",
+    "workers/backup/Dockerfile.prod",
+  ]) {
+    const source = read(file);
+    const manifestCopy =
+      "COPY backend-api/package.json backend-api/package-lock.json* /backend-api/";
+    const backendInstall = shellLogicalLines(source).find(
+      (line) => line.startsWith("RUN ") && line.includes("cd /backend-api;"),
+    );
+    const sourceCopy = "COPY backend-api /backend-api";
+    const manifestCopyIndex = source.indexOf(manifestCopy);
+    const backendInstallIndex = source.indexOf("cd /backend-api;", manifestCopyIndex);
+    const sourceCopyIndex = source.indexOf(sourceCopy, backendInstallIndex);
+
+    assert.notEqual(manifestCopyIndex, -1, `${file} must copy backend manifests first`);
+    assert.ok(backendInstall, `${file} must install backend runtime dependencies`);
+    assert.notEqual(sourceCopyIndex, -1, `${file} must copy the full backend source`);
+    assert.ok(
+      manifestCopyIndex < backendInstallIndex,
+      `${file} must copy backend manifests before installing dependencies`,
+    );
+    assert.ok(
+      backendInstallIndex < sourceCopyIndex,
+      `${file} must install backend dependencies before copying source`,
+    );
+    assert.match(source, /^ARG NPM_INSTALL_TIMEOUT_SECONDS=900$/m);
+
+    const dependencyInstalls = shellLogicalLines(source).filter(
+      (line) => line.startsWith("RUN ") && line.includes("npm ci --omit=dev"),
+    );
+    assert.equal(dependencyInstalls.length, 2, `${file} must install both dependency trees`);
+    for (const install of dependencyInstalls) {
+      assert.match(
+        install,
+        /timeout -k 30 "\$NPM_INSTALL_TIMEOUT_SECONDS" npm ci --omit=dev/,
+        `${file} must bound npm ci`,
+      );
+      assert.match(
+        install,
+        /case "\$status" in 124\|137\|143\) exit "\$status"/,
+        `${file} must not fall back after a timed-out npm ci`,
+      );
+      assert.match(
+        install,
+        /timeout -k 30 "\$NPM_INSTALL_TIMEOUT_SECONDS" npm install --omit=dev/,
+        `${file} must bound the npm install fallback`,
+      );
+    }
+  }
+});
+
 test("Helm keeps secrets out of frontends and mounts them into control-plane pods", () => {
   const frontends = read("infra/helm/nora/templates/frontends.yaml");
   const helpers = read("infra/helm/nora/templates/_helpers.tpl");
