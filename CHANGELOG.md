@@ -49,6 +49,9 @@ the next request, and recovery paths retain enough authority to remove orphaned 
 
 ### Fixed
 
+- Tested Remote Docker hosts now become genuinely selectable in the OpenClaw Deploy flow: concrete
+  host targets derive Standard and optional NemoClaw availability from the runtime family's enabled
+  sandbox profiles instead of inheriting the intentionally disabled global placeholder state.
 - Revoking Remote Docker access now cancels in-flight HTTP and WebSocket work, retires gateway RPCs,
   and terminates tracked remote command process groups instead of leaving work running after the
   caller loses authorization or disconnects. When a direct Remote Hermes command cannot be canceled

@@ -902,7 +902,7 @@ describe("ProxmoxBackend", () => {
           'const managedEnvNamesPath = "/etc/nora/openclaw-managed-env-names";',
           `const managedEnvNamesPath = ${JSON.stringify(fixtureManagedNamesPath)};`,
         );
-      const reconcile = spawnSync("node", ["-e", fixtureScript], {
+      const reconcile = spawnSync(process.execPath, ["-e", fixtureScript], {
         encoding: "utf8",
         env: {},
       });
