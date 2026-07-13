@@ -55,10 +55,11 @@ Returns an array of provider descriptors.
   key-requiring providers.
 </ResponseField>
 
-<CodeGroup>
-  ```bash curl theme={null}
-  curl http://localhost:8080/api/llm-providers/available \ -H "Authorization: Bearer $TOKEN" ```
-</CodeGroup>
+```bash curl theme={null}
+curl \
+  -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/api/llm-providers/available
+```
 
 ```json theme={null}
 [
@@ -114,10 +115,11 @@ GET /llm-providers
   ISO 8601 creation timestamp.
 </ResponseField>
 
-<CodeGroup>
-  ```bash curl theme={null}
-  curl http://localhost:8080/api/llm-providers \ -H "Authorization: Bearer $TOKEN" ```
-</CodeGroup>
+```bash curl theme={null}
+curl \
+  -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/api/llm-providers
+```
 
 ```json theme={null}
 [
@@ -266,11 +268,12 @@ DELETE /llm-providers/:id
   `true` when the record was deleted.
 </ResponseField>
 
-<CodeGroup>
-  ```bash curl theme={null}
-  curl -X DELETE http://localhost:8080/api/llm-providers/f1e2d3c4-b5a6-7890-abcd-012345678901 \ -H
-  "Authorization: Bearer $TOKEN" ```
-</CodeGroup>
+```bash curl theme={null}
+curl \
+  -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/api/llm-providers/f1e2d3c4-b5a6-7890-abcd-012345678901
+```
 
 ```json theme={null}
 { "success": true }

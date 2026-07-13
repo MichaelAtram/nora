@@ -149,6 +149,7 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy on remote host
+        timeout-minutes: 90
         env:
           TARGET_REF: ${{ steps.target.outputs.ref }}
           TARGET_VERSION: ${{ steps.release_meta.outputs.version }}
@@ -157,7 +158,11 @@ jobs:
           set -euo pipefail
 
           ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=30 \
             -o IdentitiesOnly=yes \
+            -o ServerAliveCountMax=20 \
+            -o ServerAliveInterval=30 \
             -o StrictHostKeyChecking=yes \
             -p "$DEPLOY_PORT" \
             "$DEPLOY_USER@$DEPLOY_HOST" \
