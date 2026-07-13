@@ -10,6 +10,7 @@
     "scaffold:integration": "node scripts/scaffold-integration-provider.mjs",
     "scaffold:backend": "node scripts/scaffold-backend-adapter.mjs",
     "test:scaffolds": "node --test scripts/extension-scaffolds.test.mjs",
+    "test:repository-metadata": "node --test scripts/repository-metadata.test.mjs",
     "validate:extensions": "node scripts/validate-extension-scaffolds.mjs",
     "ci:format:check": "prettier --check",
     "ci:format:write": "prettier --write",

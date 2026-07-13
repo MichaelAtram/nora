@@ -51,6 +51,8 @@ Docker, and release/deploy automation preserves exact commit provenance.
 - Trusted CodeQL runs now evaluate the exact commit analysis artifact and fail on every
   non-dismissed high or critical result, even if the default branch advances and later fixes the
   finding before the gate finishes.
+- The root Apache-2.0 license text is restored to the canonical form so repository hosts and
+  compliance tooling can identify it reliably; project attribution now lives in `NOTICE`.
 - npm, Helm, and MCP Registry publication now resolve one stable published product tag, require its
   immutable commit on protected default-branch history, wait for exact-SHA CI, and revalidate after
   protected-environment approval. Privileged jobs consume validated artifacts instead of executing
