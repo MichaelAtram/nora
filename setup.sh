@@ -645,6 +645,78 @@ read_env_value_with_alias() {
   printf '%s\n' "${value:-$default_value}"
 }
 
+nemoclaw_image_ref_is_mutable() {
+  local reference="$1" last_component tag
+  reference="${reference#"${reference%%[![:space:]]*}"}"
+  reference="${reference%"${reference##*[![:space:]]}"}"
+  [ -n "$reference" ] || return 1
+  [[ "$reference" == *"@"* ]] && return 1
+  last_component="${reference##*/}"
+  [[ "$last_component" != *":"* ]] && return 0
+  tag="${last_component##*:}"
+  case "$tag" in
+    [Ll][Aa][Tt][Ee][Ss][Tt]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+csv_value_is_enabled() {
+  local csv="$1" expected="$2" item
+  local -a items=()
+  IFS=',' read -r -a items <<< "$csv"
+  for item in "${items[@]}"; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    [ "$item" = "$expected" ] && return 0
+  done
+  return 1
+}
+
+ensure_nemoclaw_sandbox_image() {
+  local image="$1" image_present="false"
+  image="${image#"${image%%[![:space:]]*}"}"
+  image="${image%"${image##*[![:space:]]}"}"
+  if [ -z "$image" ]; then
+    error "NEMOCLAW_SANDBOX_IMAGE must not be empty"
+    return 1
+  fi
+
+  if [ "$image" = "nora-nemoclaw-agent:local" ]; then
+    echo ""
+    info "Building nora-nemoclaw-agent:local (OpenShell sandbox + tsx)..."
+    echo ""
+    if ! docker build \
+      -f agent-runtime/Dockerfile.nemoclaw-agent \
+      -t nora-nemoclaw-agent:local \
+      agent-runtime/; then
+      error "Failed to build nora-nemoclaw-agent:local"
+      return 1
+    fi
+    ok "NemoClaw sandbox image ready"
+    return 0
+  fi
+
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    image_present="true"
+  fi
+  if [ "$image_present" = "true" ] && ! nemoclaw_image_ref_is_mutable "$image"; then
+    info "Using existing immutable NemoClaw sandbox image"
+    ok "NemoClaw sandbox image ready"
+    return 0
+  fi
+
+  if [ "$image_present" = "true" ]; then
+    info "Refreshing mutable NemoClaw sandbox image..."
+  else
+    info "Pulling missing NemoClaw sandbox image..."
+  fi
+  if ! docker pull "$image"; then
+    error "Failed to pull configured NemoClaw sandbox image"
+    return 1
+  fi
+  ok "NemoClaw sandbox image ready"
+}
+
 ensure_signup_protection_env() {
   local env_path="$1"
   local burst_max burst_window daily_max daily_window provider turnstile_site_key
@@ -1441,7 +1513,11 @@ PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY="$(read_env_value "$ENV_FILE" "PROXMOX_SSH_
 PROXMOX_PCT_COMMAND="$(read_env_value "$ENV_FILE" "PROXMOX_PCT_COMMAND" "pct")"
 PROXMOX_SUDO="$(read_env_value "$ENV_FILE" "PROXMOX_SUDO" "")"
 PROXMOX_NODE_MAJOR="$(read_env_value "$ENV_FILE" "PROXMOX_NODE_MAJOR" "24")"
-PROXMOX_OPENCLAW_PACKAGE="$(read_env_value "$ENV_FILE" "PROXMOX_OPENCLAW_PACKAGE" "openclaw@latest")"
+PROXMOX_OPENCLAW_PACKAGE="$(read_env_value "$ENV_FILE" "PROXMOX_OPENCLAW_PACKAGE" "openclaw@2026.6.11")"
+if [ "$PROXMOX_OPENCLAW_PACKAGE" = "openclaw@latest" ]; then
+  warn "Migrating legacy PROXMOX_OPENCLAW_PACKAGE=openclaw@latest to Nora's validated pin."
+  PROXMOX_OPENCLAW_PACKAGE="openclaw@2026.6.11"
+fi
 PROXMOX_HERMES_BIN="$(read_env_value "$ENV_FILE" "PROXMOX_HERMES_BIN" "/opt/hermes/.venv/bin/hermes")"
 PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD="$(read_env_value "$ENV_FILE" "PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD" "false")"
 NVIDIA_API_KEY=""
@@ -1702,6 +1778,12 @@ NORA_CURRENT_COMMIT="$(resolve_current_release_commit)"
 DOCKER_GID="$(resolve_docker_gid)"
 COMPOSE_PROJECT_NAME="$(resolve_compose_project_name "$ENV_FILE")"
 DOCKER_AGENT_BIND_IP="$(read_env_value "$ENV_FILE" "DOCKER_AGENT_BIND_IP" "127.0.0.1")"
+OPENCLAW_DOCKER_PACKAGE="$(read_env_value "$ENV_FILE" "OPENCLAW_DOCKER_PACKAGE" "openclaw@2026.6.11")"
+if [ "$OPENCLAW_DOCKER_PACKAGE" = "openclaw@latest" ]; then
+  warn "Migrating legacy OPENCLAW_DOCKER_PACKAGE=openclaw@latest to Nora's validated pin."
+  OPENCLAW_DOCKER_PACKAGE="openclaw@2026.6.11"
+fi
+NEMOCLAW_SANDBOX_IMAGE="$(read_env_value "$ENV_FILE" "NEMOCLAW_SANDBOX_IMAGE" "ghcr.io/solomon2773/nora-nemoclaw-agent:latest")"
 DATABASE_URL="$(read_env_value "$ENV_FILE" "DATABASE_URL" "")"
 DB_SSL_MODE="$(read_env_value "$ENV_FILE" "DB_SSL_MODE" "")"
 DB_SSL_CA="$(read_env_value "$ENV_FILE" "DB_SSL_CA" "")"
@@ -1918,6 +2000,7 @@ ENABLED_RUNTIME_FAMILIES=${ENABLED_RUNTIME_FAMILIES}
 ENABLED_BACKENDS=${ENABLED_BACKENDS}
 ENABLED_SANDBOX_PROFILES=${ENABLED_SANDBOX_PROFILES}
 DOCKER_AGENT_BIND_IP=${DOCKER_AGENT_BIND_IP}
+OPENCLAW_DOCKER_PACKAGE=${OPENCLAW_DOCKER_PACKAGE}
 
 # ── Proxmox LXC (experimental; secure configuration required) ──────────
 PROXMOX_API_URL=${PROXMOX_API_URL}
@@ -1953,7 +2036,7 @@ NVIDIA_API_KEY=${NVIDIA_API_KEY}
 NEMOCLAW_DEFAULT_MODEL=nvidia/nemotron-3-super-120b-a12b
 # Defaults to the Nora-published GHCR image. For offline hosts or private
 # clusters, build/preload nora-nemoclaw-agent:local and override this value.
-NEMOCLAW_SANDBOX_IMAGE=ghcr.io/solomon2773/nora-nemoclaw-agent:latest
+NEMOCLAW_SANDBOX_IMAGE=${NEMOCLAW_SANDBOX_IMAGE}
 
 # ── Security ─────────────────────────────────────────────────
 CORS_ORIGINS=${CORS_ORIGINS}
@@ -2057,24 +2140,11 @@ docker build \
   agent-runtime/
 ok "OpenClaw agent image ready"
 
-# Only build the NemoClaw fallback image when the operator enables the sandbox
-# and explicitly points NEMOCLAW_SANDBOX_IMAGE at the local tag.
-case ",${ENABLED_SANDBOX_PROFILES:-}," in
-  *,nemoclaw,*)
-    if grep -Eq '^NEMOCLAW_SANDBOX_IMAGE=nora-nemoclaw-agent:local$' "$ENV_FILE"; then
-      echo ""
-      info "Building nora-nemoclaw-agent:local (OpenShell sandbox + tsx)..."
-      echo ""
-      docker build \
-        -f agent-runtime/Dockerfile.nemoclaw-agent \
-        -t nora-nemoclaw-agent:local \
-        agent-runtime/
-      ok "NemoClaw sandbox image ready"
-    else
-      info "Using GHCR NemoClaw sandbox image from NEMOCLAW_SANDBOX_IMAGE"
-    fi
-    ;;
-esac
+# Build Nora's exact local NemoClaw tag. Other refs follow provisioner policy:
+# refresh mutable refs, reuse present immutable refs, and pull any missing ref.
+if csv_value_is_enabled "${ENABLED_SANDBOX_PROFILES:-}" "nemoclaw"; then
+  ensure_nemoclaw_sandbox_image "$NEMOCLAW_SANDBOX_IMAGE"
+fi
 
 start_compose_stack
 

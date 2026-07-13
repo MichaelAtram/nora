@@ -79,6 +79,7 @@ const {
 } = require("../../agent-runtime/lib/hermesRuntimeBootstrap");
 const { waitForAgentReadiness } = require("./healthChecks");
 const { buildReadinessWarningDetail, persistReadinessWarning } = require("./readinessWarning");
+const { runDemoActivationCanary } = require("./demoActivationCanary");
 const {
   acquireDedicatedSessionLock,
   finalizeProvisionedDeployment,
@@ -3185,6 +3186,23 @@ const worker = new Worker(
                       gatewayToken,
                       bootstrappedProviderFingerprint: appliedFingerprint,
                     }),
+                  verify: builtInDemoActivation
+                    ? async () => {
+                        await runDemoActivationCanary({
+                          agentId: id,
+                          execute: (command, options) =>
+                            runProvisionerExecCommand(provisioner, containerId, command, options),
+                          onCleanupFailure: ({ error }) => {
+                            console.warn(
+                              `[provisioner] Demo activation canary session cleanup failed for agent ${id}: ${error?.message || "unknown error"}`,
+                            );
+                          },
+                        });
+                        console.log(
+                          `[provisioner] Demo activation Gateway canary passed for agent ${id}`,
+                        );
+                      }
+                    : null,
                   readFingerprint: async () =>
                     (await fetchEffectiveProviderState(userId, llmProviderId)).fingerprint,
                   withMutationLock: (operation) => withProviderMutationLock(userId, operation),

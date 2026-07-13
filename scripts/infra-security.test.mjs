@@ -206,6 +206,11 @@ test("public nginx templates enforce marketing security and homepage cache heade
       source,
       /location = \/ \{[\s\S]*?proxy_hide_header Cache-Control;[\s\S]*?proxy_hide_header Strict-Transport-Security;/,
     );
+    assert.match(
+      source,
+      /location = \/admin \{\s*return 308 \/admin\/\$is_args\$args;\s*\}/,
+      `${file} must normalize the bare admin path without dropping query arguments`,
+    );
   }
 });
 
@@ -216,6 +221,98 @@ test("Next.js frontends suppress framework disclosure headers", () => {
     "admin-dashboard/next.config.ts",
   ]) {
     assert.match(read(file), /poweredByHeader:\s*false/, `${file} must hide X-Powered-By`);
+  }
+});
+
+test("validated OpenClaw defaults stay aligned across runtime, setup, and docs", () => {
+  const defaults = read("agent-runtime/lib/openclawDefaults.ts");
+  const match = defaults.match(/DEFAULT_OPENCLAW_VERSION\s*=\s*"([^"]+)"/);
+  assert.ok(match, "openclawDefaults.ts must expose an exact validated version");
+  const version = match[1];
+  const packageSpec = `openclaw@${version}`;
+
+  for (const file of [
+    "agent-runtime/Dockerfile.openclaw-agent",
+    "agent-runtime/Dockerfile.nemoclaw-agent",
+  ]) {
+    assert.match(
+      read(file),
+      new RegExp(`ARG OPENCLAW_VERSION=${version.replaceAll(".", "\\.")}(?:\\s|$)`),
+      `${file} must bake the validated OpenClaw version`,
+    );
+  }
+
+  for (const file of [
+    ".env.example",
+    "setup.sh",
+    "setup.ps1",
+    "docs/configuration/environment-variables.mdx",
+  ]) {
+    const source = read(file);
+    assert.ok(source.includes(packageSpec), `${file} must document ${packageSpec}`);
+  }
+  assert.doesNotMatch(read(".env.example"), /openclaw@latest/);
+  assert.doesNotMatch(read("docs/configuration/environment-variables.mdx"), /openclaw@latest/);
+  assert.doesNotMatch(
+    read("setup.sh"),
+    /read_env_value[^\n]+"openclaw@latest"\)/,
+    "setup.sh must not restore a floating package default",
+  );
+  assert.doesNotMatch(
+    read("setup.ps1"),
+    /Read-EnvValue[^\n]+-Default "openclaw@latest"/,
+    "setup.ps1 must not restore a floating package default",
+  );
+});
+
+test("NemoClaw image replaces inherited npm globals before reinstalling", () => {
+  const dockerfile = read("agent-runtime/Dockerfile.nemoclaw-agent");
+  const installCommand = shellLogicalLines(dockerfile)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .find(
+      (line) =>
+        line.startsWith("RUN ") &&
+        line.includes('npm install -g "tsx@${TSX_VERSION}" "openclaw@${OPENCLAW_VERSION}"'),
+    );
+  assert.ok(installCommand, "NemoClaw Dockerfile must expose the global install command");
+
+  const treeRemoval = "rm -rf /usr/lib/node_modules/openclaw /usr/lib/node_modules/tsx";
+  const binRemoval = "rm -f /usr/bin/openclaw /usr/bin/tsx";
+  const install = 'npm install -g "tsx@${TSX_VERSION}" "openclaw@${OPENCLAW_VERSION}"';
+  const installIndex = installCommand.indexOf(install);
+
+  for (const removal of [treeRemoval, binRemoval]) {
+    const removalIndex = installCommand.indexOf(removal);
+    assert.notEqual(removalIndex, -1, `NemoClaw Dockerfile must run: ${removal}`);
+    assert.ok(removalIndex < installIndex, `${removal} must run before npm install -g`);
+  }
+
+  assert.equal(
+    (installCommand.match(/test "\$\(npm config get prefix\)" = "\/usr"/g) || []).length,
+    2,
+    "NemoClaw must verify the /usr npm prefix before and after installation",
+  );
+  assert.equal(
+    (installCommand.match(/test "\$\(npm root -g\)" = "\/usr\/lib\/node_modules"/g) || []).length,
+    2,
+    "NemoClaw must verify the /usr global root before and after installation",
+  );
+  assert.doesNotMatch(
+    installCommand,
+    /(?:NPM_CONFIG_PREFIX|npm config set prefix|npm install\b[^;&]*--prefix(?:=|\s))/,
+    "NemoClaw must replace the inherited /usr tree instead of leaving it beside a second prefix",
+  );
+  assert.match(
+    installCommand,
+    /test "\$\(node -p 'require\("\/usr\/lib\/node_modules\/openclaw\/package\.json"\)\.version'\)" = "\$\{OPENCLAW_VERSION\}"/,
+  );
+  assert.match(
+    installCommand,
+    /test "\$\(node -p 'require\("\/usr\/lib\/node_modules\/tsx\/package\.json"\)\.version'\)" = "\$\{TSX_VERSION\}"/,
+  );
+  for (const binary of ["openclaw", "tsx"]) {
+    assert.match(installCommand, new RegExp(`test -x /usr/bin/${binary}`));
+    assert.match(installCommand, new RegExp(`/usr/bin/${binary} --version`));
   }
 });
 
@@ -486,6 +583,129 @@ test("setup requires Compose 2.24.4+ and rejects standalone v1", () => {
   ]);
 });
 
+test("setup applies immutable-aware NemoClaw image policy", () => {
+  const bashSetup = read("setup.sh");
+  const powershellSetup = read("setup.ps1");
+
+  assert.match(bashSetup, /^nemoclaw_image_ref_is_mutable\(\)/m);
+  assert.match(bashSetup, /^csv_value_is_enabled\(\)/m);
+  assert.match(bashSetup, /\[Ll\]\[Aa\]\[Tt\]\[Ee\]\[Ss\]\[Tt\]/);
+  assert.doesNotMatch(bashSetup, /\$\{[^}]+,,\}/, "setup.sh must remain compatible with Bash 3.2");
+  assert.match(bashSetup, /^ensure_nemoclaw_sandbox_image\(\)/m);
+  assert.match(bashSetup, /docker image inspect "\$image"/);
+  assert.match(bashSetup, /ensure_nemoclaw_sandbox_image "\$NEMOCLAW_SANDBOX_IMAGE"/);
+  assert.match(bashSetup, /csv_value_is_enabled "\$\{ENABLED_SANDBOX_PROFILES:-\}" "nemoclaw"/);
+  assert.doesNotMatch(bashSetup, /grep -Eq '\^NEMOCLAW_SANDBOX_IMAGE=nora-nemoclaw-agent:local\$'/);
+  assert.match(powershellSetup, /function Test-NemoClawImageReferenceMutable/);
+  assert.match(powershellSetup, /function Test-CommaSeparatedValue/);
+  assert.match(powershellSetup, /function Ensure-NemoClawSandboxImage/);
+  assert.match(powershellSetup, /docker image inspect \$imageRef/);
+  assert.match(powershellSetup, /Ensure-NemoClawSandboxImage -Image \$NEMOCLAW_SANDBOX_IMAGE/);
+  assert.doesNotMatch(powershellSetup, /Select-String[^\n]+NEMOCLAW_SANDBOX_IMAGE/);
+
+  runChecked("bash", [
+    "-c",
+    `set -euo pipefail
+     info() { :; }
+     ok() { :; }
+     error() { :; }
+     source <(awk '/^nemoclaw_image_ref_is_mutable\\(\\)/,/^}/' setup.sh)
+     source <(awk '/^csv_value_is_enabled\\(\\)/,/^}/' setup.sh)
+     source <(awk '/^ensure_nemoclaw_sandbox_image\\(\\)/,/^}/' setup.sh)
+     fixture_dir="$(mktemp -d /tmp/nora-nemoclaw-image-policy.XXXXXX)"
+     docker_log="$fixture_dir/docker.log"
+     trap 'rm -rf "$fixture_dir"' EXIT
+     docker() {
+       printf '%s\n' "$*" >> "$docker_log"
+       case "$1" in
+         image)
+           case "$3" in
+             registry.example/missing:*|registry.example/unavailable:*) return 1 ;;
+             *) return 0 ;;
+           esac
+           ;;
+         pull)
+           [ "$2" != "registry.example/unavailable:1.0" ]
+           ;;
+         build) return 0 ;;
+       esac
+     }
+     reset_log() { : > "$docker_log"; }
+     assert_no_pull() { ! grep -q '^pull ' "$docker_log"; }
+
+     csv_value_is_enabled 'standard, nemoclaw' nemoclaw
+     csv_value_is_enabled ' standard ,  nemoclaw  ' nemoclaw
+     ! csv_value_is_enabled 'standard,strict' nemoclaw
+
+     reset_log
+     ensure_nemoclaw_sandbox_image nora-nemoclaw-agent:local
+     grep -Fq 'build -f agent-runtime/Dockerfile.nemoclaw-agent -t nora-nemoclaw-agent:local agent-runtime/' "$docker_log"
+     assert_no_pull
+
+     for immutable in registry.example/nemoclaw:local registry.example/nemoclaw:1.2.3 registry.example/nemoclaw@sha256:abc123; do
+       reset_log
+       ensure_nemoclaw_sandbox_image "$immutable"
+       grep -Fq "image inspect $immutable" "$docker_log"
+       assert_no_pull
+     done
+
+     for mutable in registry.example/nemoclaw registry.example/nemoclaw:latest; do
+       reset_log
+       ensure_nemoclaw_sandbox_image "$mutable"
+       grep -Fq "image inspect $mutable" "$docker_log"
+       grep -Fq "pull $mutable" "$docker_log"
+     done
+
+     reset_log
+     ensure_nemoclaw_sandbox_image registry.example/missing:2.0
+     grep -Fq 'image inspect registry.example/missing:2.0' "$docker_log"
+     grep -Fq 'pull registry.example/missing:2.0' "$docker_log"
+
+     reset_log
+     ! ensure_nemoclaw_sandbox_image registry.example/unavailable:1.0
+     grep -Fq 'pull registry.example/unavailable:1.0' "$docker_log"`,
+  ]);
+});
+
+test("production deploy reads NemoClaw settings without sourcing the env file", () => {
+  const workflow = read(".github/workflows/deploy-production.yml");
+  const functionMatch = workflow.match(/ {10}read_deploy_env_value\(\) \{\n[\s\S]*?\n {10}\}/);
+  assert.ok(functionMatch, "deploy workflow must expose the safe env reader");
+  const functionSource = functionMatch[0].replace(/^ {10}/gm, "");
+  assert.doesNotMatch(functionSource, /(?:^|\n)\s*(?:source|\.)\s+/);
+
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "nora-deploy-env-reader-"));
+  const envFile = path.join(fixtureDir, ".env");
+  try {
+    writeFileSync(
+      envFile,
+      [
+        'ENABLED_SANDBOX_PROFILES = "standard, nemoclaw"',
+        "NEMOCLAW_SANDBOX_IMAGE='nora-nemoclaw-agent:local'",
+        "JWT_SECRET=must-not-be-printed",
+      ].join("\n") + "\n",
+    );
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        `set -euo pipefail
+${functionSource}
+test "$(read_deploy_env_value "$1" ENABLED_SANDBOX_PROFILES "")" = "standard, nemoclaw"
+test "$(read_deploy_env_value "$1" NEMOCLAW_SANDBOX_IMAGE "")" = "nora-nemoclaw-agent:local"`,
+        "nora-deploy-env-reader",
+        envFile,
+      ],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "");
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
 test("setup separates new API hash secrets while preserving migration fallbacks", () => {
   const bashSetup = read("setup.sh");
   const powershellSetup = read("setup.ps1");
@@ -536,6 +756,94 @@ const hasPowerShell =
   spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "exit 0"], {
     cwd: repoRoot,
   }).status === 0;
+
+test(
+  "PowerShell setup applies immutable-aware NemoClaw image policy",
+  { skip: !hasPowerShell },
+  () => {
+    runChecked("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "-"], {
+      input: `$ErrorActionPreference = "Stop"
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+  (Resolve-Path "setup.ps1"),
+  [ref]$tokens,
+  [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+foreach ($name in @("Test-NemoClawImageReferenceMutable", "Test-CommaSeparatedValue", "Ensure-NemoClawSandboxImage")) {
+  $definition = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+  }, $true)
+  if (-not $definition) { throw "Missing function $name" }
+  Invoke-Expression $definition.Extent.Text
+}
+function Write-Info { param([string]$Message) }
+function Write-Ok { param([string]$Message) }
+function Write-Err { param([string]$Message) }
+$script:PresentImages = @(
+  "registry.example/nemoclaw:local",
+  "registry.example/nemoclaw:1.2.3",
+  "registry.example/nemoclaw@sha256:abc123",
+  "registry.example/nemoclaw",
+  "registry.example/nemoclaw:latest"
+)
+$script:DockerLog = New-Object System.Collections.Generic.List[string]
+function docker {
+  param([Parameter(ValueFromRemainingArguments = $true)][object[]]$DockerArgs)
+  $parts = @($DockerArgs | ForEach-Object { [string]$_ })
+  $script:DockerLog.Add(($parts -join " "))
+  if ($parts[0] -eq "image" -and $parts[1] -eq "inspect") {
+    $global:LASTEXITCODE = if ($script:PresentImages -contains $parts[2]) { 0 } else { 1 }
+    return
+  }
+  if ($parts[0] -eq "pull") {
+    $global:LASTEXITCODE = if ($parts[1] -eq "registry.example/unavailable:1.0") { 1 } else { 0 }
+    return
+  }
+  $global:LASTEXITCODE = 0
+}
+function Reset-DockerLog { $script:DockerLog.Clear() }
+function Assert-NoPull {
+  if ($script:DockerLog | Where-Object { $_ -like "pull *" }) { throw "Unexpected pull" }
+}
+
+if (-not (Test-NemoClawImageReferenceMutable -Image "registry.example/nemoclaw")) { throw "Untagged ref must be mutable" }
+if (-not (Test-NemoClawImageReferenceMutable -Image "registry.example/nemoclaw:latest")) { throw "latest must be mutable" }
+foreach ($immutable in @("registry.example/nemoclaw:local", "registry.example/nemoclaw:1.2.3", "registry.example/nemoclaw@sha256:abc123")) {
+  if (Test-NemoClawImageReferenceMutable -Image $immutable) { throw "$immutable must be immutable" }
+}
+if (-not (Test-CommaSeparatedValue -List "standard, nemoclaw" -Value "nemoclaw")) { throw "Whitespace profile was not enabled" }
+if (-not (Test-CommaSeparatedValue -List " standard ,  nemoclaw  " -Value "nemoclaw")) { throw "Trimmed profile was not enabled" }
+if (Test-CommaSeparatedValue -List "standard,strict" -Value "nemoclaw") { throw "Missing profile was enabled" }
+
+Reset-DockerLog
+Ensure-NemoClawSandboxImage -Image "nora-nemoclaw-agent:local"
+if (-not ($script:DockerLog | Where-Object { $_ -like "build *Dockerfile.nemoclaw-agent*" })) { throw "Exact local ref was not built" }
+Assert-NoPull
+
+foreach ($immutable in @("registry.example/nemoclaw:local", "registry.example/nemoclaw:1.2.3", "registry.example/nemoclaw@sha256:abc123")) {
+  Reset-DockerLog
+  Ensure-NemoClawSandboxImage -Image $immutable
+  Assert-NoPull
+}
+foreach ($mutable in @("registry.example/nemoclaw", "registry.example/nemoclaw:latest")) {
+  Reset-DockerLog
+  Ensure-NemoClawSandboxImage -Image $mutable
+  if (-not ($script:DockerLog -contains "pull $mutable")) { throw "$mutable was not refreshed" }
+}
+Reset-DockerLog
+Ensure-NemoClawSandboxImage -Image "registry.example/missing:2.0"
+if (-not ($script:DockerLog -contains "pull registry.example/missing:2.0")) { throw "Missing ref was not pulled" }
+Reset-DockerLog
+$failedClosed = $false
+try { Ensure-NemoClawSandboxImage -Image "registry.example/unavailable:1.0" } catch { $failedClosed = $true }
+if (-not $failedClosed) { throw "Unavailable ref did not fail closed" }
+`,
+    });
+  },
+);
 
 test(
   "PowerShell API hash migration preserves values and secures files",
@@ -737,6 +1045,31 @@ test("production update paths activate refreshed nginx config without touching c
   );
   assert.match(
     deployWorkflow,
+    /docker build \\\s*\n\s*-f agent-runtime\/Dockerfile\.openclaw-agent \\\s*\n\s*-t nora-openclaw-agent:local \\\s*\n\s*agent-runtime\//,
+    "production deploys must refresh the pinned standard OpenClaw image",
+  );
+  assert.match(deployWorkflow, /read_deploy_env_value\(\)/);
+  assert.match(
+    deployWorkflow,
+    /enabled_sandbox_profiles="\$\(read_deploy_env_value "\$DEPLOY_ENV_FILE" ENABLED_SANDBOX_PROFILES ""\)"/,
+  );
+  assert.match(
+    deployWorkflow,
+    /nemoclaw_sandbox_image="\$\(read_deploy_env_value "\$DEPLOY_ENV_FILE" NEMOCLAW_SANDBOX_IMAGE "ghcr\.io\/solomon2773\/nora-nemoclaw-agent:latest"\)"/,
+  );
+  assert.doesNotMatch(deployWorkflow, /(?:^|\n)\s*(?:source|\.)\s+"?\$DEPLOY_ENV_FILE"?/);
+  const deployNemoBuild = deployWorkflow.match(
+    /if \[ "\$nemoclaw_sandbox_image" = "nora-nemoclaw-agent:local" \]; then([\s\S]*?)\n\s*fi/,
+  );
+  assert.ok(deployNemoBuild, "production deploy must gate the local NemoClaw build exactly");
+  assert.match(deployNemoBuild[1], /agent-runtime\/Dockerfile\.nemoclaw-agent/);
+  assert.equal(
+    (deployWorkflow.match(/agent-runtime\/Dockerfile\.nemoclaw-agent/g) || []).length,
+    1,
+    "production deploy must not rebuild custom or pinned NemoClaw refs",
+  );
+  assert.match(
+    deployWorkflow,
     /docker compose "\$\{compose_args\[@\]\}" run --rm --no-deps --interactive=false -T nginx nginx -t[\s\S]*?docker compose "\$\{compose_args\[@\]\}" up -d --build[\s\S]*?docker compose "\$\{compose_args\[@\]\}" up -d --force-recreate --no-deps nginx[\s\S]*?docker compose "\$\{compose_args\[@\]\}" exec -T nginx nginx -t <\/dev\/null/,
   );
   assert.match(
@@ -770,6 +1103,22 @@ test("production update paths activate refreshed nginx config without touching c
   assert.match(
     releaseUpgrade,
     /docker compose "\$\{COMPOSE_ARGS\[@\]\}" run --rm --no-deps --interactive=false -T nginx nginx -t[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" up -d --build[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" up -d --force-recreate --no-deps nginx[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" exec -T nginx nginx -t <\/dev\/null/,
+  );
+  const directUpgradeBlock = releaseUpgrade.match(
+    /if \[ ! -f setup\.sh \] \|\| \[ "\$\{NORA_UPGRADE_USE_SETUP:-true\}" = "false" \]; then([\s\S]*?)\n\s*fi/,
+  );
+  assert.ok(directUpgradeBlock, "direct upgrade fallback must remain explicit");
+  assert.match(directUpgradeBlock[1], /agent-runtime\/Dockerfile\.openclaw-agent/);
+  assert.match(directUpgradeBlock[1], /read_env_setting "\$env_file" ENABLED_SANDBOX_PROFILES/);
+  assert.match(directUpgradeBlock[1], /read_env_setting "\$env_file" NEMOCLAW_SANDBOX_IMAGE/);
+  assert.match(
+    directUpgradeBlock[1],
+    /if \[ "\$nemoclaw_sandbox_image" = "nora-nemoclaw-agent:local" \]; then[\s\S]*?agent-runtime\/Dockerfile\.nemoclaw-agent/,
+  );
+  assert.equal(
+    (releaseUpgrade.match(/agent-runtime\/Dockerfile\.nemoclaw-agent/g) || []).length,
+    1,
+    "direct upgrade must not rebuild custom or pinned NemoClaw refs",
   );
   assert.match(
     setupTls,

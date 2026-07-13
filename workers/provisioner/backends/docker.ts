@@ -1,5 +1,6 @@
 // @ts-nocheck
 const ProvisionerBackend = require("./interface");
+const { demuxDockerExecStream } = require("./dockerExecStream");
 const crypto = require("crypto");
 const path = require("path");
 const {
@@ -976,20 +977,26 @@ class DockerBackend extends ProvisionerBackend {
 
   async exec(containerId, opts = {}) {
     const container = this.docker.getContainer(containerId);
+    const tty = opts.tty !== false;
     const execInstance = await container.exec({
       Cmd: opts.cmd || ["/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"],
       AttachStdin: true,
       AttachStdout: true,
       AttachStderr: true,
-      Tty: opts.tty !== false,
+      Tty: tty,
       Env: opts.env || ["TERM=xterm-256color"],
     });
-    const stream = await execInstance.start({
+    const rawStream = await execInstance.start({
       hijack: true,
       stdin: true,
-      Tty: opts.tty !== false,
+      Tty: tty,
     });
-    return { exec: execInstance, stream };
+    if (tty) return { exec: execInstance, stream: rawStream };
+
+    // Docker multiplexes stdout/stderr behind 8-byte frame headers whenever
+    // TTY is disabled. Demux at the adapter boundary so command consumers see
+    // the same plain byte stream as Kubernetes and Proxmox adapters.
+    return { exec: execInstance, stream: demuxDockerExecStream(this.docker, rawStream) };
   }
 }
 

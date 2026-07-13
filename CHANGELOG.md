@@ -4,6 +4,36 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.16.3](https://github.com/solomon2773/nora/releases/tag/v1.16.3) — 2026-07-13
+
+Activation and Cloudflare Access compatibility patch: demo agents now prove a real warmed Gateway
+reply before becoming runnable, while the bare Admin entrypoint normalizes to the protected
+trailing-slash route instead of serving a shell whose JavaScript may be intercepted separately.
+
+### Changed
+
+- Public nginx templates redirect exact `/admin` requests to `/admin/` before proxying the Admin
+  dashboard without dropping query parameters, preserving a consistent path boundary for
+  Cloudflare Access policies.
+- OpenClaw installs default to Nora's validated `2026.6.11` release across standard Docker,
+  Kubernetes, NemoClaw, and Proxmox paths; production rebuilds the standard image, mutable
+  NemoClaw images refresh before use, and writable bootstrap paths replace stale exact versions.
+- The Cloudflare launch runbook now requires cache-bypass and Access coverage for both exact
+  `/admin` and descendant routes, with an explicit pre-launch regression check.
+- Release metadata advances the Gemini extension manifest to `1.16.3` and the Helm chart to
+  `0.7.3` for exact-tag publication.
+
+### Fixed
+
+- Built-in demo activation no longer publishes `running` before OpenClaw has completed a real
+  Gateway-backed model turn, removing the cold first-chat timeout window.
+- Streaming chat no longer converts pre-token failures or a real timeout into a success-looking
+  empty response; terminal events are correlated to their run and current OpenClaw delta payloads
+  are accepted.
+- Anonymous visits to `/admin` no longer receive an unprotected HTML shell while `/admin/_next/*`
+  assets are redirected to Cloudflare Access, which previously left the page stuck on its loading
+  state under split exact-versus-wildcard Access rules.
+
 ## [v1.16.2](https://github.com/solomon2773/nora/releases/tag/v1.16.2) — 2026-07-12
 
 Edge-activation patch: generated public nginx policy is now applied immediately during every

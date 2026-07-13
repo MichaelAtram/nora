@@ -314,6 +314,26 @@ run_upgrade() {
 
   build_compose_args "$env_file" "$compose_files" || return $?
   if [ ! -f setup.sh ] || [ "${NORA_UPGRADE_USE_SETUP:-true}" = "false" ]; then
+    echo "Rebuilding the pinned standard OpenClaw agent image..."
+    docker build \
+      -f agent-runtime/Dockerfile.openclaw-agent \
+      -t nora-openclaw-agent:local \
+      agent-runtime/
+    local enabled_sandbox_profiles nemoclaw_sandbox_image normalized_sandbox_profiles
+    enabled_sandbox_profiles="$(read_env_setting "$env_file" ENABLED_SANDBOX_PROFILES)"
+    nemoclaw_sandbox_image="$(read_env_setting "$env_file" NEMOCLAW_SANDBOX_IMAGE)"
+    normalized_sandbox_profiles="${enabled_sandbox_profiles//[[:space:]]/}"
+    case ",${normalized_sandbox_profiles}," in
+      *,nemoclaw,*)
+        if [ "$nemoclaw_sandbox_image" = "nora-nemoclaw-agent:local" ]; then
+          echo "Rebuilding the enabled local NemoClaw sandbox image..."
+          docker build \
+            -f agent-runtime/Dockerfile.nemoclaw-agent \
+            -t nora-nemoclaw-agent:local \
+            agent-runtime/
+        fi
+        ;;
+    esac
     echo "Pre-validating nginx configuration..."
     docker compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --interactive=false -T nginx nginx -t
     docker compose "${COMPOSE_ARGS[@]}" up -d --build

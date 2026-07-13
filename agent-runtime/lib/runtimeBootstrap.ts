@@ -10,6 +10,7 @@ const {
   buildIntegrationSkillMarkdown,
   buildSplitIntegrationManifest,
 } = require("./integrationTools");
+const { DEFAULT_OPENCLAW_PACKAGE_SPEC } = require("./openclawDefaults");
 
 const TSX_PACKAGE_SPEC = process.env.OPENCLAW_TSX_PACKAGE || "tsx@4.21.0";
 
@@ -24,6 +25,7 @@ function readRuntimeSource(relPath) {
 const RUNTIME_FILES = [
   "containerCommand.ts",
   "contracts.ts",
+  "openclawDefaults.ts",
   "runtimeBootstrap.ts",
   // Required by runtimeBootstrap's require("./mcpServersConfig") — every module
   // runtimeBootstrap imports relatively must ship into the container with it,
@@ -765,7 +767,7 @@ function buildRuntimeBootstrapCommand() {
   ].join("");
 }
 
-function buildOpenClawInstallCommand(packages = ["openclaw@latest"]) {
+function buildOpenClawInstallCommand(packages = [DEFAULT_OPENCLAW_PACKAGE_SPEC]) {
   const normalizedPackages = (Array.isArray(packages) ? packages : [packages])
     .map((pkg) => String(pkg || "").trim())
     .filter(Boolean);
@@ -780,6 +782,9 @@ function buildOpenClawInstallCommand(packages = ["openclaw@latest"]) {
   }
 
   const packageList = [...normalizedPackages, TSX_PACKAGE_SPEC].join(" ");
+  const exactOpenClawVersion = normalizedPackages
+    .map((pkg) => pkg.match(/^openclaw@(\d{4}\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?)$/)?.[1] || "")
+    .find(Boolean);
 
   return [
     'OPENCLAW_BIN="${OPENCLAW_CLI_PATH:-/usr/local/bin/openclaw}"; ',
@@ -788,7 +793,11 @@ function buildOpenClawInstallCommand(packages = ["openclaw@latest"]) {
     'DETECTED_OPENCLAW_TSX_BIN="$(command -v tsx 2>/dev/null || true)"; ',
     'if [ -n "$DETECTED_OPENCLAW_BIN" ] && [ ! -x "$OPENCLAW_BIN" ]; then OPENCLAW_BIN="$DETECTED_OPENCLAW_BIN"; fi; ',
     'if [ -n "$DETECTED_OPENCLAW_TSX_BIN" ] && [ ! -x "$OPENCLAW_TSX_BIN" ]; then OPENCLAW_TSX_BIN="$DETECTED_OPENCLAW_TSX_BIN"; fi; ',
-    'if ([ -n "$OPENCLAW_BIN" ] && [ -x "$OPENCLAW_BIN" ] && "$OPENCLAW_BIN" --version >/dev/null 2>&1) && ([ -n "$OPENCLAW_TSX_BIN" ] && [ -x "$OPENCLAW_TSX_BIN" ] && "$OPENCLAW_TSX_BIN" --version >/dev/null 2>&1); then ',
+    `EXPECTED_OPENCLAW_VERSION=${shellSingleQuote(exactOpenClawVersion || "")}; `,
+    'OPENCLAW_VERSION_OUTPUT=""; OPENCLAW_VERSION_OK=1; ',
+    'if [ -n "$OPENCLAW_BIN" ] && [ -x "$OPENCLAW_BIN" ]; then OPENCLAW_VERSION_OUTPUT="$("$OPENCLAW_BIN" --version 2>/dev/null || true)"; fi; ',
+    'if [ -n "$EXPECTED_OPENCLAW_VERSION" ]; then case "$OPENCLAW_VERSION_OUTPUT" in "OpenClaw $EXPECTED_OPENCLAW_VERSION"|"OpenClaw $EXPECTED_OPENCLAW_VERSION "*) ;; *) OPENCLAW_VERSION_OK=0;; esac; fi; ',
+    'if ([ -n "$OPENCLAW_BIN" ] && [ -x "$OPENCLAW_BIN" ] && [ "$OPENCLAW_VERSION_OK" = 1 ]) && ([ -n "$OPENCLAW_TSX_BIN" ] && [ -x "$OPENCLAW_TSX_BIN" ] && "$OPENCLAW_TSX_BIN" --version >/dev/null 2>&1); then ',
     "  true; ",
     "else ",
     '  rm -f "${OPENCLAW_CLI_PATH:-/usr/local/bin/openclaw}"; ',
@@ -814,6 +823,7 @@ function buildOpenClawInstallCommand(packages = ["openclaw@latest"]) {
     '    OPENCLAW_TSX_BIN="${OPENCLAW_TSX_BIN:-$DETECTED_OPENCLAW_TSX_BIN}"; ',
     "  fi; ",
     '  if ! ([ -n "$OPENCLAW_BIN" ] && [ -x "$OPENCLAW_BIN" ] && "$OPENCLAW_BIN" --version >/dev/null 2>&1); then cat /tmp/openclaw-install.log >&2; exit 1; fi; ',
+    '  if [ -n "$EXPECTED_OPENCLAW_VERSION" ]; then OPENCLAW_VERSION_OUTPUT="$("$OPENCLAW_BIN" --version 2>/dev/null || true)"; case "$OPENCLAW_VERSION_OUTPUT" in "OpenClaw $EXPECTED_OPENCLAW_VERSION"|"OpenClaw $EXPECTED_OPENCLAW_VERSION "*) ;; *) cat /tmp/openclaw-install.log >&2; echo "Installed OpenClaw version does not match $EXPECTED_OPENCLAW_VERSION" >&2; exit 1;; esac; fi; ',
     '  if ! ([ -n "$OPENCLAW_TSX_BIN" ] && [ -x "$OPENCLAW_TSX_BIN" ] && "$OPENCLAW_TSX_BIN" --version >/dev/null 2>&1); then cat /tmp/openclaw-install.log >&2; exit 1; fi; ',
     "fi; ",
     'export OPENCLAW_CLI_PATH="$OPENCLAW_BIN"; ',

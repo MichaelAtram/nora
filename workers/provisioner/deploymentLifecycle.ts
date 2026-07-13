@@ -315,6 +315,7 @@ async function runProvisioningReadinessBarrier({
 async function reconcileProviderStateUntilStable({
   bootstrappedFingerprint,
   reconcile,
+  verify,
   readFingerprint,
   withMutationLock,
   finalize,
@@ -322,6 +323,9 @@ async function reconcileProviderStateUntilStable({
 } = {}) {
   if (typeof reconcile !== "function") {
     throw new Error("reconcile is required");
+  }
+  if (verify != null && typeof verify !== "function") {
+    throw new Error("verify must be a function");
   }
   if (typeof readFingerprint !== "function") {
     throw new Error("readFingerprint is required");
@@ -346,6 +350,14 @@ async function reconcileProviderStateUntilStable({
       throw new Error("provider reconciliation did not return a provider fingerprint");
     }
     appliedFingerprint = reconciledFingerprint;
+
+    if (typeof verify === "function") {
+      await verify({
+        pass,
+        providerFingerprint: appliedFingerprint,
+        reconciliation,
+      });
+    }
 
     const verification = await withMutationLock(async () => {
       const currentFingerprint = await readFingerprint();
