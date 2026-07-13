@@ -8,6 +8,7 @@ const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
 
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
 process.env.JWT_SECRET = JWT_SECRET;
+const ADOPTED_GATEWAY_TOKEN = "0123456789abcdef".repeat(4);
 
 const mockDbClient = { query: jest.fn(), release: jest.fn() };
 const mockDb = { query: jest.fn(), connect: jest.fn() };
@@ -2733,7 +2734,7 @@ describe("POST /agents/adopt (external runtime)", () => {
         name: "Workspace External",
         runtime_family: "openclaw",
         url: "https://203.0.113.5:18789",
-        gateway_token: "secret-token",
+        gateway_token: ADOPTED_GATEWAY_TOKEN,
       }),
     );
 
@@ -2766,7 +2767,7 @@ describe("POST /agents/adopt (external runtime)", () => {
         name: "Prod OpenClaw",
         runtime_family: "openclaw",
         url: "https://203.0.113.5:18789",
-        gateway_token: "secret-token",
+        gateway_token: ADOPTED_GATEWAY_TOKEN,
       }),
     );
 
@@ -2780,9 +2781,15 @@ describe("POST /agents/adopt (external runtime)", () => {
     // gateway_token must be ENCRYPTED on write — the param carries enc(...),
     // not the plaintext. This fails if the encrypt() call is ever dropped.
     expect(insert[1]).toEqual(
-      expect.arrayContaining(["user-1", "openclaw", "203.0.113.5", 18789, "enc(secret-token)"]),
+      expect.arrayContaining([
+        "user-1",
+        "openclaw",
+        "203.0.113.5",
+        18789,
+        `enc(${ADOPTED_GATEWAY_TOKEN})`,
+      ]),
     );
-    expect(insert[1]).not.toContain("secret-token");
+    expect(insert[1]).not.toContain(ADOPTED_GATEWAY_TOKEN);
   });
 
   it("rejects adoption without a gateway token", async () => {
@@ -2796,11 +2803,30 @@ describe("POST /agents/adopt (external runtime)", () => {
     expect(mockDb.query).not.toHaveBeenCalled();
   });
 
+  it.each(["short-token", "0123456789abcdef 0123456789abcdef"])(
+    "rejects a weak external gateway token (%s)",
+    async (gatewayToken) => {
+      const res = await auth(
+        request(app).post("/agents/adopt").send({
+          runtime_family: "openclaw",
+          url: "https://203.0.113.5:18789",
+          gateway_token: gatewayToken,
+        }),
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/cryptographically generated secret.*32-4096 characters/i);
+      expect(mockDb.query).not.toHaveBeenCalled();
+    },
+  );
+
   it("rejects an endpoint on a non-allowed port (SSRF gate)", async () => {
     const res = await auth(
-      request(app)
-        .post("/agents/adopt")
-        .send({ runtime_family: "openclaw", url: "http://203.0.113.5:8080", gateway_token: "t" }),
+      request(app).post("/agents/adopt").send({
+        runtime_family: "openclaw",
+        url: "http://203.0.113.5:8080",
+        gateway_token: ADOPTED_GATEWAY_TOKEN,
+      }),
     );
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/port is not allowed/i);
@@ -2812,7 +2838,7 @@ describe("POST /agents/adopt (external runtime)", () => {
       request(app).post("/agents/adopt").send({
         runtime_family: "openclaw",
         url: "http://169.254.169.254:18789",
-        gateway_token: "t",
+        gateway_token: ADOPTED_GATEWAY_TOKEN,
       }),
     );
     expect(res.status).toBe(400);
@@ -2822,9 +2848,11 @@ describe("POST /agents/adopt (external runtime)", () => {
 
   it("rejects an unsupported runtime family", async () => {
     const res = await auth(
-      request(app)
-        .post("/agents/adopt")
-        .send({ runtime_family: "nope", url: "https://203.0.113.5:18789", gateway_token: "t" }),
+      request(app).post("/agents/adopt").send({
+        runtime_family: "nope",
+        url: "https://203.0.113.5:18789",
+        gateway_token: ADOPTED_GATEWAY_TOKEN,
+      }),
     );
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/runtime_family/i);
@@ -2840,7 +2868,7 @@ describe("POST /agents/adopt (external runtime)", () => {
       request(app).post("/agents/adopt").send({
         runtime_family: "openclaw",
         url: "https://203.0.113.5:18789",
-        gateway_token: "t",
+        gateway_token: ADOPTED_GATEWAY_TOKEN,
       }),
     );
     expect(res.status).toBe(402);

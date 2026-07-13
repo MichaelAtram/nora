@@ -161,7 +161,6 @@ Run Nora itself on a Kubernetes cluster with the public OCI chart at `oci://ghcr
 
 ```bash
 helm install nora oci://ghcr.io/solomon2773/nora \
-  --version 0.7.5 \
   --namespace nora --create-namespace \
   --set secrets.jwtSecret="$(openssl rand -hex 32)" \
   --set secrets.encryptionKey="$(openssl rand -hex 32)" \
@@ -171,6 +170,9 @@ helm install nora oci://ghcr.io/solomon2773/nora \
   --set secrets.dbPassword="$(openssl rand -hex 24)"
 kubectl -n nora port-forward svc/nora-nginx 8080:80
 ```
+
+This resolves the latest published chart. For a reproducible production install, run `helm show
+chart oci://ghcr.io/solomon2773/nora`, record its `version`, and pass that value with `--version`.
 
 The chart refuses to install without real secrets — there are no insecure defaults. New installs
 also require distinct workspace/API and Agent Hub hash secrets; older upgrades retain their shared

@@ -53,6 +53,13 @@ const GATEWAY_PROXY_SEARCH_RE = /^\?[A-Za-z0-9._~!$&'()*+,;=:@/?%-]*$/;
 // runtime caused "Gateway handshake failed: protocol mismatch".
 const GATEWAY_MIN_PROTOCOL_VERSION = 3;
 const GATEWAY_MAX_PROTOCOL_VERSION = 4;
+const EXTERNAL_GATEWAY_TOKEN_MIN_LENGTH = 32;
+const EXTERNAL_GATEWAY_TOKEN_MAX_LENGTH = 4096;
+// Pool keys never leave this process and do not need to survive a restart. A
+// process-random HMAC key keeps the credential component opaque even if a key
+// is exposed through diagnostics, while preserving deterministic lookup for
+// the lifetime of this backend process.
+const CONNECTION_POOL_HMAC_KEY = crypto.randomBytes(32);
 
 // Hostname must be a plain DNS name / IP literal — no URL meta-chars that
 // could alter the parsed origin (no "@", "/", "?", "#", ":", whitespace, etc.).
@@ -396,6 +403,47 @@ async function assertExternalEndpointReachable(address, { paas = false } = {}) {
   return { host: resolved, port: addr.port };
 }
 
+function containsWhitespaceOrControl(value) {
+  for (const symbol of String(value || "")) {
+    const codePoint = symbol.codePointAt(0);
+    if (/\s/u.test(symbol) || codePoint <= 31 || codePoint === 127) return true;
+  }
+  return false;
+}
+
+function assertStrongExternalGatewayToken(value) {
+  const token = String(value || "").trim();
+  if (
+    token.length < EXTERNAL_GATEWAY_TOKEN_MIN_LENGTH ||
+    token.length > EXTERNAL_GATEWAY_TOKEN_MAX_LENGTH ||
+    containsWhitespaceOrControl(token)
+  ) {
+    const error = new Error(
+      "gateway_token must be a cryptographically generated secret of 32-4096 characters with no whitespace",
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+  return token;
+}
+
+function isAdoptedExternalAgent(agent) {
+  return [agent?.deploy_target, agent?.backend_type, agent?.execution_target_id].some(
+    (value) =>
+      String(value || "")
+        .trim()
+        .toLowerCase() === "external",
+  );
+}
+
+function gatewayTokenForAgent(agent) {
+  const token = decrypt(agent?.gateway_token);
+  // Existing adopted rows predate the route-level strength contract. Re-check
+  // at every connection boundary so a legacy weak bearer secret cannot be used
+  // to derive a publicly observable deterministic device identity.
+  return isAdoptedExternalAgent(agent) ? assertStrongExternalGatewayToken(token) : token;
+}
+
 // ─── Device Identity (Ed25519 keypair for Gateway auth) ──────────
 
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
@@ -406,6 +454,11 @@ function base64UrlEncode(buf) {
 }
 
 function deriveDeviceIdentity(gatewayToken) {
+  // This is a protocol identity derivation, not password storage. It must stay
+  // byte-for-byte aligned with agent-runtime/lib/runtimeBootstrap.ts and
+  // integrationTools.ts so existing paired devices keep working. Nora-created
+  // gateway tokens contain at least 128 random bits; adopted external runtimes
+  // pass assertStrongExternalGatewayToken before their credential is stored.
   const seed = crypto
     .createHash("sha256")
     .update("openclaw-device:" + gatewayToken)
@@ -1155,10 +1208,10 @@ class GatewayConnection {
 const pool = new Map(); // opaque identity hash -> GatewayConnection
 const pendingConnections = new Map(); // opaque identity hash -> pending connection state
 
-function buildConnectionPoolKey(agent, addr, token) {
+function buildConnectionPoolKey(agentId, addr, token) {
   return crypto
-    .createHash("sha256")
-    .update(String(agent?.id || ""))
+    .createHmac("sha256", CONNECTION_POOL_HMAC_KEY)
+    .update(String(agentId || ""))
     .update("\0")
     .update(addr.host)
     .update("\0")
@@ -1214,9 +1267,10 @@ async function getConnection(agent) {
   }
   // gateway_token is encrypted at rest; decrypt() is transparent to legacy
   // plaintext, so it is safe regardless of the token's storage form. The token
-  // is hashed into the pool key and is never logged or stored in plaintext there.
-  const token = decrypt(agent.gateway_token);
-  const key = buildConnectionPoolKey(agent, addr, token);
+  // is HMACed into the process-local pool key and is never logged or stored in
+  // plaintext there.
+  const token = gatewayTokenForAgent(agent);
+  const key = buildConnectionPoolKey(agent?.id, addr, token);
   retireConflictingConnections(key, agent, addr);
   const pending = pendingConnections.get(key);
   if (pending && !pending.retired) return pending.promise;
@@ -2331,7 +2385,7 @@ function attachGatewayWS(server) {
       const initialRelayAuthorizationCheckedAt = Date.now();
 
       // Decrypt once; reused for the device identity and the relay connect auth.
-      const gatewayToken = decrypt(agent.gateway_token);
+      const gatewayToken = gatewayTokenForAgent(agent);
       const identity = deriveDeviceIdentity(gatewayToken);
       let handshakeComplete = false;
       let connectPayload = null; // stored relay handshake payload
@@ -2681,6 +2735,7 @@ module.exports = {
   resolveSafeGatewayHttpTarget,
   resolveSafeHermesDashboardTarget,
   assertExternalEndpointReachable,
+  assertStrongExternalGatewayToken,
   resolveGatewayHostForProxy,
   allowedGatewayHostsForAgent,
 };

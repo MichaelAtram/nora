@@ -184,4 +184,18 @@ describe("OpenAPI document", () => {
       expect.objectContaining({ type: "string" }),
     );
   });
+
+  it("documents the strong external-runtime gateway token contract", () => {
+    const adoptSchema =
+      doc.paths["/agents/adopt"].post.requestBody.content["application/json"].schema;
+    expect(adoptSchema.required).toEqual(
+      expect.arrayContaining(["runtime_family", "gateway_token"]),
+    );
+    expect(adoptSchema.properties.gateway_token).toEqual(
+      expect.objectContaining({ type: "string", minLength: 32, maxLength: 4096 }),
+    );
+    expect(doc.paths["/agents/adopt"].post.responses[400].description).toMatch(
+      /weak gateway token/i,
+    );
+  });
 });

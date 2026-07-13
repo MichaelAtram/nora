@@ -217,7 +217,10 @@ module.exports = {
                 },
                 gateway_token: {
                   type: "string",
-                  description: "Gateway/API token for the existing runtime.",
+                  minLength: 32,
+                  maxLength: 4096,
+                  description:
+                    "High-entropy gateway/API token for the existing runtime. Use a cryptographically generated secret of at least 32 characters with no whitespace.",
                 },
               },
             },
@@ -229,6 +232,12 @@ module.exports = {
           description: "The adopted external agent (status 'running')",
           content: { "application/json": { schema: agentSummary } },
         },
+        400: {
+          description:
+            "Invalid runtime family, weak gateway token, unsafe endpoint, or unsupported port.",
+        },
+        402: { description: "Agent quota or subscription does not allow adoption." },
+        403: { description: "The API key lacks the agents:write scope." },
       },
     },
   },

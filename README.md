@@ -28,6 +28,7 @@
   <a href="https://noradocs.solomontsao.com/self-hosting">Self-Hosting</a> ·
   <a href="https://noradocs.solomontsao.com/concepts/architecture">Architecture</a> ·
   <a href="https://noradocs.solomontsao.com/compare">How Nora Compares</a> ·
+  <a href=".github/press-kit/README.md">Press Kit</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -129,10 +130,10 @@ iwr -useb https://raw.githubusercontent.com/solomon2773/nora/master/setup.ps1 | 
 **Kubernetes (Helm):**
 
 ```bash
-helm show chart oci://ghcr.io/solomon2773/nora --version 0.7.5
+helm show chart oci://ghcr.io/solomon2773/nora
 ```
 
-The public OCI chart installs the full Nora control plane. See the [Helm instructions](https://noradocs.solomontsao.com/self-hosting#kubernetes-helm) for the required secrets and Ingress options.
+The command resolves the latest published chart; pin the reported version for reproducible production installs. The public OCI chart installs the full Nora control plane. See the [Helm instructions](https://noradocs.solomontsao.com/self-hosting#kubernetes-helm) for the required secrets and Ingress options.
 
 The installer verifies prerequisites, generates or preserves secrets, optionally creates a bootstrap admin, picks free local ports when the defaults are busy, and starts the stack. Once it finishes, open the URL printed by setup. Local mode defaults to `http://localhost:8080`, but setup may select another port such as `8081` on a busy workstation. Then follow the [first-15-minutes walkthrough](https://noradocs.solomontsao.com/quickstart).
 

@@ -35,7 +35,10 @@ const {
   materializeManagedMigrationState,
 } = require("../agentMigrations");
 const { isGatewayAvailableStatus, reconcileAgentStatus } = require("../agentStatus");
-const { assertExternalEndpointReachable } = require("../gatewayProxy");
+const {
+  assertExternalEndpointReachable,
+  assertStrongExternalGatewayToken,
+} = require("../gatewayProxy");
 const {
   HERMES_DASHBOARD_PORT,
   OPENCLAW_GATEWAY_PORT,
@@ -2129,12 +2132,13 @@ router.post("/adopt", async (req, res) => {
       return res.status(400).json({ error: "Agent name must be 100 characters or less" });
     }
 
-    const token = String(body.gateway_token || body.token || "").trim();
-    if (!token) {
+    const rawToken = String(body.gateway_token || body.token || "").trim();
+    if (!rawToken) {
       return res
         .status(400)
         .json({ error: "gateway_token is required to adopt an external runtime" });
     }
+    const token = assertStrongExternalGatewayToken(rawToken);
 
     // Accept either a full URL or an explicit host (+ optional port). Default the
     // port to the runtime family's contract port (OpenClaw gateway / Hermes dashboard).

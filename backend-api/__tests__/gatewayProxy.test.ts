@@ -548,6 +548,21 @@ describe("gateway proxy control-plane routes", () => {
     expect(mockDb.query.mock.calls[1][1]).toEqual(["ws-A", "agent-1"]);
   });
 
+  it("fails closed when a legacy adopted runtime has a weak gateway token", async () => {
+    mockRunningAgent({
+      backend_type: "external",
+      deploy_target: "external",
+      execution_target_id: "external",
+      gateway_token: "0123456789abcdef 0123456789abcdef",
+    });
+
+    const res = await request(app).post("/agents/agent-1/gateway/chat").send({ message: "ping" });
+
+    expect(res.status).toBe(502);
+    expect(res.body.details).toMatch(/cryptographically generated secret.*32-4096 characters/i);
+    expect(mockFakeWebSocket.instances).toHaveLength(0);
+  });
+
   it("sends non-streaming chat through the gateway and records usage metrics", async () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [

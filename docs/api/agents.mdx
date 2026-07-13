@@ -283,6 +283,45 @@ capacity, sharing, and revocation contract.
 
 ---
 
+## Adopt an external runtime
+
+Register an already-running OpenClaw or Hermes endpoint without provisioning new compute. Nora
+stores the gateway credential encrypted, monitors and proxies the runtime, and marks the agent as
+`external`. Lifecycle actions are unavailable because Nora does not own the process; deleting the
+agent only deregisters it.
+
+```
+POST /agents/adopt
+```
+
+Provide `runtime_family`, either `url` or `host` plus optional `port`, and a cryptographically
+generated `gateway_token`. The token must contain at least 32 characters, have no whitespace, and
+be generated from a cryptographically secure random source. Hosted PaaS accepts only public
+endpoints; self-hosted operators may adopt a private-network endpoint that passes the gateway proxy's
+host and port safety checks. Nora rechecks this contract when an adopted runtime connects, so legacy
+rows with weak credential shapes fail closed until the external runtime token is rotated.
+
+```bash theme={null}
+GATEWAY_TOKEN="$(openssl rand -hex 32)"
+curl -X POST http://localhost:8080/api/agents/adopt \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"Existing OpenClaw\",\"runtime_family\":\"openclaw\",\"url\":\"https://agent.example.com:18789\",\"gateway_token\":\"$GATEWAY_TOKEN\"}"
+```
+
+The provided token must already be configured on the external runtime; generating a replacement in
+the example is appropriate only when you can update that runtime to use the same value. Workspace
+API keys require `agents:write`, and successful adoptions are atomically assigned to the key's bound
+workspace.
+
+| Status | Condition                                                            |
+| ------ | -------------------------------------------------------------------- |
+| `400`  | Weak token, invalid runtime family, unsafe endpoint, or invalid port |
+| `402`  | Billing limit reached                                                |
+| `403`  | Missing `agents:write` scope                                         |
+
+---
+
 ## Get agent
 
 Fetch a single agent by ID. The status is reconciled against the live container state on every call — if the container has stopped unexpectedly the stored status is updated before the response is returned.

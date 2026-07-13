@@ -68,6 +68,11 @@ Docker, and release/deploy automation preserves exact commit provenance.
 
 ### Fixed
 
+- External runtime adoption now rejects short, oversized, whitespace-bearing, or control-bearing
+  gateway credentials before storage and rechecks legacy adopted rows before gateway use. In-memory
+  connection-pool identities use a process-keyed HMAC instead of an unkeyed digest of the agent,
+  endpoint, and credential, while paired-device derivation remains protocol-compatible with existing
+  managed runtimes.
 - Nonempty unknown runtime families, deploy targets, execution-target ids, and sandbox profiles now
   fail with a stable client error across shared runtime fields, deploy/redeploy paths, Agent Hub
   templates, and the provisioner instead of being normalized to OpenClaw, local Docker, or the
