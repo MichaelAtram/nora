@@ -15,7 +15,7 @@ class mockFakeWebSocket extends EventEmitter {
     this.url = url;
     this.readyState = mockFakeWebSocket.OPEN;
     mockFakeWebSocket.instances.push(this);
-    setImmediate(() => {
+    const emitChallenge = () => {
       if (this.readyState !== mockFakeWebSocket.OPEN) return;
       this.emit(
         "message",
@@ -27,7 +27,12 @@ class mockFakeWebSocket extends EventEmitter {
           }),
         ),
       );
-    });
+    };
+    if (mockFakeWebSocket.challengeDelayMs > 0) {
+      setTimeout(emitChallenge, mockFakeWebSocket.challengeDelayMs);
+    } else {
+      setImmediate(emitChallenge);
+    }
   }
 
   send(payload) {
@@ -263,6 +268,7 @@ mockFakeWebSocket.statusMode = "success";
 mockFakeWebSocket.toolsCatalogResult = { tools: [] };
 mockFakeWebSocket.connectParams = [];
 mockFakeWebSocket.instances = [];
+mockFakeWebSocket.challengeDelayMs = 0;
 mockFakeWebSocket.streamMode = false;
 mockFakeWebSocket.chatRunId = "run-1";
 mockFakeWebSocket.subscriptionMode = "success";
@@ -376,6 +382,7 @@ describe("gateway proxy control-plane routes", () => {
     mockFakeWebSocket.toolsCatalogResult = { tools: [] };
     mockFakeWebSocket.connectParams = [];
     mockFakeWebSocket.instances = [];
+    mockFakeWebSocket.challengeDelayMs = 0;
     mockFakeWebSocket.streamMode = false;
     mockFakeWebSocket.chatRunId = "run-1";
     mockFakeWebSocket.subscriptionMode = "success";
@@ -773,6 +780,54 @@ describe("gateway proxy control-plane routes", () => {
     ]);
     expect(mockFakeWebSocket.instances).toHaveLength(2);
     expect(mockFakeWebSocket.instances[0].readyState).toBe(mockFakeWebSocket.CLOSED);
+  });
+
+  it("retires a pending connection when an agent gateway token rotates", async () => {
+    let token = "gateway-token-v1";
+    mockFakeWebSocket.challengeDelayMs = 100;
+    mockDb.query.mockImplementation(async (sql) => {
+      if (String(sql).includes("FROM agents WHERE id = $1")) {
+        return {
+          rows: [
+            {
+              id: "agent-1",
+              user_id: "user-1",
+              status: "running",
+              host: "10.0.0.10",
+              gateway_token: token,
+              gateway_host_port: null,
+            },
+          ],
+        };
+      }
+      return { rows: [] };
+    });
+
+    const firstRequest = request(app)
+      .post("/agents/agent-1/gateway/chat")
+      .send({ message: "before pending rotation" })
+      .then((response) => response);
+    for (let attempt = 0; attempt < 100 && mockFakeWebSocket.instances.length === 0; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(mockFakeWebSocket.instances).toHaveLength(1);
+
+    token = "gateway-token-v2-with-a-different-length";
+    const secondRequest = request(app)
+      .post("/agents/agent-1/gateway/chat")
+      .send({ message: "after pending rotation" });
+
+    const [first, second] = await Promise.all([firstRequest, secondRequest]);
+
+    expect(first.status).toBe(502);
+    expect(first.body.details).toMatch(/retired/i);
+    expect(second.status).toBe(200);
+    expect(mockFakeWebSocket.connectParams.map((params) => params.auth.password)).toEqual([
+      "gateway-token-v2-with-a-different-length",
+    ]);
+    expect(mockFakeWebSocket.instances).toHaveLength(2);
+    expect(mockFakeWebSocket.instances[0].readyState).toBe(mockFakeWebSocket.CLOSED);
+    expect(mockFakeWebSocket.instances[1].readyState).toBe(mockFakeWebSocket.OPEN);
   });
 
   it("does not reconnect a retired socket after its endpoint is reassigned", async () => {

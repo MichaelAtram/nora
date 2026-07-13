@@ -48,6 +48,9 @@ Docker, and release/deploy automation preserves exact commit provenance.
   globally serialized promotion job that rechecks the current default-branch head after immutable
   publication completes. Registry write permission is limited to the publish/promotion jobs and the
   target must remain on protected default-branch history.
+- Trusted CodeQL runs now evaluate the exact commit analysis artifact and fail on every
+  non-dismissed high or critical result, even if the default branch advances and later fixes the
+  finding before the gate finishes.
 - npm, Helm, and MCP Registry publication now resolve one stable published product tag, require its
   immutable commit on protected default-branch history, wait for exact-SHA CI, and revalidate after
   protected-environment approval. Privileged jobs consume validated artifacts instead of executing
@@ -70,9 +73,9 @@ Docker, and release/deploy automation preserves exact commit provenance.
 
 - External runtime adoption now rejects short, oversized, whitespace-bearing, or control-bearing
   gateway credentials before storage and rechecks legacy adopted rows before gateway use. In-memory
-  connection-pool identities use a process-keyed HMAC instead of an unkeyed digest of the agent,
-  endpoint, and credential, while paired-device derivation remains protocol-compatible with existing
-  managed runtimes.
+  connection-pool keys contain only the agent and logical endpoint, while credential rotation is
+  detected with constant-time comparison instead of hashing the credential into the key.
+  Paired-device derivation remains protocol-compatible with existing managed runtimes.
 - Nonempty unknown runtime families, deploy targets, execution-target ids, and sandbox profiles now
   fail with a stable client error across shared runtime fields, deploy/redeploy paths, Agent Hub
   templates, and the provisioner instead of being normalized to OpenClaw, local Docker, or the

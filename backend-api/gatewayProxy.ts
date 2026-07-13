@@ -55,11 +55,6 @@ const GATEWAY_MIN_PROTOCOL_VERSION = 3;
 const GATEWAY_MAX_PROTOCOL_VERSION = 4;
 const EXTERNAL_GATEWAY_TOKEN_MIN_LENGTH = 32;
 const EXTERNAL_GATEWAY_TOKEN_MAX_LENGTH = 4096;
-// Pool keys never leave this process and do not need to survive a restart. A
-// process-random HMAC key keeps the credential component opaque even if a key
-// is exposed through diagnostics, while preserving deterministic lookup for
-// the lifetime of this backend process.
-const CONNECTION_POOL_HMAC_KEY = crypto.randomBytes(32);
 
 // Hostname must be a plain DNS name / IP literal — no URL meta-chars that
 // could alter the parsed origin (no "@", "/", "?", "#", ":", whitespace, etc.).
@@ -1201,24 +1196,24 @@ class GatewayConnection {
   }
 }
 
-// Pool connections by agent + credential + logical endpoint. Docker may reuse
-// an IP/port immediately after an agent is deleted; address-only pooling would
-// then hand the replacement agent the previous runtime's authenticated socket,
-// device identity, and session stream.
-const pool = new Map(); // opaque identity hash -> GatewayConnection
-const pendingConnections = new Map(); // opaque identity hash -> pending connection state
+// Pool connections by non-secret agent + logical endpoint identity, then
+// verify the credential before reuse. Docker may reuse an IP/port immediately
+// after an agent is deleted; address-only pooling would then hand the
+// replacement agent the previous runtime's authenticated socket, device
+// identity, and session stream.
+const pool = new Map(); // non-secret agent + logical endpoint -> GatewayConnection
+const pendingConnections = new Map(); // same key -> pending connection state
 
-function buildConnectionPoolKey(agentId, addr, token) {
-  return crypto
-    .createHmac("sha256", CONNECTION_POOL_HMAC_KEY)
-    .update(String(agentId || ""))
-    .update("\0")
-    .update(addr.host)
-    .update("\0")
-    .update(String(addr.port))
-    .update("\0")
-    .update(String(token || ""))
-    .digest("hex");
+function buildConnectionPoolKey(agentId, addr) {
+  return JSON.stringify([String(agentId || ""), addr.host, Number(addr.port)]);
+}
+
+function gatewayTokensEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""), "utf8");
+  const rightBuffer = Buffer.from(String(right || ""), "utf8");
+  return (
+    leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer)
+  );
 }
 
 function retireConflictingConnections(key, agent, addr) {
@@ -1266,16 +1261,26 @@ async function getConnection(agent) {
     throw new Error("Agent gateway port is not allowed");
   }
   // gateway_token is encrypted at rest; decrypt() is transparent to legacy
-  // plaintext, so it is safe regardless of the token's storage form. The token
-  // is HMACed into the process-local pool key and is never logged or stored in
-  // plaintext there.
+  // plaintext, so it is safe regardless of the token's storage form. Pool keys
+  // contain only the agent id and logical endpoint; credential rotation is
+  // detected with a constant-time comparison against the in-memory connection.
   const token = gatewayTokenForAgent(agent);
-  const key = buildConnectionPoolKey(agent?.id, addr, token);
+  const key = buildConnectionPoolKey(agent?.id, addr);
   retireConflictingConnections(key, agent, addr);
   const pending = pendingConnections.get(key);
-  if (pending && !pending.retired) return pending.promise;
+  if (pending && !pending.retired) {
+    if (gatewayTokensEqual(pending.token, token)) return pending.promise;
+    pending.retired = true;
+    pending.connection?.retire();
+    pendingConnections.delete(key);
+  }
 
   let conn = pool.get(key);
+  if (conn && !gatewayTokensEqual(conn.token, token)) {
+    conn.retire();
+    pool.delete(key);
+    conn = null;
+  }
   if (conn?.isAlive) return conn;
 
   // Check circuit breaker — if cooldown elapsed, reset fully and retry
@@ -1299,6 +1304,7 @@ async function getConnection(agent) {
     agentId: agent?.id ? String(agent.id) : null,
     sourceHost: addr.host,
     port: addr.port,
+    token,
     connection: null,
     retired: false,
     promise: null,
