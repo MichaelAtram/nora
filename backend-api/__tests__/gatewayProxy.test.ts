@@ -309,6 +309,7 @@ jest.mock("ws", () => ({
 describe("gateway proxy control-plane routes", () => {
   let createGatewayRouter;
   let evictConnection;
+  let GatewayConnection;
   let app;
   const originalFetch = global.fetch;
 
@@ -406,7 +407,7 @@ describe("gateway proxy control-plane routes", () => {
     mockGetIntegrationsForSync.mockReset();
     mockBuildIntegrationToolCatalogEntries.mockReset();
 
-    ({ createGatewayRouter, evictConnection } = require("../gatewayProxy"));
+    ({ GatewayConnection, createGatewayRouter, evictConnection } = require("../gatewayProxy"));
 
     app = buildApp();
   });
@@ -533,6 +534,71 @@ describe("gateway proxy control-plane routes", () => {
     expect(mockFakeWebSocket.connectParams[0].auth.password).toBe("concurrent-gateway-token");
   });
 
+  it("revalidates and retires a warm Remote Docker socket after share revocation", async () => {
+    let grantActive = true;
+    const agent = {
+      id: "agent-remote-shared",
+      user_id: "user-1",
+      status: "running",
+      runtime_family: "openclaw",
+      backend_type: "remote-docker",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:shared-host",
+      gateway_host: "203.0.113.5",
+      gateway_port: 19042,
+      gateway_token: "shared-gateway-token",
+    };
+    mockDb.query.mockImplementation(async (sql, params = []) => {
+      const text = String(sql);
+      const remoteHostRow = {
+        id: "shared-host",
+        owner_user_id: "host-owner",
+        label: "Shared host",
+        enabled: true,
+        ssh_host: "203.0.113.5",
+        ssh_port: 22,
+        ssh_user: "operator",
+        ssh_auth_mode: "key",
+        ssh_private_key_encrypted: "encrypted-key",
+        ssh_host_key: Buffer.from("SHARED-HOST-KEY").toString("base64"),
+        gateway_host: "203.0.113.5",
+        last_test_status: "ok",
+      };
+      if (text.includes("FROM agents WHERE id = $1")) {
+        return { rows: params[0] === agent.id ? [agent] : [] };
+      }
+      if (text.includes("SELECT rh.*") && text.includes("FROM remote_hosts rh")) {
+        return { rows: grantActive ? [remoteHostRow] : [] };
+      }
+      if (/SELECT \*\s+FROM remote_hosts/.test(text)) {
+        return { rows: [remoteHostRow] };
+      }
+      if (text.includes("FROM remote_hosts WHERE id = $1 AND owner_user_id")) {
+        return { rows: [] };
+      }
+      if (text.includes("FROM workspace_remote_hosts")) {
+        return { rows: grantActive ? [{ allowed: 1 }] : [] };
+      }
+      return { rows: [] };
+    });
+
+    const first = await request(app)
+      .post(`/agents/${agent.id}/gateway/chat`)
+      .send({ message: "before revocation" });
+    expect(first.status).toBe(200);
+    expect(mockFakeWebSocket.instances).toHaveLength(1);
+
+    grantActive = false;
+    const second = await request(app)
+      .post(`/agents/${agent.id}/gateway/chat`)
+      .send({ message: "after revocation" });
+
+    expect(second.status).toBe(502);
+    expect(second.body.details).toMatch(/revoked/i);
+    expect(mockFakeWebSocket.instances).toHaveLength(1);
+    expect(mockFakeWebSocket.instances[0].readyState).toBe(mockFakeWebSocket.CLOSED);
+  });
+
   it("reconnects with a new identity when an agent gateway token rotates", async () => {
     let token = "gateway-token-v1";
     mockDb.query.mockImplementation(async (sql) => {
@@ -610,6 +676,160 @@ describe("gateway proxy control-plane routes", () => {
       "old-gateway-token",
       "new-gateway-token",
     ]);
+  });
+
+  it("retires instead of reconnecting to a stale address when host authorization fails", async () => {
+    const authorizationError = Object.assign(
+      new Error("Unable to verify Remote Docker host access"),
+      { code: "REMOTE_HOST_AUTH_CHECK_FAILED" },
+    );
+    const resolveHost = jest.fn().mockRejectedValue(authorizationError);
+    const authorize = jest.fn().mockResolvedValue(undefined);
+    const onRetire = jest.fn();
+    const connection = new GatewayConnection("203.0.113.5", "gateway-token", 19042, {
+      resolveHost,
+      sourceHost: "remote-host.example",
+      agentId: "agent-remote",
+      authorize,
+    });
+    connection._baseDelay = 0;
+    connection.onRetire(onRetire);
+
+    await expect(connection.reconnect()).rejects.toBe(authorizationError);
+
+    expect(resolveHost).toHaveBeenCalledTimes(1);
+    expect(onRetire).toHaveBeenCalledWith(authorizationError);
+    expect(connection._retired).toBe(true);
+    expect(mockFakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("verifies current authorization before opening a gateway socket", async () => {
+    let releaseInitialAuthorization;
+    const initialAuthorization = new Promise((resolve) => {
+      releaseInitialAuthorization = resolve;
+    });
+    const authorize = jest
+      .fn()
+      .mockImplementationOnce(() => initialAuthorization)
+      .mockResolvedValue(undefined);
+    const connection = new GatewayConnection("203.0.113.5", "gateway-token", 19042, {
+      agentId: "agent-remote",
+      authorize,
+    });
+
+    const connecting = connection.connect();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(authorize).toHaveBeenCalledTimes(1);
+    expect(mockFakeWebSocket.instances).toHaveLength(0);
+
+    releaseInitialAuthorization();
+    await connecting;
+
+    expect(authorize).toHaveBeenCalledTimes(2);
+    expect(mockFakeWebSocket.instances).toHaveLength(1);
+    expect(mockFakeWebSocket.connectParams).toHaveLength(1);
+    expect(mockFakeWebSocket.connectParams[0].auth.password).toBe("gateway-token");
+    connection.retire();
+  });
+
+  it("retires a pending gateway challenge when its Remote Docker grant is revoked", async () => {
+    const authorizationError = Object.assign(
+      new Error("Remote Docker host access has been revoked"),
+      { code: "REMOTE_HOST_ACCESS_REVOKED" },
+    );
+    let releaseChallengeAuthorization;
+    const challengeAuthorization = new Promise((resolve) => {
+      releaseChallengeAuthorization = resolve;
+    });
+    const authorize = jest
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(() => challengeAuthorization)
+      .mockRejectedValueOnce(authorizationError)
+      .mockResolvedValue(undefined);
+    const connection = new GatewayConnection("203.0.113.5", "gateway-token", 19042, {
+      agentId: "agent-remote",
+      authorize,
+    });
+    connection._authorizationRecheckMs = 20;
+
+    const connecting = connection.connect();
+    await expect(connecting).rejects.toBe(authorizationError);
+
+    expect(authorize).toHaveBeenCalledTimes(3);
+    expect(mockFakeWebSocket.instances).toHaveLength(1);
+    expect(mockFakeWebSocket.instances[0].readyState).toBe(mockFakeWebSocket.CLOSED);
+    expect(mockFakeWebSocket.connectParams).toHaveLength(0);
+    expect(connection._retired).toBe(true);
+
+    releaseChallengeAuthorization();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockFakeWebSocket.connectParams).toHaveLength(0);
+  });
+
+  it("rejects an unresolved authorization check immediately when the connection is retired", async () => {
+    let releaseAuthorization;
+    const authorization = new Promise((resolve) => {
+      releaseAuthorization = resolve;
+    });
+    const authorize = jest.fn(() => authorization);
+    const connection = new GatewayConnection("203.0.113.5", "gateway-token", 19042, {
+      agentId: "agent-remote",
+      authorize,
+    });
+    const retiredError = Object.assign(new Error("Remote Docker host access has been revoked"), {
+      code: "REMOTE_HOST_ACCESS_REVOKED",
+    });
+
+    const connecting = connection.connect();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(authorize).toHaveBeenCalledTimes(1);
+    expect(mockFakeWebSocket.instances).toHaveLength(0);
+
+    connection.retire(retiredError);
+    await expect(connecting).rejects.toBe(retiredError);
+    expect(mockFakeWebSocket.instances).toHaveLength(0);
+
+    releaseAuthorization();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockFakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("rejects pending RPCs before a delayed socket close can deliver a late response", async () => {
+    const connection = new GatewayConnection("10.0.0.50", "gateway-token", 19042);
+    await connection.connect();
+
+    const socket = mockFakeWebSocket.instances.at(-1);
+    const originalClose = socket.close.bind(socket);
+    socket.close = jest.fn(() => {
+      socket.readyState = mockFakeWebSocket.CLOSING;
+    });
+
+    const callOutcome = connection.call("pending.rpc", {}, 5000).then(
+      (value) => ({ status: "resolved", value }),
+      (error) => ({ status: "rejected", error }),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const [requestId] = connection.pending.keys();
+    expect(requestId).toBeTruthy();
+
+    const revokedError = Object.assign(new Error("Remote Docker host access has been revoked"), {
+      code: "REMOTE_HOST_ACCESS_REVOKED",
+    });
+    connection.retire(revokedError);
+
+    expect(socket.close).toHaveBeenCalledTimes(1);
+    expect(connection.pending.size).toBe(0);
+    socket.emit(
+      "message",
+      Buffer.from(JSON.stringify({ id: requestId, ok: true, result: { accepted: true } })),
+    );
+
+    await expect(callOutcome).resolves.toEqual({ status: "rejected", error: revokedError });
+
+    socket.close = originalClose;
+    originalClose();
   });
 
   it("records model token metadata from streaming chat final events", async () => {
@@ -1275,6 +1495,37 @@ describe("gateway proxy control-plane routes", () => {
       error: "Chat stream timed out after 10ms",
       runId: "run-1",
     });
+  });
+
+  it("ends an active chat stream immediately when its pooled connection is retired", async () => {
+    app = buildApp({ chatTimeoutMs: 1000 });
+    mockFakeWebSocket.streamMode = true;
+    mockFakeWebSocket.streamEvents = [];
+    mockRunningAgent();
+
+    const responsePromise = postStreamingChat().then((response) => response);
+    for (
+      let attempt = 0;
+      attempt < 20 && mockFakeWebSocket.chatSendRequests.length === 0;
+      attempt++
+    ) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(mockFakeWebSocket.chatSendRequests).toHaveLength(1);
+
+    evictConnection({ id: "agent-1" });
+    const res = await responsePromise;
+    const payloads = parseSsePayloads(res.body);
+
+    expect(payloads).toContainEqual(
+      expect.objectContaining({
+        type: "error",
+        state: "error",
+        code: "GATEWAY_CONNECTION_RETIRED",
+        sessionKey: "main",
+      }),
+    );
+    expect(res.body).not.toContain("CHAT_TIMEOUT");
   });
 
   it("returns 502 when gateway health and status both fail", async () => {

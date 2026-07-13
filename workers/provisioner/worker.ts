@@ -1,5 +1,7 @@
 // @ts-nocheck
 const { UnrecoverableError, Worker } = require("bullmq");
+const { randomBytes } = require("crypto");
+const { decrypt: decryptProvisionerSecret } = require("./crypto");
 const IORedis = require("ioredis");
 const { Client, Pool } = require("pg");
 const {
@@ -38,7 +40,11 @@ const {
   getKubernetesClusterProfile,
   markKubernetesClusterPolicyStatus,
 } = require("../../backend-api/kubernetesClusters");
-const { getRemoteHostProfile } = require("../../backend-api/remoteHosts");
+const {
+  assertRemoteHostAgentUse,
+  isRemoteHostAccessRevokedError,
+} = require("../../backend-api/remoteHosts");
+const containerManager = require("../../backend-api/containerManager");
 const {
   allocateGatewayPort,
   DEFAULT_RANGE_MIN,
@@ -53,10 +59,7 @@ const {
   createWithDockerPortRetry,
   getOccupiedDockerPublishedPorts,
 } = require("./backends/dockerPublishedPorts");
-const {
-  buildIntegrationSyncEntry,
-  decryptSensitiveConfig,
-} = require("../../backend-api/integrations");
+const { getIntegrationEnvVars, getIntegrationsForSync } = require("../../backend-api/integrations");
 const mcpServers = require("../../backend-api/mcpServers");
 const {
   HERMES_INTEGRATIONS_CONFIG_FILE,
@@ -71,14 +74,21 @@ const {
   buildOpenClawAuthProfilesWriteCommand,
   buildOpenClawConfigMergeCommand,
   buildOpenClawCustomProviders,
-  buildOpenClawDefaultModelCommand,
+  buildOpenClawManagedMcpServersCommand,
+  buildOpenClawManagedProviderStateCommand,
   buildOpenClawModelForProvider,
+  buildMcpManagedEnv,
+  buildMcpManagedEnvNames,
+  buildMcpServerEnvAlias,
+  buildMcpServersConfig,
+  encodeOpenClawManagedMcpServers,
+  mapNoraProviderIdToOpenClaw,
+  OPENCLAW_MANAGED_MCP_SERVERS_ENV,
 } = require("../../agent-runtime/lib/runtimeBootstrap");
 const {
   buildHermesRuntimeBootstrapEnv,
 } = require("../../agent-runtime/lib/hermesRuntimeBootstrap");
 const { waitForAgentReadiness } = require("./healthChecks");
-const { buildReadinessWarningDetail, persistReadinessWarning } = require("./readinessWarning");
 const { runDemoActivationCanary } = require("./demoActivationCanary");
 const {
   acquireDedicatedSessionLock,
@@ -98,6 +108,14 @@ const {
   removeSavedSkillEntry,
   normalizeSavedSkillEntry: normalizeSavedClawhubSkillEntry,
 } = require("../../agent-runtime/lib/clawhubReconciliation");
+
+const REMOTE_PROVISIONER_AUTHORIZATION = Symbol("remoteProvisionerAuthorization");
+const REMOTE_PROVISIONER_CLEANUP_EXEC = Symbol("remoteProvisionerCleanupExec");
+const REMOTE_AUTHORIZATION_FAILURE = Symbol("remoteAuthorizationFailure");
+const REMOTE_EXEC_AUTH_RECHECK_MS = 2000;
+const PROVISIONER_EXEC_CLEANUP_TIMEOUT_MS = 8000;
+const PROVISIONER_EXEC_TERMINATION_FAILURE_MARKER = "NORA_EXEC_WRAPPER_TERMINATION_UNCONFIRMED";
+const PROVISIONER_EXEC_TERMINATION_STATE_VERSION = "nora-exec-termination-v1";
 
 // ── Connections ──────────────────────────────────────────
 const connection = createRedisClient(IORedis, process.env, {
@@ -239,6 +257,36 @@ function isFinalDeploymentAttempt(job) {
   return attempt >= maxAttempts;
 }
 
+function isUnrecoverableDeploymentError(error) {
+  return error?.name === "UnrecoverableError";
+}
+
+function resolveCanonicalDeploymentOwnerUserId(jobData = {}, agentRow = {}) {
+  const ownerUserId = String(agentRow.user_id || "").trim();
+  if (!ownerUserId) {
+    const error = new UnrecoverableError(
+      `Deployment job for agent ${jobData.id || agentRow.id || "unknown"} has no canonical owner`,
+    );
+    error.code = "DEPLOYMENT_OWNER_MISSING";
+    throw error;
+  }
+
+  const queuedUserId = jobData.userId;
+  if (queuedUserId !== undefined && queuedUserId !== null) {
+    const normalizedQueuedUserId = String(queuedUserId).trim();
+    if (normalizedQueuedUserId !== ownerUserId) {
+      const error = new UnrecoverableError(
+        `Deployment job owner does not match the persisted owner for agent ${jobData.id || agentRow.id || "unknown"}`,
+      );
+      error.code = "DEPLOYMENT_OWNER_MISMATCH";
+      error.statusCode = 403;
+      throw error;
+    }
+  }
+
+  return ownerUserId;
+}
+
 async function allocateAvailableLocalDockerGatewayPort({
   agentId,
   containerName,
@@ -294,7 +342,8 @@ async function persistProvisioningFailure({
   }
 
   const { attempt, maxAttempts } = deploymentAttemptInfo(job);
-  const terminal = forceTerminal || isFinalDeploymentAttempt(job);
+  const retrySuppressed = forceTerminal || isUnrecoverableDeploymentError(error);
+  const terminal = retrySuppressed || isFinalDeploymentAttempt(job);
   if (!terminal) {
     await queryable.query(
       "UPDATE agents SET status = 'queued' WHERE id = $1 AND status IN ('deploying', 'running', 'warning')",
@@ -316,7 +365,7 @@ async function persistProvisioningFailure({
       agentId,
       attempt,
       maxAttempts,
-      ...(forceTerminal ? { retrySuppressed: true } : {}),
+      ...(retrySuppressed ? { retrySuppressed: true } : {}),
       ...(error?.containerId ? { containerId: String(error.containerId) } : {}),
     }),
   ]);
@@ -573,6 +622,51 @@ const PROVIDER_ENV_MAP = Object.freeze({
   nvidia: "NVIDIA_API_KEY",
   "microsoft-foundry": "MICROSOFT_FOUNDRY_API_KEY",
 });
+const PROVIDER_ENV_NAMES = new Set(Object.values(PROVIDER_ENV_MAP));
+const MANAGED_OPENCLAW_AUTH_PROFILE_IDS = [
+  ...new Set(
+    Object.keys(PROVIDER_ENV_MAP)
+      .map(mapNoraProviderIdToOpenClaw)
+      .filter(Boolean)
+      .map((providerId) => `${providerId}:default`),
+  ),
+];
+const MANAGED_OPENCLAW_MODEL_PROVIDER_IDS = [
+  ...new Set(Object.keys(PROVIDER_ENV_MAP).map(mapNoraProviderIdToOpenClaw).filter(Boolean)),
+];
+
+function buildMcpAliasPlaceholderEntries(enabledIds = []) {
+  const entries = [];
+  for (const provider of mcpServers.normalizeEnabledIds(enabledIds)) {
+    const mapping = mcpServers.SUPPORTED_MCP_PROVIDERS[provider];
+    if (!mapping) continue;
+    const env = {};
+    if (mapping.primaryEnv) env[mapping.primaryEnv] = "managed";
+    for (const envName of Object.values(mapping.configEnv || {})) {
+      if (envName) env[envName] = "managed";
+    }
+    entries.push({ name: provider, npmPackage: "managed-placeholder", env });
+  }
+  return entries;
+}
+
+function buildCredentialManagedEnvNames({
+  runtimeFamily = "openclaw",
+  integrationEnvNames = [],
+  mcpEnabledIds = [],
+  preservedEnvNames = [],
+} = {}) {
+  const preserved = new Set((preservedEnvNames || []).map((name) => String(name || "")));
+  const names = new Set([
+    ...getManagedProviderEnvNames({ runtimeFamily }),
+    ...(integrationEnvNames || []),
+    ...buildMcpManagedEnvNames(buildMcpAliasPlaceholderEntries(mcpEnabledIds)),
+  ]);
+  if (String(runtimeFamily).toLowerCase() === "openclaw") {
+    names.add(OPENCLAW_MANAGED_MCP_SERVERS_ENV);
+  }
+  return [...names].filter((name) => name && !preserved.has(name)).sort();
+}
 
 const PROVIDER_ENV_ENDPOINT_MAP = Object.freeze({
   GEMINI_API_KEY: "https://generativelanguage.googleapis.com/v1beta",
@@ -598,7 +692,7 @@ const PROVIDER_MODEL_DEFAULTS = Object.freeze({
   moonshot: "kimi-k2.5",
   zai: "glm-5",
   minimax: "MiniMax-M2.7",
-  // Bare deployment name — buildDefaultModelCommand prefixes it with the
+  // Bare deployment name — buildDefaultOpenClawModel prefixes it with the
   // OpenClaw provider id (azure-openai-responses) via buildOpenClawModelForProvider.
   "microsoft-foundry": "gpt-5.5-1",
 });
@@ -679,14 +773,9 @@ function buildAuthProfiles(providerKeys = {}) {
 }
 
 function buildAuthProfilesWriteCommand(authProfiles) {
-  return buildOpenClawAuthProfilesWriteCommand(authProfiles);
-}
-
-function buildDefaultModelCommand(defaultProvider = null) {
-  const fullModel = buildDefaultOpenClawModel(defaultProvider);
-  if (!fullModel) return null;
-
-  return buildOpenClawDefaultModelCommand(fullModel);
+  return buildOpenClawAuthProfilesWriteCommand(authProfiles, {
+    managedProfileIds: MANAGED_OPENCLAW_AUTH_PROFILE_IDS,
+  });
 }
 
 function buildDefaultOpenClawModel(defaultProvider = null) {
@@ -856,6 +945,123 @@ function buildHermesEnvWriteCommand(envVars = {}) {
     "chown hermes:hermes /opt/data/.env 2>/dev/null || true",
     "chmod 0600 /opt/data/.env",
   ].join("\n");
+}
+
+function buildHermesSeedError({ agentId, code, message, cause = null } = {}) {
+  const error = new Error(`Hermes seed restore for agent ${agentId || "unknown"} ${message}`);
+  error.code = code;
+  error.agentId = agentId || null;
+  if (cause) error.cause = cause;
+  return error;
+}
+
+async function repairHermesSeedOwnership(provisioner, containerId, agentId) {
+  return runProvisionerExecCommand(
+    provisioner,
+    containerId,
+    "chown -R hermes:hermes /opt/data/workspace",
+    { timeout: 30000, agentId },
+  );
+}
+
+async function seedHermesArchiveForDeployment({
+  agentId,
+  provisioner,
+  containerId,
+  loadManifest = getMigrationManifestForAgent,
+  buildSeedArchive = buildHermesSeedArchive,
+  authorize = assertProvisionerAuthorized,
+  repairOwnership = repairHermesSeedOwnership,
+} = {}) {
+  let migrationManifest;
+  try {
+    migrationManifest = await loadManifest(agentId);
+  } catch (error) {
+    throw buildHermesSeedError({
+      agentId,
+      code: "HERMES_SEED_MANIFEST_LOAD_FAILED",
+      message: `could not load its attached migration manifest: ${error.message}`,
+      cause: error,
+    });
+  }
+
+  if (!migrationManifest) {
+    return { seeded: false, reason: "manifest-missing" };
+  }
+
+  const seedFiles = Array.isArray(migrationManifest?.hermesSeed?.files)
+    ? migrationManifest.hermesSeed.files
+    : [];
+  if (seedFiles.length === 0) return { seeded: false, reason: "archive-empty" };
+
+  let seedArchive;
+  try {
+    seedArchive = await buildSeedArchive(migrationManifest);
+  } catch (error) {
+    throw buildHermesSeedError({
+      agentId,
+      code: "HERMES_SEED_ARCHIVE_BUILD_FAILED",
+      message: `could not build its archive: ${error.message}`,
+      cause: error,
+    });
+  }
+
+  if (!seedArchive) {
+    throw buildHermesSeedError({
+      agentId,
+      code: "HERMES_SEED_ARCHIVE_EMPTY",
+      message: "produced no archive for its attached workspace files",
+    });
+  }
+
+  if (
+    !provisioner?.docker ||
+    typeof provisioner.docker.getContainer !== "function" ||
+    typeof containerId !== "string" ||
+    containerId.length === 0
+  ) {
+    throw buildHermesSeedError({
+      agentId,
+      code: "HERMES_SEED_RUNTIME_UNAVAILABLE",
+      message: "could not resolve the created runtime for archive upload",
+    });
+  }
+
+  let container;
+  try {
+    await authorize(provisioner);
+    container = provisioner.docker.getContainer(containerId);
+    if (!container || typeof container.putArchive !== "function") {
+      throw new Error("Provisioner did not return a writable Docker container");
+    }
+    await container.putArchive(seedArchive, { path: "/" });
+  } catch (error) {
+    throwIfRemoteAuthorizationFailure(error);
+    throw buildHermesSeedError({
+      agentId,
+      code: "HERMES_SEED_ARCHIVE_UPLOAD_FAILED",
+      message: `could not upload its archive: ${error.message}`,
+      cause: error,
+    });
+  }
+
+  try {
+    await repairOwnership(provisioner, containerId, agentId);
+  } catch (error) {
+    throwIfRemoteAuthorizationFailure(error);
+    throw buildHermesSeedError({
+      agentId,
+      code: "HERMES_SEED_OWNERSHIP_REPAIR_FAILED",
+      message: `could not repair restored workspace ownership: ${error.message}`,
+      cause: error,
+    });
+  }
+
+  // The upload and ownership repair may outlive a Remote Docker grant.
+  // Revalidate before accepting restored files so a mid-transfer revocation
+  // enters the normal provisioning cleanup path instead of finalizing runtime.
+  await authorize(provisioner);
+  return { seeded: true, reason: null };
 }
 
 function buildHermesPythonCommand(script) {
@@ -1052,15 +1258,67 @@ async function fetchDeploymentProvider(userId, providerId = null) {
   }
 }
 
-async function fetchEffectiveProviderState(userId, providerId = null) {
-  const [envVars, defaultProvider] = await Promise.all([
-    fetchUserLlmEnvVars(userId, providerId),
-    fetchDeploymentProvider(userId, providerId),
-  ]);
+async function fetchEffectiveProviderState(
+  userId,
+  providerId = null,
+  agentId = null,
+  { runtimeFamily = "openclaw" } = {},
+) {
+  const [providerEnvVars, defaultProvider, integrationEnvVars, mcpRuntimeState, integrationSync] =
+    await Promise.all([
+      fetchUserLlmEnvVars(userId, providerId),
+      fetchDeploymentProvider(userId, providerId),
+      agentId ? getIntegrationEnvVars(agentId) : Promise.resolve({}),
+      agentId && String(runtimeFamily).toLowerCase() === "openclaw"
+        ? mcpServers.getEnabledMcpRuntimeState(agentId)
+        : Promise.resolve({ enabledIds: [], entries: [], env: {}, managedEnvNames: [] }),
+      agentId ? getIntegrationsForSync(agentId) : Promise.resolve([]),
+    ]);
+  const integrationLlmEnvVars = Object.fromEntries(
+    Object.entries(integrationEnvVars || {}).filter(([name]) => PROVIDER_ENV_NAMES.has(name)),
+  );
+  // Explicit llm_provider rows remain authoritative when an integration emits
+  // the same env name. Integration-backed LLM auth still participates in the
+  // fingerprint so connect/remove cannot race deployment finalization.
+  const envVars = normalizeEnvValueMap({ ...integrationLlmEnvVars, ...providerEnvVars });
+  const mcpEntries = Array.isArray(mcpRuntimeState?.entries) ? mcpRuntimeState.entries : [];
+  const mcpEnvVars = buildMcpManagedEnv(mcpEntries);
+  const mcpServersConfig = buildMcpServersConfig(mcpEntries);
+  const credentialEnvVars = normalizeEnvValueMap({
+    ...(integrationEnvVars || {}),
+    ...mcpEnvVars,
+    ...envVars,
+  });
+  const managedCredentialEnvNames = buildCredentialManagedEnvNames({
+    runtimeFamily,
+    integrationEnvNames: Object.keys(integrationEnvVars || {}),
+    mcpEnabledIds: mcpRuntimeState?.enabledIds || [],
+  });
+  const normalizedIntegrationSync = (Array.isArray(integrationSync) ? integrationSync : [])
+    .slice()
+    .sort((left, right) => {
+      const providerOrder = String(left?.provider || "").localeCompare(
+        String(right?.provider || ""),
+      );
+      if (providerOrder !== 0) return providerOrder;
+      return String(left?.id || "").localeCompare(String(right?.id || ""));
+    });
   return {
     envVars,
+    integrationEnvVars: normalizeEnvValueMap(integrationEnvVars || {}),
+    mcpEnvVars,
+    mcpServers: mcpServersConfig,
+    mcpEnabledIds: mcpRuntimeState?.enabledIds || [],
+    integrationSync: normalizedIntegrationSync,
+    credentialEnvVars,
+    managedCredentialEnvNames,
     defaultProvider,
-    fingerprint: fingerprintEffectiveProviderState({ envVars, defaultProvider }),
+    fingerprint: fingerprintEffectiveProviderState({
+      envVars: credentialEnvVars,
+      defaultProvider,
+      mcpServers: mcpServersConfig,
+      integrations: normalizedIntegrationSync,
+    }),
   };
 }
 
@@ -1079,48 +1337,202 @@ function buildKubernetesProviderEnv(runtimeFamily, defaultProvider, llmEnvVars =
   };
 }
 
-async function runRuntimeCommand(agent, command, { timeout = 30000 } = {}) {
+async function fetchWithProvisionerAuthorization(
+  provisioner,
+  resource,
+  init = {},
+  { authorizationRecheckMs = REMOTE_EXEC_AUTH_RECHECK_MS } = {},
+) {
+  const authorize = provisioner?.[REMOTE_PROVISIONER_AUTHORIZATION];
+  if (typeof authorize !== "function") {
+    const response = await fetch(resource, init);
+    if (!response?.ok) {
+      throw new Error(`Runtime request failed with HTTP ${response?.status ?? "unknown"}`);
+    }
+    return response;
+  }
+
+  await authorize();
+
+  const controller = new AbortController();
+  const callerSignal = init?.signal;
+  const abortFromCaller = () => controller.abort(callerSignal?.reason);
+  if (callerSignal) {
+    if (callerSignal.aborted) abortFromCaller();
+    else callerSignal.addEventListener("abort", abortFromCaller, { once: true });
+  }
+
+  let authorizationError = null;
+  let authorizationInFlight = null;
+  let requestSettled = false;
+  const recheckMs = Math.max(1, Number(authorizationRecheckMs) || REMOTE_EXEC_AUTH_RECHECK_MS);
+  const checkAuthorization = () => {
+    if (requestSettled || authorizationInFlight) return authorizationInFlight;
+    authorizationInFlight = Promise.resolve()
+      .then(() => authorize())
+      .catch((error) => {
+        authorizationError = error;
+        if (!requestSettled) controller.abort(error);
+      })
+      .finally(() => {
+        authorizationInFlight = null;
+      });
+    return authorizationInFlight;
+  };
+  const authorizationInterval = setInterval(() => {
+    void checkAuthorization();
+  }, recheckMs);
+  authorizationInterval.unref?.();
+
+  try {
+    const response = await fetch(resource, {
+      ...init,
+      signal: controller.signal,
+    });
+    requestSettled = true;
+    clearInterval(authorizationInterval);
+    const pendingAuthorization = authorizationInFlight;
+    if (pendingAuthorization) await pendingAuthorization;
+    if (authorizationError) throw authorizationError;
+
+    // A response can race the periodic check. Revalidate once more before the
+    // caller accepts the runtime mutation as successful.
+    await authorize();
+    if (!response?.ok) {
+      throw new Error(`Runtime request failed with HTTP ${response?.status ?? "unknown"}`);
+    }
+    return response;
+  } catch (error) {
+    if (authorizationError) throw authorizationError;
+    throw error;
+  } finally {
+    requestSettled = true;
+    clearInterval(authorizationInterval);
+    if (callerSignal && !callerSignal.aborted) {
+      callerSignal.removeEventListener("abort", abortFromCaller);
+    }
+  }
+}
+
+async function runRuntimeCommand(
+  agent,
+  command,
+  {
+    timeout = 30000,
+    beforeAttempt = null,
+    authorizationRecheckMs = REMOTE_EXEC_AUTH_RECHECK_MS,
+  } = {},
+) {
   const runtimeUrl = runtimeUrlForAgent(agent, "/exec");
   if (!runtimeUrl) {
     throw new Error("Agent runtime endpoint unavailable");
   }
 
+  if (typeof beforeAttempt === "function") {
+    await beforeAttempt();
+  }
+
+  const controller = new AbortController();
+  let authorizationError = null;
+  let authorizationInFlight = null;
+  let settled = false;
+  const checkAuthorization = () => {
+    if (settled || authorizationInFlight || authorizationError) {
+      return authorizationInFlight;
+    }
+    authorizationInFlight = Promise.resolve()
+      .then(() => beforeAttempt())
+      .catch((error) => {
+        authorizationError = error;
+        if (!settled) controller.abort(error);
+      })
+      .finally(() => {
+        authorizationInFlight = null;
+      });
+    return authorizationInFlight;
+  };
+  const authorizationInterval =
+    typeof beforeAttempt === "function"
+      ? setInterval(
+          () => {
+            void checkAuthorization();
+          },
+          Math.max(1, Number(authorizationRecheckMs) || REMOTE_EXEC_AUTH_RECHECK_MS),
+        )
+      : null;
+
   // gateway_token is encrypted at rest; decrypt() is transparent to legacy
   // plaintext, so it is safe whether the agent row was freshly selected
   // (encrypted) or carries an in-memory plaintext token.
-  const { decrypt } = require("./crypto");
-  const response = await fetch(runtimeUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...buildRuntimeAuthHeaders(
-        agent && agent.gateway_token ? decrypt(agent.gateway_token) : null,
-      ),
-    },
-    body: JSON.stringify({
-      command,
-      timeout,
-    }),
-  });
-
-  let payload = {};
   try {
-    payload = await response.json();
-  } catch {
-    payload = {};
-  }
+    const response = await fetch(runtimeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...buildRuntimeAuthHeaders(
+          agent && agent.gateway_token ? decryptProvisionerSecret(agent.gateway_token) : null,
+        ),
+      },
+      body: JSON.stringify({
+        command,
+        timeout,
+      }),
+      signal: controller.signal,
+    });
 
-  if (!response.ok) {
-    throw new Error(payload.error || `Runtime command failed with HTTP ${response.status}`);
-  }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (cause) {
+      const error = new Error("Runtime command returned malformed JSON");
+      error.code = "RUNTIME_COMMAND_RESPONSE_INVALID";
+      error.cause = cause;
+      throw error;
+    }
 
-  if ((payload.exitCode || 0) !== 0) {
-    throw new Error(
-      payload.stderr || payload.stdout || `Runtime command exited with code ${payload.exitCode}`,
-    );
-  }
+    // Stop new checks, wait for one that raced the response, and require one
+    // final positive authorization result before accepting the mutation.
+    settled = true;
+    if (authorizationInterval) clearInterval(authorizationInterval);
+    const pendingAuthorization = authorizationInFlight;
+    if (pendingAuthorization) await pendingAuthorization;
+    if (authorizationError) throw authorizationError;
+    if (typeof beforeAttempt === "function") await beforeAttempt();
 
-  return payload;
+    if (!response.ok) {
+      throw new Error(
+        (payload && typeof payload === "object" && !Array.isArray(payload) && payload.error) ||
+          `Runtime command failed with HTTP ${response.status}`,
+      );
+    }
+
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      const error = new Error("Runtime command returned an invalid response body");
+      error.code = "RUNTIME_COMMAND_RESPONSE_INVALID";
+      throw error;
+    }
+    if (!Number.isInteger(payload.exitCode)) {
+      const error = new Error("Runtime command did not confirm an integer exit code");
+      error.code = "RUNTIME_COMMAND_EXIT_UNCONFIRMED";
+      throw error;
+    }
+    if (payload.exitCode !== 0) {
+      const error = new Error(
+        payload.stderr || payload.stdout || `Runtime command exited with code ${payload.exitCode}`,
+      );
+      error.code = "RUNTIME_COMMAND_FAILED";
+      error.exitCode = payload.exitCode;
+      throw error;
+    }
+
+    return payload;
+  } catch (error) {
+    if (authorizationError) throw authorizationError;
+    throw error;
+  } finally {
+    settled = true;
+    if (authorizationInterval) clearInterval(authorizationInterval);
+  }
 }
 
 function appendChunkTail(chunks, chunk, state, maxBytes) {
@@ -1163,6 +1575,259 @@ function sanitizeExecOutput(output = "") {
     .trim();
 }
 
+function provisionerExecStateDir(commandId) {
+  if (!/^[a-f0-9]{32}$/.test(String(commandId || ""))) {
+    throw new Error("Invalid provisioner exec command identity");
+  }
+  return `/tmp/.nora-worker-exec-${commandId}`;
+}
+
+function buildTrackedProvisionerCommand(command, commandId) {
+  const stateDir = provisionerExecStateDir(commandId);
+  const trackedRunner = [
+    "set +e",
+    "umask 077",
+    "state_dir=$1",
+    "command_id=$2",
+    "command=$3",
+    "command_pgid=$$",
+    'command_identity="$(awk \'{print $5 " " $22}\' "/proc/$$/stat" 2>/dev/null || true)"',
+    "set -- $command_identity",
+    '[ "$#" -eq 2 ] || { rm -rf "$state_dir"; exit 125; }',
+    "command_group=$1",
+    "command_start=$2",
+    'case "$command_group" in ""|*[!0-9]*) rm -rf "$state_dir"; exit 125 ;; esac',
+    'case "$command_start" in ""|*[!0-9]*) rm -rf "$state_dir"; exit 125 ;; esac',
+    '[ "$command_group" = "$command_pgid" ] || { rm -rf "$state_dir"; exit 125; }',
+    'pid_tmp="$state_dir/pid.tmp.$$"',
+    'if ! printf "nora-exec-v1 %s %s %s\\n" "$command_id" "$command_pgid" "$command_start" > "$pid_tmp" || ! mv -f "$pid_tmp" "$state_dir/pid"; then rm -f "$pid_tmp"; rm -rf "$state_dir"; exit 125; fi',
+    'exec /bin/sh -lc "$command"',
+  ].join("; ");
+  return [
+    "set +e",
+    "umask 077",
+    `command_id=${shellSingleQuote(commandId)}`,
+    `state_dir=${shellSingleQuote(stateDir)}`,
+    'mkdir -m 700 "$state_dir" || exit 125',
+    'setsid_path="$(command -v setsid 2>/dev/null || true)"',
+    '[ -n "$setsid_path" ] || { rm -rf "$state_dir"; echo "setsid is required for tracked runtime commands" >&2; exit 125; }',
+    `"$setsid_path" /bin/sh -c ${shellSingleQuote(trackedRunner)} nora-tracked-command "$state_dir" ${shellSingleQuote(commandId)} ${shellSingleQuote(command)} &`,
+    "command_pgid=$!",
+    'case "$command_pgid" in ""|*[!0-9]*) rm -rf "$state_dir"; exit 125 ;; esac',
+    'pid_file="$state_dir/pid"',
+    "attempt=0",
+    'while [ ! -s "$pid_file" ] && kill -0 "$command_pgid" 2>/dev/null && [ "$attempt" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done',
+    '[ -f "$pid_file" ] && [ ! -L "$pid_file" ] && [ -r "$pid_file" ] || { wait "$command_pgid" 2>/dev/null || true; rm -rf "$state_dir"; exit 125; }',
+    'pid_state="$(cat "$pid_file" 2>/dev/null)" || { wait "$command_pgid" 2>/dev/null || true; rm -rf "$state_dir"; exit 125; }',
+    "old_ifs=$IFS",
+    "IFS=' '",
+    "set -f",
+    "set -- $pid_state",
+    "set +f",
+    "IFS=$old_ifs",
+    '[ "$#" -eq 4 ] && [ "$1" = "nora-exec-v1" ] && [ "$2" = "$command_id" ] && [ "$3" = "$command_pgid" ] || { wait "$command_pgid" 2>/dev/null || true; rm -rf "$state_dir"; exit 125; }',
+    "expected_start=$4",
+    'case "$expected_start" in ""|*[!0-9]*) wait "$command_pgid" 2>/dev/null || true; rm -rf "$state_dir"; exit 125 ;; esac',
+    'verify_group_identity() { if [ -r "/proc/$command_pgid/stat" ]; then current_identity="$(awk \'{print $5 " " $22}\' "/proc/$command_pgid/stat" 2>/dev/null || true)"; set -- $current_identity; [ "$#" -eq 2 ] && [ "$1" = "$command_pgid" ] && [ "$2" = "$expected_start" ] || return 76; elif [ -e "/proc/$command_pgid" ]; then return 76; fi; return 0; }',
+    'terminate_group() { verify_group_identity || return 76; if ! kill -TERM "-$command_pgid" 2>/dev/null && kill -0 "-$command_pgid" 2>/dev/null; then return 73; fi; sleep 0.2; if kill -0 "-$command_pgid" 2>/dev/null; then verify_group_identity || return 76; if ! kill -KILL "-$command_pgid" 2>/dev/null && kill -0 "-$command_pgid" 2>/dev/null; then return 74; fi; fi; attempt=0; while kill -0 "-$command_pgid" 2>/dev/null && [ "$attempt" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done; kill -0 "-$command_pgid" 2>/dev/null && return 75; return 0; }',
+    `record_termination_failure() { termination_tmp="$state_dir/termination.tmp.$$"; if ! printf '${PROVISIONER_EXEC_TERMINATION_STATE_VERSION} %s %s %s\\n' "$command_id" "$command_status" "$termination_status" > "$termination_tmp" || ! mv -f "$termination_tmp" "$state_dir/termination"; then rm -f "$termination_tmp"; fi; printf '\\n${PROVISIONER_EXEC_TERMINATION_FAILURE_MARKER}:%s:%s:%s\\n' "$command_id" "$command_status" "$termination_status" >&2; }`,
+    'wait "$command_pgid"',
+    "command_status=$?",
+    'if kill -0 "-$command_pgid" 2>/dev/null; then terminate_group; termination_status=$?; if [ "$termination_status" -ne 0 ]; then record_termination_failure; exit "$termination_status"; fi; fi',
+    'rm -rf "$state_dir"',
+    'exit "$command_status"',
+  ].join("\n");
+}
+
+function buildProvisionerExecCleanupCommand(commandId) {
+  const stateDir = provisionerExecStateDir(commandId);
+  return [
+    "set +e",
+    `command_id=${shellSingleQuote(commandId)}`,
+    `state_dir=${shellSingleQuote(stateDir)}`,
+    'pid_file="$state_dir/pid"',
+    "attempt=0",
+    'while [ ! -s "$pid_file" ] && [ "$attempt" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done',
+    '[ -f "$pid_file" ] && [ ! -L "$pid_file" ] && [ -r "$pid_file" ] || { echo "tracked command pid state unavailable" >&2; exit 70; }',
+    'pid_size="$(wc -c < "$pid_file" 2>/dev/null || true)"',
+    'case "$pid_size" in ""|*[!0-9]*) echo "tracked command pid state unreadable" >&2; exit 71 ;; esac',
+    '[ "$pid_size" -le 160 ] || { echo "tracked command pid state malformed" >&2; exit 71; }',
+    'pid_state="$(cat "$pid_file" 2>/dev/null)" || { echo "tracked command pid state unreadable" >&2; exit 71; }',
+    "old_ifs=$IFS",
+    "IFS=' '",
+    "set -f",
+    "set -- $pid_state",
+    "set +f",
+    "IFS=$old_ifs",
+    '[ "$#" -eq 4 ] || { echo "tracked command pid state malformed" >&2; exit 71; }',
+    '[ "$1" = "nora-exec-v1" ] && [ "$2" = "$command_id" ] || { echo "tracked command pid state identity mismatch" >&2; exit 72; }',
+    "command_pgid=$3",
+    "expected_start=$4",
+    '[ "$pid_state" = "nora-exec-v1 $command_id $command_pgid $expected_start" ] || { echo "tracked command pid state malformed" >&2; exit 71; }',
+    'case "$command_pgid" in ""|*[!0-9]*) echo "tracked command pgid malformed" >&2; exit 71 ;; esac',
+    'case "$expected_start" in ""|*[!0-9]*) echo "tracked command start time malformed" >&2; exit 71 ;; esac',
+    '[ "$command_pgid" -gt 1 ] || { echo "tracked command pgid unsafe" >&2; exit 71; }',
+    'if [ -r "/proc/$command_pgid/stat" ]; then current_identity="$(awk \'{print $5 " " $22}\' "/proc/$command_pgid/stat" 2>/dev/null || true)"; set -- $current_identity; [ "$#" -eq 2 ] && [ "$1" = "$command_pgid" ] && [ "$2" = "$expected_start" ] || { echo "tracked command process group identity mismatch" >&2; exit 72; }; elif [ -e "/proc/$command_pgid" ]; then echo "tracked command process group identity unavailable" >&2; exit 72; fi',
+    'if kill -0 "-$command_pgid" 2>/dev/null && ! kill -TERM "-$command_pgid" 2>/dev/null && kill -0 "-$command_pgid" 2>/dev/null; then echo "tracked command process group rejected SIGTERM" >&2; exit 73; fi',
+    "sleep 1",
+    'if kill -0 "-$command_pgid" 2>/dev/null; then if [ -r "/proc/$command_pgid/stat" ]; then delayed_identity="$(awk \'{print $5 " " $22}\' "/proc/$command_pgid/stat" 2>/dev/null || true)"; set -- $delayed_identity; [ "$#" -eq 2 ] && [ "$1" = "$command_pgid" ] && [ "$2" = "$expected_start" ] || { echo "tracked command process group identity changed before SIGKILL" >&2; exit 76; }; elif [ -e "/proc/$command_pgid" ]; then echo "tracked command process group identity unavailable before SIGKILL" >&2; exit 76; fi; if ! kill -KILL "-$command_pgid" 2>/dev/null && kill -0 "-$command_pgid" 2>/dev/null; then echo "tracked command process group rejected SIGKILL" >&2; exit 74; fi; fi',
+    "attempt=0",
+    'while kill -0 "-$command_pgid" 2>/dev/null && [ "$attempt" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done',
+    'if kill -0 "-$command_pgid" 2>/dev/null; then echo "tracked command process group survived SIGKILL" >&2; exit 75; fi',
+    'rm -rf "$state_dir"',
+    `printf '%s\\n' ${shellSingleQuote(`NORA_EXEC_CLEANUP_OK:${commandId}`)}`,
+    "exit 0",
+  ].join("\n");
+}
+
+async function waitForProvisionerCleanupExec(execResult, expectedMarker) {
+  if (!execResult?.exec || !execResult?.stream) {
+    throw new Error("Provisioner command cleanup exec unavailable");
+  }
+  const output = [];
+  const capture = (chunk) => {
+    if (!chunk) return;
+    output.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  };
+  const stream = execResult.stream;
+  stream.on("data", capture);
+  if (typeof stream.read === "function") {
+    let buffered;
+    while ((buffered = stream.read()) !== null) capture(buffered);
+  }
+
+  const streamEnded = () => Boolean(stream.readableEnded || stream.closed || stream.destroyed);
+  if (!streamEnded()) {
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanupListeners = () => {
+        stream.removeListener("end", finish);
+        stream.removeListener("close", finish);
+        stream.removeListener("error", onError);
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanupListeners();
+        try {
+          stream.destroy();
+        } catch {
+          // Best-effort cleanup stream teardown.
+        }
+        reject(new Error("Provisioner command cleanup timed out"));
+      }, PROVISIONER_EXEC_CLEANUP_TIMEOUT_MS);
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanupListeners();
+        resolve();
+      };
+      const onError = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanupListeners();
+        reject(error);
+      };
+      stream.once("end", finish);
+      stream.once("close", finish);
+      stream.once("error", onError);
+      if (streamEnded()) finish();
+      else stream.resume?.();
+    });
+  }
+
+  if (typeof stream.read === "function") {
+    let buffered;
+    while ((buffered = stream.read()) !== null) capture(buffered);
+  }
+
+  const status = await execResult.exec.inspect();
+  if (!status || status.Running === true || status.ExitCode !== 0) {
+    throw new Error(
+      `Provisioner command cleanup exited without confirmation (exit ${status?.ExitCode ?? "unknown"})`,
+    );
+  }
+  if (!Buffer.concat(output).toString("utf8").includes(expectedMarker)) {
+    throw new Error("Provisioner command cleanup confirmation marker was missing");
+  }
+}
+
+async function startFixedProvisionerExecCleanup(provisioner, containerId, commandId, agentId) {
+  const cleanupCommand = buildProvisionerExecCleanupCommand(commandId);
+  return provisioner.exec(containerId, {
+    cmd: ["/bin/sh", "-c", cleanupCommand],
+    tty: false,
+    env: [],
+    ...(agentId ? { agentId } : {}),
+  });
+}
+
+async function terminateTrackedProvisionerCommand(provisioner, containerId, commandId, agentId) {
+  const cleanupExec = provisioner?.[REMOTE_PROVISIONER_CLEANUP_EXEC];
+  const execResult =
+    typeof cleanupExec === "function"
+      ? await cleanupExec(containerId, commandId, agentId)
+      : await startFixedProvisionerExecCleanup(provisioner, containerId, commandId, agentId);
+  await waitForProvisionerCleanupExec(execResult, `NORA_EXEC_CLEANUP_OK:${commandId}`);
+}
+
+function buildProvisionerExecTerminationUnconfirmedError(originalError, cleanupError) {
+  const error = new Error("Provisioner command termination could not be confirmed", {
+    cause: originalError,
+  });
+  error.code = "PROVISIONER_EXEC_TERMINATION_UNCONFIRMED";
+  error.cleanupError = cleanupError;
+  return error;
+}
+
+function extractTrackedProvisionerTerminationFailure(output, protocolOutput, commandId) {
+  const markerPrefix = `${PROVISIONER_EXEC_TERMINATION_FAILURE_MARKER}:${commandId}:`;
+  const protocolLines = String(protocolOutput || "")
+    .split("\n")
+    .map((line) => line.trim());
+  let failure = null;
+
+  for (const line of protocolLines) {
+    if (!line.startsWith(markerPrefix)) continue;
+    const fields = line.slice(markerPrefix.length).split(":");
+    if (fields.length !== 2) continue;
+    const commandStatus = Number(fields[0]);
+    const terminationStatus = Number(fields[1]);
+    if (
+      Number.isInteger(commandStatus) &&
+      commandStatus >= 0 &&
+      commandStatus <= 255 &&
+      Number.isInteger(terminationStatus) &&
+      terminationStatus >= 73 &&
+      terminationStatus <= 76
+    ) {
+      failure = { commandStatus, terminationStatus, marker: line };
+    }
+  }
+
+  if (!failure) return null;
+  const cleanOutput = String(output || "")
+    .split("\n")
+    .filter((line) => line.trim() !== failure.marker)
+    .join("\n")
+    .trim();
+  return { ...failure, output: cleanOutput };
+}
+
+function buildProvisionerCommandExitError(exitCode, output = "", timeout = null) {
+  if (exitCode === 124) {
+    return new Error(
+      timeout == null
+        ? "Container command timed out inside the runtime"
+        : `Container command timed out after ${timeout}ms`,
+    );
+  }
+  return new Error(String(output || "").trim() || `Container command exited with code ${exitCode}`);
+}
+
 /**
  * Execute a shell command inside an already-running runtime container.
  *
@@ -1189,8 +1854,10 @@ async function runProvisionerExecCommand(
   command,
   { timeout = 30000, maxOutputBytes = 65536, tty = false, env = [], agentId = null } = {},
 ) {
+  const commandId = randomBytes(16).toString("hex");
+  const trackedCommand = buildTrackedProvisionerCommand(command, commandId);
   const execResult = await provisioner.exec(containerId, {
-    cmd: ["/bin/sh", "-lc", command],
+    cmd: ["/bin/sh", "-c", trackedCommand],
     tty,
     env,
     ...(agentId ? { agentId } : {}),
@@ -1199,21 +1866,41 @@ async function runProvisionerExecCommand(
     throw new Error("Container exec unavailable");
   }
 
-  const output = await new Promise((resolve, reject) => {
+  const { output, protocolOutput } = await new Promise((resolve, reject) => {
     const chunks = [];
     const state = { totalBytes: 0 };
+    const protocolChunks = [];
+    const protocolState = { totalBytes: 0 };
     let settled = false;
     let inspectInterval = null;
-    const timer = setTimeout(() => {
+    let inspectInFlight = false;
+    let streamBoundaryCheckPromise = null;
+    let lastAuthorizationCheckAt = Date.now();
+
+    const fail = (error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       if (inspectInterval) clearInterval(inspectInterval);
       try {
         execResult.stream.destroy();
       } catch {
         // Ignore stream teardown failures.
       }
-      reject(new Error(`Container command timed out after ${timeout}ms`));
+      Promise.resolve(
+        terminateTrackedProvisionerCommand(provisioner, containerId, commandId, agentId),
+      )
+        .then(() => reject(error))
+        .catch((cleanupError) => {
+          console.warn(
+            `[provisioner] Failed to terminate tracked command ${commandId} in ${containerId}: ${cleanupError.message}`,
+          );
+          reject(buildProvisionerExecTerminationUnconfirmedError(error, cleanupError));
+        });
+    };
+
+    const timer = setTimeout(() => {
+      fail(new Error(`Container command timed out after ${timeout}ms`));
     }, timeout);
 
     const finish = () => {
@@ -1221,47 +1908,117 @@ async function runProvisionerExecCommand(
       settled = true;
       clearTimeout(timer);
       if (inspectInterval) clearInterval(inspectInterval);
-      resolve(sanitizeExecOutput(Buffer.concat(chunks).toString("utf8")));
+      resolve({
+        output: sanitizeExecOutput(Buffer.concat(chunks).toString("utf8")),
+        protocolOutput: sanitizeExecOutput(Buffer.concat(protocolChunks).toString("utf8")),
+      });
+    };
+
+    const finishFromStreamBoundary = () => {
+      if (settled || streamBoundaryCheckPromise) return;
+      streamBoundaryCheckPromise = (async () => {
+        try {
+          // An attached Docker/SSH stream can end because the transport was
+          // lost while the exec is still running. Treat the stream only as the
+          // output-drain boundary; require Docker to confirm process exit
+          // before accepting the command as complete.
+          await assertProvisionerAuthorized(provisioner);
+          const status = await execResult.exec.inspect();
+          if (!status || status.Running !== false || status.ExitCode == null) {
+            const error = new Error(
+              "Provisioner command stream ended before tracked command exit was confirmed",
+            );
+            error.code = "PROVISIONER_EXEC_EXIT_UNCONFIRMED";
+            fail(error);
+            return;
+          }
+          finish();
+        } catch (error) {
+          fail(error);
+        } finally {
+          streamBoundaryCheckPromise = null;
+        }
+      })();
     };
 
     execResult.stream.on("data", (chunk) => {
       appendChunkTail(chunks, chunk, state, maxOutputBytes);
+      appendChunkTail(protocolChunks, chunk, protocolState, 1024);
     });
-    execResult.stream.on("end", finish);
-    execResult.stream.on("close", finish);
+    execResult.stream.on("end", finishFromStreamBoundary);
+    execResult.stream.on("close", finishFromStreamBoundary);
     execResult.stream.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (inspectInterval) clearInterval(inspectInterval);
-      reject(error);
+      fail(error);
     });
 
     inspectInterval = setInterval(async () => {
-      if (settled) return;
+      if (settled || inspectInFlight) return;
+      inspectInFlight = true;
       try {
-        const status = await execResult.exec.inspect();
-        if (status && status.Running === false && status.ExitCode != null) {
-          finish();
+        if (Date.now() - lastAuthorizationCheckAt >= REMOTE_EXEC_AUTH_RECHECK_MS) {
+          await assertProvisionerAuthorized(provisioner);
+          lastAuthorizationCheckAt = Date.now();
         }
+        // Keep the stream as the completion boundary. Docker can report the
+        // exec as stopped before its final supervisor marker has drained; an
+        // inspect-driven finish would lose the wrapper's termination evidence.
+        await execResult.exec.inspect();
       } catch (error) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (inspectInterval) clearInterval(inspectInterval);
-        reject(error);
+        fail(error);
+      } finally {
+        inspectInFlight = false;
       }
     }, 500);
   });
 
+  const terminationFailure = extractTrackedProvisionerTerminationFailure(
+    output,
+    protocolOutput,
+    commandId,
+  );
+  if (terminationFailure) {
+    const originalError =
+      terminationFailure.commandStatus === 0
+        ? new Error(
+            `Tracked command wrapper could not confirm process-group termination (exit ${terminationFailure.terminationStatus})`,
+          )
+        : buildProvisionerCommandExitError(
+            terminationFailure.commandStatus,
+            terminationFailure.output,
+            timeout,
+          );
+    originalError.exitCode = terminationFailure.commandStatus;
+    originalError.terminationExitCode = terminationFailure.terminationStatus;
+    try {
+      await terminateTrackedProvisionerCommand(provisioner, containerId, commandId, agentId);
+    } catch (cleanupError) {
+      throw buildProvisionerExecTerminationUnconfirmedError(originalError, cleanupError);
+    }
+
+    await assertProvisionerAuthorized(provisioner);
+    if (terminationFailure.commandStatus !== 0) throw originalError;
+    return { exitCode: 0, output: terminationFailure.output };
+  }
+
+  // The exec handle talks to the remote Docker daemon too. Re-check after a
+  // long command before inspecting its exit status so a mid-command revocation
+  // cannot be followed by another credentialed Docker request.
+  await assertProvisionerAuthorized(provisioner);
   const inspectResult = await execResult.exec.inspect();
+  if (!inspectResult || inspectResult.Running !== false || inspectResult.ExitCode == null) {
+    const originalError = new Error(
+      "Provisioner command exit could not be confirmed after its output stream ended",
+    );
+    originalError.code = "PROVISIONER_EXEC_EXIT_UNCONFIRMED";
+    try {
+      await terminateTrackedProvisionerCommand(provisioner, containerId, commandId, agentId);
+    } catch (cleanupError) {
+      throw buildProvisionerExecTerminationUnconfirmedError(originalError, cleanupError);
+    }
+    throw originalError;
+  }
   const exitCode = inspectResult?.ExitCode ?? 0;
-  if (exitCode === 124) {
-    throw new Error(`Container command timed out after ${timeout}ms`);
-  }
-  if (exitCode !== 0) {
-    throw new Error(output.trim() || `Container command exited with code ${exitCode}`);
-  }
+  if (exitCode !== 0) throw buildProvisionerCommandExitError(exitCode, output, timeout);
 
   return { exitCode, output };
 }
@@ -1320,10 +2077,26 @@ async function reconcileRuntimeLlmAuth({
   gatewayPort,
   gatewayToken,
   bootstrappedProviderFingerprint,
+  preservedEnvNames = [],
 } = {}) {
-  const providerState = await fetchEffectiveProviderState(userId, llmProviderId);
-  const { envVars: llmEnvVars, defaultProvider, fingerprint: providerFingerprint } = providerState;
-  if (!shouldReconcileEffectiveProviderState(bootstrappedProviderFingerprint, providerState)) {
+  const providerState = await fetchEffectiveProviderState(userId, llmProviderId, agentId, {
+    runtimeFamily,
+  });
+  const {
+    envVars: llmEnvVars,
+    integrationEnvVars,
+    mcpEnvVars,
+    mcpServers: desiredMcpServers,
+    integrationSync,
+    managedCredentialEnvNames,
+    defaultProvider,
+    fingerprint: providerFingerprint,
+  } = providerState;
+  const providerStateChanged = shouldReconcileEffectiveProviderState(
+    bootstrappedProviderFingerprint,
+    providerState,
+  );
+  if (!providerStateChanged && resolvedBackend !== "proxmox") {
     return { status: "skipped", reason: "unchanged", providerFingerprint };
   }
   const hasLlmKeys = Object.keys(llmEnvVars).length > 0;
@@ -1335,15 +2108,32 @@ async function reconcileRuntimeLlmAuth({
     throw error;
   }
 
-  if (resolvedBackend === "k8s") {
+  if (providerStateChanged || resolvedBackend === "proxmox") {
     if (typeof provisioner?.updateEnv !== "function") {
-      throw new Error("Kubernetes provider reconciliation requires updateEnv support");
+      throw new Error(`${resolvedBackend} provider reconciliation requires updateEnv support`);
     }
-    const managedEnv = buildKubernetesProviderEnv(runtimeFamily, defaultProvider, llmEnvVars);
+    const preserved = new Set((preservedEnvNames || []).map((name) => String(name || "")));
+    const credentialManagedEnvNames = managedCredentialEnvNames.filter(
+      (name) => !preserved.has(name),
+    );
+    const managedEnv = Object.fromEntries(
+      Object.entries({
+        ...(integrationEnvVars || {}),
+        ...(mcpEnvVars || {}),
+        ...buildKubernetesProviderEnv(runtimeFamily, defaultProvider, llmEnvVars),
+        ...(String(runtimeFamily).toLowerCase() === "openclaw"
+          ? {
+              [OPENCLAW_MANAGED_MCP_SERVERS_ENV]:
+                encodeOpenClawManagedMcpServers(desiredMcpServers),
+            }
+          : {}),
+      }).filter(([name]) => !preserved.has(name)),
+    );
     await provisioner.updateEnv(containerId, managedEnv, {
       agentId,
       runtimeFamily,
-      managedEnvNames: getManagedProviderEnvNames({ runtimeFamily }),
+      managedEnvNames: credentialManagedEnvNames,
+      replaceManagedState: true,
     });
   }
 
@@ -1357,6 +2147,7 @@ async function reconcileRuntimeLlmAuth({
     gateway_port: gatewayPort,
     gateway_token: gatewayToken,
   };
+  const authorizeRuntimeUse = () => assertProvisionerAuthorized(provisioner);
 
   if (runtimeFamily === "hermes") {
     let persistedModelConfig = null;
@@ -1388,6 +2179,12 @@ async function reconcileRuntimeLlmAuth({
       buildHermesEnvWriteCommand(llmEnvVars),
       { agentId },
     );
+    await runProvisionerExecCommand(
+      provisioner,
+      containerId,
+      buildHermesIntegrationInstallCommand(Array.isArray(integrationSync) ? integrationSync : []),
+      { timeout: 30000, agentId },
+    );
     await provisioner.restart(containerId, { agentId });
     const readiness = await waitForAgentReadiness(
       {
@@ -1400,6 +2197,7 @@ async function reconcileRuntimeLlmAuth({
         checkGateway: false,
       },
       {
+        beforeAttempt: authorizeRuntimeUse,
         runtime: {
           attempts: 8,
           intervalMs: 5000,
@@ -1416,17 +2214,17 @@ async function reconcileRuntimeLlmAuth({
   }
 
   const authProfiles = buildAuthProfiles(llmEnvVars);
-  const modelCommand = buildDefaultModelCommand(defaultProvider);
-  if (Object.keys(authProfiles).length === 0 && !modelCommand) {
-    return { status: "skipped", providerFingerprint };
-  }
+  const defaultModel = buildDefaultOpenClawModel(defaultProvider);
 
   const authWriteCommand = buildAuthProfilesWriteCommand(authProfiles);
   const reconciliationMutations = [
     async () => {
       try {
-        await runRuntimeCommand(agentRef, authWriteCommand);
+        await runRuntimeCommand(agentRef, authWriteCommand, {
+          beforeAttempt: authorizeRuntimeUse,
+        });
       } catch (error) {
+        throwIfRemoteAuthorizationFailure(error);
         if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) {
           throw error;
         }
@@ -1435,9 +2233,9 @@ async function reconcileRuntimeLlmAuth({
     },
   ];
 
-  // Merge custom-provider registrations (Microsoft Foundry) into openclaw.json
-  // before the restart so model strings like `microsoft-foundry/<deployment>`
-  // resolve instead of throwing "Unknown model" on first request.
+  // Replace Nora-owned custom-provider registrations and default-model state
+  // before restart. This must run even when the desired provider set is empty,
+  // otherwise a deleted Foundry/demo key remains embedded in openclaw.json.
   const customProviderEnv =
     defaultProvider?.provider === "microsoft-foundry"
       ? {
@@ -1449,45 +2247,77 @@ async function reconcileRuntimeLlmAuth({
         }
       : llmEnvVars;
   const customProviders = buildOpenClawCustomProviders(customProviderEnv);
-  if (Object.keys(customProviders).length > 0) {
-    const providerMergeCommand = buildOpenClawConfigMergeCommand({
-      models: { providers: customProviders },
-    });
-    reconciliationMutations.push(async () => {
-      try {
-        await runRuntimeCommand(agentRef, providerMergeCommand);
-      } catch (error) {
-        if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) {
-          throw error;
-        }
-        await runProvisionerExecCommand(provisioner, containerId, providerMergeCommand, {
-          agentId,
-        });
-      }
-    });
-  }
+  const providerStateCommand = buildOpenClawManagedProviderStateCommand({
+    customProviders,
+    defaultModel,
+    managedModelProviderIds: MANAGED_OPENCLAW_MODEL_PROVIDER_IDS,
+  });
+  reconciliationMutations.push(async () => {
+    try {
+      return await runRuntimeCommand(agentRef, providerStateCommand, {
+        timeout: 60000,
+        beforeAttempt: authorizeRuntimeUse,
+      });
+    } catch (error) {
+      throwIfRemoteAuthorizationFailure(error);
+      if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) throw error;
+      return runProvisionerExecCommand(provisioner, containerId, providerStateCommand, {
+        agentId,
+      });
+    }
+  });
 
-  // Apply the default model inside the same reconciliation boundary. Readiness
-  // must be the final runtime operation; otherwise the config watcher can reload
-  // a gateway immediately after the worker publishes it as running.
-  if (modelCommand) {
-    reconciliationMutations.push(() =>
-      runRuntimeCommand(agentRef, modelCommand, { timeout: 60000 }),
+  const mcpStateCommand = buildOpenClawManagedMcpServersCommand(desiredMcpServers);
+  reconciliationMutations.push(async () => {
+    try {
+      return await runRuntimeCommand(agentRef, mcpStateCommand, {
+        timeout: 60000,
+        beforeAttempt: authorizeRuntimeUse,
+      });
+    } catch (error) {
+      throwIfRemoteAuthorizationFailure(error);
+      if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) throw error;
+      return runProvisionerExecCommand(provisioner, containerId, mcpStateCommand, { agentId });
+    }
+  });
+
+  reconciliationMutations.push(async () => {
+    const syncData = Array.isArray(integrationSync) ? integrationSync : [];
+    const runtimeUrl = runtimeUrlForAgent(
+      {
+        host,
+        runtime_host: runtimeHost,
+        runtime_port: runtimePort,
+      },
+      "/integrations/sync",
     );
-  }
+    await fetchWithProvisionerAuthorization(provisioner, runtimeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...buildRuntimeAuthHeaders(gatewayToken),
+      },
+      body: JSON.stringify({ integrations: syncData }),
+    });
+  });
 
   const readiness = await runRuntimeReconciliationBoundary({
     mutations: reconciliationMutations,
     restart: () => provisioner.restart(containerId, { agentId }),
     checkReadiness: () =>
-      waitForAgentReadiness({
-        host,
-        runtimeHost,
-        runtimePort,
-        gatewayHostPort,
-        gatewayHost,
-        gatewayPort,
-      }),
+      waitForAgentReadiness(
+        {
+          host,
+          runtimeHost,
+          runtimePort,
+          gatewayHostPort,
+          gatewayHost,
+          gatewayPort,
+        },
+        {
+          beforeAttempt: authorizeRuntimeUse,
+        },
+      ),
   });
   if (!readiness.ok) {
     throw new Error(
@@ -1528,7 +2358,127 @@ function backendInstanceKey(runtimeFields = {}) {
   return backend;
 }
 
-async function loadBackend(runtimeFields = {}) {
+async function assertWorkerRemoteHostUse(runtimeFields = {}, ownerUserId = null, options = {}) {
+  try {
+    return await assertRemoteHostAgentUse(
+      {
+        ...runtimeFields,
+        user_id: ownerUserId,
+      },
+      options,
+    );
+  } catch (error) {
+    if (!isRemoteHostAccessRevokedError(error)) throw error;
+    const revoked = new UnrecoverableError(error.message);
+    revoked.code = error.code;
+    revoked.statusCode = error.statusCode;
+    throw revoked;
+  }
+}
+
+function isRemoteDockerRuntime(runtimeFields = {}) {
+  return (
+    normalizeBackendName(
+      runtimeFields.deploy_target || runtimeFields.deployTarget || runtimeFields.backend_type,
+    ) === "remote-docker"
+  );
+}
+
+async function runRemoteAuthorizationCheck(check) {
+  try {
+    return await check();
+  } catch (error) {
+    if (error && (typeof error === "object" || typeof error === "function")) {
+      error[REMOTE_AUTHORIZATION_FAILURE] = true;
+    }
+    throw error;
+  }
+}
+
+function findErrorInChain(error, predicate) {
+  const seen = new Set();
+  let current = error;
+  while (current && !seen.has(current)) {
+    if (predicate(current)) return current;
+    seen.add(current);
+    current = current.cause;
+  }
+  return null;
+}
+
+function errorChainSome(error, predicate) {
+  return Boolean(findErrorInChain(error, predicate));
+}
+
+function isRemoteHostRevocation(error) {
+  return errorChainSome(error, isRemoteHostAccessRevokedError);
+}
+
+function isRemoteAuthorizationFailure(error) {
+  return errorChainSome(
+    error,
+    (current) =>
+      Boolean(current?.[REMOTE_AUTHORIZATION_FAILURE]) || isRemoteHostAccessRevokedError(current),
+  );
+}
+
+function toUnrecoverableRemoteHostRevocation(error) {
+  const revoked = findErrorInChain(error, isRemoteHostAccessRevokedError);
+  if (!revoked) return error;
+  if (error?.name === "UnrecoverableError" && isRemoteHostAccessRevokedError(error)) {
+    return error;
+  }
+  const unrecoverable = new UnrecoverableError(revoked.message);
+  unrecoverable.code = revoked.code;
+  unrecoverable.statusCode = revoked.statusCode;
+  unrecoverable.cause = error;
+  return unrecoverable;
+}
+
+function throwIfRemoteAuthorizationFailure(error) {
+  if (isRemoteAuthorizationFailure(error)) throw error;
+}
+
+/**
+ * Wrap a credential-bearing Remote Docker adapter so every worker operation
+ * revalidates the current owner/workspace grant. `destroy` remains deliberately
+ * unguarded: failure cleanup must be able to remove a runtime created just
+ * before the grant was revoked.
+ */
+function guardRemoteProvisioner(provisioner, runtimeFields = {}, ownerUserId = null) {
+  if (!provisioner || !isRemoteDockerRuntime(runtimeFields)) return provisioner;
+
+  const authorize = () =>
+    runRemoteAuthorizationCheck(() =>
+      assertWorkerRemoteHostUse(runtimeFields, ownerUserId, { includeProfile: false }),
+    );
+
+  return new Proxy(provisioner, {
+    get(target, property, receiver) {
+      if (property === REMOTE_PROVISIONER_AUTHORIZATION) return authorize;
+      if (property === REMOTE_PROVISIONER_CLEANUP_EXEC) {
+        return (containerId, commandId, agentId) =>
+          startFixedProvisionerExecCleanup(target, containerId, commandId, agentId);
+      }
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== "function") return value;
+      if (property === "destroy") return value.bind(target);
+      return async (...args) => {
+        await authorize();
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+}
+
+async function assertProvisionerAuthorized(provisioner) {
+  const authorize = provisioner?.[REMOTE_PROVISIONER_AUTHORIZATION];
+  if (typeof authorize === "function") {
+    await authorize();
+  }
+}
+
+async function loadBackend(runtimeFields = {}, { ownerUserId = null } = {}) {
   const key = backendInstanceKey(runtimeFields);
   // Profile-backed targets can change at runtime. Rebuild from the latest
   // stored profile so credential rotation, host-key pins, addresses, namespaces,
@@ -1572,7 +2522,7 @@ async function loadBackend(runtimeFields = {}) {
       }
       if (key.startsWith("hermes:remote:")) {
         const executionTargetId = key.slice("hermes:".length);
-        const profile = await getRemoteHostProfile(executionTargetId);
+        const profile = await assertWorkerRemoteHostUse(runtimeFields, ownerUserId);
         if (!profile) {
           throw new Error(`Unknown remote host execution target: ${executionTargetId}`);
         }
@@ -1586,7 +2536,7 @@ async function loadBackend(runtimeFields = {}) {
       }
       if (key.startsWith("nemoclaw:remote:")) {
         const executionTargetId = key.slice("nemoclaw:".length);
-        const profile = await getRemoteHostProfile(executionTargetId);
+        const profile = await assertWorkerRemoteHostUse(runtimeFields, ownerUserId);
         if (!profile) {
           throw new Error(`Unknown remote host execution target: ${executionTargetId}`);
         }
@@ -1599,7 +2549,7 @@ async function loadBackend(runtimeFields = {}) {
         break;
       }
       if (key.startsWith("remote:")) {
-        const profile = await getRemoteHostProfile(key);
+        const profile = await assertWorkerRemoteHostUse(runtimeFields, ownerUserId);
         if (!profile) {
           throw new Error(`Unknown remote host execution target: ${key}`);
         }
@@ -1622,7 +2572,7 @@ async function loadBackend(runtimeFields = {}) {
   }
 
   backendInstances.set(key, instance);
-  return instance;
+  return guardRemoteProvisioner(instance, runtimeFields, ownerUserId);
 }
 
 async function runKubernetesPolicyReconcileJob({ clusterId }) {
@@ -1693,54 +2643,219 @@ async function runKubernetesPolicyReconcileJob({ clusterId }) {
   }
 }
 
-function safeK8sName(name, fallback) {
-  return (
-    String(name || fallback || "")
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 63) || fallback
+function replacementRuntimeError(message, code = "REPLACEMENT_RUNTIME_INVALID") {
+  const error = new UnrecoverableError(message);
+  error.code = code;
+  return error;
+}
+
+function normalizeReplacementValue(value) {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+}
+
+function loadQueuedPreviousRuntimeTuple(agentId, jobData, agentRow) {
+  const requiredFields = [
+    "previous_container_id",
+    "previous_container_name",
+    "previous_host",
+    "previous_backend",
+    "previous_runtime_family",
+    "previous_deploy_target",
+    "previous_execution_target_id",
+    "previous_sandbox_profile",
+  ];
+  const missing = requiredFields.filter(
+    (field) => !Object.prototype.hasOwnProperty.call(jobData, field),
   );
+  if (missing.length > 0) {
+    throw replacementRuntimeError(
+      `Replacement job for agent ${agentId} omitted the previous runtime tuple: ${missing.join(", ")}`,
+      "REPLACEMENT_RUNTIME_TUPLE_INCOMPLETE",
+    );
+  }
+
+  const queued = {
+    container_id: normalizeReplacementValue(jobData.previous_container_id),
+    container_name: normalizeReplacementValue(jobData.previous_container_name),
+    host: normalizeReplacementValue(jobData.previous_host),
+    backend_type: normalizeReplacementValue(jobData.previous_backend),
+    runtime_family: normalizeReplacementValue(jobData.previous_runtime_family),
+    deploy_target: normalizeReplacementValue(jobData.previous_deploy_target),
+    execution_target_id: normalizeReplacementValue(jobData.previous_execution_target_id),
+    sandbox_profile: normalizeReplacementValue(jobData.previous_sandbox_profile),
+  };
+  const durableRuntimeFields = buildAgentRuntimeFields(agentRow);
+  const durable = {
+    container_id: normalizeReplacementValue(agentRow.container_id),
+    container_name: normalizeReplacementValue(agentRow.container_name),
+    host: normalizeReplacementValue(agentRow.host),
+    backend_type: durableRuntimeFields.backend_type,
+    runtime_family: durableRuntimeFields.runtime_family,
+    deploy_target: durableRuntimeFields.deploy_target,
+    execution_target_id: durableRuntimeFields.execution_target_id,
+    sandbox_profile: durableRuntimeFields.sandbox_profile,
+  };
+
+  for (const field of ["container_id", "container_name", "host"]) {
+    if (queued[field] !== durable[field]) {
+      throw replacementRuntimeError(
+        `Replacement runtime identity mismatch for agent ${agentId}: queued ${field}=${queued[field] || "empty"}, persisted ${field}=${durable[field] || "empty"}`,
+        "REPLACEMENT_RUNTIME_IDENTITY_MISMATCH",
+      );
+    }
+  }
+  for (const field of [
+    "backend_type",
+    "runtime_family",
+    "deploy_target",
+    "execution_target_id",
+    "sandbox_profile",
+  ]) {
+    if (queued[field] !== durable[field]) {
+      throw replacementRuntimeError(
+        `Replacement runtime tuple mismatch for agent ${agentId}: queued ${field}=${queued[field] || "empty"}, persisted ${field}=${durable[field] || "empty"}`,
+        "REPLACEMENT_RUNTIME_TUPLE_MISMATCH",
+      );
+    }
+  }
+
+  return queued;
 }
 
-function defaultK8sDeployName(runtimeFamily, id, name) {
-  const prefix = runtimeFamily === "hermes" ? "nora-hermes" : "nora-oclaw";
-  return safeK8sName(`${prefix}-${name || "agent"}-${id}`, `${prefix}-${id}`);
-}
-
-async function cleanupPreviousK8sRuntime({
+async function prepareReplacementRuntime({
+  queryable = db,
   agentId,
+  agentRow,
+  name,
   jobData = {},
-  fallbackRuntimeFields = {},
+  resolvedRuntimeFields,
+  resolvedImage,
 } = {}) {
-  const previousBackend = normalizeBackendName(
-    jobData.previous_backend || jobData.previous_deploy_target || "",
-  );
-  if (previousBackend !== "k8s") return;
+  if (jobData.replace_existing_runtime !== true) {
+    return { replacement: false, agentRow };
+  }
 
-  const previousRuntimeFields = buildAgentRuntimeFields({
-    runtime_family: jobData.previous_runtime_family || fallbackRuntimeFields.runtime_family,
-    backend_type: "k8s",
-    deploy_target: "k8s",
-    execution_target_id:
-      jobData.previous_execution_target_id || fallbackRuntimeFields.execution_target_id,
-    sandbox_profile: jobData.previous_sandbox_profile || fallbackRuntimeFields.sandbox_profile,
-  });
-  const previousResourceName =
-    jobData.previous_container_id ||
-    jobData.previous_container_name ||
-    defaultK8sDeployName(previousRuntimeFields.runtime_family, agentId, jobData.name);
-  const previousProvisioner = await loadBackend(previousRuntimeFields);
+  const previousRuntime = loadQueuedPreviousRuntimeTuple(agentId, jobData, agentRow);
+  const previousRuntimeFields = {
+    backend_type: previousRuntime.backend_type,
+    runtime_family: previousRuntime.runtime_family,
+    deploy_target: previousRuntime.deploy_target,
+    execution_target_id: previousRuntime.execution_target_id,
+    sandbox_profile: previousRuntime.sandbox_profile,
+  };
+  const previousContainerId = previousRuntime.container_id;
+  const previousContainerName = previousRuntime.container_name;
 
-  console.log(
-    `[provisioner] Destroying previous Kubernetes runtime ${previousResourceName} before redeploying agent ${agentId}`,
-  );
-  await previousProvisioner.destroy(previousResourceName, {
-    agentId,
-    host: jobData.previous_host || null,
-    runtimeFamily: previousRuntimeFields.runtime_family,
-  });
+  const previousAgent = {
+    id: agentId,
+    name: name || jobData.name || agentRow.name,
+    user_id: agentRow.user_id,
+    container_id: previousContainerId,
+    container_name: previousContainerName,
+    host: previousRuntime.host,
+    runtime_family: previousRuntimeFields.runtime_family,
+    backend_type: previousRuntimeFields.backend_type,
+    deploy_target: previousRuntimeFields.deploy_target,
+    execution_target_id: previousRuntimeFields.execution_target_id,
+    sandbox_profile: previousRuntimeFields.sandbox_profile,
+    sandbox_type: previousRuntimeFields.sandbox_profile,
+  };
+
+  let previousRuntimeDestroyed = false;
+  const hasPreviousRuntimeIdentity = Boolean(previousContainerId || previousContainerName);
+  const canDestroyPreviousRuntime = containerManager.canDestroy(previousAgent);
+  if (hasPreviousRuntimeIdentity && !canDestroyPreviousRuntime) {
+    throw replacementRuntimeError(
+      `Previous runtime for agent ${agentId} has persisted identity but cannot be destroyed safely`,
+      "REPLACEMENT_RUNTIME_DESTROY_UNAVAILABLE",
+    );
+  }
+  if (canDestroyPreviousRuntime) {
+    console.log(
+      `[provisioner] Destroying previous ${previousRuntimeFields.deploy_target} runtime ${previousAgent.container_id || previousAgent.container_name || previousAgent.name} before redeploying agent ${agentId}`,
+    );
+    await containerManager.destroy(previousAgent);
+    previousRuntimeDestroyed = true;
+  }
+
+  const desiredContainerName = jobData.container_name || agentRow.container_name || null;
+  let updated;
+  try {
+    updated = await queryable.query(
+      `UPDATE agents
+        SET container_id = NULL,
+            host = NULL,
+            runtime_host = NULL,
+            runtime_port = NULL,
+            gateway_host = NULL,
+            gateway_port = NULL,
+            gateway_host_port = NULL,
+            gateway_token = NULL,
+            dashboard_port = NULL,
+            backend_type = $2,
+            sandbox_type = $3,
+            runtime_family = $4,
+            deploy_target = $5,
+            execution_target_id = $6,
+            sandbox_profile = $7,
+            container_name = $8,
+            image = $9
+      WHERE id = $1
+        AND status = 'deploying'
+        AND container_id IS NOT DISTINCT FROM $10
+        AND container_name IS NOT DISTINCT FROM $11
+        AND backend_type = $12
+        AND runtime_family = $13
+        AND deploy_target = $14
+        AND execution_target_id = $15
+        AND sandbox_profile = $16
+        AND host IS NOT DISTINCT FROM $17
+      RETURNING image, template_payload, sandbox_type, backend_type, runtime_family,
+                deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers,
+                status, container_id, container_name, host, runtime_host, runtime_port,
+                gateway_host, gateway_port, gateway_host_port, dashboard_port, user_id`,
+      [
+        agentId,
+        resolvedRuntimeFields.backend_type,
+        resolvedRuntimeFields.sandbox_profile,
+        resolvedRuntimeFields.runtime_family,
+        resolvedRuntimeFields.deploy_target,
+        resolvedRuntimeFields.execution_target_id,
+        resolvedRuntimeFields.sandbox_profile,
+        desiredContainerName,
+        resolvedImage,
+        previousContainerId,
+        previousContainerName,
+        previousRuntimeFields.backend_type,
+        previousRuntimeFields.runtime_family,
+        previousRuntimeFields.deploy_target,
+        previousRuntimeFields.execution_target_id,
+        previousRuntimeFields.sandbox_profile,
+        previousRuntime.host,
+      ],
+    );
+  } catch (error) {
+    if (!previousRuntimeDestroyed) throw error;
+    const persistenceError = replacementRuntimeError(
+      `Previous runtime for agent ${agentId} was destroyed, but replacement placement could not be persisted`,
+      "REPLACEMENT_RUNTIME_STATE_PERSIST_FAILED",
+    );
+    persistenceError.previousRuntimeDestroyed = true;
+    persistenceError.cause = error;
+    throw persistenceError;
+  }
+  if (!updated.rows[0]) {
+    const error = replacementRuntimeError(
+      `Agent ${agentId} changed while its previous runtime was being retired`,
+      "REPLACEMENT_RUNTIME_STATE_CHANGED",
+    );
+    error.previousRuntimeDestroyed = previousRuntimeDestroyed;
+    throw error;
+  }
+  Object.assign(agentRow, updated.rows[0]);
+  return { replacement: true, agentRow, previousAgent };
 }
 
 async function markDeploymentLifecycle(db, agentId, status) {
@@ -1804,8 +2919,11 @@ async function reconcileOpenClawChannelState({
   };
   const command = buildOpenClawConfigMergeCommand(delta);
   try {
-    await runRuntimeCommand(agentRef, command);
+    await runRuntimeCommand(agentRef, command, {
+      beforeAttempt: () => assertProvisionerAuthorized(provisioner),
+    });
   } catch (error) {
+    throwIfRemoteAuthorizationFailure(error);
     if (!DOCKER_EXEC_FALLBACK_BACKENDS.has(resolvedBackend)) throw error;
     await runProvisionerExecCommand(provisioner, containerId, command, { agentId });
   }
@@ -2041,6 +3159,7 @@ async function reconcileClawhubSkills({
   try {
     installedSkills = await readInstalledClawhubSkills(provisioner, containerId, agentId);
   } catch (error) {
+    throwIfRemoteAuthorizationFailure(error);
     console.warn(
       `${logPrefix} agent=${agentId} Failed to read installed skills before reconciliation: ${error.message}`,
     );
@@ -2071,6 +3190,7 @@ async function reconcileClawhubSkills({
         `${logPrefix} agent=${agentId} slug=${skill.installSlug} Reconciliation install completed`,
       );
     } catch (error) {
+      throwIfRemoteAuthorizationFailure(error);
       const message = String(error?.message || "");
       if (message.includes("Already installed")) {
         console.log(
@@ -2113,6 +3233,7 @@ async function reconcileClawhubSkills({
           `${logPrefix} agent=${agentId} slug=${skill.slug} Reconciliation uninstall completed`,
         );
       } catch (error) {
+        throwIfRemoteAuthorizationFailure(error);
         const message = String(error?.message || "");
         console.warn(
           `${logPrefix} agent=${agentId} slug=${skill.slug} Reconciliation uninstall failed: ${message}`,
@@ -2124,7 +3245,7 @@ async function reconcileClawhubSkills({
 
 async function loadClawhubJobAgent(agentId) {
   const result = await db.query(
-    `SELECT id, name, status, container_id, backend_type, runtime_family, deploy_target,
+    `SELECT id, user_id, name, status, container_id, backend_type, runtime_family, deploy_target,
             execution_target_id, sandbox_profile, clawhub_skills
        FROM agents
       WHERE id = $1
@@ -2329,7 +3450,6 @@ const worker = new Worker(
       name,
       image,
       specs,
-      userId,
       sandbox,
       backend,
       container_name,
@@ -2348,7 +3468,8 @@ const worker = new Worker(
       const agentRowResult = await db.query(
         `SELECT image, template_payload, sandbox_type, backend_type, runtime_family,
             deploy_target, execution_target_id, sandbox_profile, gateway_token, mcp_servers, status,
-            container_id
+            container_id, container_name, host, runtime_host, runtime_port, gateway_host,
+            gateway_port, gateway_host_port, dashboard_port, user_id
        FROM agents
       WHERE id = $1`,
         [id],
@@ -2358,24 +3479,25 @@ const worker = new Worker(
         console.warn(`[provisioner] Skipping deployment job ${job.id}; agent ${id} was deleted`);
         return { canceled: true, reason: "agent-deleted" };
       }
-      if (!["queued", "deploying", "error"].includes(agentRow.status)) {
+      if (!["queued", "deploying"].includes(agentRow.status)) {
         console.warn(
           `[provisioner] Skipping deployment job ${job.id}; agent ${id} is ${agentRow.status}`,
         );
         return { canceled: true, reason: `agent-${agentRow.status}` };
       }
-      if (agentRow.container_id) {
-        console.error(
-          `[provisioner] Refusing to create a replacement runtime for agent ${id}; unresolved runtime ${agentRow.container_id} is still persisted`,
-        );
-        return await failDeploymentForUnresolvedRuntime({
+      let ownerUserId;
+      try {
+        ownerUserId = resolveCanonicalDeploymentOwnerUserId(job.data, agentRow);
+      } catch (error) {
+        await persistProvisioningFailure({
           queryable: db,
           job,
           agentId: id,
           name,
-          containerId: agentRow.container_id,
-          error: new Error("A previous provisioning attempt left runtime identity in place"),
+          error,
+          forceTerminal: true,
         });
+        throw error;
       }
       // gateway_token is encrypted at rest. Decrypt the stored value in place so
       // the reuse path (k8s/Hermes pass it back into the container as the runtime
@@ -2394,7 +3516,7 @@ const worker = new Worker(
       }
       const storedRuntimeFields = buildAgentRuntimeFields(agentRow);
       const resolvedRuntimeFields = buildAgentRuntimeFields({
-        runtime_family: storedRuntimeFields.runtime_family,
+        runtime_family: job.data.runtime_family || storedRuntimeFields.runtime_family,
         deploy_target: isKnownBackend(backend)
           ? normalizeBackendName(backend)
           : storedRuntimeFields.deploy_target,
@@ -2407,7 +3529,24 @@ const worker = new Worker(
       });
       const resolvedBackend = resolvedRuntimeFields.backend_type;
       const resolvedSandbox = resolvedRuntimeFields.sandbox_profile;
-      const provisioner = await loadBackend(resolvedRuntimeFields);
+      let provisioner;
+      try {
+        provisioner = await loadBackend(resolvedRuntimeFields, {
+          ownerUserId,
+        });
+      } catch (error) {
+        if (isRemoteHostAccessRevokedError(error) || isUnrecoverableDeploymentError(error)) {
+          await persistProvisioningFailure({
+            queryable: db,
+            job,
+            agentId: id,
+            name,
+            error,
+            forceTerminal: true,
+          });
+        }
+        throw error;
+      }
       const resolvedImage =
         image ||
         agentRow.image ||
@@ -2417,6 +3556,19 @@ const worker = new Worker(
           sandbox_profile: resolvedSandbox,
           backend: resolvedBackend,
         });
+      if (agentRow.container_id && job.data.replace_existing_runtime !== true) {
+        console.error(
+          `[provisioner] Refusing to create a replacement runtime for agent ${id}; unresolved runtime ${agentRow.container_id} is still persisted`,
+        );
+        return await failDeploymentForUnresolvedRuntime({
+          queryable: db,
+          job,
+          agentId: id,
+          name,
+          containerId: agentRow.container_id,
+          error: new Error("A previous provisioning attempt left runtime identity in place"),
+        });
+      }
       let templatePayload = agentRow.template_payload || {};
       if (typeof templatePayload === "string") {
         try {
@@ -2430,248 +3582,45 @@ const worker = new Worker(
         `Processing deployment job ${job.id}: agent=${id} name=${name} backend=${resolvedBackend} (${vcpu}vCPU/${ram_mb}MB/${disk_gb}GB)`,
       );
       await markDeploymentLifecycle(db, id, "deploying");
-      await cleanupPreviousK8sRuntime({
-        agentId: id,
-        jobData: job.data,
-        fallbackRuntimeFields: resolvedRuntimeFields,
-      });
+      try {
+        await prepareReplacementRuntime({
+          queryable: db,
+          agentId: id,
+          agentRow,
+          name,
+          jobData: job.data,
+          resolvedRuntimeFields,
+          resolvedImage,
+        });
+      } catch (error) {
+        if (isUnrecoverableDeploymentError(error) || error?.previousRuntimeDestroyed) {
+          try {
+            await persistProvisioningFailure({
+              queryable: db,
+              job,
+              agentId: id,
+              name,
+              error,
+              forceTerminal: true,
+            });
+          } catch (persistError) {
+            error.persistenceError = persistError;
+          }
+        }
+        throw error;
+      }
 
-      // Fetch user's LLM provider keys from DB for injection into container
-      const bootstrappedProviderState = await fetchEffectiveProviderState(userId, llmProviderId);
-      const {
-        envVars: llmEnvVars,
-        defaultProvider: defaultLlmProvider,
-        fingerprint: bootstrappedProviderFingerprint,
-      } = bootstrappedProviderState;
+      // Runtime creation is deliberately credential-neutral. Provider and
+      // integration state is fetched again and staged only after the runtime is
+      // reachable, while the shared mutation lock is held through finalization.
+      const defaultLlmProvider = await fetchDeploymentProvider(ownerUserId, llmProviderId);
+      const bootstrappedProviderFingerprint = null;
       const builtInDemoActivation = isBuiltInDemoActivation({
         jobId: job.id,
         agentId: id,
         llmProviderId,
         defaultProvider: defaultLlmProvider,
       });
-      const defaultOpenClawModel = buildDefaultOpenClawModel(defaultLlmProvider);
-      const hermesRuntimeBootstrapEnv =
-        resolvedRuntimeFields.runtime_family === "hermes"
-          ? buildHermesRuntimeBootstrapEnvFor(defaultLlmProvider, llmEnvVars)
-          : {};
-      if (Object.keys(llmEnvVars).length > 0) {
-        console.log(
-          `[provisioner] Injecting ${Object.keys(llmEnvVars).length} LLM provider key(s) for user ${userId}`,
-        );
-      }
-
-      // Fetch integration credentials for this agent and inject as env vars into the container
-      let integrationEnvVars = {};
-      // Decrypted creds for providers the operator enabled as MCP servers, keyed
-      // by provider — resolved into an openclaw.json mcpServers block below.
-      const mcpIntegrationsByProvider = {};
-      try {
-        const INTEGRATION_ENV_MAP = {
-          huggingface: "HF_TOKEN",
-          github: "GITHUB_TOKEN",
-          gitlab: "GITLAB_TOKEN",
-          slack: "SLACK_TOKEN",
-          discord: "DISCORD_TOKEN",
-          notion: "NOTION_TOKEN",
-          linear: "LINEAR_API_KEY",
-          datadog: "DD_API_KEY",
-          sentry: "SENTRY_AUTH_TOKEN",
-          sendgrid: "SENDGRID_API_KEY",
-          openai: "OPENAI_API_KEY",
-          anthropic: "ANTHROPIC_API_KEY",
-          airtable: "AIRTABLE_API_KEY",
-          asana: "ASANA_TOKEN",
-          stripe: "STRIPE_SECRET_KEY",
-          hubspot: "HUBSPOT_ACCESS_TOKEN",
-          pipedrive: "PIPEDRIVE_API_KEY",
-          pinecone: "PINECONE_API_KEY",
-          vercel: "VERCEL_TOKEN",
-          circleci: "CIRCLE_TOKEN",
-          terraform: "TFE_TOKEN",
-          pagerduty: "PAGERDUTY_TOKEN",
-          dropbox: "DROPBOX_ACCESS_TOKEN",
-          twilio: "TWILIO_AUTH_TOKEN",
-          shopify: "SHOPIFY_ACCESS_TOKEN",
-          linkedin: "LINKEDIN_ACCESS_TOKEN",
-          salesforce: "SALESFORCE_ACCESS_TOKEN",
-          twitter: "TWITTER_ACCESS_TOKEN",
-          digitalocean: "DIGITALOCEAN_TOKEN",
-          algolia: "ALGOLIA_API_KEY",
-          clickup: "CLICKUP_API_KEY",
-          monday: "MONDAY_API_KEY",
-          zendesk: "ZENDESK_API_TOKEN",
-          "docker-hub": "DOCKER_HUB_TOKEN",
-          bitbucket: "BITBUCKET_TOKEN",
-          confluence: "CONFLUENCE_TOKEN",
-          jira: "JIRA_API_TOKEN",
-          jenkins: "JENKINS_TOKEN",
-          grafana: "GRAFANA_TOKEN",
-          woocommerce: "WOOCOMMERCE_SECRET_KEY",
-          trello: "TRELLO_TOKEN",
-          elasticsearch: "ELASTICSEARCH_PASSWORD",
-          supabase: "SUPABASE_SERVICE_ROLE_KEY",
-          facebook: "FACEBOOK_ACCESS_TOKEN",
-          aws: "AWS_SECRET_ACCESS_KEY",
-          azure: "AZURE_CLIENT_SECRET",
-          s3: "S3_SECRET_ACCESS_KEY",
-          mongodb: "MONGODB_URI",
-          redis: "REDIS_PASSWORD",
-          postgresql: "PGPASSWORD",
-          paypal: "PAYPAL_CLIENT_SECRET",
-          segment: "SEGMENT_WRITE_KEY",
-          mixpanel: "MIXPANEL_API_SECRET",
-          weaviate: "WEAVIATE_API_KEY",
-          email: "SMTP_PASS",
-        };
-        const INTEGRATION_CONFIG_ENV_MAP = {
-          "github.org": "GITHUB_ORG",
-          "gitlab.base_url": "GITLAB_BASE_URL",
-          "bitbucket.username": "BITBUCKET_USERNAME",
-          "bitbucket.workspace": "BITBUCKET_WORKSPACE",
-          "jira.email": "JIRA_EMAIL",
-          "jira.site_url": "JIRA_BASE_URL",
-          "jira.project_key": "JIRA_PROJECT_KEY",
-          "linear.team_id": "LINEAR_TEAM_ID",
-          "slack.default_channel": "SLACK_DEFAULT_CHANNEL",
-          "discord.guild_id": "DISCORD_GUILD_ID",
-          "teams.webhook_url": "TEAMS_WEBHOOK_URL",
-          "email.smtp_host": "SMTP_HOST",
-          "email.smtp_port": "SMTP_PORT",
-          "email.smtp_user": "SMTP_USER",
-          "email.from_address": "SMTP_FROM_ADDRESS",
-          "twilio.account_sid": "TWILIO_ACCOUNT_SID",
-          "twilio.phone_number": "TWILIO_PHONE_NUMBER",
-          "sendgrid.from_email": "SENDGRID_FROM_EMAIL",
-          "openai.org_id": "OPENAI_ORG_ID",
-          "huggingface.model_id": "HF_DEFAULT_MODEL",
-          "aws.access_key_id": "AWS_ACCESS_KEY_ID",
-          "aws.region": "AWS_DEFAULT_REGION",
-          "gcp.service_account_json": "GOOGLE_APPLICATION_CREDENTIALS_JSON",
-          "gcp.project_id": "GCP_PROJECT_ID",
-          "azure.tenant_id": "AZURE_TENANT_ID",
-          "azure.client_id": "AZURE_CLIENT_ID",
-          "s3.access_key_id": "S3_ACCESS_KEY_ID",
-          "s3.region": "S3_REGION",
-          "s3.bucket": "S3_BUCKET",
-          "google-drive.service_account_json": "GOOGLE_DRIVE_SA_JSON",
-          "google-drive.folder_id": "GOOGLE_DRIVE_FOLDER_ID",
-          "postgresql.host": "PGHOST",
-          "postgresql.port": "PGPORT",
-          "postgresql.database": "PGDATABASE",
-          "postgresql.user": "PGUSER",
-          "mongodb.database": "MONGODB_DATABASE",
-          "redis.host": "REDIS_HOST",
-          "redis.port": "REDIS_PORT",
-          "redis.password": "REDIS_PASSWORD",
-          "supabase.url": "SUPABASE_URL",
-          "firebase.service_account_json": "FIREBASE_SA_JSON",
-          "firebase.database_url": "FIREBASE_DATABASE_URL",
-          "elasticsearch.node_url": "ELASTICSEARCH_URL",
-          "elasticsearch.username": "ELASTICSEARCH_USERNAME",
-          "elasticsearch.password": "ELASTICSEARCH_PASSWORD",
-          "elasticsearch.index": "ELASTICSEARCH_INDEX",
-          "weaviate.host": "WEAVIATE_HOST",
-          "weaviate.api_key": "WEAVIATE_API_KEY",
-          "pinecone.environment": "PINECONE_ENVIRONMENT",
-          "pinecone.index_name": "PINECONE_INDEX",
-          "algolia.app_id": "ALGOLIA_APP_ID",
-          "algolia.index_name": "ALGOLIA_INDEX",
-          "datadog.app_key": "DD_APP_KEY",
-          "datadog.site": "DD_SITE",
-          "pagerduty.routing_key": "PAGERDUTY_ROUTING_KEY",
-          "sentry.organization": "SENTRY_ORG",
-          "sentry.project": "SENTRY_PROJECT",
-          "grafana.url": "GRAFANA_URL",
-          "jenkins.url": "JENKINS_URL",
-          "jenkins.username": "JENKINS_USERNAME",
-          "vercel.team_id": "VERCEL_TEAM_ID",
-          "terraform.organization": "TF_ORGANIZATION",
-          "kubernetes.kubeconfig": "KUBECONFIG_CONTENT",
-          "kubernetes.context": "KUBE_CONTEXT",
-          "notion.workspace_id": "NOTION_WORKSPACE_ID",
-          "airtable.base_id": "AIRTABLE_BASE_ID",
-          "trello.api_key": "TRELLO_API_KEY",
-          "trello.board_id": "TRELLO_BOARD_ID",
-          "clickup.workspace_id": "CLICKUP_WORKSPACE_ID",
-          "confluence.base_url": "CONFLUENCE_BASE_URL",
-          "confluence.email": "CONFLUENCE_EMAIL",
-          "google-sheets.service_account_json": "GOOGLE_SHEETS_SA_JSON",
-          "google-sheets.spreadsheet_id": "GOOGLE_SHEETS_SPREADSHEET_ID",
-          "google-calendar.service_account_json": "GOOGLE_CALENDAR_SA_JSON",
-          "google-calendar.calendar_id": "GOOGLE_CALENDAR_ID",
-          "salesforce.instance_url": "SALESFORCE_INSTANCE_URL",
-          "zendesk.subdomain": "ZENDESK_SUBDOMAIN",
-          "zendesk.email": "ZENDESK_EMAIL",
-          "pipedrive.company_domain": "PIPEDRIVE_DOMAIN",
-          "paypal.client_id": "PAYPAL_CLIENT_ID",
-          "stripe.webhook_secret": "STRIPE_WEBHOOK_SECRET",
-          "twitter.api_key": "TWITTER_API_KEY",
-          "twitter.api_secret": "TWITTER_API_SECRET",
-          "twitter.default_username": "TWITTER_DEFAULT_USERNAME",
-          "facebook.page_id": "FACEBOOK_PAGE_ID",
-          "mixpanel.project_token": "MIXPANEL_PROJECT_TOKEN",
-          "google-analytics.service_account_json": "GOOGLE_ANALYTICS_SA_JSON",
-          "google-analytics.property_id": "GA4_PROPERTY_ID",
-          "shopify.shop_domain": "SHOPIFY_SHOP_DOMAIN",
-          "woocommerce.site_url": "WOOCOMMERCE_STORE_URL",
-          "woocommerce.consumer_key": "WOOCOMMERCE_CONSUMER_KEY",
-          "zapier.webhook_url": "ZAPIER_WEBHOOK_URL",
-          "make.webhook_url": "MAKE_WEBHOOK_URL",
-          "n8n.webhook_url": "N8N_WEBHOOK_URL",
-          "n8n.api_key": "N8N_API_KEY",
-          "docker-hub.username": "DOCKER_HUB_USERNAME",
-        };
-        const intResult = await db.query(
-          "SELECT provider, access_token, config FROM integrations WHERE agent_id = $1 AND status = 'active'",
-          [id],
-        );
-        const { decrypt } = require("./crypto");
-        for (const row of intResult.rows) {
-          // Primary token
-          const envName = INTEGRATION_ENV_MAP[row.provider];
-          if (envName && row.access_token) {
-            try {
-              integrationEnvVars[envName] = decrypt(row.access_token);
-            } catch (err) {
-              console.warn(
-                `[provisioner] Skipping integration token for agent ${id} provider ${row.provider}: ${err.message}`,
-              );
-            }
-          }
-          // Config fields (URLs, usernames, IDs, secondary secrets)
-          const cfg = decryptSensitiveConfig(row.provider, row.config);
-          for (const [cfgKey, cfgValue] of Object.entries(cfg)) {
-            if (!cfgValue) continue;
-            const cfgEnvName = INTEGRATION_CONFIG_ENV_MAP[`${row.provider}.${cfgKey}`];
-            if (cfgEnvName) {
-              integrationEnvVars[cfgEnvName] = String(cfgValue);
-            }
-          }
-          // Stash the decrypted token+config for providers that can back an MCP
-          // server, so an enabled MCP server gets the credential its own server
-          // expects (which differs from the generic tool env var above).
-          if (mcpServers.isSupportedProvider(row.provider) && row.access_token) {
-            try {
-              mcpIntegrationsByProvider[row.provider] = {
-                token: decrypt(row.access_token),
-                config: cfg,
-              };
-            } catch {
-              // Already logged above when the tool token failed to decrypt.
-            }
-          }
-        }
-        if (Object.keys(integrationEnvVars).length > 0) {
-          console.log(
-            `[provisioner] Injecting ${Object.keys(integrationEnvVars).length} integration credential(s) for agent ${id}`,
-          );
-        }
-      } catch (e) {
-        console.warn(
-          `[provisioner] Failed to fetch integration credentials for agent ${id}:`,
-          e.message,
-        );
-      }
       let agentSecretEnvVars = {};
       try {
         agentSecretEnvVars = normalizeEnvValueMap(await getAgentSecretEnvVars(id));
@@ -2687,25 +3636,11 @@ const worker = new Worker(
         );
       }
 
-      // Resolve the agent's enabled MCP servers into openclaw.json entries
-      // (credential-injected). Empty unless the operator enabled one and the
-      // backing integration is connected. OpenClaw-only; ignored elsewhere.
-      let mcpServerEntries = [];
-      try {
-        mcpServerEntries = mcpServers.resolveMcpEntries({
-          enabledIds: agentRow.mcp_servers,
-          integrationsByProvider: mcpIntegrationsByProvider,
-        });
-        if (mcpServerEntries.length > 0) {
-          console.log(
-            `[provisioner] Wiring ${mcpServerEntries.length} MCP server(s) for agent ${id}: ${mcpServerEntries
-              .map((e) => e.name)
-              .join(", ")}`,
-          );
-        }
-      } catch (e) {
-        console.warn(`[provisioner] Failed to resolve MCP servers for agent ${id}:`, e.message);
-      }
+      const credentialManagedEnvNames = buildCredentialManagedEnvNames({
+        runtimeFamily: resolvedRuntimeFields.runtime_family,
+        mcpEnabledIds: agentRow.mcp_servers,
+        preservedEnvNames: Object.keys(agentSecretEnvVars),
+      });
 
       const configuredProvisionTimeout = parseTimeoutMs(process.env.PROVISION_TIMEOUT_MS, 840000);
       const jobTimeout = parseTimeoutMs(job?.opts?.timeout, 900000);
@@ -2791,6 +3726,9 @@ const worker = new Worker(
           );
           return { canceled: true, reason: "agent-deleted-before-create" };
         }
+        await assertWorkerRemoteHostUse(resolvedRuntimeFields, ownerUserId, {
+          includeProfile: false,
+        });
         const onRuntimeIdentity = async (identity = {}) => {
           const createdContainerId = String(identity.containerId || "").trim();
           if (!createdContainerId) {
@@ -2828,7 +3766,7 @@ const worker = new Worker(
             dashboardHostPort: allocatedDashboardPort,
             gatewayToken: agentRow.gateway_token || undefined,
             templatePayload,
-            mcpServers: mcpServerEntries,
+            credentialManagedEnvNames,
             runtimeFamily: resolvedRuntimeFields.runtime_family,
             deployTarget: resolvedRuntimeFields.deploy_target,
             executionTargetId: resolvedRuntimeFields.execution_target_id,
@@ -2849,13 +3787,7 @@ const worker = new Worker(
               ...(resolvedRuntimeFields.sandbox_profile === "nemoclaw" && model
                 ? { NEMOCLAW_MODEL: model }
                 : {}),
-              ...(defaultOpenClawModel && resolvedRuntimeFields.runtime_family === "openclaw"
-                ? { NORA_DEFAULT_OPENCLAW_MODEL: defaultOpenClawModel }
-                : {}),
-              ...hermesRuntimeBootstrapEnv,
               ...agentSecretEnvVars,
-              ...integrationEnvVars,
-              ...llmEnvVars,
             },
           });
         const createPromise = usesLocalDockerPublishedPort
@@ -2922,6 +3854,13 @@ const worker = new Worker(
             : null;
         dashboardPort = result.dashboardPort || null;
 
+        // The host grant may change while the external Docker create call is
+        // in flight. Re-check after capturing the returned identity so failure
+        // enters the normal cleanup path and no replacement retry is created.
+        await assertWorkerRemoteHostUse(resolvedRuntimeFields, ownerUserId, {
+          includeProfile: false,
+        });
+
         // Persist container_id immediately so that if the worker crashes or the
         // final status UPDATE fails below, the container can still be located
         // and cleaned up by the failure catch, a reconciler, or a retry. Without
@@ -2987,35 +3926,16 @@ const worker = new Worker(
         }
 
         if (resolvedRuntimeFields.runtime_family === "hermes") {
-          const [migrationManifest, persistedHermesState] = await Promise.all([
-            getMigrationManifestForAgent(id).catch(() => null),
-            getPersistedHermesState(id).catch(() => ({ modelConfig: {}, channels: [] })),
-          ]);
+          const persistedHermesState = await getPersistedHermesState(id).catch(() => ({
+            modelConfig: {},
+            channels: [],
+          }));
 
-          const seedArchive = migrationManifest
-            ? await buildHermesSeedArchive(migrationManifest).catch(() => null)
-            : null;
-          // Require a real containerId — dockerode stringifies null/undefined
-          // into the URL as the literal word "null", which is what surfaces to
-          // the UI as `No such container: null`. Skip the seed step rather than
-          // emit that confusing error; the provision will continue without the
-          // seed archive (Hermes can run without imported migration state).
-          if (
-            seedArchive &&
-            provisioner?.docker &&
-            typeof containerId === "string" &&
-            containerId.length > 0
-          ) {
-            try {
-              await provisioner.docker.getContainer(containerId).putArchive(seedArchive, {
-                path: "/",
-              });
-            } catch (e) {
-              console.warn(
-                `[provisioner] Hermes seed archive upload failed for agent ${id}: ${e.message}`,
-              );
-            }
-          }
+          await seedHermesArchiveForDeployment({
+            agentId: id,
+            provisioner,
+            containerId,
+          });
 
           if (
             hasMeaningfulHermesModelConfig(persistedHermesState?.modelConfig) ||
@@ -3024,18 +3944,23 @@ const worker = new Worker(
             await applyPersistedHermesState(
               {
                 id,
+                user_id: ownerUserId,
                 container_id: containerId,
+                container_name: containerName || container_name || null,
+                image: resolvedImage,
                 backend_type: resolvedBackend,
                 runtime_family: "hermes",
                 deploy_target: resolvedRuntimeFields.deploy_target,
                 execution_target_id: resolvedRuntimeFields.execution_target_id,
-                sandbox_profile: "standard",
+                sandbox_profile: resolvedRuntimeFields.sandbox_profile,
+                sandbox_type: resolvedRuntimeFields.sandbox_type,
                 host,
                 runtime_host: runtimeHost,
                 runtime_port: runtimePort,
                 gateway_host_port: gatewayHostPort,
                 gateway_host: gatewayHost,
                 gateway_port: gatewayPort,
+                gateway_token: gatewayToken,
                 dashboard_port: dashboardPort,
               },
               persistedHermesState,
@@ -3073,12 +3998,16 @@ const worker = new Worker(
           agentId: id,
           name,
           error: err,
+          forceTerminal: isRemoteHostRevocation(err) || isUnrecoverableDeploymentError(err),
         });
         if (failure.canceled) {
           console.warn(
             `[provisioner] Suppressing retry for deployment job ${job.id}; agent ${id} was deleted`,
           );
           return { canceled: true, reason: "agent-deleted-after-failure" };
+        }
+        if (isRemoteHostRevocation(err)) {
+          throw toUnrecoverableRemoteHostRevocation(err);
         }
         throw err;
       }
@@ -3129,26 +4058,26 @@ const worker = new Worker(
         // their first chat request.
         const readinessBarrier = await runProvisioningReadinessBarrier({
           checkReadiness: () =>
-            waitForAgentReadiness({
-              host,
-              runtimeHost,
-              runtimePort,
-              gatewayHost,
-              gatewayHostPort,
-              gatewayPort,
-              checkGateway: resolvedRuntimeFields.runtime_family !== "hermes",
-            }),
-          failClosedOnReadinessFailure: builtInDemoActivation,
-          onReadinessWarning: async (readiness) => {
-            const detail = buildReadinessWarningDetail(readiness);
-            console.warn(`[provisioner] Readiness check failed for agent ${id}: ${detail}`);
-            await persistReadinessWarning(db, { agentId: id, name, host, readiness });
-          },
-          reconcileAuth: userId
+            waitForAgentReadiness(
+              {
+                host,
+                runtimeHost,
+                runtimePort,
+                gatewayHost,
+                gatewayHostPort,
+                gatewayPort,
+                checkGateway: resolvedRuntimeFields.runtime_family !== "hermes",
+              },
+              {
+                beforeAttempt: () => assertProvisionerAuthorized(provisioner),
+              },
+            ),
+          failClosedOnReadinessFailure: true,
+          reconcileAuth: ownerUserId
             ? () =>
                 reconcileRuntimeLlmAuth({
                   agentId: id,
-                  userId,
+                  userId: ownerUserId,
                   llmProviderId,
                   runtimeFamily: resolvedRuntimeFields.runtime_family,
                   resolvedBackend,
@@ -3162,16 +4091,17 @@ const worker = new Worker(
                   gatewayPort,
                   gatewayToken,
                   bootstrappedProviderFingerprint,
+                  preservedEnvNames: Object.keys(agentSecretEnvVars),
                 })
             : null,
-          reconcileAndFinalize: userId
+          reconcileAndFinalize: ownerUserId
             ? () =>
                 reconcileProviderStateUntilStable({
                   bootstrappedFingerprint: bootstrappedProviderFingerprint,
                   reconcile: (appliedFingerprint) =>
                     reconcileRuntimeLlmAuth({
                       agentId: id,
-                      userId,
+                      userId: ownerUserId,
                       llmProviderId,
                       runtimeFamily: resolvedRuntimeFields.runtime_family,
                       resolvedBackend,
@@ -3185,6 +4115,7 @@ const worker = new Worker(
                       gatewayPort,
                       gatewayToken,
                       bootstrappedProviderFingerprint: appliedFingerprint,
+                      preservedEnvNames: Object.keys(agentSecretEnvVars),
                     }),
                   verify: builtInDemoActivation
                     ? async () => {
@@ -3204,26 +4135,34 @@ const worker = new Worker(
                       }
                     : null,
                   readFingerprint: async () =>
-                    (await fetchEffectiveProviderState(userId, llmProviderId)).fingerprint,
-                  withMutationLock: (operation) => withProviderMutationLock(userId, operation),
+                    (
+                      await fetchEffectiveProviderState(ownerUserId, llmProviderId, id, {
+                        runtimeFamily: resolvedRuntimeFields.runtime_family,
+                      })
+                    ).fingerprint,
+                  withMutationLock: (operation) => withProviderMutationLock(ownerUserId, operation),
                   finalize: () =>
-                    finalizeProvisionedDeployment(db, {
-                      agentId: id,
-                      containerId,
-                      name,
-                      backend: resolvedBackend,
-                      host,
-                    }),
+                    assertProvisionerAuthorized(provisioner).then(() =>
+                      finalizeProvisionedDeployment(db, {
+                        agentId: id,
+                        containerId,
+                        name,
+                        backend: resolvedBackend,
+                        host,
+                      }),
+                    ),
                 })
             : null,
           finalize: () =>
-            finalizeProvisionedDeployment(db, {
-              agentId: id,
-              containerId,
-              name,
-              backend: resolvedBackend,
-              host,
-            }),
+            assertProvisionerAuthorized(provisioner).then(() =>
+              finalizeProvisionedDeployment(db, {
+                agentId: id,
+                containerId,
+                name,
+                backend: resolvedBackend,
+                host,
+              }),
+            ),
         });
         const { readiness } = readinessBarrier;
         if (readinessBarrier.status === "canceled") {
@@ -3272,6 +4211,7 @@ const worker = new Worker(
               );
             }
           } catch (e) {
+            throwIfRemoteAuthorizationFailure(e);
             console.warn(
               `[provisioner] Failed to reseed OpenClaw channel config for agent ${id}:`,
               e.message,
@@ -3291,60 +4231,11 @@ const worker = new Worker(
               provisioner,
             });
           } catch (e) {
+            throwIfRemoteAuthorizationFailure(e);
             console.warn(
               `[provisioner] Failed to reconcile saved ClawHub skills for agent ${id}:`,
               e.message,
             );
-          }
-        }
-
-        // The built-in demo activation is deliberately mutation-free after
-        // readiness finalization. Its payload has no channels, skills, or
-        // integrations, and skipping these generic reseed passes guarantees
-        // the first chat cannot race a post-finalization gateway reload.
-        if (!builtInDemoActivation) {
-          try {
-            const intResult = await db.query(
-              `SELECT i.id, i.provider, i.catalog_id, i.config, i.status,
-                ic.name as catalog_name, ic.category as catalog_category,
-                ic.auth_type, ic.config_schema
-         FROM integrations i
-         LEFT JOIN integration_catalog ic ON i.catalog_id = ic.id
-         WHERE i.agent_id = $1 AND i.status = 'active'`,
-              [id],
-            );
-            const syncData = intResult.rows.map(buildIntegrationSyncEntry);
-            if (resolvedRuntimeFields.runtime_family === "openclaw") {
-              const runtimeUrl = runtimeUrlForAgent(
-                {
-                  host,
-                  runtime_host: runtimeHost,
-                  runtime_port: runtimePort,
-                },
-                "/integrations/sync",
-              );
-              await fetch(runtimeUrl, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  ...buildRuntimeAuthHeaders(gatewayToken),
-                },
-                body: JSON.stringify({ integrations: syncData }),
-              });
-              console.log(`[provisioner] Synced ${syncData.length} integration(s) to agent ${id}`);
-            } else if (resolvedRuntimeFields.runtime_family === "hermes" && containerId) {
-              await runProvisionerExecCommand(
-                provisioner,
-                containerId,
-                buildHermesIntegrationInstallCommand(syncData),
-                { timeout: 30000, agentId: id },
-              );
-              console.log(
-                `[provisioner] Installed Nora integration skill with ${syncData.length} integration(s) to Hermes agent ${id}`,
-              );
-            }
-          } catch (e) {
-            console.warn(`[provisioner] Failed to sync integrations for agent ${id}:`, e.message);
           }
         }
       } catch (err) {
@@ -3374,9 +4265,13 @@ const worker = new Worker(
           agentId: id,
           name,
           error: err,
+          forceTerminal: isRemoteHostRevocation(err) || isUnrecoverableDeploymentError(err),
         });
         if (failure.canceled) {
           return { canceled: true, reason: "agent-deleted-after-persistence-failure" };
+        }
+        if (isRemoteHostRevocation(err)) {
+          throw toUnrecoverableRemoteHostRevocation(err);
         }
         throw err;
       }
@@ -3390,12 +4285,16 @@ const worker = new Worker(
 worker.on("failed", async (job, err) => {
   const attempts = job?.attemptsMade || 0;
   const maxAttempts = job?.opts?.attempts || 1;
+  const unrecoverable = isUnrecoverableDeploymentError(err);
   console.error(`Job ${job?.id} failed (attempt ${attempts}/${maxAttempts}): ${err.message}`);
 
-  if (job && attempts >= maxAttempts) {
-    // Final failure — job exhausted all retries, now in dead letter queue
+  if (job && (attempts >= maxAttempts || unrecoverable)) {
+    // Final failure — either retries were exhausted or BullMQ suppressed them
+    // because the failure is explicitly unrecoverable.
     console.error(
-      `[DLQ] Agent "${job.data.name}" (${job.data.id}) exhausted all ${maxAttempts} retry attempts`,
+      unrecoverable
+        ? `[DLQ] Agent "${job.data.name}" (${job.data.id}) failed unrecoverably`
+        : `[DLQ] Agent "${job.data.name}" (${job.data.id}) exhausted all ${maxAttempts} retry attempts`,
     );
     try {
       // Terminal: without this, a job that died after the container was
@@ -3405,10 +4304,21 @@ worker.on("failed", async (job, err) => {
       await db.query("UPDATE agents SET status = 'error' WHERE id = $1 AND status = 'deploying'", [
         job.data.id,
       ]);
+      await db.query(
+        "UPDATE deployments SET status = 'failed' WHERE agent_id = $1 AND status IN ('queued', 'deploying')",
+        [job.data.id],
+      );
       await db.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
         "agent_deploy_dlq",
-        `Agent "${job.data.name}" exhausted all ${maxAttempts} retry attempts`,
-        JSON.stringify({ agentId: job.data.id, error: err.message, jobId: job.id }),
+        unrecoverable
+          ? `Agent "${job.data.name}" failed unrecoverably`
+          : `Agent "${job.data.name}" exhausted all ${maxAttempts} retry attempts`,
+        JSON.stringify({
+          agentId: job.data.id,
+          error: err.message,
+          jobId: job.id,
+          ...(unrecoverable ? { retrySuppressed: true } : {}),
+        }),
       ]);
     } catch (dbErr) {
       console.error("[DLQ] Failed to log DLQ event:", dbErr.message);
@@ -3447,7 +4357,9 @@ const clawhubJobsWorker = new Worker(
       operation: normalizedOperation,
     });
     const agent = await loadClawhubJobAgent(agentId);
-    const provisioner = await loadBackend(buildAgentRuntimeFields(agent));
+    const provisioner = await loadBackend(buildAgentRuntimeFields(agent), {
+      ownerUserId: agent.user_id,
+    });
 
     logJob("start", `Starting ${normalizedOperation} job`);
 
@@ -3627,13 +4539,24 @@ healthServer.listen(HEALTH_PORT, () => {
 
 module.exports = {
   allocateAvailableLocalDockerGatewayPort,
+  buildProvisionerExecCleanupCommand,
+  buildTrackedProvisionerCommand,
   buildUnresolvedRuntimeError,
   cleanupProvisionedRuntimeAfterFailure,
   failDeploymentForUnresolvedRuntime,
   fetchDeploymentProvider,
+  fetchWithProvisionerAuthorization,
   fetchUserLlmEnvVars,
+  guardRemoteProvisioner,
+  isRemoteAuthorizationFailure,
   isFinalDeploymentAttempt,
   persistProvisionedRuntimeIdentity,
   persistProvisioningFailure,
+  prepareReplacementRuntime,
+  provisionerExecStateDir,
   reconcileProvisioningFailureRuntime,
+  resolveCanonicalDeploymentOwnerUserId,
+  runRuntimeCommand,
+  runProvisionerExecCommand,
+  seedHermesArchiveForDeployment,
 };

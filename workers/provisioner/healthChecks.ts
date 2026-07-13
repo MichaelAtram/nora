@@ -12,12 +12,21 @@ async function waitForHttpReady(url, options = {}) {
     timeoutMs = 5000,
     acceptStatuses = [200],
     fetchImpl = fetch,
+    beforeAttempt = null,
   } = options;
 
   let lastStatus = null;
   let lastError = null;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    // Authorization hooks deliberately run outside the network-error catch.
+    // A revoked Remote Docker grant (or a failed authorization lookup) must
+    // stop polling immediately instead of being flattened into "unreachable"
+    // and retried against credentials the worker no longer has authority to use.
+    if (typeof beforeAttempt === "function") {
+      await beforeAttempt({ attempt, url });
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -75,6 +84,9 @@ async function waitForAgentReadiness(
       intervalMs: 5000,
       timeoutMs: 5000,
       acceptStatuses: [200],
+      ...(typeof options.beforeAttempt === "function"
+        ? { beforeAttempt: options.beforeAttempt }
+        : {}),
       ...options.runtime,
     },
   );
@@ -99,6 +111,9 @@ async function waitForAgentReadiness(
       intervalMs: 10000,
       timeoutMs: 5000,
       acceptStatuses: [200, 401, 403],
+      ...(typeof options.beforeAttempt === "function"
+        ? { beforeAttempt: options.beforeAttempt }
+        : {}),
       ...options.gateway,
     });
     gateway = {

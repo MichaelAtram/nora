@@ -11,25 +11,78 @@ const monitoring = require("./monitoring");
 const metrics = require("./metrics");
 const agentSchedules = require("./agentSchedules");
 const containerManager = require("./containerManager");
-const { addDeploymentJob } = require("./redisQueue");
+const { addDeploymentJob, cancelDeploymentJobsForAgent } = require("./redisQueue");
 const {
   rpcCall,
   resolveGatewayHostForProxy,
   allowedGatewayHostsForAgent,
 } = require("./gatewayProxy");
 const { runtimeAuthHeaders } = require("./runtimeAuth");
-const { resolveAgentRuntimeFamily } = require("./agentRuntimeFields");
+const { buildAgentRuntimeFields, resolveAgentRuntimeFamily } = require("./agentRuntimeFields");
+const { assertRemoteHostAgentUse } = require("./remoteHosts");
+const { resumeAgentWithProviderAuth } = require("./authSync");
+const {
+  acquireAgentProvisionLock,
+  buildReplacementDeploymentJob,
+  enqueueReplacementDeployment,
+} = require("./agentProvisionLock");
 
 // Lifecycle actions that bring an agent UP — must not resurrect a budget-paused
 // agent (the budget sweep would just re-pause it; a schedule shouldn't fight it).
 const REVIVE_ACTIONS = new Set(["start", "restart", "redeploy"]);
-const ADDRESS_REFRESH_ACTIONS = new Set(["start", "restart"]);
-
 const CHAT_TIMEOUT_MS = 240000;
 
 async function loadAgent(agentId) {
   const result = await db.query("SELECT * FROM agents WHERE id = $1", [agentId]);
   return result.rows[0] || null;
+}
+
+async function enqueueScheduledReplacement(agent, jobData) {
+  return enqueueReplacementDeployment(agent, jobData, {
+    queryable: db,
+    cancelDeploymentJobsForAgent,
+    addDeploymentJob,
+    acquireLock: acquireAgentProvisionLock,
+    applicationName: "nora-backend-scheduled-replacement",
+  });
+}
+
+function assertScheduledLifecycleNotProvisioning(agent) {
+  if (!["queued", "deploying"].includes(agent?.status)) return;
+  const error = new Error(
+    "Agent deployment is queued or in progress; scheduled lifecycle action was not run",
+  );
+  error.statusCode = 409;
+  error.code = "AGENT_PROVISIONING_IN_PROGRESS";
+  throw error;
+}
+
+async function runScheduledLifecycleAction(agentId, actionType, userId) {
+  const provisionLock = await acquireAgentProvisionLock(agentId, {
+    applicationName: `nora-backend-scheduled-${actionType}`,
+  });
+  try {
+    const agent = await loadAgent(agentId);
+    if (!agent) {
+      const error = new Error("Agent not found");
+      error.code = "AGENT_NOT_FOUND";
+      throw error;
+    }
+    assertScheduledLifecycleNotProvisioning(agent);
+    if (actionType === "start" || actionType === "restart") {
+      const resumed = await resumeAgentWithProviderAuth(agent, actionType);
+      return resumed.agent;
+    }
+
+    await performAction(agent, actionType, null, userId);
+    if (actionType === "stop") {
+      await db.query("UPDATE agents SET status = 'stopped' WHERE id = $1", [agent.id]);
+      agent.status = "stopped";
+    }
+    return agent;
+  } finally {
+    await provisionLock.release();
+  }
 }
 
 async function deliverPrompt(agent, prompt, userId) {
@@ -87,14 +140,20 @@ async function performAction(agent, actionType, prompt, userId) {
   switch (actionType) {
     case "prompt":
       return deliverPrompt(agent, prompt, userId);
-    case "restart":
-      return containerManager.restart(agent);
     case "stop":
       return containerManager.stop(agent);
-    case "start":
-      return containerManager.start(agent);
-    case "redeploy":
-      return addDeploymentJob(agent);
+    case "redeploy": {
+      await assertRemoteHostAgentUse(agent, { includeProfile: false });
+      const runtimeFields = buildAgentRuntimeFields(agent);
+      return enqueueScheduledReplacement(
+        agent,
+        buildReplacementDeploymentJob(agent, {
+          runtimeFields,
+          containerName: agent.container_name || null,
+          image: agent.image || null,
+        }),
+      );
+    }
     default:
       throw new Error(`Unknown schedule action: ${actionType}`);
   }
@@ -112,7 +171,7 @@ async function runScheduledAction(payload = {}) {
     throw new Error("runScheduledAction requires scheduleId, agentId, actionType");
   }
 
-  const agent = await loadAgent(agentId);
+  let agent = await loadAgent(agentId);
   if (!agent) {
     await agentSchedules.markRun(scheduleId, "agent_missing").catch(() => {});
     return { ok: false, status: "agent_missing" };
@@ -145,9 +204,10 @@ async function runScheduledAction(payload = {}) {
   }
 
   try {
-    const lifecycleResult = await performAction(agent, actionType, prompt, createdBy);
-    if (ADDRESS_REFRESH_ACTIONS.has(actionType)) {
-      await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
+    if (["start", "stop", "restart"].includes(actionType)) {
+      agent = await runScheduledLifecycleAction(agent.id, actionType, createdBy);
+    } else {
+      await performAction(agent, actionType, prompt, createdBy);
     }
   } catch (err) {
     const status = `failed: ${err?.message || err}`.slice(0, 180);

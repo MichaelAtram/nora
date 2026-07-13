@@ -21,7 +21,12 @@ function canonicalize(value) {
   );
 }
 
-function buildEffectiveProviderState({ envVars = {}, defaultProvider = null } = {}) {
+function buildEffectiveProviderState({
+  envVars = {},
+  defaultProvider = null,
+  mcpServers = {},
+  integrations = [],
+} = {}) {
   const normalizedEnv = Object.fromEntries(
     Object.entries(envVars || {})
       .filter(([key, value]) => key && value != null && String(value) !== "")
@@ -34,10 +39,16 @@ function buildEffectiveProviderState({ envVars = {}, defaultProvider = null } = 
         config: normalizeProviderConfig(defaultProvider.config),
       }
     : null;
+  const normalizedIntegrations = (Array.isArray(integrations) ? integrations : [])
+    .map(canonicalize)
+    .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
 
   return canonicalize({
     env: normalizedEnv,
     defaultProvider: normalizedProvider,
+    mcpServers:
+      mcpServers && typeof mcpServers === "object" && !Array.isArray(mcpServers) ? mcpServers : {},
+    integrations: normalizedIntegrations,
   });
 }
 
@@ -264,7 +275,7 @@ async function runProvisioningReadinessBarrier({
   reconcileAuth,
   reconcileAndFinalize,
   finalize,
-  failClosedOnReadinessFailure = false,
+  failClosedOnReadinessFailure = true,
   onReadinessWarning,
 } = {}) {
   if (typeof checkReadiness !== "function") {
@@ -319,7 +330,7 @@ async function reconcileProviderStateUntilStable({
   readFingerprint,
   withMutationLock,
   finalize,
-  maxPasses = 3,
+  providerLockHeld = false,
 } = {}) {
   if (typeof reconcile !== "function") {
     throw new Error("reconcile is required");
@@ -337,54 +348,41 @@ async function reconcileProviderStateUntilStable({
     throw new Error("finalize is required");
   }
 
-  const passLimit = Number.isFinite(Number(maxPasses))
-    ? Math.max(1, Math.min(10, Number(maxPasses)))
-    : 3;
-  let appliedFingerprint = bootstrappedFingerprint || null;
-  let reconciliation = { status: "skipped", reason: "unchanged" };
-
-  for (let pass = 1; pass <= passLimit; pass += 1) {
-    reconciliation = await reconcile(appliedFingerprint);
+  const settle = async () => {
+    const reconciliation = await reconcile(bootstrappedFingerprint || null);
     const reconciledFingerprint = reconciliation?.providerFingerprint;
     if (!reconciledFingerprint) {
       throw new Error("provider reconciliation did not return a provider fingerprint");
     }
-    appliedFingerprint = reconciledFingerprint;
 
     if (typeof verify === "function") {
       await verify({
-        pass,
-        providerFingerprint: appliedFingerprint,
+        pass: 1,
+        providerFingerprint: reconciledFingerprint,
         reconciliation,
       });
     }
 
-    const verification = await withMutationLock(async () => {
-      const currentFingerprint = await readFingerprint();
-      if (!currentFingerprint) {
-        throw new Error("provider verification did not return a provider fingerprint");
-      }
-      if (currentFingerprint !== appliedFingerprint) {
-        return { stable: false, currentFingerprint };
-      }
-      return { stable: true, finalization: await finalize() };
-    });
-
-    if (verification?.stable) {
-      return {
-        reconciliation,
-        finalization: verification.finalization,
-        providerFingerprint: appliedFingerprint,
-        passes: pass,
-      };
+    const currentFingerprint = await readFingerprint();
+    if (!currentFingerprint) {
+      throw new Error("provider verification did not return a provider fingerprint");
     }
-  }
+    if (currentFingerprint !== reconciledFingerprint) {
+      const error = new Error(
+        "Provider or integration state changed while the shared mutation lock was held",
+      );
+      error.code = "PROVIDER_STATE_UNSTABLE";
+      throw error;
+    }
+    return {
+      reconciliation,
+      finalization: await finalize(),
+      providerFingerprint: reconciledFingerprint,
+      passes: 1,
+    };
+  };
 
-  const error = new Error(
-    `LLM provider state changed during ${passLimit} consecutive deployment finalization passes`,
-  );
-  error.code = "PROVIDER_STATE_UNSTABLE";
-  throw error;
+  return providerLockHeld ? settle() : withMutationLock(settle);
 }
 
 async function runRuntimeReconciliationBoundary({ mutations = [], restart, checkReadiness } = {}) {

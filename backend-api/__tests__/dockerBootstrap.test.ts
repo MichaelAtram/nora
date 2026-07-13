@@ -3,10 +3,14 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { PassThrough } = require("node:stream");
+const { DatabaseSync } = require("node:sqlite");
 const {
   buildOpenClawAuthProfilesWriteCommand,
   buildOpenClawConfigMergeScript,
   buildOpenClawConfigMergeCommand,
+  buildOpenClawManagedCustomProvidersCommand,
+  buildOpenClawManagedConfigEnvPruneCommand,
+  buildOpenClawManagedDefaultModelCommand,
   buildMcpServersConfig,
   buildOpenClawCustomProviders,
   buildOpenClawInstallCommand,
@@ -57,6 +61,60 @@ async function extractTarEntries(archiveBuffer) {
 
   extract.end(archiveBuffer);
   return done;
+}
+
+function seedOpenClawAuthDatabase(agentDir, store, state) {
+  fs.mkdirSync(agentDir, { recursive: true });
+  const databasePath = path.join(agentDir, "openclaw-agent.sqlite");
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec(`
+      CREATE TABLE auth_profile_store (
+        store_key TEXT NOT NULL PRIMARY KEY,
+        store_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE auth_profile_state (
+        state_key TEXT NOT NULL PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    database
+      .prepare(
+        "INSERT INTO auth_profile_store (store_key, store_json, updated_at) VALUES ('primary', ?, ?)",
+      )
+      .run(JSON.stringify(store), Date.now());
+    if (state) {
+      database
+        .prepare(
+          "INSERT INTO auth_profile_state (state_key, state_json, updated_at) VALUES ('primary', ?, ?)",
+        )
+        .run(JSON.stringify(state), Date.now());
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function readOpenClawAuthDatabase(agentDir) {
+  const database = new DatabaseSync(path.join(agentDir, "openclaw-agent.sqlite"), {
+    readOnly: true,
+  });
+  try {
+    const storeRow = database
+      .prepare("SELECT store_json FROM auth_profile_store WHERE store_key = 'primary'")
+      .get();
+    const stateRow = database
+      .prepare("SELECT state_json FROM auth_profile_state WHERE state_key = 'primary'")
+      .get();
+    return {
+      store: storeRow ? JSON.parse(storeRow.store_json) : null,
+      state: stateRow ? JSON.parse(stateRow.state_json) : null,
+    };
+  } finally {
+    database.close();
+  }
 }
 
 describe("OpenClaw bootstrap helpers", () => {
@@ -262,6 +320,379 @@ exit 2
         order: { "nora-demo": ["nora-demo:default"] },
         lastGood: { "nora-demo": "nora-demo:default" },
       });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reconciles Nora-owned SQLite auth profiles exactly while preserving manual profiles", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nora-openclaw-auth-exact-"));
+    try {
+      const authPath = path.join(tmpDir, "auth-profiles.json");
+      const fakeOpenClaw = path.join(tmpDir, "openclaw");
+      fs.writeFileSync(
+        fakeOpenClaw,
+        `#!/bin/sh
+cat > /dev/null
+echo "error: unknown option '--provider'" >&2
+exit 1
+`,
+        { mode: 0o755 },
+      );
+      seedOpenClawAuthDatabase(
+        tmpDir,
+        {
+          version: 1,
+          profiles: {
+            "openai:default": { type: "api_key", provider: "openai", key: "stale-openai" },
+            "anthropic:default": {
+              type: "api_key",
+              provider: "anthropic",
+              key: "stale-anthropic",
+            },
+            "microsoft-foundry:default": {
+              type: "api_key",
+              provider: "microsoft-foundry",
+              key: "stale-foundry",
+            },
+            "openai:manual": { type: "api_key", provider: "openai", key: "manual-openai" },
+            "manual-provider:default": {
+              type: "api_key",
+              provider: "manual-provider",
+              key: "manual-provider-key",
+            },
+          },
+          order: {
+            openai: ["openai:manual", "openai:default"],
+            anthropic: ["anthropic:default"],
+            "microsoft-foundry": ["microsoft-foundry:default"],
+            "manual-provider": ["manual-provider:default"],
+          },
+          lastGood: {
+            openai: "openai:default",
+            anthropic: "anthropic:default",
+            "microsoft-foundry": "microsoft-foundry:default",
+            "manual-provider": "manual-provider:default",
+          },
+          usageStats: {
+            "openai:default": { lastUsed: 1 },
+            "openai:manual": { lastUsed: 2 },
+            "anthropic:default": { lastUsed: 3 },
+            "microsoft-foundry:default": { lastUsed: 4 },
+          },
+          extensionState: { keep: true },
+        },
+        {
+          version: 1,
+          order: {
+            openai: ["openai:manual", "openai:default"],
+            anthropic: ["anthropic:default"],
+            "microsoft-foundry": ["microsoft-foundry:default"],
+            "manual-provider": ["manual-provider:default"],
+          },
+          lastGood: {
+            openai: "openai:manual",
+            anthropic: "anthropic:default",
+            "microsoft-foundry": "microsoft-foundry:default",
+            "manual-provider": "manual-provider:default",
+          },
+          usageStats: {
+            "openai:default": { lastUsed: 4 },
+            "openai:manual": { lastUsed: 5 },
+            "anthropic:default": { lastUsed: 6 },
+            "microsoft-foundry:default": { lastUsed: 7 },
+          },
+          extensionState: { keep: true },
+        },
+      );
+
+      const command = buildOpenClawAuthProfilesWriteCommand(
+        {
+          version: 1,
+          profiles: {
+            "openai:default": { type: "api_key", provider: "openai", key: "current-openai" },
+          },
+          order: { openai: ["openai:default"] },
+          lastGood: { openai: "openai:default" },
+        },
+        {
+          authPath,
+          managedProfileIds: [
+            "openai:default",
+            "anthropic:default",
+            "azure-openai-responses:default",
+          ],
+        },
+      );
+      const result = require("child_process").spawnSync("/bin/sh", ["-c", command], {
+        encoding: "utf8",
+        env: { ...process.env, OPENCLAW_CLI_PATH: fakeOpenClaw },
+      });
+
+      expect(result.status).toBe(0);
+      const { store, state } = readOpenClawAuthDatabase(tmpDir);
+      expect(store.profiles).toEqual({
+        "openai:default": { type: "api_key", provider: "openai", key: "current-openai" },
+        "openai:manual": { type: "api_key", provider: "openai", key: "manual-openai" },
+        "manual-provider:default": {
+          type: "api_key",
+          provider: "manual-provider",
+          key: "manual-provider-key",
+        },
+      });
+      expect(store.order).toEqual({
+        openai: ["openai:manual"],
+        "manual-provider": ["manual-provider:default"],
+      });
+      expect(store.lastGood).toEqual({ "manual-provider": "manual-provider:default" });
+      expect(store.usageStats).toEqual({ "openai:manual": { lastUsed: 2 } });
+      expect(store.extensionState).toEqual({ keep: true });
+      expect(state).toEqual({
+        version: 1,
+        order: {
+          openai: ["openai:default", "openai:manual"],
+          "manual-provider": ["manual-provider:default"],
+        },
+        lastGood: {
+          openai: "openai:manual",
+          "manual-provider": "manual-provider:default",
+        },
+        usageStats: { "openai:manual": { lastUsed: 5 } },
+        extensionState: { keep: true },
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes the final Nora-managed SQLite profile when desired auth is empty", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nora-openclaw-auth-empty-"));
+    try {
+      const authPath = path.join(tmpDir, "auth-profiles.json");
+      seedOpenClawAuthDatabase(
+        tmpDir,
+        {
+          version: 1,
+          profiles: {
+            "openai:default": { type: "api_key", provider: "openai", key: "stale-openai" },
+            "openai:manual": { type: "api_key", provider: "openai", key: "manual-openai" },
+          },
+        },
+        {
+          version: 1,
+          order: { openai: ["openai:default", "openai:manual"] },
+          lastGood: { openai: "openai:default" },
+          usageStats: {
+            "openai:default": { lastUsed: 1 },
+            "openai:manual": { lastUsed: 2 },
+          },
+        },
+      );
+
+      const command = buildOpenClawAuthProfilesWriteCommand(
+        { version: 1, profiles: {} },
+        { authPath, managedProfileIds: ["openai:default"] },
+      );
+      const result = require("child_process").spawnSync("/bin/sh", ["-c", command], {
+        encoding: "utf8",
+        env: { ...process.env, OPENCLAW_CLI_PATH: path.join(tmpDir, "missing-openclaw") },
+      });
+
+      expect(result.status).toBe(0);
+      expect(readOpenClawAuthDatabase(tmpDir)).toEqual({
+        store: {
+          version: 1,
+          profiles: {
+            "openai:manual": { type: "api_key", provider: "openai", key: "manual-openai" },
+          },
+        },
+        state: {
+          version: 1,
+          order: { openai: ["openai:manual"] },
+          usageStats: { "openai:manual": { lastUsed: 2 } },
+        },
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reconciles only Nora-managed custom providers", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nora-openclaw-providers-"));
+    try {
+      const configPath = path.join(tmpDir, "openclaw.json");
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          gateway: { bind: "lan" },
+          models: {
+            mode: "merge",
+            providers: {
+              "azure-openai-responses": { api: "stale-foundry" },
+              "nora-demo": { api: "stale-demo" },
+              "manual-provider": { api: "manual", apiKey: "manual-key" },
+            },
+          },
+        }),
+      );
+
+      const command = buildOpenClawManagedCustomProvidersCommand(
+        {
+          "azure-openai-responses": {
+            api: "azure-openai-responses",
+            baseUrl: "https://example.openai.azure.com/openai/v1",
+          },
+        },
+        { configPath },
+      );
+      const result = require("child_process").spawnSync("/bin/sh", ["-c", command], {
+        encoding: "utf8",
+      });
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({
+        gateway: { bind: "lan" },
+        models: {
+          mode: "merge",
+          providers: {
+            "azure-openai-responses": {
+              api: "azure-openai-responses",
+              baseUrl: "https://example.openai.azure.com/openai/v1",
+            },
+            "manual-provider": { api: "manual", apiKey: "manual-key" },
+          },
+        },
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prunes stopped-runtime credential names from persisted OpenClaw config env", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nora-openclaw-config-env-"));
+    try {
+      const configPath = path.join(tmpDir, "openclaw.json");
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          gateway: { bind: "lan" },
+          env: {
+            OLD_PROVIDER_API_KEY: "provider-secret",
+            OLD_INTEGRATION_TOKEN: "integration-secret",
+            OPERATOR_SETTING: "preserve-me",
+          },
+        }),
+      );
+      const stateEnvName = "NORA_K8S_MANAGED_ENV_B64";
+      const managedState = Buffer.from(
+        JSON.stringify({ managedNames: ["OLD_INTEGRATION_TOKEN"], values: {} }),
+        "utf8",
+      ).toString("base64");
+      const command = buildOpenClawManagedConfigEnvPruneCommand(["OLD_PROVIDER_API_KEY"], {
+        configPath,
+        managedStateEnvName: stateEnvName,
+      });
+      const result = require("child_process").spawnSync("/bin/sh", ["-c", command], {
+        encoding: "utf8",
+        env: { ...process.env, [stateEnvName]: managedState },
+      });
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({
+        gateway: { bind: "lan" },
+        env: { OPERATOR_SETTING: "preserve-me" },
+      });
+      expect(command).toContain("__NORA_PRUNE_MANAGED_OPENCLAW_CONFIG_ENV__");
+      expect(command).not.toContain("provider-secret");
+      expect(command).not.toContain("integration-secret");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves unmarked defaults and clears only marker-owned Nora defaults", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nora-openclaw-default-model-"));
+    try {
+      const configPath = path.join(tmpDir, "openclaw.json");
+      const markerPath = path.join(tmpDir, ".nora-managed-default-model");
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          gateway: { bind: "lan" },
+          agents: {
+            defaults: {
+              model: {
+                primary: "azure-openai-responses/stale-deployment",
+                fallbacks: ["manual-provider/manual-model"],
+              },
+              models: {
+                "azure-openai-responses/stale-deployment": { alias: "stale" },
+                "manual-provider/manual-model": { alias: "manual" },
+              },
+              workspace: "/root/.openclaw/workspace",
+            },
+          },
+        }),
+      );
+      const managedProviderIds = ["azure-openai-responses", "nora-demo"];
+
+      const clearLegacy = buildOpenClawManagedDefaultModelCommand("", {
+        configPath,
+        markerPath,
+        managedProviderIds,
+      });
+      let result = require("child_process").spawnSync("/bin/sh", ["-c", clearLegacy], {
+        encoding: "utf8",
+      });
+      expect(result.status).toBe(0);
+      let config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      expect(config.agents.defaults.model).toEqual({
+        primary: "azure-openai-responses/stale-deployment",
+        fallbacks: ["manual-provider/manual-model"],
+      });
+      expect(config.agents.defaults.models).toEqual({
+        "azure-openai-responses/stale-deployment": { alias: "stale" },
+        "manual-provider/manual-model": { alias: "manual" },
+      });
+      expect(config.agents.defaults.workspace).toBe("/root/.openclaw/workspace");
+      expect(config.gateway).toEqual({ bind: "lan" });
+
+      const setManaged = buildOpenClawManagedDefaultModelCommand("nora-demo/nora-demo-1", {
+        configPath,
+        markerPath,
+        managedProviderIds,
+      });
+      result = require("child_process").spawnSync("/bin/sh", ["-c", setManaged], {
+        encoding: "utf8",
+      });
+      expect(result.status).toBe(0);
+      config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      expect(config.agents.defaults.model.primary).toBe("nora-demo/nora-demo-1");
+      expect(config.agents.defaults.models).toEqual({
+        "azure-openai-responses/stale-deployment": { alias: "stale" },
+        "manual-provider/manual-model": { alias: "manual" },
+        "nora-demo/nora-demo-1": {},
+      });
+      expect(fs.readFileSync(markerPath, "utf8")).toBe("nora-demo/nora-demo-1\n");
+
+      const clearManaged = buildOpenClawManagedDefaultModelCommand(null, {
+        configPath,
+        markerPath,
+        managedProviderIds,
+      });
+      result = require("child_process").spawnSync("/bin/sh", ["-c", clearManaged], {
+        encoding: "utf8",
+      });
+      expect(result.status).toBe(0);
+      config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      expect(config.agents.defaults.model).toEqual({
+        fallbacks: ["manual-provider/manual-model"],
+      });
+      expect(config.agents.defaults.models).toEqual({
+        "azure-openai-responses/stale-deployment": { alias: "stale" },
+        "manual-provider/manual-model": { alias: "manual" },
+      });
+      expect(fs.existsSync(markerPath)).toBe(false);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -505,6 +936,108 @@ exit 2
 });
 
 describe("Provisioner backends", () => {
+  it("initializes managed state without rereading stopped container files", async () => {
+    const dockerBackend = new DockerBackend();
+    const container = {};
+    dockerBackend.docker = { getContainer: jest.fn(() => container) };
+    dockerBackend._readManagedEnvState = jest.fn().mockRejectedValue(new Error("unexpected read"));
+    dockerBackend._readContainerFile = jest.fn().mockRejectedValue(new Error("unexpected read"));
+    dockerBackend._putBootstrapFiles = jest.fn().mockResolvedValue(undefined);
+
+    await dockerBackend.updateEnv(
+      "container-1",
+      {
+        OPENAI_API_KEY: "provider-secret-sentinel",
+        OPENCLAW_GATEWAY_TOKEN: "gateway-secret-sentinel",
+      },
+      {
+        managedEnvNames: ["OPENAI_API_KEY"],
+        replaceManagedState: true,
+        initializeManagedState: true,
+        runtimeFamily: "openclaw",
+      },
+    );
+
+    expect(dockerBackend._readManagedEnvState).not.toHaveBeenCalled();
+    expect(dockerBackend._readContainerFile).not.toHaveBeenCalled();
+    const files = dockerBackend._putBootstrapFiles.mock.calls[0][1];
+    const stateFile = files.find((file) => file.name === "opt/nora-managed-env/state.json");
+    const reconcileFile = files.find(
+      (file) => file.name === "opt/nora-managed-env/reconcile-openclaw.sh",
+    );
+    expect(stateFile.mode).toBe(0o600);
+    expect(JSON.parse(stateFile.content)).toEqual({
+      version: 1,
+      managedNames: ["OPENAI_API_KEY"],
+      values: {
+        OPENAI_API_KEY: "provider-secret-sentinel",
+        OPENCLAW_GATEWAY_TOKEN: "gateway-secret-sentinel",
+      },
+    });
+    expect(reconcileFile.content).toContain("__NORA_PRUNE_MANAGED_OPENCLAW_CONFIG_ENV__");
+    expect(reconcileFile.content).not.toContain("provider-secret-sentinel");
+    expect(reconcileFile.content).not.toContain("gateway-secret-sentinel");
+    expect(files.some((file) => file.name === "opt/openclaw-runtime/start.sh")).toBe(false);
+  });
+
+  it("keeps Docker creation metadata and generated bootstrap scripts credential-free", async () => {
+    const dockerBackend = new DockerBackend();
+    const createdContainer = {
+      id: "container-secret-regression",
+      start: jest.fn().mockResolvedValue(undefined),
+      inspect: jest.fn().mockResolvedValue({
+        NetworkSettings: { IPAddress: "172.18.0.20", Networks: {}, Ports: {} },
+      }),
+      remove: jest.fn().mockResolvedValue(undefined),
+    };
+    dockerBackend._ensureDefaultAgentImage = jest.fn().mockResolvedValue(undefined);
+    dockerBackend._findComposeNetwork = jest.fn().mockResolvedValue(null);
+    dockerBackend._putBootstrapFiles = jest.fn().mockResolvedValue(undefined);
+    dockerBackend.docker = {
+      getContainer: jest.fn((id) =>
+        id === createdContainer.id
+          ? createdContainer
+          : { inspect: jest.fn().mockRejectedValue(new Error("not found")) },
+      ),
+      createVolume: jest.fn().mockResolvedValue(undefined),
+      createContainer: jest.fn().mockResolvedValue(createdContainer),
+      getNetwork: jest.fn(() => ({ connect: jest.fn().mockResolvedValue(undefined) })),
+    };
+
+    const sentinels = {
+      OPENAI_API_KEY: "provider-secret-sentinel",
+      GITHUB_TOKEN: "integration-secret-sentinel",
+      NORA_MCP_GITLAB_TOKEN_ALIAS: "mcp-secret-sentinel",
+    };
+    await dockerBackend.create({
+      id: "secret-regression",
+      name: "Secret Regression",
+      gatewayHostPort: 19444,
+      credentialManagedEnvNames: Object.keys(sentinels),
+      env: sentinels,
+    });
+
+    const createConfig = dockerBackend.docker.createContainer.mock.calls[0][0];
+    const [bootstrapFiles, managedFiles] = dockerBackend._putBootstrapFiles.mock.calls.map(
+      (call) => call[1],
+    );
+    const stateFile = managedFiles.find((file) => file.name === "opt/nora-managed-env/state.json");
+    const state = JSON.parse(stateFile.content);
+    const immutableArtifacts = JSON.stringify({ createConfig, bootstrapFiles });
+
+    for (const secret of [...Object.values(sentinels), state.values.OPENCLAW_GATEWAY_TOKEN]) {
+      expect(immutableArtifacts).not.toContain(secret);
+    }
+    expect(state.values).toEqual(
+      expect.objectContaining({
+        ...sentinels,
+        OPENCLAW_GATEWAY_TOKEN: expect.any(String),
+      }),
+    );
+    expect(stateFile.mode).toBe(0o600);
+    expect(createdContainer.start).toHaveBeenCalledTimes(1);
+  });
+
   it("demuxes non-TTY Docker exec output before command consumers read it", async () => {
     const dockerBackend = new DockerBackend();
     const rawStream = new PassThrough();
@@ -554,6 +1087,7 @@ describe("Provisioner backends", () => {
         "opt/openclaw-runtime/lib/agent.ts",
         "opt/openclaw-runtime/lib/build-auth.js",
         "usr/local/bin/nora-integration-tool",
+        "usr/local/bin/nora-mcp-server",
         "opt/openclaw-runtime/start.sh",
       ]),
     );
@@ -619,6 +1153,7 @@ describe("Provisioner backends", () => {
         "opt/openclaw-runtime/lib/agent.ts",
         "opt/openclaw-runtime/lib/build-auth.js",
         "usr/local/bin/nora-integration-tool",
+        "usr/local/bin/nora-mcp-server",
         "opt/openclaw-runtime/start.sh",
       ]),
     );
@@ -627,10 +1162,7 @@ describe("Provisioner backends", () => {
     expect(startupScript.content).toContain('exec "$OPENCLAW_BIN" gateway --port 18789');
   });
 
-  it("embeds the Foundry provider registration into the startup merge script", () => {
-    // End-to-end check: when _buildBootstrapFiles receives a gatewayConfig
-    // with models.providers["azure-openai-responses"], the generated start.sh
-    // ships those fields verbatim into the openclaw.json deep-merge.
+  it("keeps Foundry provider registration secret-free in the startup merge script", () => {
     const dockerBackend = new DockerBackend();
     const files = dockerBackend._buildBootstrapFiles({
       gatewayConfig: {
@@ -650,13 +1182,12 @@ describe("Provisioner backends", () => {
     });
     const startupScript = files.find((file) => file.name === "opt/openclaw-runtime/start.sh");
     expect(startupScript.content).toContain("azure-openai-responses");
-    expect(startupScript.content).toContain('"apiKey": "ms-key"');
+    expect(startupScript.content).toContain("https://r.openai.azure.com/openai/v1");
+    expect(startupScript.content).not.toContain('"apiKey"');
+    expect(startupScript.content).not.toContain("ms-key");
   });
 
-  it("embeds a per-agent mcpServers block into the startup merge script", () => {
-    // buildMcpServersConfig produces the openclaw.json mcpServers shape; when it
-    // is placed on the gatewayConfig, _buildBootstrapFiles ships it verbatim
-    // into the deep-merge so OpenClaw spawns the stdio server with its creds.
+  it("embeds only secret-free MCP wrapper configuration into the startup merge script", () => {
     const dockerBackend = new DockerBackend();
     const mcpServers = buildMcpServersConfig([
       {
@@ -671,9 +1202,13 @@ describe("Provisioner backends", () => {
       buildAuthScript: 'console.log("build auth");',
     });
     const startupScript = files.find((file) => file.name === "opt/openclaw-runtime/start.sh");
+    const encodedWrapperConfig = mcpServers.gitlab.args[0];
     expect(startupScript.content).toContain('"mcpServers"');
-    expect(startupScript.content).toContain("@modelcontextprotocol/server-gitlab");
-    expect(startupScript.content).toContain('"GITLAB_PERSONAL_ACCESS_TOKEN": "glpat-secret"');
+    expect(startupScript.content).toContain("/usr/local/bin/nora-mcp-server");
+    expect(startupScript.content).toContain(encodedWrapperConfig);
+    expect(startupScript.content).not.toContain("@modelcontextprotocol/server-gitlab");
+    expect(startupScript.content).not.toContain("GITLAB_PERSONAL_ACCESS_TOKEN");
+    expect(startupScript.content).not.toContain("glpat-secret");
   });
 
   it("wires the executable guard into OpenClaw startup paths", () => {

@@ -833,6 +833,72 @@ describe("gateway control-plane embed", () => {
     expect(res.text).not.toContain("enc(gateway-password)");
   });
 
+  it("does not expose the gateway bootstrap password after a Remote Docker grant is revoked", async () => {
+    const agent = {
+      id: "agent-remote",
+      user_id: "user-1",
+      host: "203.0.113.10",
+      gateway_host: "203.0.113.10",
+      gateway_port: 18789,
+      gateway_token: "enc(remote-gateway-password)",
+      status: "running",
+      backend_type: "remote-docker",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:shared-host",
+    };
+    mockDb.query.mockImplementation(async (sql) => {
+      const text = String(sql);
+      if (text.includes("FROM agents") && text.includes("WHERE id = $1 AND user_id = $2")) {
+        return { rows: [agent] };
+      }
+      if (text.includes("FROM remote_hosts")) return { rows: [] };
+      return { rows: [] };
+    });
+
+    const res = await request(app)
+      .get(`/agents/${agent.id}/gateway/embed/bootstrap.js?token=${encodeURIComponent(token)}`)
+      .set("Host", "nora.test")
+      .set("X-Forwarded-Proto", "https");
+
+    expect(res.status).toBe(403);
+    expect(res.text).toMatch(/host access has been revoked/i);
+    expect(res.text).not.toContain("remote-gateway-password");
+  });
+
+  it("does not expose Remote Docker authorization-store failures from embed access", async () => {
+    const agent = {
+      id: "agent-remote-auth-store-error",
+      user_id: "user-1",
+      host: "203.0.113.10",
+      gateway_host: "203.0.113.10",
+      gateway_port: 18789,
+      gateway_token: "enc(remote-gateway-password)",
+      status: "running",
+      backend_type: "remote-docker",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:shared-host",
+    };
+    const internalError = new Error("postgres://internal-user:secret@db/private");
+    mockDb.query.mockImplementation(async (sql) => {
+      const text = String(sql);
+      if (text.includes("FROM agents") && text.includes("WHERE id = $1 AND user_id = $2")) {
+        return { rows: [agent] };
+      }
+      if (text.includes("FROM remote_hosts")) throw internalError;
+      return { rows: [] };
+    });
+
+    const res = await request(app)
+      .get(`/agents/${agent.id}/gateway/embed/bootstrap.js?token=${encodeURIComponent(token)}`)
+      .set("Host", "nora.test")
+      .set("X-Forwarded-Proto", "https");
+
+    expect(res.status).toBe(503);
+    expect(res.text).toBe("Unable to verify Remote Docker host access");
+    expect(res.text).not.toContain(internalError.message);
+    expect(res.text).not.toContain("remote-gateway-password");
+  });
+
   it("uses the published gateway host port when one is recorded", async () => {
     // GATEWAY_HOST is the operator-configured published host; it must be on the
     // allowlist (RFC1918 here) for the embed proxy to reach it.
@@ -1593,6 +1659,52 @@ describe("Hermes dashboard embed", () => {
       .set("Host", "nora.test");
 
     expect(res.status).toBe(404);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("Hermes runtime host grants", () => {
+  const token = jwt.sign({ id: "user-1", role: "user" }, JWT_SECRET, {
+    expiresIn: "1h",
+  });
+
+  beforeEach(() => {
+    mockDb.query.mockReset();
+    global.fetch = jest.fn();
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+  });
+
+  it("rejects Remote Hermes runtime access after the workspace host grant is revoked", async () => {
+    const agent = {
+      id: "agent-remote-hermes",
+      user_id: "user-1",
+      name: "Remote Hermes",
+      status: "running",
+      container_id: "remote-hermes-container",
+      backend_type: "remote-docker",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:shared-host",
+      runtime_family: "hermes",
+      runtime_host: "203.0.113.10",
+      runtime_port: 8642,
+      gateway_token: "enc(runtime-token)",
+    };
+    mockDb.query.mockImplementation(async (sql) => {
+      const text = String(sql);
+      if (text === "SELECT * FROM agents WHERE id = $1") return { rows: [agent] };
+      if (text.includes("FROM remote_hosts")) return { rows: [] };
+      return { rows: [] };
+    });
+
+    const res = await request(app)
+      .get(`/agents/${agent.id}/hermes-ui`)
+      .set("Cookie", `nora_auth=${encodeURIComponent(token)}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/host access has been revoked/i);
     expect(global.fetch).not.toHaveBeenCalled();
   });
 });

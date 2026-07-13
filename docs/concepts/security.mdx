@@ -2,20 +2,26 @@
 
 > How Nora protects credentials, sessions, runtime access, and operator data across the control plane, the provisioning workers, and the agent runtimes it manages.
 
-Nora is built to be trustworthy in real operator environments: you run it on your own infrastructure, the secrets stay in your database encrypted with your key, and every layer between a browser and a runtime enforces access control. This page collects the security posture in one place.
+Nora is built to be trustworthy in real operator environments: you run it on your own infrastructure, supported credentials are encrypted with your key by default, and every layer between a browser and a runtime enforces access control. This page collects the security posture in one place.
 
 ## Secrets and credentials
 
-- **LLM provider keys, integration credentials, remote-host SSH credentials, and per-agent runtime gateway tokens are encrypted at rest** with AES-256-GCM before they are stored in PostgreSQL. The encryption key is the operator-owned `ENCRYPTION_KEY` generated during setup — Nora never stores plaintext credentials. Gateway tokens (the bearer that authenticates the control plane to each runtime sidecar) are encrypted on write and decrypted only at the point of use; they are never returned in API responses.
-- **Key sync to runtimes is explicit.** Provider keys are pushed to a runtime on demand as part of provisioning or an operator-triggered sync, not broadcast.
+- **LLM provider keys, integration credentials, remote-host SSH credentials, and per-agent runtime gateway tokens are encrypted at rest by default** with AES-256-GCM before they are stored in PostgreSQL. The encryption key is the operator-owned `ENCRYPTION_KEY` generated during setup. Gateway tokens (the bearer that authenticates the control plane to each runtime sidecar) are encrypted on write and decrypted only at the point of use; they are never returned in API responses. `NORA_ALLOW_PLAINTEXT_SECRETS=true` is an explicit insecure recovery/development override and should never be enabled on an internet-facing installation.
+- **Provider and integration credential reconciliation is exact and fail closed.** Credential create, rotation, and deletion replace Nora-managed runtime environment, OpenClaw file/SQLite auth profiles, custom-provider configuration, MCP configuration, and managed default-model state from the current durable state, including empty state. Mutations are serialized with deployment and lifecycle reconciliation so an older job cannot republish a revoked key. New runtimes launch credential-neutral and receive the current state only inside that fence. A runtime that cannot be reconciled is stopped and quarantined; if Nora cannot confirm that containment, the mutation returns a committed `502` instead of reporting success.
+- **Bootstrap artifacts are secret-free.** Docker and NemoClaw immutable container metadata and startup scripts do not carry provider, integration, gateway, pairing, or MCP credentials. Kubernetes stores mutable credentials in per-agent Secrets rather than ConfigMaps or pod-spec literals. Runtime startup derives pairing state from the owner-only gateway token and rebuilds mutable auth/config from restricted managed state.
 - **Setup generates strong secrets.** The installer creates `JWT_SECRET` and `ENCRYPTION_KEY` with OpenSSL and preserves existing secrets on re-runs.
-- **Production refuses weak secrets.** In production the backend will not boot when `JWT_SECRET` is missing, too short, or a placeholder, or when `ENCRYPTION_KEY` is missing or malformed — so a copy-pasted `.env.example` can never reach the internet. The only way around the encryption requirement is the explicit `NORA_ALLOW_PLAINTEXT_SECRETS=true` override.
+- **Production refuses weak secrets by default.** The backend will not boot when `JWT_SECRET` is missing, too short, or a placeholder, or when `ENCRYPTION_KEY` is missing or malformed. The only encryption-key bypass is the explicit `NORA_ALLOW_PLAINTEXT_SECRETS=true` override, which logs a security warning and transfers responsibility to the operator.
 - **First-run claim flow.** Until the first user registers, the signup page runs in "claim this server" mode; the first account becomes the platform admin. `GET /api/auth/bootstrap-status` exposes that boolean plus safe runtime OAuth visibility, platform mode, and signup-challenge metadata, never provider verification secrets.
 
 ## Authentication and authorization
 
 - **JWT-based sessions** authenticate dashboard and API requests; OAuth sign-in flows hand off to backend-issued HttpOnly session cookies.
 - **Role-based access control** separates operators from platform admins — admin routes are guarded by explicit role checks, and the admin dashboard is a separate application surface.
+- **Migration inspection is a privileged boundary.** Migration drafts and uploads require a browser
+  session. Reading a live Docker container is available only to a platform admin on a self-hosted
+  control plane because it crosses the backend Docker-socket boundary; hosted users and workspace
+  API keys cannot invoke it. Live SSH pull is disabled until independently verified host-key pinning
+  is available, so cross-host migration uses an exported bundle instead.
 - **Scoped Agent Hub API keys** can be issued, rotated, and revoked per tenant, with dedicated middleware guarding the public `/api/agent-hub/*` surface.
 - **Signup abuse controls**: signup-specific burst and daily rate limits, duplicate-email short-circuiting, and optional Cloudflare Turnstile or Google reCAPTCHA with server-side challenge verification.
 
@@ -23,7 +29,7 @@ Nora is built to be trustworthy in real operator environments: you run it on you
 
 - **helmet** security headers and **CORS** restricted to the configured `CORS_ORIGINS` allowlist.
 - **Layered rate limiting**: a global limiter plus a stricter limiter on mutating requests in the API, and nginx-level rate-limit zones for auth and API paths at the public edge.
-- **No raw error leakage**: unexpected failures route through a central error handler with correlation IDs, so 5xx responses never expose exception internals.
+- **Centralized unexpected-error handling**: uncaught failures route through a sanitizing error handler with correlation IDs. Some runtime and upstream-proxy routes intentionally return bounded operational failure messages, so operators should still keep detailed service logs private.
 - **TLS setup is scripted** (`infra/setup-tls.sh`) for public deployments, and public nginx trusts `CF-Connecting-IP` only from Cloudflare's published networks so proxied per-IP controls remain accurate without accepting direct-header spoofing.
 
 ## Runtime access control
@@ -37,9 +43,9 @@ Nora is built to be trustworthy in real operator environments: you run it on you
 
 Isolation strength is a property of the **deploy target + sandbox profile**, not a single global setting. Pick the tier that matches how much you trust the agent's code.
 
-### Standard profile — Docker and Kubernetes (GA)
+### Standard profile — Docker/Kubernetes (GA), Remote Docker (experimental)
 
-- **Each agent runs in its own container** with its own namespaces (PID, mount, network, IPC, UTS) and **operator-set CPU, RAM, and disk limits** (Docker `NanoCpus`/`Memory`; Kubernetes `resources.limits`). The host kernel's default container protections apply (Docker's default seccomp profile, dropped ambient capabilities).
+- **Each agent runs in its own container** with its own namespaces (PID, mount, network, IPC, UTS). Docker and Remote Docker enforce operator-set CPU and RAM limits (`NanoCpus`/`Memory`); their `disk_gb` value is metadata, not a storage quota. Kubernetes applies workload resource limits plus provisioned storage requests. The host kernel's default container protections apply (Docker's default seccomp profile, dropped ambient capabilities).
 - This is **shared-kernel** isolation: appropriate for first-party or trusted agent code, the same trust boundary you'd give any container you deploy. It is **not** intended as a hard boundary for arbitrary untrusted code — for that, use the NemoClaw profile or an independently configured VM/microVM runtime.
 
 ### NemoClaw profile — hardened sandbox (experimental, OpenClaw only)

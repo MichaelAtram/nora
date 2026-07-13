@@ -50,6 +50,7 @@ function isMutableImageReference(imgName) {
 function buildHermesStartCommand() {
   const hermesRuntimeCommand = [
     "set -eu",
+    "if [ -r /opt/nora-managed-env/apply.sh ]; then . /opt/nora-managed-env/apply.sh; fi",
     buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
@@ -107,6 +108,16 @@ function safeContainerName(prefix, name, id) {
 }
 
 class HermesBackend extends DockerBackend {
+  async _initialManagedEnvFileOwnership(_container) {
+    // The official Hermes image runs its application user as 10000:10000.
+    // Existing-container reconciliation still verifies the live passwd entry.
+    return { uid: 10000, gid: 10000 };
+  }
+
+  async _managedEnvFileOwnership(container) {
+    return this._containerUserOwnership(container, "hermes");
+  }
+
   async _pullImage(imgName) {
     console.log(`[hermes] Pulling image ${imgName}...`);
     await new Promise((resolve, reject) => {
@@ -159,7 +170,17 @@ class HermesBackend extends DockerBackend {
   }
 
   async create(config) {
-    const { id, name, image, vcpu, ram_mb, env, container_name, abortSignal } = config;
+    const {
+      id,
+      name,
+      image,
+      vcpu,
+      ram_mb,
+      env,
+      container_name,
+      abortSignal,
+      credentialManagedEnvNames = [],
+    } = config;
     const containerName = container_name || safeContainerName("nora-hermes", name, id);
     const imgName = image || getHermesDockerAgentImage();
     let container = null;
@@ -187,13 +208,11 @@ class HermesBackend extends DockerBackend {
 
     const apiServerKey = crypto.randomBytes(32).toString("hex");
     const envArray = Object.entries({
-      ...(env || {}),
       HERMES_HOME,
       HOME: `${HERMES_HOME}/home`,
       API_SERVER_ENABLED: "true",
       API_SERVER_HOST: "0.0.0.0",
       API_SERVER_PORT: String(HERMES_RUNTIME_PORT),
-      API_SERVER_KEY: apiServerKey,
       GATEWAY_HEALTH_URL: `http://127.0.0.1:${HERMES_RUNTIME_PORT}`,
       MESSAGING_CWD: HERMES_WORKSPACE,
       TERMINAL_CWD: HERMES_WORKSPACE,
@@ -246,6 +265,16 @@ class HermesBackend extends DockerBackend {
         },
       });
 
+      await this.updateEnv(
+        container.id,
+        { ...(env || {}), API_SERVER_KEY: apiServerKey },
+        {
+          managedEnvNames: credentialManagedEnvNames,
+          replaceManagedState: true,
+          initializeManagedState: true,
+          runtimeFamily: "hermes",
+        },
+      );
       throwIfAborted(abortSignal, `hermes start for ${containerName}`);
       await container.start();
 

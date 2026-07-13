@@ -10,6 +10,7 @@ const {
 } = require("../../workers/provisioner/healthChecks");
 const { waitForAgentReadiness: waitForBackendAgentReadiness } = require("../healthChecks");
 const { DEFAULT_OPENCLAW_PACKAGE_SPEC } = require("../../agent-runtime/lib/openclawDefaults");
+const { OPENCLAW_MANAGED_MCP_SERVERS_ENV } = require("../../agent-runtime/lib/runtimeBootstrap");
 
 const mockReadNamespace = jest.fn();
 const mockCreateNamespace = jest.fn();
@@ -218,6 +219,49 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(result.error).toBe("timeout after 5ms");
   });
 
+  it("stops readiness polling immediately when the before-attempt authorization hook fails", async () => {
+    const revoked = Object.assign(new Error("Remote host access was revoked"), {
+      code: "REMOTE_HOST_ACCESS_REVOKED",
+    });
+    const beforeAttempt = jest.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(revoked);
+    const fetchImpl = jest.fn().mockResolvedValue({ status: 503 });
+
+    await expect(
+      waitForHttpReady("http://remote-agent.internal:9090/health", {
+        attempts: 3,
+        intervalMs: 1,
+        timeoutMs: 25,
+        fetchImpl,
+        beforeAttempt,
+      }),
+    ).rejects.toBe(revoked);
+
+    expect(beforeAttempt).toHaveBeenCalledTimes(2);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("rechecks authorization between runtime and gateway readiness probes", async () => {
+    const revoked = Object.assign(new Error("Remote host access was revoked"), {
+      code: "REMOTE_HOST_ACCESS_REVOKED",
+    });
+    const beforeAttempt = jest.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(revoked);
+    const fetchImpl = jest.fn().mockResolvedValue({ status: 200 });
+
+    await expect(
+      waitForAgentReadiness(
+        { host: "remote-agent.internal", gatewayHostPort: 19123 },
+        {
+          beforeAttempt,
+          runtime: { attempts: 1, intervalMs: 1, timeoutMs: 25, fetchImpl },
+          gateway: { attempts: 1, intervalMs: 1, timeoutMs: 25, fetchImpl },
+        },
+      ),
+    ).rejects.toBe(revoked);
+
+    expect(beforeAttempt).toHaveBeenCalledTimes(2);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("checks runtime on 9090 and gateway on the published control-plane port", async () => {
     const fetchImpl = jest
       .fn()
@@ -373,6 +417,7 @@ describe("provisioning runtime/gateway contracts", () => {
       name: "Nora QA",
       vcpu: 2,
       ram_mb: 2048,
+      gatewayToken: "gateway-secret-sentinel",
       env: { OPENAI_API_KEY: "test-key" },
     });
 
@@ -384,11 +429,28 @@ describe("provisioning runtime/gateway contracts", () => {
     const deployment = mockCreateNamespacedDeployment.mock.calls[0][0].body;
     const service = mockCreateNamespacedService.mock.calls[0][0].body;
     const configMap = mockCreateNamespacedConfigMap.mock.calls[0][0].body;
+    const secret = mockCreateNamespacedSecret.mock.calls[0][0].body;
     const container = deployment.spec.template.spec.containers[0];
+
+    expect(JSON.stringify(configMap)).not.toContain("test-key");
+    expect(JSON.stringify(deployment)).not.toContain("test-key");
+    expect(JSON.stringify(configMap)).not.toContain("gateway-secret-sentinel");
+    expect(JSON.stringify(deployment)).not.toContain("gateway-secret-sentinel");
+    expect(secret.stringData).toEqual(
+      expect.objectContaining({
+        OPENAI_API_KEY: "test-key",
+        OPENCLAW_GATEWAY_TOKEN: "gateway-secret-sentinel",
+      }),
+    );
 
     expect(configMap.data["bootstrap.sh"]).toContain(DEFAULT_OPENCLAW_PACKAGE_SPEC);
     expect(configMap.data["bootstrap.sh"]).toContain("__NORA_OPENCLAW_AUTH_SQLITE_IMPORT__");
     expect(configMap.data["bootstrap.sh"]).toContain("paste-api-key");
+    expect(configMap.data["bootstrap.sh"]).toContain("__NORA_PRUNE_MANAGED_OPENCLAW_CONFIG_ENV__");
+    expect(configMap.data["bootstrap.sh"]).toContain("NORA_K8S_MANAGED_ENV_B64");
+    expect(
+      configMap.data["bootstrap.sh"].indexOf("__NORA_PRUNE_MANAGED_OPENCLAW_CONFIG_ENV__"),
+    ).toBeLessThan(configMap.data["bootstrap.sh"].lastIndexOf("gateway --port"));
     expect(configMap.metadata.labels["nora.sandbox.profile"]).toBe("standard");
     expect(container.command).toEqual(["/bin/sh", "-c"]);
     expect(container.args).toEqual([". /opt/nora-bootstrap/bootstrap.sh"]);
@@ -475,7 +537,7 @@ describe("provisioning runtime/gateway contracts", () => {
     );
   });
 
-  it("bakes MCP servers into the kubernetes bootstrap like the docker backend", async () => {
+  it("keeps kubernetes MCP bootstrap secret-free until managed state is reconciled", async () => {
     const K8sBackend = require("../../workers/provisioner/backends/k8s");
     const backend = new K8sBackend(k8sProfile());
 
@@ -486,15 +548,32 @@ describe("provisioning runtime/gateway contracts", () => {
       ram_mb: 2048,
       env: {},
       mcpServers: [
-        { name: "notion", npmPackage: "@notionhq/notion-mcp-server", env: { NOTION_TOKEN: "t" } },
+        {
+          name: "notion",
+          npmPackage: "@notionhq/notion-mcp-server",
+          env: { NOTION_TOKEN: "mcp-notion-secret-sentinel" },
+        },
       ],
     });
 
+    const deployment = mockCreateNamespacedDeployment.mock.calls[0][0].body;
     const configMap = mockCreateNamespacedConfigMap.mock.calls[0][0].body;
+    const container = deployment.spec.template.spec.containers[0];
     const script = configMap.data["bootstrap.sh"];
-    expect(script).toContain('"notion"');
-    expect(script).toContain("@notionhq/notion-mcp-server");
-    expect(script).toContain("config.mcpServers = mcpServers");
+    const managedMcpEntry = container.env.find(
+      (entry) => entry.name === OPENCLAW_MANAGED_MCP_SERVERS_ENV,
+    );
+
+    expect(JSON.parse(Buffer.from(managedMcpEntry.value, "base64").toString("utf8"))).toEqual({});
+    expect(script).toContain(`process.env.${OPENCLAW_MANAGED_MCP_SERVERS_ENV}`);
+    expect(script).toContain("delete server.env");
+    expect(script).toContain("config.mcpServers = desiredMcpServers");
+    expect(script).toContain("/usr/local/bin/nora-mcp-server");
+    expect(script).not.toContain("@notionhq/notion-mcp-server");
+    expect(script).not.toContain("NOTION_TOKEN");
+    expect(script).not.toContain('"notion"');
+    expect(JSON.stringify(configMap)).not.toContain("mcp-notion-secret-sentinel");
+    expect(JSON.stringify(deployment)).not.toContain("mcp-notion-secret-sentinel");
   });
 
   it("routes sensitive updateEnv values into the env Secret instead of plaintext pod spec", async () => {
@@ -532,7 +611,11 @@ describe("provisioning runtime/gateway contracts", () => {
     const envOp = patch.find((op) => op.path.includes("/env"));
     const sensitiveEntry = envOp.value.find((entry) => entry.name === "OPENAI_API_KEY");
     expect(sensitiveEntry.valueFrom).toEqual({
-      secretKeyRef: { name: "nora-oclaw-nora-qa-123-env", key: "OPENAI_API_KEY" },
+      secretKeyRef: {
+        name: "nora-oclaw-nora-qa-123-env",
+        key: "OPENAI_API_KEY",
+        optional: true,
+      },
     });
     expect(sensitiveEntry.value).toBeUndefined();
     expect(envOp.value).toContainEqual({ name: "PLAIN_SETTING", value: "value" });
@@ -588,7 +671,11 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(envOp.value).toContainEqual({
       name: "GEMINI_API_KEY",
       valueFrom: {
-        secretKeyRef: { name: "nora-oclaw-nora-qa-123-env", key: "GEMINI_API_KEY" },
+        secretKeyRef: {
+          name: "nora-oclaw-nora-qa-123-env",
+          key: "GEMINI_API_KEY",
+          optional: true,
+        },
       },
     });
     expect(envOp.value.some((entry) => entry.name === "OPENAI_API_KEY")).toBe(false);
@@ -824,6 +911,7 @@ describe("provisioning runtime/gateway contracts", () => {
       vcpu: 2,
       ram_mb: 2048,
       sandboxProfile: "nemoclaw",
+      credentialManagedEnvNames: ["NVIDIA_API_KEY"],
       env: { NEMOCLAW_MODEL: "nvidia/test-model" },
     });
 
@@ -854,16 +942,22 @@ describe("provisioning runtime/gateway contracts", () => {
       }),
     );
     expect(envVars.NVIDIA_API_KEY).toBeUndefined();
+    expect(JSON.stringify(configMap)).not.toContain("test-nvidia-key");
+    expect(JSON.stringify(deployment)).not.toContain("test-nvidia-key");
     expect(secret.metadata.name).toBe("nora-oclaw-nemo-loadbalancer-qa-nemo-env");
-    expect(secret.stringData).toEqual(
-      expect.objectContaining({
-        NVIDIA_API_KEY: "test-nvidia-key",
-      }),
-    );
-    expect(secretEnvVars.NVIDIA_API_KEY).toEqual({
+    expect(secret.stringData.NVIDIA_API_KEY).toBeUndefined();
+    expect(secret.stringData.OPENCLAW_GATEWAY_TOKEN).toEqual(expect.any(String));
+    expect(
+      JSON.parse(
+        Buffer.from(secret.stringData.NORA_K8S_MANAGED_ENV_B64, "base64").toString("utf8"),
+      ),
+    ).toEqual({ managedNames: ["NVIDIA_API_KEY"], values: {} });
+    expect(secretEnvVars.NORA_K8S_MANAGED_ENV_B64).toEqual({
       name: "nora-oclaw-nemo-loadbalancer-qa-nemo-env",
-      key: "NVIDIA_API_KEY",
+      key: "NORA_K8S_MANAGED_ENV_B64",
+      optional: true,
     });
+    expect(secretEnvVars.NVIDIA_API_KEY).toBeUndefined();
     expect(container.args).toEqual([". /opt/nora-bootstrap/bootstrap.sh"]);
     expect(configMap.data["bootstrap.sh"]).toContain("nemoclaw@latest");
     expect(configMap.metadata.labels["nora.sandbox.profile"]).toBe("nemoclaw");
@@ -1690,6 +1784,7 @@ describe("Hermes dashboard provisioning", () => {
   it("starts the official Hermes dashboard alongside the gateway", async () => {
     const HermesBackend = require("../../workers/provisioner/backends/hermes");
     const backend = new HermesBackend();
+    backend.updateEnv = jest.fn().mockResolvedValue(undefined);
 
     const createdContainer = {
       id: "hermes-container-1",
@@ -1767,6 +1862,18 @@ describe("Hermes dashboard provisioning", () => {
     expect(bridgeConnect).toHaveBeenCalledWith({
       Container: "hermes-container-1",
     });
+    expect(backend.updateEnv).toHaveBeenCalledWith(
+      "hermes-container-1",
+      expect.objectContaining({ OPENAI_API_KEY: "test-key", API_SERVER_KEY: expect.any(String) }),
+      expect.objectContaining({
+        initializeManagedState: true,
+        replaceManagedState: true,
+        runtimeFamily: "hermes",
+      }),
+    );
+    expect(backend.updateEnv.mock.invocationCallOrder[0]).toBeLessThan(
+      createdContainer.start.mock.invocationCallOrder[0],
+    );
     expect(result).toEqual(
       expect.objectContaining({
         runtimeHost: "10.0.0.50",
@@ -1784,6 +1891,7 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
   function mockDockerBackend() {
     const DockerBackend = require("../../workers/provisioner/backends/docker");
     const backend = new DockerBackend();
+    backend.updateEnv = jest.fn().mockResolvedValue(undefined);
     backend._findComposeNetwork = jest.fn().mockResolvedValue(null);
     const createdContainer = {
       id: "oclaw-port-1",
@@ -1833,6 +1941,18 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
       }),
     );
     expect(config.HostConfig.CapAdd).toBeUndefined();
+    expect(backend.updateEnv).toHaveBeenCalledWith(
+      "oclaw-port-1",
+      expect.objectContaining({ OPENCLAW_GATEWAY_TOKEN: expect.any(String) }),
+      expect.objectContaining({
+        initializeManagedState: true,
+        replaceManagedState: true,
+        runtimeFamily: "openclaw",
+      }),
+    );
+    expect(backend.updateEnv.mock.invocationCallOrder[0]).toBeLessThan(
+      backend._testCreatedContainer.start.mock.invocationCallOrder[0],
+    );
     expect(config.HostConfig.PortBindings["18789/tcp"]).toEqual([
       { HostIp: "127.0.0.1", HostPort: "19500" },
     ]);

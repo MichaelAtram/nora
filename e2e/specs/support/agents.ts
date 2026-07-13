@@ -18,6 +18,17 @@ type PlatformExecutionTarget = {
   configured?: boolean;
 };
 
+type AccessibleRemoteHost = {
+  id?: string;
+  executionTargetId?: string;
+  enabled?: boolean;
+  configured?: boolean;
+  connected?: boolean;
+  available?: boolean;
+  canDeploy?: boolean;
+  [key: string]: unknown;
+};
+
 type PlatformConfig = {
   enabledBackends?: string[];
   enabledDeployTargets?: string[];
@@ -197,6 +208,52 @@ async function getPlatformConfig(request: APIRequestContext, token: string) {
   return normalizePlatformConfig(body);
 }
 
+function selectAccessibleRemoteExecutionTarget(
+  value: unknown,
+  requestedExecutionTargetId: string,
+): PlatformExecutionTarget | null {
+  const requested = requestedExecutionTargetId.trim();
+  if (!requested.startsWith("remote:") || !Array.isArray(value)) return null;
+
+  for (const entry of value) {
+    if (!isJsonRecord(entry)) continue;
+    const host = entry as AccessibleRemoteHost;
+    const executionTargetId =
+      typeof host.executionTargetId === "string" && host.executionTargetId.trim()
+        ? host.executionTargetId.trim()
+        : typeof host.id === "string" && host.id.trim()
+          ? `remote:${host.id.trim()}`
+          : "";
+
+    if (executionTargetId !== requested) continue;
+    if (
+      host.enabled !== true ||
+      host.configured !== true ||
+      host.connected !== true ||
+      host.available !== true ||
+      host.canDeploy !== true
+    ) {
+      return null;
+    }
+
+    // Keep the real-matrix catalog view intentionally minimal. The
+    // session-only endpoint returns masked connection metadata, but target
+    // resolution needs only the canonical id and its availability flags.
+    return { id: executionTargetId, available: true, configured: true };
+  }
+
+  return null;
+}
+
+async function getAccessibleRemoteExecutionTarget(
+  request: APIRequestContext,
+  token: string,
+  executionTargetId: string,
+) {
+  const { body } = await apiJson<AccessibleRemoteHost[]>(request, "/api/remote-hosts", { token });
+  return selectAccessibleRemoteExecutionTarget(body, executionTargetId);
+}
+
 function backendSupported(platform: PlatformConfig, backendId: string, executionTargetId?: string) {
   if (Array.isArray(platform.executionTargets)) {
     const target = platform.executionTargets.find(
@@ -349,7 +406,7 @@ async function startAgent(request: APIRequestContext, token: string, agentId: st
 }
 
 async function deleteAgent(request: APIRequestContext, token: string, agentId: string) {
-  await apiJson(request, `/api/agents/${agentId}`, {
+  return apiJson(request, `/api/agents/${agentId}`, {
     method: "DELETE",
     token,
     failOnStatus: false,
@@ -622,6 +679,8 @@ async function deleteChannel(
 
 export {
   getPlatformConfig,
+  getAccessibleRemoteExecutionTarget,
+  selectAccessibleRemoteExecutionTarget,
   backendSupported,
   runtimeSupported,
   deployAgent,

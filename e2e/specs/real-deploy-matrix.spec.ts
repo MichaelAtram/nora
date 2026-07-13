@@ -6,17 +6,19 @@
 // Requires .env.real with at least REAL_LLM_API_KEY set, plus REAL_ENABLE_*
 // flags for the cells you want to exercise. See e2e/REAL_TESTS.md.
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type APIRequestContext } from "@playwright/test";
 import {
   DEFAULT_PASSWORD,
   apiJson,
   createUserSession,
+  ensureUserSession,
   getCurrentUser,
   uniqueEmail,
   uniqueName,
 } from "./support/app";
 import {
   getPlatformConfig,
+  getAccessibleRemoteExecutionTarget,
   backendSupported,
   runtimeSupported,
   deployAgent,
@@ -62,6 +64,16 @@ const CELLS: MatrixCell[] = [
     backend: "docker",
     sandboxProfile: "standard",
     enabledFlag: () => real.enableOpenclawDocker,
+  },
+  {
+    key: "openclaw-remote-docker",
+    label: "OpenClaw + Remote Docker",
+    runtimeFamily: "openclaw",
+    backend: "remote-docker",
+    targetPrefix: "remote:",
+    executionTargetId: () => real.remoteDockerExecutionTargetId,
+    sandboxProfile: "standard",
+    enabledFlag: () => real.enableOpenclawRemoteDocker,
   },
   {
     key: "openclaw-k8s",
@@ -143,9 +155,34 @@ function resolveExecutionTarget(platform: PlatformConfig, cell: MatrixCell) {
   return target?.id;
 }
 
-test.describe("Deploy matrix — real credentials", () => {
-  test.describe.configure({ mode: "serial" });
+async function destroyAgentAndVerify(request: APIRequestContext, token: string, agentId: string) {
+  const { response: deleteResponse, body: deleteBody } = await deleteAgent(request, token, agentId);
+  if (!deleteResponse.ok() && deleteResponse.status() !== 404) {
+    throw new Error(
+      `Failed to destroy real-matrix agent ${agentId}: ${deleteResponse.status()} ${JSON.stringify(
+        deleteBody,
+      )}`,
+    );
+  }
 
+  const { response: lookupResponse, body: lookupBody } = await apiJson(
+    request,
+    `/api/agents/${agentId}`,
+    {
+      token,
+      failOnStatus: false,
+    },
+  );
+  if (lookupResponse.status() !== 404) {
+    throw new Error(
+      `Real-matrix agent ${agentId} still exists after destroy: ${lookupResponse.status()} ${JSON.stringify(
+        lookupBody,
+      )}`,
+    );
+  }
+}
+
+test.describe("Deploy matrix — real credentials", () => {
   /** @type {{email: string, password: string, token: string, profile: any} | null} */
   let operator = null;
   const providerRecordIds: Record<string, string | undefined> = {};
@@ -156,10 +193,15 @@ test.describe("Deploy matrix — real credentials", () => {
       "REAL_LLM_API_KEY (or provider-specific real API key) not set",
     );
 
-    operator = await createUserSession(request, {
-      email: uniqueEmail("nora-real-matrix"),
-      password: DEFAULT_PASSWORD,
-    });
+    operator = real.operatorEmail
+      ? await ensureUserSession(request, {
+          email: real.operatorEmail,
+          password: real.operatorPassword || DEFAULT_PASSWORD,
+        })
+      : await createUserSession(request, {
+          email: uniqueEmail("nora-real-matrix"),
+          password: DEFAULT_PASSWORD,
+        });
     operator.profile = await getCurrentUser(request, operator.token);
 
     if (real.llmApiKey) {
@@ -190,10 +232,40 @@ test.describe("Deploy matrix — real credentials", () => {
       /** @type {any} */
       let agent = null;
 
+      test.afterAll(async ({ request }, testInfo) => {
+        testInfo.setTimeout(120000);
+        if (!agent?.id || !operator?.token) return;
+
+        const agentId = agent.id;
+        await destroyAgentAndVerify(request, operator.token, agentId);
+        agent = null;
+      });
+
       test(`[L1] deploy`, async ({ request }) => {
         test.skip(!cell.enabledFlag(), `Cell disabled via REAL_ENABLE_* flag`);
 
-        const platform = await getPlatformConfig(request, operator.token);
+        const basePlatform = await getPlatformConfig(request, operator.token);
+        const explicitExecutionTargetId =
+          typeof cell.executionTargetId === "function" ? cell.executionTargetId() : null;
+        const accessibleRemoteTarget =
+          cell.backend === "remote-docker" && explicitExecutionTargetId
+            ? await getAccessibleRemoteExecutionTarget(
+                request,
+                operator.token,
+                explicitExecutionTargetId,
+              )
+            : null;
+        const platform = accessibleRemoteTarget
+          ? {
+              ...basePlatform,
+              executionTargets: [
+                ...(basePlatform.executionTargets || []).filter(
+                  (entry) => entry?.id !== accessibleRemoteTarget.id,
+                ),
+                accessibleRemoteTarget,
+              ],
+            }
+          : basePlatform;
         const executionTargetId = resolveExecutionTarget(platform, cell);
         test.skip(
           Boolean(cell.targetPrefix) && !executionTargetId,
@@ -390,13 +462,9 @@ test.describe("Deploy matrix — real credentials", () => {
 
       test(`[L10] destroy`, async ({ request }) => {
         test.skip(!agent, "no agent from [L1]");
-        await deleteAgent(request, operator.token, agent.id);
-        // After delete, the per-user GET should 404 or return deleted state.
-        const { response } = await apiJson(request, `/api/agents/${agent.id}`, {
-          token: operator.token,
-          failOnStatus: false,
-        });
-        expect([404, 200]).toContain(response.status());
+        const agentId = agent.id;
+        await destroyAgentAndVerify(request, operator.token, agentId);
+        agent = null;
       });
     });
   }

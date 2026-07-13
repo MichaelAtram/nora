@@ -74,14 +74,27 @@ const {
   saveHermesChannel,
   testHermesChannel,
 } = require("../hermesUi");
-const { runContainerCommand, syncAuthToUserAgents } = require("../authSync");
+const {
+  isProviderAuthStatusHoldReason,
+  runContainerCommand,
+  resumeAgentWithProviderAuth,
+  syncAuthToUserAgents,
+} = require("../authSync");
 const { findAccessibleAgent } = require("../middleware/ownership");
 const { scopeByMethod } = require("../middleware/auth");
 const agentVersions = require("../agentVersions");
 const { assertKubernetesExecutionTargetAvailable } = require("../kubernetesClusters");
-const { assertRemoteHostExecutionTargetAvailable } = require("../remoteHosts");
+const {
+  assertRemoteHostAgentUse,
+  assertRemoteHostExecutionTargetAvailable,
+} = require("../remoteHosts");
 const { releaseGatewayPort } = require("../portAllocations");
 const { buildPostgresConfig } = require("../lib/connectionConfig");
+const {
+  acquireAgentProvisionLock,
+  buildReplacementDeploymentJob,
+  enqueueReplacementDeployment: enqueueReplacementDeploymentWithLock,
+} = require("../agentProvisionLock");
 
 const router = express.Router();
 router.use(createMutationFailureAuditMiddleware("agent"));
@@ -90,6 +103,50 @@ router.use(createMutationFailureAuditMiddleware("agent"));
 router.use(scopeByMethod("agents:read", "agents:write"));
 
 const DEMO_ACTIVATION_MARKER = "local-docker-demo-v1";
+
+async function enqueueReplacementDeployment(agent, jobData, options = {}) {
+  return enqueueReplacementDeploymentWithLock(agent, jobData, {
+    queryable: db,
+    cancelDeploymentJobsForAgent,
+    addDeploymentJob,
+    acquireLock: acquireAgentProvisionLock,
+    ...options,
+  });
+}
+
+function createAgentNotFoundError() {
+  const error = new Error("Agent not found");
+  error.statusCode = 404;
+  return error;
+}
+
+function assertLifecycleNotProvisioning(agent) {
+  if (!["queued", "deploying"].includes(agent?.status)) return;
+  const error = new Error(
+    "Agent deployment is queued or in progress. Wait for provisioning to finish before changing lifecycle state.",
+  );
+  error.statusCode = 409;
+  error.code = "AGENT_PROVISIONING_IN_PROGRESS";
+  throw error;
+}
+
+async function withAccessibleAgentLifecycleLock(
+  { agentId, userId, role = "editor", applicationName },
+  callback,
+) {
+  const visible = await findAccessibleAgent(agentId, userId, role);
+  if (!visible) throw createAgentNotFoundError();
+
+  const provisionLock = await acquireAgentProvisionLock(agentId, { applicationName });
+  try {
+    const agent = await findAccessibleAgent(agentId, userId, role);
+    if (!agent) throw createAgentNotFoundError();
+    assertLifecycleNotProvisioning(agent);
+    return await callback(agent);
+  } finally {
+    await provisionLock.release();
+  }
+}
 
 function createDemoActivationLockClient() {
   const {
@@ -135,36 +192,97 @@ async function ensureDemoDeploymentQueued(agent, userId, demoProviderId, plan, q
 
   let deploymentAgent = agent;
   if (agent.status === "error") {
-    const canceledJobs = await cancelDeploymentJobsForAgent(agent.id);
-    if (canceledJobs.active > 0) {
-      const error = new Error(
-        "The previous demo deployment is still finishing. Try again shortly.",
+    const provisionLock = await acquireAgentProvisionLock(agent.id, {
+      applicationName: "nora-backend-demo-activation-retry",
+    });
+    let resetPerformed = false;
+    try {
+      const currentResult = await queryable.query("SELECT * FROM agents WHERE id = $1", [agent.id]);
+      const currentAgent = currentResult.rows[0];
+      if (!currentAgent) throw createAgentNotFoundError();
+      if (currentAgent.status !== "error") return currentAgent;
+      agent = currentAgent;
+
+      const canceledJobs = await cancelDeploymentJobsForAgent(agent.id);
+      if (canceledJobs.active > 0) {
+        const error = new Error(
+          "The previous demo deployment is still finishing. Try again shortly.",
+        );
+        error.statusCode = 409;
+        throw error;
+      }
+      const hasRuntimeIdentity = [agent.container_id, agent.container_name].some(
+        (value) => value != null && String(value).trim() !== "",
       );
-      error.statusCode = 409;
+      if (hasRuntimeIdentity && !containerManager.canDestroy(agent)) {
+        const error = new Error(
+          "The failed demo runtime identity cannot be cleaned up safely. Remove it manually before retrying activation.",
+        );
+        error.code = "DEMO_RUNTIME_CLEANUP_UNAVAILABLE";
+        error.statusCode = 409;
+        throw error;
+      }
+      if (hasRuntimeIdentity) {
+        await containerManager.destroy(agent);
+      }
+      const reset = await queryable.query(
+        `UPDATE agents
+            SET status = 'queued',
+                container_id = NULL,
+                container_name = NULL,
+                host = NULL,
+                runtime_host = NULL,
+                runtime_port = NULL,
+                gateway_host = NULL,
+                gateway_port = NULL,
+                gateway_host_port = NULL,
+                gateway_token = NULL
+          WHERE id = $1
+            AND status = 'error'
+            AND container_id IS NOT DISTINCT FROM $2
+            AND container_name IS NOT DISTINCT FROM $3
+            AND host IS NOT DISTINCT FROM $4
+          RETURNING *`,
+        [agent.id, agent.container_id || null, agent.container_name || null, agent.host || null],
+      );
+      if (!reset.rows[0]) {
+        const error = new Error("The demo runtime changed while activation was being retried");
+        error.code = "DEMO_RUNTIME_STATE_CHANGED";
+        error.statusCode = 409;
+        throw error;
+      }
+      resetPerformed = true;
+      deploymentAgent = reset.rows[0];
+      await queryable.query("UPDATE deployments SET status = 'queued' WHERE agent_id = $1", [
+        agent.id,
+      ]);
+
+      await addDeploymentJob(
+        buildDemoDeploymentJob(deploymentAgent, userId, demoProviderId, plan),
+        {
+          jobId: demoActivationJobId(deploymentAgent.id),
+        },
+      );
+      return deploymentAgent;
+    } catch (error) {
+      if (resetPerformed) {
+        const compensation = await Promise.allSettled([
+          queryable.query(
+            "UPDATE agents SET status = 'error' WHERE id = $1 AND status = 'queued'",
+            [agent.id],
+          ),
+          queryable.query(
+            "UPDATE deployments SET status = 'failed' WHERE agent_id = $1 AND status = 'queued'",
+            [agent.id],
+          ),
+        ]);
+        const compensationFailure = compensation.find((result) => result.status === "rejected");
+        if (compensationFailure) error.compensationError = compensationFailure.reason;
+      }
       throw error;
+    } finally {
+      await provisionLock.release();
     }
-    if (containerManager.canDestroy(agent)) {
-      await containerManager.destroy(agent);
-    }
-    const reset = await queryable.query(
-      `UPDATE agents
-          SET status = 'queued',
-              container_id = NULL,
-              host = NULL,
-              runtime_host = NULL,
-              runtime_port = NULL,
-              gateway_host = NULL,
-              gateway_port = NULL,
-              gateway_host_port = NULL,
-              gateway_token = NULL
-        WHERE id = $1
-        RETURNING *`,
-      [agent.id],
-    );
-    deploymentAgent = reset.rows[0] || { ...agent, status: "queued" };
-    await queryable.query("UPDATE deployments SET status = 'queued' WHERE agent_id = $1", [
-      agent.id,
-    ]);
   }
 
   if (!["queued", "deploying"].includes(deploymentAgent.status)) return deploymentAgent;
@@ -172,6 +290,26 @@ async function ensureDemoDeploymentQueued(agent, userId, demoProviderId, plan, q
     jobId: demoActivationJobId(deploymentAgent.id),
   });
   return deploymentAgent;
+}
+
+async function reconcileReadyDemoAgent(agent, userId) {
+  if (!agent || !["running", "warning", "stopped"].includes(agent.status)) return agent;
+
+  const results = await syncAuthToUserAgents(userId, agent.id, {
+    providerLockHeld: true,
+  });
+  const result = results.find((entry) => entry?.agentId === agent.id);
+  if (result?.status !== "synced") {
+    const error = new Error(
+      "The demo provider was restored, but the existing demo runtime could not be reconciled",
+    );
+    error.statusCode = 502;
+    error.code = "DEMO_PROVIDER_RECONCILIATION_FAILED";
+    error.syncResult = result || null;
+    throw error;
+  }
+
+  return agent;
 }
 
 function demoActivationMarkerPayload() {
@@ -420,6 +558,7 @@ router.get(
     // warning as a first-class degraded state until the container actually stops.
     if (
       containerManager.canMutate(agent) &&
+      !isProviderAuthStatusHoldReason(agent.paused_reason) &&
       ["running", "warning", "error", "stopped"].includes(agent.status)
     ) {
       try {
@@ -619,6 +758,11 @@ async function loadHermesUiAgent(req, { requiredRole = "viewer" } = {}) {
   if (!isGatewayAvailableStatus(agent.status)) {
     throw createStatusCodeError("Hermes WebUI is only available while the agent is running", 409);
   }
+
+  // Hermes status, chat, cron, channel, and dashboard routes can use runtime
+  // bearer credentials or the remote host directly. Agent ownership alone is
+  // not a durable capability after a workspace host share is revoked.
+  await assertRemoteHostAgentUse(agent, { includeProfile: false });
 
   // Belt-and-braces: gateway-available status should imply container_id is set
   // (the worker writes both atomically in the final UPDATE). If they've drifted
@@ -826,6 +970,9 @@ async function resolveHermesApiToken(agent) {
 }
 
 async function fetchHermesApi(agent, path, options = {}) {
+  // Re-check at the credential-use boundary as defense in depth. This closes
+  // the race between the shared route loader and a later runtime request.
+  await assertRemoteHostAgentUse(agent, { includeProfile: false });
   const runtimeUrl = runtimeUrlForAgent(agent, path);
   if (!runtimeUrl) {
     const error = new Error("Hermes runtime endpoint not available");
@@ -882,6 +1029,7 @@ async function fetchHermesApi(agent, path, options = {}) {
 }
 
 async function fetchHermesDashboard(agent, path, options = {}) {
+  await assertRemoteHostAgentUse(agent, { includeProfile: false });
   const dashboardUrl = dashboardUrlForAgent(agent, path);
   if (!dashboardUrl) {
     const error = new Error("Hermes dashboard endpoint not available");
@@ -1509,6 +1657,7 @@ router.post("/activate-demo", async (req, res) => {
         undefined,
         client,
       );
+      await reconcileReadyDemoAgent(activatedAgent, userId);
       return res.json(serializeAgent(activatedAgent));
     }
 
@@ -2123,45 +2272,38 @@ router.post(
 
 router.post("/:id/start", async (req, res, next) => {
   try {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent, {
-      ownerEmail: req.user.email || null,
-    });
-    if (!containerManager.canMutate(agent))
-      return res.status(400).json({ error: "No container — redeploy the agent first" });
+    const result = await withAccessibleAgentLifecycleLock(
+      {
+        agentId: req.params.id,
+        userId: req.user.id,
+        applicationName: "nora-backend-agent-start",
+      },
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent, {
+          ownerEmail: req.user.email || null,
+        });
+        if (!containerManager.canMutate(agent)) {
+          const error = new Error("No container — redeploy the agent first");
+          error.statusCode = 400;
+          throw error;
+        }
 
-    const lifecycleResult = await containerManager.start(agent);
-    await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
+        // The lifecycle lock is already held here. Provider state remains
+        // locked from offline staging through readiness and the final status
+        // publish, so a concurrent key rotation cannot race this start.
+        const resumed = await resumeAgentWithProviderAuth(agent, "start");
 
-    // Manual start is an explicit operator override of a budget pause; the
-    // budget sweep re-pauses on its next cycle if the agent is still over cap.
-    const updated = await db.query(
-      "UPDATE agents SET status = 'running', paused_reason = NULL WHERE id = $1 RETURNING *",
-      [agent.id],
-    );
-    try {
-      const authSyncResults = await syncAuthToUserAgents(req.user.id, agent.id, {
-        onlyIfAuthPresent: true,
-      });
-      const failedSync = authSyncResults.find((result) => result.status === "failed");
-      if (failedSync) {
-        console.warn(
-          `[agents.start] Auth sync failed for agent ${agent.id}: ${failedSync.error || "unknown error"}`,
+        await monitoring.logEvent(
+          "agent_started",
+          `Agent "${agent.name}" started`,
+          agentAuditMetadata(req, resumed.agent, {
+            result: { status: "running" },
+          }),
         );
-      }
-    } catch (syncError) {
-      console.warn(`[agents.start] Auth sync errored for agent ${agent.id}: ${syncError.message}`);
-    }
-
-    await monitoring.logEvent(
-      "agent_started",
-      `Agent "${agent.name}" started`,
-      agentAuditMetadata(req, updated.rows[0], {
-        result: { status: "running" },
-      }),
+        return serializeAgent(resumed.agent);
+      },
     );
-    res.json(serializeAgent(updated.rows[0]));
+    res.json(result);
   } catch (e) {
     next(e);
   }
@@ -2169,35 +2311,43 @@ router.post("/:id/start", async (req, res, next) => {
 
 router.post("/:id/stop", async (req, res, next) => {
   try {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent, {
-      ownerEmail: req.user.email || null,
-    });
+    const result = await withAccessibleAgentLifecycleLock(
+      {
+        agentId: req.params.id,
+        userId: req.user.id,
+        applicationName: "nora-backend-agent-stop",
+      },
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent, {
+          ownerEmail: req.user.email || null,
+        });
 
-    if (containerManager.canMutate(agent)) {
-      try {
-        await containerManager.stop(agent);
-      } catch (e) {
-        if (!containerManager.isIgnorableStopError(e)) {
-          console.error("Container stop error:", e.message);
-          return res.status(e.statusCode || 500).json({ error: e.message });
+        if (containerManager.canMutate(agent)) {
+          try {
+            await containerManager.stop(agent);
+          } catch (error) {
+            if (!containerManager.isIgnorableStopError(error)) {
+              console.error("Container stop error:", error.message);
+              throw error;
+            }
+          }
         }
-      }
-    }
 
-    const updated = await db.query(
-      "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
-      [agent.id],
+        const updated = await db.query(
+          "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
+          [agent.id],
+        );
+        await monitoring.logEvent(
+          "agent_stopped",
+          `Agent "${agent.name}" stopped`,
+          agentAuditMetadata(req, updated.rows[0], {
+            result: { status: "stopped" },
+          }),
+        );
+        return serializeAgent(updated.rows[0]);
+      },
     );
-    await monitoring.logEvent(
-      "agent_stopped",
-      `Agent "${agent.name}" stopped`,
-      agentAuditMetadata(req, updated.rows[0], {
-        result: { status: "stopped" },
-      }),
-    );
-    res.json(serializeAgent(updated.rows[0]));
+    res.json(result);
   } catch (e) {
     next(e);
   }
@@ -2266,24 +2416,33 @@ router.delete("/:id", async (req, res, next) => {
 
 router.post("/:id/restart", async (req, res, next) => {
   try {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent, {
-      ownerEmail: req.user.email || null,
-    });
-    if (!containerManager.canMutate(agent))
-      return res.status(400).json({ error: "No container — redeploy the agent first" });
+    await withAccessibleAgentLifecycleLock(
+      {
+        agentId: req.params.id,
+        userId: req.user.id,
+        applicationName: "nora-backend-agent-restart",
+      },
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent, {
+          ownerEmail: req.user.email || null,
+        });
+        if (!containerManager.canMutate(agent)) {
+          const error = new Error("No container — redeploy the agent first");
+          error.statusCode = 400;
+          throw error;
+        }
 
-    const lifecycleResult = await containerManager.restart(agent);
-    await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
-
-    await db.query("UPDATE agents SET status = 'running' WHERE id = $1", [agent.id]);
-    await monitoring.logEvent(
-      "agent_restarted",
-      `Agent "${agent.name}" restarted`,
-      agentAuditMetadata(req, agent, {
-        result: { status: "running" },
-      }),
+        // Auth sync owns the one exact restart. Do not restart once here and a
+        // second time during provider reconciliation.
+        const resumed = await resumeAgentWithProviderAuth(agent, "restart");
+        await monitoring.logEvent(
+          "agent_restarted",
+          `Agent "${agent.name}" restarted`,
+          agentAuditMetadata(req, resumed.agent, {
+            result: { status: "running" },
+          }),
+        );
+      },
     );
     res.json({ success: true });
   } catch (e) {
@@ -2320,7 +2479,10 @@ router.post("/:id/redeploy", async (req, res) => {
       },
       fallback: currentRuntimeFields,
     });
-    await assertRuntimeTargetAvailable(runtimeFields, req.user.id);
+    // Workspace editors may trigger a redeploy, but the runtime always belongs
+    // to the persisted agent owner. Validate and queue using that owner so the
+    // editor's provider credentials can never be selected by the worker.
+    await assertRuntimeTargetAvailable(runtimeFields, agent.user_id);
     const containerName = resolveContainerName({
       requestedName: requestBody.container_name,
       currentName: agent.container_name,
@@ -2334,60 +2496,18 @@ router.post("/:id/redeploy", async (req, res) => {
       fallbackRuntimeFields: currentRuntimeFields,
     });
 
-    await db.query(
-      `UPDATE agents
-          SET status = 'queued',
-              container_id = NULL,
-              host = NULL,
-              runtime_host = NULL,
-              runtime_port = NULL,
-              gateway_host = NULL,
-              gateway_port = NULL,
-              gateway_host_port = NULL,
-              gateway_token = NULL,
-              backend_type = $2,
-              sandbox_type = $3,
-              runtime_family = $4,
-              deploy_target = $5,
-              execution_target_id = $6,
-              sandbox_profile = $7,
-              container_name = $8,
-              image = $9
-        WHERE id = $1`,
-      [
-        agent.id,
-        runtimeFields.backend_type,
-        runtimeFields.sandbox_type,
-        runtimeFields.runtime_family,
-        runtimeFields.deploy_target,
-        runtimeFields.execution_target_id,
-        runtimeFields.sandbox_profile,
+    // Preserve the exact previous runtime identity and placement until the
+    // provisioner has validated the new target and owns its per-agent lock.
+    // This keeps enqueue rejection, deployment-row failure, or target-auth
+    // failure cleanup-safe.
+    await enqueueReplacementDeployment(
+      agent,
+      buildReplacementDeploymentJob(agent, {
+        runtimeFields,
         containerName,
         image,
-      ],
+      }),
     );
-
-    await db.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [agent.id]);
-
-    await addDeploymentJob({
-      id: agent.id,
-      name: agent.name,
-      userId: req.user.id,
-      backend: runtimeFields.backend_type,
-      execution_target_id: runtimeFields.execution_target_id,
-      sandbox: runtimeFields.sandbox_profile,
-      specs: { vcpu: agent.vcpu || 2, ram_mb: agent.ram_mb || 2048, disk_gb: agent.disk_gb || 20 },
-      container_name: containerName,
-      previous_container_id: agent.container_id || null,
-      previous_container_name: agent.container_name || null,
-      previous_host: agent.host || null,
-      previous_backend: currentRuntimeFields.backend_type,
-      previous_runtime_family: currentRuntimeFields.runtime_family,
-      previous_deploy_target: currentRuntimeFields.deploy_target,
-      previous_execution_target_id: currentRuntimeFields.execution_target_id,
-      previous_sandbox_profile: currentRuntimeFields.sandbox_profile,
-      image,
-    });
 
     await monitoring.logEvent(
       "agent_redeployed",
@@ -2601,77 +2721,107 @@ router.get(
 router.post(
   "/:id/rollback/:versionId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    let agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     const target = await agentVersions.getVersion(agent.id, req.params.versionId);
     if (!target) return res.status(404).json({ error: "Version not found" });
 
-    res.locals.auditContext = buildAgentContext(agent, {
-      ownerEmail: req.user.email || null,
+    const provisionLock = await acquireAgentProvisionLock(agent.id, {
+      applicationName: "nora-backend-agent-rollback",
     });
-
-    // Snapshot the current state first so rollback is itself reversible.
-    const currentResult = await db.query("SELECT template_payload FROM agents WHERE id = $1", [
-      agent.id,
-    ]);
-    const currentPayload = currentResult.rows[0]?.template_payload || {};
-    await agentVersions.recordVersionBestEffort(agent.id, currentPayload, {
-      createdBy: req.user.id,
-      message: `Pre-rollback snapshot (rolling back to v${target.versionNumber})`,
-      source: "rollback",
-    });
-
-    // Replace the agent's template_payload with the target version.
-    await db.query("UPDATE agents SET template_payload = $1::jsonb WHERE id = $2", [
-      JSON.stringify(target.config),
-      agent.id,
-    ]);
-
-    // Record the rolled-back state as the new "current" version.
-    const restored = await agentVersions.recordVersion(agent.id, target.config, {
-      createdBy: req.user.id,
-      message: `Rolled back to v${target.versionNumber}`,
-      source: "rollback",
-    });
-
-    // Re-materialize wiring + queue redeploy if the agent has a container.
+    let shouldRedeploy = false;
+    let restored;
+    let currentPayload = null;
+    let payloadUpdated = false;
     try {
-      await materializeTemplateWiring(agent.id, target.config);
-    } catch (err) {
-      console.warn(`[agents.rollback] wiring materialize failed: ${err.message}`);
-    }
-    if (agent.container_id) {
-      // Validate the agent's execution target is still deployable before
-      // queuing the redeploy — a remote host / k8s cluster may have been
-      // removed or disconnected since the original deploy. Owner-scoped to the
-      // agent's owner (an editor may trigger the rollback). Fail before we
-      // clear container_id so a rejected rollback leaves the agent intact.
-      await assertRuntimeTargetAvailable(
-        buildAgentRuntimeFields(agent),
-        agent.user_id || req.user.id,
-      );
-      await db.query(
-        `UPDATE agents
-            SET status = 'queued',
-                container_id = NULL
-          WHERE id = $1`,
-        [agent.id],
-      );
-      await db.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [agent.id]);
-      await addDeploymentJob({
-        id: agent.id,
-        name: agent.name,
-        userId: req.user.id,
-        backend: agent.backend_type,
-        sandbox: agent.sandbox_profile,
-        specs: {
-          vcpu: agent.vcpu || 2,
-          ram_mb: agent.ram_mb || 2048,
-          disk_gb: agent.disk_gb || 20,
-        },
-        container_name: agent.container_name,
-        image: agent.image,
+      // The access check above keeps lock acquisition unavailable to callers
+      // who cannot see the agent. Re-read after acquiring the shared lock so a
+      // deployment that finished while rollback was waiting cannot make us
+      // restore config without redeploying the now-running runtime.
+      agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+      if (!agent) throw createAgentNotFoundError();
+      res.locals.auditContext = buildAgentContext(agent, {
+        ownerEmail: req.user.email || null,
       });
+      shouldRedeploy = containerManager.canDestroy(agent);
+
+      let runtimeFields = null;
+      if (shouldRedeploy) {
+        const canceledJobs = await cancelDeploymentJobsForAgent(agent.id);
+        if (canceledJobs.active > 0) {
+          return res.status(409).json({
+            error:
+              "An earlier deployment is still active for this agent. Try rollback again shortly.",
+          });
+        }
+        // Validate while the shared lock is held and before mutating the
+        // rollback config. A removed target must leave the current config and
+        // runtime identity untouched.
+        runtimeFields = buildAgentRuntimeFields(agent);
+        await assertRuntimeTargetAvailable(runtimeFields, agent.user_id);
+      }
+
+      // Snapshot the current state first so rollback is itself reversible.
+      const currentResult = await db.query("SELECT template_payload FROM agents WHERE id = $1", [
+        agent.id,
+      ]);
+      currentPayload = currentResult.rows[0]?.template_payload || {};
+      await agentVersions.recordVersionBestEffort(agent.id, currentPayload, {
+        createdBy: req.user.id,
+        message: `Pre-rollback snapshot (rolling back to v${target.versionNumber})`,
+        source: "rollback",
+      });
+
+      // Replace the agent's template_payload with the target version.
+      await db.query("UPDATE agents SET template_payload = $1::jsonb WHERE id = $2", [
+        JSON.stringify(target.config),
+        agent.id,
+      ]);
+      payloadUpdated = true;
+
+      // Record the rolled-back state as the new "current" version.
+      restored = await agentVersions.recordVersion(agent.id, target.config, {
+        createdBy: req.user.id,
+        message: `Rolled back to v${target.versionNumber}`,
+        source: "rollback",
+      });
+
+      // Re-materialize wiring + queue redeploy if the agent has a container.
+      await materializeTemplateWiring(agent.id, target.config);
+      if (shouldRedeploy) {
+        await enqueueReplacementDeployment(
+          agent,
+          buildReplacementDeploymentJob(agent, {
+            runtimeFields,
+            containerName: agent.container_name,
+            image: agent.image,
+          }),
+          {
+            provisionLock,
+            skipCancellation: true,
+          },
+        );
+      }
+    } catch (error) {
+      if (payloadUpdated) {
+        try {
+          await db.query("UPDATE agents SET template_payload = $1::jsonb WHERE id = $2", [
+            JSON.stringify(currentPayload || {}),
+            agent.id,
+          ]);
+          await materializeTemplateWiring(agent.id, currentPayload || {});
+          await agentVersions.recordVersionBestEffort(agent.id, currentPayload || {}, {
+            createdBy: req.user.id,
+            message: `Rollback to v${target.versionNumber} could not be queued; restored previous config`,
+            source: "rollback",
+          });
+        } catch (compensationError) {
+          error.rollbackCompensationError = compensationError;
+        }
+      }
+      throw error;
+    } finally {
+      await provisionLock.release();
     }
 
     await monitoring.logEvent(
@@ -2689,7 +2839,7 @@ router.post(
     res.json({
       success: true,
       restored,
-      redeployed: Boolean(agent.container_id),
+      redeployed: shouldRedeploy,
     });
   }),
 );

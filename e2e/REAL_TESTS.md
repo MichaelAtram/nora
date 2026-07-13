@@ -36,12 +36,17 @@ security fixes shipped in integrations.ts / channels/adapters.ts.
    npx playwright install --with-deps chromium
    ```
 3. **`.env.real` filled in**:
+
    ```bash
    cp .env.real.example .env.real
    # edit — at minimum REAL_LLM_PROVIDER_ID and its matching API key
    # (REAL_ANTHROPIC_API_KEY, REAL_OPENAI_API_KEY, REAL_GOOGLE_API_KEY,
    #  REAL_NVIDIA_API_KEY for NemoClaw, or REAL_LLM_API_KEY as a generic fallback).
    ```
+
+   Set `REAL_OPERATOR_EMAIL` and `REAL_OPERATOR_PASSWORD` when a matrix cell must use a target
+   owned by an existing operator, especially Remote Docker. Without them the matrix creates a
+   throwaway user, which intentionally cannot see another user's registered host.
 
 ## Running
 
@@ -65,7 +70,7 @@ BASE_URL=http://localhost:8080 npx playwright test --headed specs/real-deploy-ma
 REAL_ENABLE_HERMES_DOCKER=1 REAL_ENABLE_OPENCLAW_DOCKER=0 \
 BASE_URL=http://localhost:8080 \
 npx playwright test specs/real-deploy-matrix.spec.ts
-````
+```
 
 Setting `BASE_URL` disables the auto-managed `docker-compose.e2e.yml` stack in
 `playwright.config.ts`, so the specs talk to whichever stack you already have
@@ -76,6 +81,7 @@ up.
 | Cell                                | Enabled by                                      | Extra host requirements                                                                                                                                           |
 | ----------------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | OpenClaw + Docker                   | `REAL_ENABLE_OPENCLAW_DOCKER=1` (default)       | Docker socket reachable from `backend-api` / `worker-provisioner` (already wired in the default compose)                                                          |
+| OpenClaw + Remote Docker            | `REAL_ENABLE_OPENCLAW_REMOTE_DOCKER=1`          | A connected host owned/shared to `REAL_OPERATOR_EMAIL`; set `REAL_REMOTE_DOCKER_EXECUTION_TARGET_ID=remote:<id>` and keep published ports private                 |
 | OpenClaw + K8s                      | `REAL_ENABLE_OPENCLAW_K8S=1`                    | Control plane started with `docker-compose.kubernetes.yml`; set `REAL_K8S_EXECUTION_TARGET_ID=k8s:<id>` or let the spec pick the first available K8s target       |
 | OpenClaw + NemoClaw + Docker        | `REAL_ENABLE_OPENCLAW_NEMOCLAW=1`               | `REAL_NVIDIA_API_KEY` or `NVIDIA_API_KEY`; stack must enable `ENABLED_SANDBOX_PROFILES=standard,nemoclaw`                                                         |
 | OpenClaw + NemoClaw + Remote Docker | `REAL_ENABLE_OPENCLAW_NEMOCLAW_REMOTE_DOCKER=1` | A connected remote host target; set `REAL_REMOTE_DOCKER_EXECUTION_TARGET_ID=remote:<id>` and provide `REAL_NVIDIA_API_KEY` or `NVIDIA_API_KEY`                    |
@@ -85,8 +91,10 @@ up.
 
 Each cell runs in order: `[L1] deploy → [L2] reach running → [L3] gateway
 reachable → [L4] chat roundtrip → [L5] logs/events → [L7] metrics populate →
-[L8] stop+start → [L10] destroy`. If any step fails, later steps in that cell
-still run (Playwright serial mode with `test.skip` fallbacks), but subsequent
+[L8] stop+start → [L10] destroy`. If a step fails, Playwright serial mode skips
+the remaining lifecycle tests in that cell. An unconditional per-cell
+`afterAll` hook still attempts the destroy operation and verifies that the
+agent row is gone, so failed cells do not silently strand runtimes. Subsequent
 cells are unaffected.
 
 Lifecycle steps L6 (terminal `printenv`) and L9 (provider-key rotation sync)

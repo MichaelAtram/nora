@@ -24,6 +24,7 @@ const {
   getDeploymentProvider,
   getManagedProviderEnvNames,
   updateProvider,
+  withProviderStateLock,
 } = require("../llmProviders");
 
 beforeEach(() => {
@@ -378,6 +379,24 @@ describe("llmProviders demo/default transitions", () => {
       updateProvider("provider-openai", "user-1", { is_default: "false" }),
     ).rejects.toThrow("is_default must be a boolean");
     expect(mockPgClient).not.toHaveBeenCalled();
+  });
+
+  it("serializes provider-state readers with the same advisory lock as mutations", async () => {
+    const operation = jest.fn().mockResolvedValue("synced");
+
+    await expect(withProviderStateLock("user-1", operation)).resolves.toBe("synced");
+
+    expect(mockDbClient.query.mock.calls.map(([sql]) => sql)).toEqual([
+      "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+      "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+    ]);
+    expect(mockDbClient.query).toHaveBeenNthCalledWith(
+      1,
+      "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+      ["nora:llm-providers:user-1"],
+    );
+    expect(operation).toHaveBeenCalledWith(mockDbClient);
+    expect(mockDbClient.end).toHaveBeenCalledTimes(1);
   });
 
   it("enumerates the runtime-owned provider env set for replacement updates", () => {

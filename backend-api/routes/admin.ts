@@ -17,6 +17,7 @@ const {
   addBackupJob,
   addDeploymentJob,
   addKubernetesPolicyReconcileJob,
+  cancelDeploymentJobsForAgent,
   getDLQJobs,
   retryDLQJob,
 } = require("../redisQueue");
@@ -71,6 +72,12 @@ const {
 } = require("../platformSettings");
 const mailer = require("../mailer");
 const { resolveAuditSource } = require("../auditSource");
+const { isProviderAuthStatusHoldReason, resumeAgentWithProviderAuth } = require("../authSync");
+const {
+  acquireAgentProvisionLock,
+  buildReplacementDeploymentJob,
+  enqueueReplacementDeployment,
+} = require("../agentProvisionLock");
 
 const router = express.Router();
 
@@ -141,6 +148,47 @@ async function assertRuntimeTargetAvailable(runtimeFields) {
   // (enabled/configured/connected) without owner-scoping the trusted admin.
   await remoteHosts.assertRemoteHostExecutionTargetAvailable(runtimeFields);
   return status;
+}
+
+async function enqueueAdminReplacementDeployment(agent, jobData) {
+  return enqueueReplacementDeployment(agent, jobData, {
+    queryable: db,
+    cancelDeploymentJobsForAgent,
+    addDeploymentJob,
+    acquireLock: acquireAgentProvisionLock,
+    applicationName: "nora-backend-admin-agent-replacement",
+  });
+}
+
+function createAdminAgentNotFoundError() {
+  const error = new Error("Agent not found");
+  error.statusCode = 404;
+  return error;
+}
+
+function assertAdminLifecycleNotProvisioning(agent) {
+  if (!["queued", "deploying"].includes(agent?.status)) return;
+  const error = new Error(
+    "Agent deployment is queued or in progress. Wait for provisioning to finish before changing lifecycle state.",
+  );
+  error.statusCode = 409;
+  error.code = "AGENT_PROVISIONING_IN_PROGRESS";
+  throw error;
+}
+
+async function withAdminAgentLifecycleLock(agentId, applicationName, callback) {
+  const visible = await findAdminAgent(agentId, { includeOwner: true });
+  if (!visible) throw createAdminAgentNotFoundError();
+
+  const provisionLock = await acquireAgentProvisionLock(agentId, { applicationName });
+  try {
+    const agent = await findAdminAgent(agentId, { includeOwner: true });
+    if (!agent) throw createAdminAgentNotFoundError();
+    assertAdminLifecycleNotProvisioning(agent);
+    return await callback(agent);
+  } finally {
+    await provisionLock.release();
+  }
 }
 
 function resolveRequestedImage({
@@ -416,7 +464,11 @@ function adminReportAuditMetadata(req, report, extra = {}) {
 }
 
 async function reconcileAdminAgent(agent) {
-  if (!agent?.container_id || !["running", "warning", "error", "stopped"].includes(agent.status)) {
+  if (
+    !agent?.container_id ||
+    isProviderAuthStatusHoldReason(agent.paused_reason) ||
+    !["running", "warning", "error", "stopped"].includes(agent.status)
+  ) {
     return agent;
   }
 
@@ -1537,108 +1589,117 @@ router.get(
 router.post(
   "/agents/:id/start",
   asyncHandler(async (req, res) => {
-    const agent = await findAdminAgent(req.params.id, { includeOwner: true });
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent);
-    if (!containerManager.canMutate(agent)) {
-      return res.status(400).json({ error: "No container - redeploy the agent first" });
-    }
+    const result = await withAdminAgentLifecycleLock(
+      req.params.id,
+      "nora-backend-admin-agent-start",
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent);
+        if (!containerManager.canMutate(agent)) {
+          const error = new Error("No container - redeploy the agent first");
+          error.statusCode = 400;
+          throw error;
+        }
 
-    const lifecycleResult = await containerManager.start(agent);
-    await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
-    const updated = await db.query(
-      "UPDATE agents SET status = 'running' WHERE id = $1 RETURNING *",
-      [agent.id],
+        const resumed = await resumeAgentWithProviderAuth(agent, "start");
+        await monitoring.logEvent(
+          "admin_agent_started",
+          `Admin started agent "${agent.name}"`,
+          adminAgentAuditMetadata(
+            req,
+            {
+              ...resumed.agent,
+              ownerEmail: agent.ownerEmail,
+            },
+            {
+              result: { status: "running" },
+            },
+          ),
+        );
+        return serializeAgent(resumed.agent);
+      },
     );
-    await monitoring.logEvent(
-      "admin_agent_started",
-      `Admin started agent "${agent.name}"`,
-      adminAgentAuditMetadata(
-        req,
-        {
-          ...updated.rows[0],
-          ownerEmail: agent.ownerEmail,
-        },
-        {
-          result: { status: "running" },
-        },
-      ),
-    );
-    res.json(serializeAgent(updated.rows[0]));
+    res.json(result);
   }),
 );
 
 router.post(
   "/agents/:id/stop",
   asyncHandler(async (req, res) => {
-    const agent = await findAdminAgent(req.params.id, { includeOwner: true });
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent);
+    const result = await withAdminAgentLifecycleLock(
+      req.params.id,
+      "nora-backend-admin-agent-stop",
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent);
 
-    if (containerManager.canMutate(agent)) {
-      try {
-        await containerManager.stop(agent);
-      } catch (error) {
-        if (!containerManager.isIgnorableStopError(error)) {
-          console.error("Container stop error:", error.message);
-          throw error;
+        if (containerManager.canMutate(agent)) {
+          try {
+            await containerManager.stop(agent);
+          } catch (error) {
+            if (!containerManager.isIgnorableStopError(error)) {
+              console.error("Container stop error:", error.message);
+              throw error;
+            }
+          }
         }
-      }
-    }
 
-    const updated = await db.query(
-      "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
-      [agent.id],
+        const updated = await db.query(
+          "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
+          [agent.id],
+        );
+        await monitoring.logEvent(
+          "admin_agent_stopped",
+          `Admin stopped agent "${agent.name}"`,
+          adminAgentAuditMetadata(
+            req,
+            {
+              ...updated.rows[0],
+              ownerEmail: agent.ownerEmail,
+            },
+            {
+              result: { status: "stopped" },
+            },
+          ),
+        );
+        return serializeAgent(updated.rows[0]);
+      },
     );
-    await monitoring.logEvent(
-      "admin_agent_stopped",
-      `Admin stopped agent "${agent.name}"`,
-      adminAgentAuditMetadata(
-        req,
-        {
-          ...updated.rows[0],
-          ownerEmail: agent.ownerEmail,
-        },
-        {
-          result: { status: "stopped" },
-        },
-      ),
-    );
-    res.json(serializeAgent(updated.rows[0]));
+    res.json(result);
   }),
 );
 
 router.post(
   "/agents/:id/restart",
   asyncHandler(async (req, res) => {
-    const agent = await findAdminAgent(req.params.id, { includeOwner: true });
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent);
-    if (!containerManager.canMutate(agent)) {
-      return res.status(400).json({ error: "No container - redeploy the agent first" });
-    }
+    const result = await withAdminAgentLifecycleLock(
+      req.params.id,
+      "nora-backend-admin-agent-restart",
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent);
+        if (!containerManager.canMutate(agent)) {
+          const error = new Error("No container - redeploy the agent first");
+          error.statusCode = 400;
+          throw error;
+        }
 
-    const lifecycleResult = await containerManager.restart(agent);
-    await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
-    const updated = await db.query(
-      "UPDATE agents SET status = 'running' WHERE id = $1 RETURNING *",
-      [agent.id],
+        const resumed = await resumeAgentWithProviderAuth(agent, "restart");
+        await monitoring.logEvent(
+          "admin_agent_restarted",
+          `Admin restarted agent "${agent.name}"`,
+          adminAgentAuditMetadata(
+            req,
+            {
+              ...resumed.agent,
+              ownerEmail: agent.ownerEmail,
+            },
+            {
+              result: { status: "running" },
+            },
+          ),
+        );
+        return serializeAgent(resumed.agent);
+      },
     );
-    await monitoring.logEvent(
-      "admin_agent_restarted",
-      `Admin restarted agent "${agent.name}"`,
-      adminAgentAuditMetadata(
-        req,
-        {
-          ...updated.rows[0],
-          ownerEmail: agent.ownerEmail,
-        },
-        {
-          result: { status: "running" },
-        },
-      ),
-    );
-    res.json(serializeAgent(updated.rows[0]));
+    res.json(result);
   }),
 );
 
@@ -1713,64 +1774,17 @@ router.post(
       fallbackRuntimeFields: currentRuntimeFields,
     });
 
-    await db.query(
-      `UPDATE agents
-          SET status = 'queued',
-              container_id = NULL,
-              host = NULL,
-              runtime_host = NULL,
-              runtime_port = NULL,
-              gateway_host = NULL,
-              gateway_port = NULL,
-              gateway_host_port = NULL,
-              gateway_token = NULL,
-              backend_type = $2,
-              sandbox_type = $3,
-              runtime_family = $4,
-              deploy_target = $5,
-              execution_target_id = $6,
-              sandbox_profile = $7,
-              container_name = $8,
-              image = $9
-        WHERE id = $1`,
-      [
-        agent.id,
-        runtimeFields.backend_type,
-        runtimeFields.sandbox_type,
-        runtimeFields.runtime_family,
-        runtimeFields.deploy_target,
-        runtimeFields.execution_target_id,
-        runtimeFields.sandbox_profile,
+    // Admin and operator redeploys intentionally share one replacement
+    // contract. The previous identity remains durable until the provisioner
+    // validates the complete queued tuple and destroys that exact runtime.
+    await enqueueAdminReplacementDeployment(
+      agent,
+      buildReplacementDeploymentJob(agent, {
+        runtimeFields,
         containerName,
         image,
-      ],
+      }),
     );
-
-    await db.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [agent.id]);
-
-    await addDeploymentJob({
-      id: agent.id,
-      name: agent.name,
-      userId: agent.user_id,
-      backend: runtimeFields.backend_type,
-      execution_target_id: runtimeFields.execution_target_id,
-      sandbox: runtimeFields.sandbox_profile,
-      specs: {
-        vcpu: agent.vcpu || 2,
-        ram_mb: agent.ram_mb || 2048,
-        disk_gb: agent.disk_gb || 20,
-      },
-      container_name: containerName,
-      previous_container_id: agent.container_id || null,
-      previous_container_name: agent.container_name || null,
-      previous_host: agent.host || null,
-      previous_backend: currentRuntimeFields.backend_type,
-      previous_runtime_family: currentRuntimeFields.runtime_family,
-      previous_deploy_target: currentRuntimeFields.deploy_target,
-      previous_execution_target_id: currentRuntimeFields.execution_target_id,
-      previous_sandbox_profile: currentRuntimeFields.sandbox_profile,
-      image,
-    });
 
     await monitoring.logEvent(
       "admin_agent_redeployed",

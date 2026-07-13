@@ -12,7 +12,10 @@ The core value is straightforward: if you care about infrastructure control, obs
 
 <CardGroup cols={2}>
   <Card title="Deploy agent runtimes" icon="rocket">
-    Launch agent runtimes into isolated environments with configurable CPU, RAM, and disk. Manage agent lifecycle — deploy, restart, and remove — from a single operator surface.
+    Launch agent runtimes into isolated environments with configurable CPU and RAM plus
+    target-specific storage behavior. Docker and Remote Docker retain `disk_gb` as requested
+    metadata rather than enforcing a filesystem quota. Manage agent lifecycle — deploy, restart,
+    and remove — from a single operator surface.
   </Card>
 
 <Card title="Manage LLM provider keys" icon="key">
@@ -83,9 +86,10 @@ Nora is built around five properties that define what kind of product it is and 
 
 <Card title="Enterprise-capable" icon="buildings">
   Nora makes sense from single-host Docker evaluation through Kubernetes, private cloud, on-prem,
-  and AWS / Azure / GCP rollouts. Proxmox unprivileged LXC placement is experimental and still
-  requires real-hardware smoke before production use. It is not a toy dashboard — it is designed to
-  grow with operator requirements.
+  operator-registered Remote Docker hosts, and AWS / Azure / GCP rollouts. Remote Docker and Proxmox
+  unprivileged LXC placement are experimental and require validation on the exact infrastructure
+  before production use. It is not a toy dashboard — it is designed to grow with operator
+  requirements.
 </Card>
 
   <Card title="Apache 2.0 licensed" icon="file-certificate">
@@ -101,8 +105,14 @@ Nora is designed to grow with your infrastructure requirements. Lead evaluation 
 | ---------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------- |
 | **Docker**                   | GA           | Fastest local or single-host proof and the recommended first install                                                    |
 | **Kubernetes**               | GA           | Cluster-backed placement on k3s, AKS, GKE, or EKS                                                                       |
-| **NemoClaw sandbox profile** | Experimental | GPU-backed secure-sandbox evaluation with explicit contract validation                                                  |
+| **Remote Docker**            | Experimental | Explicit placement on a self-hosted, user-registered Docker machine reached over SSH; private networking required       |
+| **NemoClaw sandbox profile** | Experimental | NVIDIA/Nemotron-backed secure-sandbox evaluation with explicit contract validation                                      |
 | **Proxmox unprivileged LXC** | Experimental | OpenClaw and prepared Hermes images only; secure API TLS and pinned SSH; real-hardware smoke required before production |
+
+Remote Docker is not a capacity scheduler or failover layer. Its connection badge is the stored
+result of a manual backend-only test, and operators select one exact `remote:<id>` target per agent.
+Review the [Remote Docker guide](/configuration/provisioner-backends/remote-docker) before exposing a
+host or sharing it with a workspace.
 
 <Warning>
   NemoClaw on Proxmox remains blocked. Do not present Proxmox as GA or as a hardware-isolation path

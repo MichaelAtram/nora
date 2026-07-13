@@ -48,16 +48,16 @@ Nora is the self-hosted AI agent ops platform for running autonomous agent fleet
 
 Most teams running agents in production eventually rebuild the same layer around the runtime itself: deploy workflows, secrets, monitoring, logs, terminal, templates, and a separate admin surface. Nora exists so that layer doesn't have to be rewritten every time the runtime conversation changes. Operator workflows live under `/app`; platform-wide admin lives under `/admin`.
 
-→ [Why Nora](https://noradocs.solomontsao.com/introduction#why-teams-choose-nora) · [Runtime model](https://noradocs.solomontsao.com/concepts/runtimes) · [Deployment footprint](https://noradocs.solomontsao.com/concepts/architecture#deployment-topologies)
+→ [Why Nora](https://noradocs.solomontsao.com/introduction#positioning-pillars) · [Runtime model](https://noradocs.solomontsao.com/concepts/runtimes) · [Deployment footprint](https://noradocs.solomontsao.com/concepts/architecture#deployment-topologies)
 
 ## Features
 
 - **Deploy & operate runtimes** — provision OpenClaw and Hermes agents to Docker or Kubernetes (both GA, official Helm chart) with full lifecycle controls: deploy, start/stop, restart, redeploy, and version history.
-- **Migrate existing runtimes** — adopt agents you already run via uploaded bundles or live Docker/SSH inspection.
+- **Migrate existing runtimes** — recreate agents from uploaded bundles, with privileged local-Docker Live Pull available to self-hosted platform admins.
 - **Live operator access** — streaming logs, an interactive terminal into running containers, a file browser/editor, and the OpenClaw gateway &amp; Hermes dashboard embedded in the operator UI.
 - **Monitoring & alerting** — per-agent metrics and cost, a fleet needs-attention roll-up (errored, stuck, over-budget, stalled telemetry), and user-defined alert rules delivered to your channels.
 - **Budgets & scheduled runs** — per-agent LLM budget hard caps with auto-pause, plus recurring cron schedules for agent runs with queue retries and sweep guards.
-- **Secrets that fail closed** — provider keys AES-256-GCM encrypted at rest and synced to running runtimes; production refuses to boot without a valid encryption key; SSH host-key pinning protects remote (BYOC) Docker hosts.
+- **Secrets that fail closed by default** — provider keys are AES-256-GCM encrypted at rest and synced to running runtimes; production refuses to boot without a valid encryption key unless an operator deliberately enables the insecure plaintext override; SSH host-key pinning protects remote (BYOC) Docker hosts.
 - **Network isolation** — baseline Kubernetes NetworkPolicy ingress isolation with admin-managed CIDR allow rules, and an experimental NemoClaw hardened sandbox for untrusted code.
 - **Agent Hub** — installable, versioned starter templates to go from zero to a working agent fast.
 - **Integrations** — a 69-entry credential/connectivity catalog (source control, chat, cloud, observability, vector DBs, automation) plus 17+ LLM providers. Executable behavior comes from runtime skills or MCP adapters; supported per-agent MCP servers are enabled explicitly.
@@ -129,20 +129,21 @@ iwr -useb https://raw.githubusercontent.com/solomon2773/nora/master/setup.ps1 | 
 **Kubernetes (Helm):**
 
 ```bash
-helm show chart oci://ghcr.io/solomon2773/nora --version 0.7.3
+helm show chart oci://ghcr.io/solomon2773/nora --version 0.7.4
 ```
 
 The public OCI chart installs the full Nora control plane. See the [Helm instructions](https://noradocs.solomontsao.com/self-hosting#kubernetes-helm) for the required secrets and Ingress options.
 
 The installer verifies prerequisites, generates or preserves secrets, optionally creates a bootstrap admin, picks free local ports when the defaults are busy, and starts the stack. Once it finishes, open the URL printed by setup. Local mode defaults to `http://localhost:8080`, but setup may select another port such as `8081` on a busy workstation. Then follow the [first-15-minutes walkthrough](https://noradocs.solomontsao.com/quickstart).
 
-> **No API key yet?** On installations with the local Docker target enabled, choose **Launch local Docker demo** on the Getting Started page. Nora deploys a working agent against its built-in deterministic demo provider, so you can validate chat and the operator workflow with zero keys and zero cost. Kubernetes-only installations start by adding a model provider and deploying to an enabled cluster target.
+> **No API key yet?** On installations with the local Docker target enabled, choose **Launch local Docker demo** on the Getting Started page. Nora deploys a working agent against its built-in deterministic demo provider, so you can validate chat and the operator workflow with zero keys and zero model-usage cost. Kubernetes-only installations start by adding a model provider and deploying to an enabled cluster target.
 
-For manual setup, environment variables, public-domain mode, TLS, Kubernetes, NemoClaw, and experimental Proxmox LXC configuration, see the docs:
+For manual setup, environment variables, public-domain mode, TLS, Remote Docker, Kubernetes, NemoClaw, and experimental Proxmox LXC configuration, see the docs:
 
 - [Self-hosting guide](https://noradocs.solomontsao.com/self-hosting)
 - [Environment variables reference](https://noradocs.solomontsao.com/configuration/environment-variables)
 - [Provisioner backends](https://noradocs.solomontsao.com/configuration/provisioner-backends) (Docker and k3s/Kubernetes are GA; Remote Docker, NemoClaw, and Proxmox LXC are experimental)
+- [Remote Docker BYOC setup](https://noradocs.solomontsao.com/configuration/provisioner-backends/remote-docker) — SSH registration, private networking, validation, sharing, and recovery
 - [TLS and public domains](https://noradocs.solomontsao.com/configuration/tls-domains)
 - [Fronting a launch with Cloudflare](infra/cloudflare-launch.md) — edge caching, rate limiting, and spike absorption for the single-host deploy
 
@@ -225,7 +226,7 @@ See the [MCP guide](https://noradocs.solomontsao.com/guides/mcp-server) for Gemi
 - **MCP — shipped.** A control-plane [MCP](https://modelcontextprotocol.io) server (`@noraai/mcp-server`, published to the official [MCP Registry](https://github.com/modelcontextprotocol/registry)) plus per-agent MCP server management — operate the fleet from Claude Code, Gemini CLI, Claude Desktop, or Cursor, and wire MCP tools into individual agents.
 - **OpenTelemetry GenAI — available.** [OTLP + Prometheus export](https://noradocs.solomontsao.com/guides/opentelemetry) of runtime telemetry under the `gen_ai.*` semantic conventions — per-exchange chat spans plus token/cost/resource metrics flow into the Grafana / Datadog / Langfuse stack you already run. (Per-tool-call sub-spans depend on runtime event streams and remain on the roadmap.)
 - **A2A — on the roadmap.** Agent Cards / Agent-to-Agent discovery for managed OpenClaw and Hermes agents.
-- **Isolation, per deploy target.** Standard Docker and Kubernetes runs use container namespaces plus operator-set CPU / RAM / disk limits; the experimental **NemoClaw** profile hardens untrusted code with a non-root user, all Linux capabilities dropped, `no-new-privileges`, Landlock + seccomp, and default-deny egress. Experimental Proxmox placement uses unprivileged LXC, which remains a shared-kernel boundary and is not presented as VM-grade isolation. See the [isolation model](https://noradocs.solomontsao.com/concepts/security#runtime-isolation).
+- **Isolation, per deploy target.** Standard Docker runs use container namespaces plus operator-set CPU and RAM limits; `disk_gb` is metadata and operators must monitor Docker storage. Kubernetes adds workload resource limits and provisioned storage requests. The experimental **NemoClaw** profile hardens untrusted code with a non-root user, all Linux capabilities dropped, `no-new-privileges`, Landlock + seccomp, and default-deny egress. Experimental Proxmox placement uses unprivileged LXC, which remains a shared-kernel boundary and is not presented as VM-grade isolation. See the [isolation model](https://noradocs.solomontsao.com/concepts/security#runtime-isolation).
 
 ## Roadmap
 

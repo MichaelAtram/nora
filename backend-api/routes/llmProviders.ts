@@ -8,8 +8,24 @@ const router = express.Router();
 
 async function syncAfterProviderSave(userId, successMessage = "Provider saved") {
   try {
-    const results = await syncAuthToUserAgents(userId);
+    // Provider mutations hold the same per-user advisory lock through this
+    // after-commit callback. Mark it explicitly so auth sync does not try to
+    // reacquire the non-reentrant lock on a second PostgreSQL session.
+    const results = await syncAuthToUserAgents(userId, null, { providerLockHeld: true });
     const failed = results.filter((result) => result.status === "failed");
+    const unsafeFailures = failed.filter(
+      (result) => result.runtimeStopped !== true || result.quarantinePersisted !== true,
+    );
+    if (unsafeFailures.length > 0) {
+      const error = new Error(
+        `${successMessage}, but ${unsafeFailures.length} running agent${unsafeFailures.length === 1 ? " could" : "s could"} not be stopped and quarantined after credential reconciliation failed`,
+      );
+      error.statusCode = 502;
+      error.code = "PROVIDER_RUNTIME_REVOCATION_UNCONFIRMED";
+      error.committed = true;
+      error.syncResults = results;
+      throw error;
+    }
     return {
       sync_results: results,
       ...(failed.length > 0
@@ -19,11 +35,17 @@ async function syncAfterProviderSave(userId, successMessage = "Provider saved") 
         : {}),
     };
   } catch (error) {
+    if (error?.code === "PROVIDER_RUNTIME_REVOCATION_UNCONFIRMED") throw error;
     console.warn("[llmProviders] Post-save auth sync failed:", error.message);
-    return {
-      sync_results: [],
-      sync_warning: `${successMessage}, but running agents could not be updated automatically`,
-    };
+    const containmentError = new Error(
+      `${successMessage}, but runtime credential reconciliation could not be confirmed`,
+    );
+    containmentError.statusCode = 502;
+    containmentError.code = "PROVIDER_RUNTIME_REVOCATION_UNCONFIRMED";
+    containmentError.committed = true;
+    containmentError.syncResults = [];
+    containmentError.cause = error;
+    throw containmentError;
   }
 }
 
@@ -62,7 +84,11 @@ router.post("/", async (req, res) => {
       ),
     );
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(e.statusCode || 400).json({
+      error: e.message,
+      ...(e.committed ? { committed: true } : {}),
+      ...(Array.isArray(e.syncResults) ? { sync_results: e.syncResults } : {}),
+    });
   }
 });
 
@@ -74,7 +100,11 @@ router.put("/:id", async (req, res) => {
       ),
     );
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(e.statusCode || 400).json({
+      error: e.message,
+      ...(e.committed ? { committed: true } : {}),
+      ...(Array.isArray(e.syncResults) ? { sync_results: e.syncResults } : {}),
+    });
   }
 });
 
@@ -86,7 +116,11 @@ router.delete("/:id", async (req, res) => {
       ),
     );
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(e.statusCode || 400).json({
+      error: e.message,
+      ...(e.committed ? { committed: true } : {}),
+      ...(Array.isArray(e.syncResults) ? { sync_results: e.syncResults } : {}),
+    });
   }
 });
 

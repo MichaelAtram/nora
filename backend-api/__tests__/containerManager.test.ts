@@ -8,6 +8,7 @@ const mockStatus = jest.fn();
 const mockStats = jest.fn();
 const mockLogs = jest.fn();
 const mockExec = jest.fn();
+const mockUpdateEnv = jest.fn();
 const mockHermesStart = jest.fn();
 const mockHermesStop = jest.fn();
 const mockHermesRestart = jest.fn();
@@ -34,12 +35,16 @@ const mockProxmoxLogs = jest.fn();
 const mockProxmoxExec = jest.fn();
 const mockProxmoxUpdateEnv = jest.fn();
 const mockRemoteStart = jest.fn();
+const mockRemoteStop = jest.fn();
+const mockRemoteDestroy = jest.fn();
 const mockRemoteHermesStart = jest.fn();
 const mockRemoteNemoStart = jest.fn();
-const mockGetRemoteHostProfile = jest.fn();
+const mockGetRemoteHostCleanupProfile = jest.fn();
+const mockAssertRemoteHostAgentUse = jest.fn();
 
 jest.mock("../remoteHosts", () => ({
-  getRemoteHostProfile: (...args) => mockGetRemoteHostProfile(...args),
+  assertRemoteHostAgentUse: (...args) => mockAssertRemoteHostAgentUse(...args),
+  getRemoteHostCleanupProfile: (...args) => mockGetRemoteHostCleanupProfile(...args),
 }));
 
 jest.mock("../backends/hermes", () => {
@@ -65,6 +70,7 @@ jest.mock("../backends/nemoclaw", () => {
     stats: mockStats,
     logs: mockLogs,
     exec: mockExec,
+    updateEnv: mockUpdateEnv,
   }));
 });
 
@@ -133,6 +139,8 @@ describe("containerManager NemoClaw routing", () => {
     const remoteBackendFactory = () =>
       jest.fn().mockImplementation(() => ({
         start: mockRemoteStart,
+        stop: mockRemoteStop,
+        destroy: mockRemoteDestroy,
       }));
     const remoteBackendPath = path.resolve(
       __dirname,
@@ -172,7 +180,10 @@ describe("containerManager NemoClaw routing", () => {
     mockRemoteNemoStart.mockReset().mockResolvedValue(undefined);
     mockRemoteHermesStart.mockReset().mockResolvedValue(undefined);
     mockRemoteStart.mockReset().mockResolvedValue(undefined);
-    mockGetRemoteHostProfile.mockReset();
+    mockRemoteStop.mockReset().mockResolvedValue(undefined);
+    mockRemoteDestroy.mockReset().mockResolvedValue(undefined);
+    mockGetRemoteHostCleanupProfile.mockReset();
+    mockAssertRemoteHostAgentUse.mockReset();
     mockStart.mockReset().mockResolvedValue(undefined);
     mockStop.mockReset().mockResolvedValue(undefined);
     mockRestart.mockReset().mockResolvedValue(undefined);
@@ -185,6 +196,7 @@ describe("containerManager NemoClaw routing", () => {
     });
     mockLogs.mockReset().mockResolvedValue("log-stream");
     mockExec.mockReset().mockResolvedValue({ exec: "exec-instance", stream: "stream-instance" });
+    mockUpdateEnv.mockReset().mockResolvedValue(undefined);
     mockHermesStart.mockReset().mockResolvedValue(undefined);
     mockHermesStop.mockReset().mockResolvedValue(undefined);
     mockHermesRestart.mockReset().mockResolvedValue(undefined);
@@ -273,6 +285,45 @@ describe("containerManager NemoClaw routing", () => {
     await containerManager.start(agent);
 
     expect(mockStart).toHaveBeenCalledWith("nemo-456");
+  });
+
+  it("forwards exact managed-state replacement options to Docker-family adapters", async () => {
+    const containerManager = require("../containerManager");
+    const signal = new AbortController().signal;
+    const agent = {
+      id: "agent-nemo-env",
+      runtime_family: "openclaw",
+      deploy_target: "docker",
+      sandbox_profile: "nemoclaw",
+      backend_type: "docker",
+      container_id: "nemo-env-456",
+    };
+
+    await containerManager.updateEnv(
+      agent,
+      { OPENAI_API_KEY: "rotated" },
+      {
+        managedEnvNames: ["OPENAI_API_KEY", "GITHUB_TOKEN"],
+        replaceManagedState: true,
+        signal,
+        runtimeFamily: "hermes",
+        agentId: "attacker-controlled-id",
+        namespace: "attacker-controlled-namespace",
+      },
+    );
+
+    expect(mockUpdateEnv).toHaveBeenCalledWith(
+      "nemo-env-456",
+      { OPENAI_API_KEY: "rotated" },
+      {
+        agentId: "agent-nemo-env",
+        host: null,
+        runtimeFamily: "openclaw",
+        managedEnvNames: ["OPENAI_API_KEY", "GITHUB_TOKEN"],
+        replaceManagedState: true,
+        signal,
+      },
+    );
   });
 
   it("keeps Kubernetes plus NemoClaw lifecycle calls on the Kubernetes adapter", async () => {
@@ -374,7 +425,7 @@ describe("containerManager NemoClaw routing", () => {
   });
 
   it("routes remote-docker lifecycle calls to the remote backend, not the local docker host", async () => {
-    mockGetRemoteHostProfile.mockResolvedValue({
+    mockAssertRemoteHostAgentUse.mockResolvedValue({
       id: "my-laptop",
       executionTargetId: "remote:my-laptop",
       sshHost: "100.64.0.5",
@@ -387,19 +438,20 @@ describe("containerManager NemoClaw routing", () => {
       deploy_target: "remote-docker",
       execution_target_id: "remote:my-laptop",
       backend_type: "remote-docker",
+      user_id: "user-1",
       container_id: "oclaw-agent-remote",
     };
 
     await containerManager.start(agent);
 
-    expect(mockGetRemoteHostProfile).toHaveBeenCalledWith("remote:my-laptop");
+    expect(mockAssertRemoteHostAgentUse).toHaveBeenCalledWith(agent);
     expect(mockRemoteStart).toHaveBeenCalledWith("oclaw-agent-remote");
     // critical: must NOT fall back to the local docker backend
     expect(mockStart).not.toHaveBeenCalled();
   });
 
   it("reloads a remote host profile for each lifecycle operation", async () => {
-    mockGetRemoteHostProfile
+    mockAssertRemoteHostAgentUse
       .mockResolvedValueOnce({
         id: "my-laptop",
         executionTargetId: "remote:my-laptop",
@@ -420,18 +472,19 @@ describe("containerManager NemoClaw routing", () => {
       deploy_target: "remote-docker",
       execution_target_id: "remote:my-laptop",
       backend_type: "remote-docker",
+      user_id: "user-1",
       container_id: "oclaw-agent-remote",
     };
 
     await containerManager.start(agent);
     await containerManager.start(agent);
 
-    expect(mockGetRemoteHostProfile).toHaveBeenCalledTimes(2);
+    expect(mockAssertRemoteHostAgentUse).toHaveBeenCalledTimes(2);
     expect(mockRemoteStart).toHaveBeenCalledTimes(2);
   });
 
   it("routes a remote Hermes agent to the remote-hermes backend (not remote-docker)", async () => {
-    mockGetRemoteHostProfile.mockResolvedValue({
+    mockAssertRemoteHostAgentUse.mockResolvedValue({
       id: "my-laptop",
       executionTargetId: "remote:my-laptop",
       sshHost: "100.64.0.5",
@@ -444,6 +497,7 @@ describe("containerManager NemoClaw routing", () => {
       deploy_target: "remote-docker",
       execution_target_id: "remote:my-laptop",
       backend_type: "remote-docker",
+      user_id: "user-1",
       container_id: "hermes-agent-remote",
     };
 
@@ -456,7 +510,7 @@ describe("containerManager NemoClaw routing", () => {
   });
 
   it("routes a remote NemoClaw agent to the remote-nemoclaw backend", async () => {
-    mockGetRemoteHostProfile.mockResolvedValue({
+    mockAssertRemoteHostAgentUse.mockResolvedValue({
       id: "my-laptop",
       executionTargetId: "remote:my-laptop",
       sshHost: "100.64.0.5",
@@ -470,6 +524,7 @@ describe("containerManager NemoClaw routing", () => {
       execution_target_id: "remote:my-laptop",
       sandbox_profile: "nemoclaw",
       backend_type: "remote-docker",
+      user_id: "user-1",
       container_id: "nemo-agent-remote",
     };
 
@@ -481,7 +536,7 @@ describe("containerManager NemoClaw routing", () => {
   });
 
   it("fails closed for a remote-docker agent whose host is unconfigured (no credential)", async () => {
-    mockGetRemoteHostProfile.mockResolvedValue({
+    mockAssertRemoteHostAgentUse.mockResolvedValue({
       id: "half-set-up",
       executionTargetId: "remote:half-set-up",
       sshHost: "100.64.0.9",
@@ -495,6 +550,7 @@ describe("containerManager NemoClaw routing", () => {
       deploy_target: "remote-docker",
       execution_target_id: "remote:half-set-up",
       backend_type: "remote-docker",
+      user_id: "user-1",
       container_id: "oclaw-agent-half",
     };
 
@@ -504,19 +560,94 @@ describe("containerManager NemoClaw routing", () => {
   });
 
   it("fails closed for a remote-docker agent whose host is not registered", async () => {
-    mockGetRemoteHostProfile.mockResolvedValue(null);
+    mockAssertRemoteHostAgentUse.mockResolvedValue(null);
     const containerManager = require("../containerManager");
     const agent = {
       runtime_family: "openclaw",
       deploy_target: "remote-docker",
       execution_target_id: "remote:ghost",
       backend_type: "remote-docker",
+      user_id: "user-1",
       container_id: "oclaw-agent-ghost",
     };
 
     await expect(containerManager.start(agent)).rejects.toThrow(/registered remote host/i);
     expect(mockStart).not.toHaveBeenCalled();
     expect(mockRemoteStart).not.toHaveBeenCalled();
+  });
+
+  it("blocks active Remote Docker operations after the host grant is revoked", async () => {
+    const revoked = Object.assign(new Error("Remote Docker host access has been revoked"), {
+      statusCode: 403,
+      code: "REMOTE_HOST_ACCESS_REVOKED",
+    });
+    mockAssertRemoteHostAgentUse.mockRejectedValue(revoked);
+    const containerManager = require("../containerManager");
+    const agent = {
+      id: "agent-revoked",
+      user_id: "former-grantee",
+      runtime_family: "openclaw",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:shared-host",
+      backend_type: "remote-docker",
+      container_id: "remote-container",
+    };
+
+    for (const operation of [
+      () => containerManager.start(agent),
+      () => containerManager.restart(agent),
+      () => containerManager.status(agent),
+      () => containerManager.stats(agent),
+      () => containerManager.logs(agent),
+      () => containerManager.exec(agent),
+      () => containerManager.updateEnv(agent, { OPENAI_API_KEY: "rotated" }),
+      () => containerManager.backendFor(agent),
+      () => containerManager.backendFor(agent, { allowRevokedRemoteHostCleanup: true }),
+    ]) {
+      await expect(operation()).rejects.toMatchObject({
+        statusCode: 403,
+        code: "REMOTE_HOST_ACCESS_REVOKED",
+      });
+    }
+
+    expect(mockGetRemoteHostCleanupProfile).not.toHaveBeenCalled();
+    expect(mockRemoteStart).not.toHaveBeenCalled();
+  });
+
+  it("keeps stop and destroy as explicit cleanup paths after revocation", async () => {
+    mockAssertRemoteHostAgentUse.mockRejectedValue(
+      Object.assign(new Error("revoked"), { code: "REMOTE_HOST_ACCESS_REVOKED" }),
+    );
+    mockGetRemoteHostCleanupProfile.mockResolvedValue({
+      id: "shared-host",
+      executionTargetId: "remote:shared-host",
+      sshHost: "100.64.0.5",
+      sshUser: "operator",
+      configured: true,
+    });
+    const containerManager = require("../containerManager");
+    const agent = {
+      id: "agent-cleanup",
+      user_id: "former-grantee",
+      runtime_family: "openclaw",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:shared-host",
+      backend_type: "remote-docker",
+      container_id: "remote-container",
+    };
+
+    await containerManager.stop(agent);
+    await containerManager.destroy(agent);
+
+    expect(mockAssertRemoteHostAgentUse).not.toHaveBeenCalled();
+    expect(mockGetRemoteHostCleanupProfile).toHaveBeenCalledTimes(2);
+    expect(mockGetRemoteHostCleanupProfile).toHaveBeenNthCalledWith(1, agent);
+    expect(mockGetRemoteHostCleanupProfile).toHaveBeenNthCalledWith(2, agent);
+    expect(mockRemoteStop).toHaveBeenCalledWith("remote-container");
+    expect(mockRemoteDestroy).toHaveBeenCalledWith(
+      "remote-container",
+      expect.objectContaining({ agentId: "agent-cleanup" }),
+    );
   });
 
   it("uses container_name as a Kubernetes destroy fallback when container_id was cleared", async () => {

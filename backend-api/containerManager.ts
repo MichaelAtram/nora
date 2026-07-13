@@ -23,7 +23,7 @@ const {
   resolveAgentSandboxProfile,
 } = require("./agentRuntimeFields");
 const { getKubernetesClusterProfile } = require("./kubernetesClusters");
-const { getRemoteHostProfile } = require("./remoteHosts");
+const { assertRemoteHostAgentUse, getRemoteHostCleanupProfile } = require("./remoteHosts");
 
 // Lazy-load backends so missing optional deps (e.g. @kubernetes/client-node)
 // don't crash the API server when only Docker is used.
@@ -187,7 +187,7 @@ function resolveBackendPath(name) {
   }
 }
 
-async function getBackendInstance(type, agent = {}) {
+async function getBackendInstance(type, agent = {}, cleanupOnly = false) {
   const cacheKey =
     type === "k8s" || type === "k3s" || type === "kubernetes" || type === "remote-docker"
       ? resolveAgentExecutionTargetId(agent)
@@ -240,8 +240,9 @@ async function getBackendInstance(type, agent = {}) {
     }
     case "remote-docker": {
       const RemoteDockerBackend = require(resolveBackendPath("remote-docker"));
-      const executionTargetId = resolveAgentExecutionTargetId(agent);
-      const profile = await getRemoteHostProfile(executionTargetId);
+      const profile = cleanupOnly
+        ? await getRemoteHostCleanupProfile(agent)
+        : await assertRemoteHostAgentUse(agent);
       if (!profile) {
         throw new Error(
           "Remote Docker lifecycle operations require a registered remote host execution target.",
@@ -255,8 +256,9 @@ async function getBackendInstance(type, agent = {}) {
     }
     case "remote-nemoclaw": {
       const RemoteNemoClawBackend = require(resolveBackendPath("remote-nemoclaw"));
-      const executionTargetId = resolveAgentExecutionTargetId(agent);
-      const profile = await getRemoteHostProfile(executionTargetId);
+      const profile = cleanupOnly
+        ? await getRemoteHostCleanupProfile(agent)
+        : await assertRemoteHostAgentUse(agent);
       if (!profile) {
         throw new Error(
           "Remote NemoClaw lifecycle operations require a registered remote host execution target.",
@@ -270,8 +272,9 @@ async function getBackendInstance(type, agent = {}) {
     }
     case "remote-hermes": {
       const RemoteHermesBackend = require(resolveBackendPath("remote-hermes"));
-      const executionTargetId = resolveAgentExecutionTargetId(agent);
-      const profile = await getRemoteHostProfile(executionTargetId);
+      const profile = cleanupOnly
+        ? await getRemoteHostCleanupProfile(agent)
+        : await assertRemoteHostAgentUse(agent);
       if (!profile) {
         throw new Error(
           "Remote Hermes lifecycle operations require a registered remote host execution target.",
@@ -295,23 +298,34 @@ async function getBackendInstance(type, agent = {}) {
  * @param {{ backend_type?: string, deploy_target?: string, sandbox_profile?: string }} agent
  * @returns {import('../workers/provisioner/backends/interface')}
  */
-async function backendFor(agent) {
+async function backendForMode(agent, cleanupOnly) {
   const type = resolveAgentBackendType(agent);
   if (type === "docker") {
     if (resolveAgentRuntimeFamily(agent) === "hermes") {
-      return getBackendInstance("docker:hermes", agent);
+      return getBackendInstance("docker:hermes", agent, cleanupOnly);
     }
     if (resolveAgentSandboxProfile(agent) === "nemoclaw") {
-      return getBackendInstance("docker:nemoclaw", agent);
+      return getBackendInstance("docker:nemoclaw", agent, cleanupOnly);
     }
   }
   if (type === "remote-docker" && resolveAgentRuntimeFamily(agent) === "hermes") {
-    return getBackendInstance("remote-hermes", agent);
+    return getBackendInstance("remote-hermes", agent, cleanupOnly);
   }
   if (type === "remote-docker" && resolveAgentSandboxProfile(agent) === "nemoclaw") {
-    return getBackendInstance("remote-nemoclaw", agent);
+    return getBackendInstance("remote-nemoclaw", agent, cleanupOnly);
   }
-  return getBackendInstance(type, agent);
+  return getBackendInstance(type, agent, cleanupOnly);
+}
+
+async function backendFor(agent) {
+  return backendForMode(agent, false);
+}
+
+// Intentionally private: only stop/destroy below may bypass the current host
+// grant and PaaS active-use gate. Exported backendFor always resolves through
+// assertRemoteHostAgentUse, even if a caller supplies extra arguments.
+async function backendForCleanup(agent) {
+  return backendForMode(agent, true);
 }
 
 // ── Public API ──────────────────────────────────────────
@@ -333,7 +347,9 @@ module.exports = {
 
   async stop(agent) {
     const id = resolveKubernetesRuntimeId(agent, "stop");
-    const backend = await backendFor(agent);
+    // Stop is a cleanup operation: a former grantee must be able to quiesce a
+    // runtime after host access is revoked, even though active use is blocked.
+    const backend = await backendForCleanup(agent);
     return usesLifecycleOptions(agent)
       ? backend.stop(id, lifecycleOptions(agent))
       : backend.stop(id);
@@ -354,15 +370,36 @@ module.exports = {
       throw new Error(`Backend ${resolveAgentBackendType(agent)} does not support env updates`);
     }
     const managedEnvNames = Array.isArray(options.managedEnvNames) ? options.managedEnvNames : [];
+    const authoritativeLifecycle = lifecycleOptions(agent);
     return backend.updateEnv(id, envVars, {
-      ...lifecycleOptions(agent),
+      ...authoritativeLifecycle,
+      runtimeFamily: authoritativeLifecycle.runtimeFamily,
       ...(managedEnvNames.length > 0 ? { managedEnvNames } : {}),
+      ...(options.replaceManagedState === true ? { replaceManagedState: true } : {}),
+      ...(options.signal && typeof options.signal === "object" ? { signal: options.signal } : {}),
+    });
+  },
+
+  async inspectEnv(agent, envNames = []) {
+    const id = resolveKubernetesRuntimeId(agent, "inspect environment");
+    const backend = await backendFor(agent);
+    if (typeof backend.inspectEnv !== "function") {
+      throw new Error(
+        `Backend ${resolveAgentBackendType(agent)} does not support environment inspection`,
+      );
+    }
+    return backend.inspectEnv(id, {
+      ...lifecycleOptions(agent),
+      envNames: Array.isArray(envNames) ? envNames : [],
     });
   },
 
   async destroy(agent) {
     const id = resolveDestroyContainerId(agent);
-    return (await backendFor(agent)).destroy(id, {
+    // Destroy is the final cleanup escape hatch for direct owners/admins. The
+    // route layer constrains who may delete; do not expose this bypass to
+    // normal start/restart/read/exec operations.
+    return (await backendForCleanup(agent)).destroy(id, {
       agentId: agent.id,
       host: agent.host || null,
       runtimeFamily: resolveAgentRuntimeFamily(agent),

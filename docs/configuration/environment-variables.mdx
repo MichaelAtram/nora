@@ -127,6 +127,7 @@ Redis backs BullMQ for deployment, ClawHub install, backup, and alert-delivery j
 | `BACKUP_WORKER_CONCURRENCY`         | No       | `2`       | Backup worker concurrency.                                                                                                                                                                                    |
 | `NORA_BACKUP_JOB_TIMEOUT_MS`        | No       | `1800000` | Backup job hard timeout. The backup worker enforces this via `Promise.race` because BullMQ v5 ignores `defaultJobOptions.timeout`.                                                                            |
 | `NORA_BACKUP_SCHEDULE_POLL_MS`      | No       | `60000`   | How often the backup worker checks for due scheduled backups.                                                                                                                                                 |
+| `AGENT_PROVISION_LOCK_TIMEOUT_MS`   | No       | `30000`   | Maximum wait for the shared per-agent provision lock used by replacement producers and destructive restore. On timeout Nora rejects the transition instead of racing an active worker.                        |
 | `ALERT_DELIVERY_ATTEMPTS`           | No       | `5`       | Number of retry attempts for an alert webhook delivery before the worker records a terminal failure on the rule. Clamped to `[1, 10]`.                                                                        |
 | `ALERT_DELIVERY_WORKER_CONCURRENCY` | No       | `5`       | Concurrency of the alert-deliveries worker.                                                                                                                                                                   |
 | `WORKER_HEALTH_PORT`                | No       | `4001`    | Provisioner worker health-check port.                                                                                                                                                                         |
@@ -144,6 +145,16 @@ These variables control which nginx configuration is mounted, the listening port
 | `NEXTAUTH_URL`              | No       | `http://localhost:8080` | Canonical browser-facing URL of your Nora deployment. Set to your `https://` origin when exposing on a domain.                                                                                                         |
 | `NORA_PUBLIC_URL`           | No       | —                       | Optional explicit public origin used by emails, OAuth callbacks, and audit links when it differs from `NEXTAUTH_URL`.                                                                                                  |
 | `NORA_FORCE_SECURE_COOKIES` | No       | —                       | When set to `1`, forces the `Secure` flag on session cookies regardless of inbound scheme. Set for always-on-TLS public deployments behind a proxy/CDN that may strip `X-Forwarded-Proto`; leave empty for local HTTP. |
+
+## Login abuse protection
+
+Password and OAuth login share one per-IP rate-limit budget. Overrides must be positive integers;
+invalid values fall back to the secure defaults below.
+
+| Variable                    | Required | Default  | Description                                                       |
+| --------------------------- | -------- | -------- | ----------------------------------------------------------------- |
+| `AUTH_RATE_LIMIT_MAX`       | No       | `20`     | Combined password and OAuth login attempts allowed per IP/window. |
+| `AUTH_RATE_LIMIT_WINDOW_MS` | No       | `900000` | Login rate-limit window in milliseconds (15 minutes).             |
 
 ## OAuth
 
@@ -217,20 +228,20 @@ The former built-in `40` attempts / `3` seconds pair is treated as a legacy defa
 
 ## Platform mode
 
-| Variable        | Required | Default      | Description                                                                                                                                                                                                                             |
-| --------------- | -------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PLATFORM_MODE` | No       | `selfhosted` | Operating mode. `selfhosted` uses operator-defined resource limits with no billing. `paas` enables Stripe billing and locks resources to subscription plan tiers. See [Platform modes](/configuration/platform-modes) for full details. |
+| Variable        | Required | Default      | Description                                                                                                                                                                                                                                                                                                             |
+| --------------- | -------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PLATFORM_MODE` | No       | `selfhosted` | Operating mode. `selfhosted` uses operator-defined request limits with no billing. `paas` enables Stripe billing; plan tiers control agent-count and managed-backup entitlements while per-agent compute uses operator-managed platform defaults. See [Platform modes](/configuration/platform-modes) for full details. |
 
 ## Self-hosted resource limits
 
 These variables are only read when `PLATFORM_MODE=selfhosted`. They define the maximum resources any single user can request when deploying an agent.
 
-| Variable      | Required | Default | Description                                                            |
-| ------------- | -------- | ------- | ---------------------------------------------------------------------- |
-| `MAX_VCPU`    | No       | `16`    | Maximum vCPUs a user may allocate to a single agent.                   |
-| `MAX_RAM_MB`  | No       | `32768` | Maximum RAM in megabytes a user may allocate to a single agent.        |
-| `MAX_DISK_GB` | No       | `500`   | Maximum disk space in gigabytes a user may allocate to a single agent. |
-| `MAX_AGENTS`  | No       | `50`    | Maximum number of agents a single user may deploy.                     |
+| Variable      | Required | Default | Description                                                                           |
+| ------------- | -------- | ------- | ------------------------------------------------------------------------------------- |
+| `MAX_VCPU`    | No       | `16`    | Maximum vCPUs a user may allocate to a single agent.                                  |
+| `MAX_RAM_MB`  | No       | `32768` | Maximum RAM in megabytes a user may allocate to a single agent.                       |
+| `MAX_DISK_GB` | No       | `500`   | Maximum requested `disk_gb`; actual storage enforcement depends on the deploy target. |
+| `MAX_AGENTS`  | No       | `50`    | Maximum number of agents a single user may deploy.                                    |
 
 ## Billing / Stripe
 
@@ -288,35 +299,50 @@ Defaults allow OpenClaw's internal gateway port, Docker-published 19000-19999, a
 | `NORA_GATEWAY_PROXY_ALLOWED_PORTS` | No       | —       | Comma-separated list of additional ports the gateway proxy may target.     |
 | `NORA_GATEWAY_PROXY_ALLOWED_HOSTS` | No       | —       | Comma-separated list of additional hostnames the gateway proxy may target. |
 
+## Remote Docker safety and authorization
+
+Active Remote Docker gateway, log, and terminal streams periodically re-check that the agent owner
+still owns the host or has an `editor`, `admin`, or `owner` workspace grant. Lower values reduce the
+window before those streams close after revocation, at the cost of more authorization queries.
+Remote-host create, edit, Test, SSH-pin reset, delete, share, and unshare operations are serialized
+per host id so concurrent ownership, grant, trust, or credential mutations cannot race across
+backend replicas.
+
+| Variable                               | Required | Default | Description                                                                                                                                          |
+| -------------------------------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REMOTE_HOST_AUTH_RECHECK_MS`          | No       | `1000`  | Grant recheck interval in milliseconds for active gateway, log, and terminal streams. Minimum 250.                                                   |
+| `REMOTE_HOST_MUTATION_LOCK_TIMEOUT_MS` | No       | `15000` | Maximum wait for another create/edit/Test/pin-reset/delete/share/unshare operation on the same host id. Timeout rejects the competing request (409). |
+
 ## Proxmox
 
 Proxmox is an opt-in experimental LXC target for standard OpenClaw and prepared Hermes images. Keep Docker enabled while validating it, use verified API TLS and pinned SSH host keys, and run the real-host smoke before production use. NemoClaw on Proxmox remains blocked.
 
-| Variable                                   | Required            | Default                                                    | Description                                                                                               |
-| ------------------------------------------ | ------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `PROXMOX_API_URL`                          | With target         | —                                                          | HTTPS Proxmox API origin or URL ending in `/api2/json`.                                                   |
-| `PROXMOX_TOKEN_ID`                         | With target         | —                                                          | API token ID in `user@realm!tokenname` format.                                                            |
-| `PROXMOX_TOKEN_SECRET`                     | With target         | —                                                          | Secret associated with the API token.                                                                     |
-| `PROXMOX_VERIFY_TLS`                       | No                  | `true`                                                     | Verifies the Proxmox API certificate. `false` is test-only.                                               |
-| `PROXMOX_CA_CERT` / `PROXMOX_CA_CERT_PATH` | No                  | —                                                          | Inline or mounted private CA certificate.                                                                 |
-| `PROXMOX_ALLOW_INSECURE_HTTP`              | No                  | `false`                                                    | Test-only opt-in for an isolated HTTP fixture.                                                            |
-| `PROXMOX_NODE`                             | No                  | `pve`                                                      | Proxmox node where LXCs are created.                                                                      |
-| `PROXMOX_TEMPLATE`                         | No                  | `local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst` | LXC template used for OpenClaw agents.                                                                    |
-| `PROXMOX_HERMES_TEMPLATE`                  | For Hermes          | —                                                          | Prepared LXC template containing the Hermes executable and `hermes` user.                                 |
-| `PROXMOX_ROOTFS_STORAGE`                   | No                  | `local-lvm`                                                | Storage pool used for the rootfs.                                                                         |
-| `PROXMOX_BRIDGE`                           | No                  | `vmbr0`                                                    | DHCP-capable network bridge attached to created LXCs.                                                     |
-| `PROXMOX_SSH_HOST` / `PROXMOX_SSH_USER`    | With target         | — / `root`                                                 | SSH endpoint used to run `pct`.                                                                           |
-| `PROXMOX_SSH_PORT`                         | No                  | `22`                                                       | SSH port.                                                                                                 |
-| `PROXMOX_SSH_PRIVATE_KEY` / `_PATH`        | One SSH auth method | —                                                          | Inline or mounted SSH private key.                                                                        |
-| `PROXMOX_SSH_PRIVATE_KEY_PASSPHRASE`       | No                  | —                                                          | Passphrase for the configured private key.                                                                |
-| `PROXMOX_SSH_PASSWORD`                     | One SSH auth method | —                                                          | Password fallback when key auth is not configured.                                                        |
-| `PROXMOX_SSH_HOST_FINGERPRINT`             | With target         | —                                                          | Trusted OpenSSH SHA-256 host-key fingerprint.                                                             |
-| `PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY`     | No                  | `false`                                                    | Test-only bypass for pinned host verification.                                                            |
-| `PROXMOX_PCT_COMMAND` / `PROXMOX_SUDO`     | No                  | `pct` / auto                                               | Override the `pct` command or sudo prefix for a restricted SSH account.                                   |
-| `PROXMOX_NODE_MAJOR`                       | No                  | `24`                                                       | Minimum Node.js major installed in stock OpenClaw templates.                                              |
-| `PROXMOX_OPENCLAW_PACKAGE`                 | No                  | `openclaw@2026.6.11`                                       | Package spec installed for OpenClaw. Override only after validating Gateway and activation compatibility. |
-| `PROXMOX_HERMES_BIN`                       | No                  | `/opt/hermes/.venv/bin/hermes`                             | Hermes executable in the prepared template.                                                               |
-| `PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD` | No                  | `false`                                                    | Publishes the unauthenticated Hermes dashboard on `0.0.0.0`; leave false unless separately protected.     |
+| Variable                                   | Required            | Default                                                    | Description                                                                                                                                     |
+| ------------------------------------------ | ------------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PROXMOX_API_URL`                          | With target         | —                                                          | HTTPS Proxmox API origin or URL ending in `/api2/json`.                                                                                         |
+| `PROXMOX_TOKEN_ID`                         | With target         | —                                                          | API token ID in `user@realm!tokenname` format.                                                                                                  |
+| `PROXMOX_TOKEN_SECRET`                     | With target         | —                                                          | Secret associated with the API token.                                                                                                           |
+| `PROXMOX_VERIFY_TLS`                       | No                  | `true`                                                     | Verifies the Proxmox API certificate. `false` is test-only.                                                                                     |
+| `PROXMOX_CA_CERT` / `PROXMOX_CA_CERT_PATH` | No                  | —                                                          | Inline or mounted private CA certificate.                                                                                                       |
+| `PROXMOX_ALLOW_INSECURE_HTTP`              | No                  | `false`                                                    | Test-only opt-in for an isolated HTTP fixture.                                                                                                  |
+| `PROXMOX_NODE`                             | No                  | `pve`                                                      | Proxmox node where LXCs are created.                                                                                                            |
+| `PROXMOX_TEMPLATE`                         | No                  | `local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst` | LXC template used for OpenClaw agents.                                                                                                          |
+| `PROXMOX_HERMES_TEMPLATE`                  | For Hermes          | —                                                          | Prepared LXC template containing the Hermes executable and `hermes` user.                                                                       |
+| `PROXMOX_ROOTFS_STORAGE`                   | No                  | `local-lvm`                                                | Storage pool used for the rootfs.                                                                                                               |
+| `PROXMOX_BRIDGE`                           | No                  | `vmbr0`                                                    | DHCP-capable network bridge attached to created LXCs.                                                                                           |
+| `PROXMOX_SSH_HOST` / `PROXMOX_SSH_USER`    | With target         | — / `root`                                                 | SSH endpoint used to run `pct`.                                                                                                                 |
+| `PROXMOX_SSH_PORT`                         | No                  | `22`                                                       | SSH port.                                                                                                                                       |
+| `PROXMOX_SSH_PRIVATE_KEY` / `_PATH`        | One SSH auth method | —                                                          | Inline or mounted SSH private key.                                                                                                              |
+| `PROXMOX_SSH_PRIVATE_KEY_PASSPHRASE`       | No                  | —                                                          | Passphrase for the configured private key.                                                                                                      |
+| `PROXMOX_SSH_PASSWORD`                     | One SSH auth method | —                                                          | Password fallback when key auth is not configured.                                                                                              |
+| `PROXMOX_SSH_HOST_FINGERPRINT`             | With target         | —                                                          | Trusted OpenSSH SHA-256 host-key fingerprint.                                                                                                   |
+| `PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY`     | No                  | `false`                                                    | Test-only bypass for pinned host verification.                                                                                                  |
+| `PROXMOX_PCT_COMMAND` / `PROXMOX_SUDO`     | No                  | `pct` / auto                                               | Override the `pct` command or sudo prefix for a restricted SSH account.                                                                         |
+| `PROXMOX_OFFLINE_STAGE_COMMAND`            | Non-root SSH only   | —                                                          | Absolute path to an operator-installed strict helper that stages managed state into a stopped LXC. Generic sudo or shell commands are rejected. |
+| `PROXMOX_NODE_MAJOR`                       | No                  | `24`                                                       | Minimum Node.js major installed in stock OpenClaw templates.                                                                                    |
+| `PROXMOX_OPENCLAW_PACKAGE`                 | No                  | `openclaw@2026.6.11`                                       | Package spec installed for OpenClaw. Override only after validating Gateway and activation compatibility.                                       |
+| `PROXMOX_HERMES_BIN`                       | No                  | `/opt/hermes/.venv/bin/hermes`                             | Hermes executable in the prepared template.                                                                                                     |
+| `PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD` | No                  | `false`                                                    | Publishes the unauthenticated Hermes dashboard on `0.0.0.0`; leave false unless separately protected.                                           |
 
 ## NemoClaw / NVIDIA
 

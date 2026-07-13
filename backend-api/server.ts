@@ -50,6 +50,7 @@ const {
   resolveSafeHermesDashboardTarget,
 } = require("./gatewayProxy");
 const { isGatewayAvailableStatus } = require("./agentStatus");
+const { assertRemoteHostAgentUse, toPublicRemoteHostAuthorizationError } = require("./remoteHosts");
 const { repairHermesAgentConfig } = require("./hermesUi");
 const { HERMES_EMBED_AGENT_COLUMNS, GATEWAY_EMBED_AGENT_COLUMNS } = require("./embedAgentColumns");
 const {
@@ -553,6 +554,18 @@ async function resolveEmbedAccess(
   const agent = await lookupAgent(agentId, userId);
   if (!agent) {
     res.status(404).send("agent not found or not running");
+    return null;
+  }
+
+  try {
+    // Embed sessions and the OpenClaw bootstrap script expose live runtime
+    // traffic and, for bootstrap.js, the decrypted gateway password. Re-check
+    // the current host grant before minting/accepting an embed session so a
+    // stale agent row cannot remain a credential oracle after unshare.
+    await assertRemoteHostAgentUse(agent, { includeProfile: false });
+  } catch (error) {
+    const publicError = toPublicRemoteHostAuthorizationError(error);
+    res.status(publicError.statusCode || 503).send(publicError.message);
     return null;
   }
 

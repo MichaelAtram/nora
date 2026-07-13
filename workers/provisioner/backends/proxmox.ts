@@ -10,9 +10,12 @@ const { URL } = require("url");
 const ProvisionerBackend = require("./interface");
 const {
   buildOpenClawAuthImportFromFileCommand,
+  buildOpenClawGatewayPairingCommand,
   buildOpenClawInstallCommand,
+  buildMcpManagedEnv,
+  buildMcpManagedEnvNames,
   buildMcpServersConfig,
-  buildOpenClawCustomProviders,
+  buildMcpServerWrapperScript,
   buildIntegrationToolWrapperScript,
   buildRuntimeBootstrapFiles,
   buildRuntimeEnv,
@@ -48,14 +51,28 @@ const HERMES_HOME = "/opt/data";
 const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const OPENCLAW_ENV_FILE = "/etc/nora/openclaw.env.b64";
 const OPENCLAW_GATEWAY_CONFIG_FILE = "/etc/nora/openclaw-gateway-config.json";
-const OPENCLAW_CUSTOM_PROVIDERS_FILE = "/etc/nora/openclaw-custom-providers.json";
+const OPENCLAW_PROVIDER_BOOTSTRAP_FILE = "/etc/nora/openclaw-provider-bootstrap.sh";
+const OPENCLAW_MANAGED_ENV_NAMES_FILE = "/etc/nora/openclaw-managed-env-names";
+const OPENCLAW_PRESTART_FILE = "/etc/nora/openclaw-prestart.sh";
+const OPENCLAW_PRESTART_RECONCILER_FILE =
+  "/opt/openclaw-runtime/lib/nora-proxmox-prestart-reconcile.js";
+const OPENCLAW_MCP_WRAPPER_FILE = "/usr/local/bin/nora-mcp-server";
+const OPENCLAW_PRESTART_DROPIN_DIR = "/etc/systemd/system/nora-openclaw.service.d";
+const OPENCLAW_PRESTART_DROPIN_FILE = `${OPENCLAW_PRESTART_DROPIN_DIR}/10-nora-managed-state.conf`;
 const HERMES_ENV_FILE = `${HERMES_HOME}/.nora-system-env.b64`;
+const HERMES_MANAGED_ENV_NAMES_FILE = `${HERMES_HOME}/.nora-managed-env-names`;
+const HERMES_PRESTART_FILE = `${HERMES_HOME}/.nora-prestart.sh`;
+const HERMES_PRESTART_DROPIN_DIR = "/etc/systemd/system/nora-hermes.service.d";
+const HERMES_PRESTART_DROPIN_FILE = `${HERMES_PRESTART_DROPIN_DIR}/10-nora-managed-state.conf`;
+const PROXMOX_OFFLINE_STAGE_HELPER_ENV = "PROXMOX_OFFLINE_STAGE_COMMAND";
 const PROXMOX_NEMOCLAW_UNSUPPORTED =
   "NemoClaw on Proxmox is not supported: writing a policy file inside an LXC does not provide the enforced OpenShell sandbox contract.";
 const PROXMOX_AGENT_OWNERSHIP_MARKER_PREFIX = "nora-agent:";
 const PROXMOX_CREATE_OWNERSHIP_MARKER_PREFIX = "nora-owner:";
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PROXMOX_TEMPLATE_RE = /^[A-Za-z0-9_.-]+:vztmpl\/[A-Za-z0-9._+~-]+\.tar\.zst$/;
+const SAFE_HOST_EXECUTABLE_RE = /^(?:\/[A-Za-z0-9_./-]+|[A-Za-z0-9_.-]+)$/;
+const SAFE_HOST_HELPER_RE = /^\/[A-Za-z0-9_./-]+$/;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -143,6 +160,297 @@ function environmentLoaderLines(filePath) {
     "fi",
     "unset nora_key nora_value_b64 nora_value NORA_ENV_FILE",
   ];
+}
+
+function buildOpenClawAuthBuilderScript() {
+  return [
+    "const fs = require('fs');",
+    "const path = require('path');",
+    "const authPath = '/root/.openclaw/agents/main/agent/auth-profiles.json';",
+    "const providers = {",
+    "  ANTHROPIC_API_KEY: { provider: 'anthropic' },",
+    "  OPENAI_API_KEY: { provider: 'openai' },",
+    "  GEMINI_API_KEY: { provider: 'google' },",
+    "  GROQ_API_KEY: { provider: 'groq' },",
+    "  MISTRAL_API_KEY: { provider: 'mistral' },",
+    "  DEEPSEEK_API_KEY: { provider: 'deepseek' },",
+    "  OPENROUTER_API_KEY: { provider: 'openrouter' },",
+    "  TOGETHER_API_KEY: { provider: 'together' },",
+    "  COHERE_API_KEY: { provider: 'cohere' },",
+    "  XAI_API_KEY: { provider: 'xai' },",
+    "  MOONSHOT_API_KEY: { provider: 'moonshot' },",
+    "  ZAI_API_KEY: { provider: 'zai' },",
+    "  OLLAMA_API_KEY: { provider: 'ollama' },",
+    "  MINIMAX_API_KEY: { provider: 'minimax' },",
+    "  COPILOT_GITHUB_TOKEN: { provider: 'github-copilot' },",
+    "  HF_TOKEN: { provider: 'huggingface' },",
+    "  CEREBRAS_API_KEY: { provider: 'cerebras' },",
+    "  NVIDIA_API_KEY: { provider: 'nvidia', defaultEndpoint: 'https://integrate.api.nvidia.com/v1' },",
+    "  MICROSOFT_FOUNDRY_API_KEY: { provider: 'azure-openai-responses' },",
+    "  NORA_DEMO_LLM_TOKEN: { provider: 'nora-demo', baseUrlEnv: 'NORA_DEMO_LLM_BASE_URL' },",
+    "};",
+    "const auth = { version: 1, profiles: {}, order: {}, lastGood: {} };",
+    "for (const [envName, spec] of Object.entries(providers)) {",
+    "  const key = String(process.env[envName] || '');",
+    "  if (!key) continue;",
+    "  const profileId = `${spec.provider}:default`;",
+    "  const baseName = envName.replace(/_API_KEY$|_TOKEN$/, '');",
+    "  const endpoint = String(",
+    "    process.env[spec.baseUrlEnv || `${baseName}_BASE_URL`] || spec.defaultEndpoint || '',",
+    "  ).trim();",
+    "  const apiVersion = String(process.env[`${baseName}_API_VERSION`] || '').trim();",
+    "  auth.profiles[profileId] = {",
+    "    type: 'api_key',",
+    "    provider: spec.provider,",
+    "    key,",
+    "    ...(endpoint ? { endpoint } : {}),",
+    "    ...(apiVersion ? { api_version: apiVersion } : {}),",
+    "  };",
+    "  auth.order[spec.provider] = [profileId];",
+    "  auth.lastGood[spec.provider] = profileId;",
+    "}",
+    "if (Object.keys(auth.order).length === 0) delete auth.order;",
+    "if (Object.keys(auth.lastGood).length === 0) delete auth.lastGood;",
+    "fs.mkdirSync(path.dirname(authPath), { recursive: true });",
+    "const temporaryPath = `${authPath}.nora-${process.pid}-${Date.now()}.tmp`;",
+    "try {",
+    "  fs.writeFileSync(temporaryPath, JSON.stringify(auth));",
+    "  fs.chmodSync(temporaryPath, 0o600);",
+    "  fs.renameSync(temporaryPath, authPath);",
+    "} finally {",
+    "  try { fs.rmSync(temporaryPath, { force: true }); } catch {}",
+    "}",
+    "",
+  ].join("\n");
+}
+
+function buildOpenClawPrestartReconcilerScript() {
+  return [
+    "const fs = require('fs');",
+    "const path = require('path');",
+    "const configPath = '/root/.openclaw/openclaw.json';",
+    "const markerPath = '/root/.openclaw/.nora-managed-default-model';",
+    `const managedEnvNamesPath = ${JSON.stringify(OPENCLAW_MANAGED_ENV_NAMES_FILE)};`,
+    "const managedProviderIds = new Set(['azure-openai-responses', 'nora-demo']);",
+    "const foundryDefaults = [",
+    "  { id: 'gpt-5.5', name: 'GPT-5.5 (Azure)', reasoning: true, contextWindow: 400000, maxTokens: 16384 },",
+    "  { id: 'gpt-5.5-mini', name: 'GPT-5.5 Mini (Azure)', reasoning: true, contextWindow: 400000, maxTokens: 16384 },",
+    "  { id: 'gpt-5.5-pro', name: 'GPT-5.5 Pro (Azure)', reasoning: true, contextWindow: 200000, maxTokens: 128000 },",
+    "  { id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex (Azure)', reasoning: true, contextWindow: 400000, maxTokens: 16384 },",
+    "  { id: 'o3', name: 'o3 (Azure)', reasoning: true, contextWindow: 200000, maxTokens: 100000 },",
+    "];",
+    "function isPlainObject(value) { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }",
+    "function foundryDeployment() {",
+    "  let value = String(process.env.MICROSOFT_FOUNDRY_DEPLOYMENT || process.env.NORA_DEFAULT_OPENCLAW_MODEL || '').trim();",
+    "  for (const prefix of ['azure-openai-responses/', 'microsoft-foundry/', 'openai/', 'openai-responses/']) {",
+    "    if (value.startsWith(prefix)) { value = value.slice(prefix.length).trim(); break; }",
+    "  }",
+    "  return value && !value.includes('/') ? value : 'gpt-5.5';",
+    "}",
+    "function foundryModels() {",
+    "  const models = foundryDefaults.map((entry) => ({",
+    "    ...entry,",
+    "    api: 'azure-openai-responses',",
+    "    input: ['text', 'image'],",
+    "    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },",
+    "    compat: { supportsStore: false, supportsReasoningEffort: true },",
+    "  }));",
+    "  const deployment = foundryDeployment();",
+    "  if (models.some((model) => model.id === deployment)) return models;",
+    "  const baseId = deployment.replace(/-\\d+$/, '');",
+    "  const template = models.find((model) => model.id === baseId) || models[0];",
+    "  return [{ ...template, id: deployment, name: `${deployment} (Azure deployment)` }, ...models];",
+    "}",
+    "function buildDesiredProviders() {",
+    "  const desired = {};",
+    "  const foundryKey = String(process.env.MICROSOFT_FOUNDRY_API_KEY || '');",
+    "  const foundryBaseUrl = String(process.env.MICROSOFT_FOUNDRY_BASE_URL || '').replace(/\\/+$/, '');",
+    "  if (foundryKey && foundryBaseUrl) {",
+    "    desired['azure-openai-responses'] = {",
+    "      api: 'azure-openai-responses',",
+    "      baseUrl: foundryBaseUrl,",
+    "      apiKey: foundryKey,",
+    "      models: foundryModels(),",
+    "    };",
+    "  }",
+    "  const demoToken = String(process.env.NORA_DEMO_LLM_TOKEN || '');",
+    "  const demoBaseUrl = String(process.env.NORA_DEMO_LLM_BASE_URL || '').replace(/\\/+$/, '');",
+    "  if (demoToken && demoBaseUrl) {",
+    "    desired['nora-demo'] = {",
+    "      api: 'openai-completions',",
+    "      baseUrl: demoBaseUrl,",
+    "      apiKey: demoToken,",
+    "      models: [{",
+    "        id: 'nora-demo-1', name: 'Nora Demo (deterministic stub)', api: 'openai-completions',",
+    "        reasoning: false, input: ['text'],",
+    "        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },",
+    "        contextWindow: 32768, maxTokens: 4096,",
+    "      }],",
+    "    };",
+    "  }",
+    "  return desired;",
+    "}",
+    "function readConfig() {",
+    "  if (!fs.existsSync(configPath)) return {};",
+    "  const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));",
+    "  if (!isPlainObject(parsed)) throw new Error('OpenClaw config must contain a JSON object');",
+    "  return parsed;",
+    "}",
+    "function writeConfig(config) {",
+    "  fs.mkdirSync(path.dirname(configPath), { recursive: true });",
+    "  const temporaryPath = `${configPath}.nora-${process.pid}-${Date.now()}.tmp`;",
+    "  try {",
+    "    fs.writeFileSync(temporaryPath, JSON.stringify(config, null, 2) + '\\n');",
+    "    fs.chmodSync(temporaryPath, 0o600);",
+    "    fs.renameSync(temporaryPath, configPath);",
+    "  } finally {",
+    "    try { fs.rmSync(temporaryPath, { force: true }); } catch {}",
+    "  }",
+    "}",
+    "const current = readConfig();",
+    "const managedEnvNames = new Set();",
+    "try {",
+    "  for (const line of fs.readFileSync(managedEnvNamesPath, 'utf8').split(/\\r?\\n/)) {",
+    "    const name = String(line || '').trim();",
+    "    if (name && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) managedEnvNames.add(name);",
+    "  }",
+    "} catch (error) {",
+    "  if (error?.code !== 'ENOENT') throw error;",
+    "}",
+    "if (current.env !== undefined && !isPlainObject(current.env)) throw new Error('OpenClaw env config must be an object');",
+    "if (isPlainObject(current.env)) {",
+    "  const configEnv = { ...current.env };",
+    "  for (const name of managedEnvNames) delete configEnv[name];",
+    "  if (Object.keys(configEnv).length > 0) current.env = configEnv;",
+    "  else delete current.env;",
+    "}",
+    "if (current.models !== undefined && !isPlainObject(current.models)) {",
+    "  throw new Error('OpenClaw models config must be an object');",
+    "}",
+    "const models = { ...(current.models || {}) };",
+    "if (models.providers !== undefined && !isPlainObject(models.providers)) {",
+    "  throw new Error('OpenClaw custom providers config must be an object');",
+    "}",
+    "const providers = { ...(models.providers || {}) };",
+    "for (const providerId of managedProviderIds) delete providers[providerId];",
+    "for (const [providerId, providerConfig] of Object.entries(buildDesiredProviders())) {",
+    "  if (managedProviderIds.has(providerId)) providers[providerId] = providerConfig;",
+    "}",
+    "if (Object.keys(providers).length > 0) models.providers = providers;",
+    "else delete models.providers;",
+    "if (Object.keys(models).length > 0) current.models = models;",
+    "else delete current.models;",
+    "const desiredDefaultModel = String(process.env.NORA_DEFAULT_OPENCLAW_MODEL || '').trim();",
+    "if (current.agents !== undefined && !isPlainObject(current.agents)) throw new Error('OpenClaw agents config must be an object');",
+    "const agents = isPlainObject(current.agents) ? { ...current.agents } : {};",
+    "if (agents.defaults !== undefined && !isPlainObject(agents.defaults)) throw new Error('OpenClaw agent defaults config must be an object');",
+    "const defaults = isPlainObject(agents.defaults) ? { ...agents.defaults } : {};",
+    "if (defaults.model !== undefined && !isPlainObject(defaults.model)) throw new Error('OpenClaw default model config must be an object');",
+    "if (defaults.models !== undefined && !isPlainObject(defaults.models)) throw new Error('OpenClaw allowed models config must be an object');",
+    "const model = isPlainObject(defaults.model) ? { ...defaults.model } : {};",
+    "const allowedModels = isPlainObject(defaults.models) ? { ...defaults.models } : {};",
+    "const currentPrimary = String(model.primary || '').trim();",
+    "let previousManagedModel = '';",
+    "try { previousManagedModel = String(fs.readFileSync(markerPath, 'utf8') || '').trim(); } catch {}",
+    "if (previousManagedModel) delete allowedModels[previousManagedModel];",
+    "if (desiredDefaultModel) {",
+    "  model.primary = desiredDefaultModel;",
+    "  if (!isPlainObject(allowedModels[desiredDefaultModel])) allowedModels[desiredDefaultModel] = {};",
+    "} else if (previousManagedModel && currentPrimary === previousManagedModel) {",
+    "  delete model.primary;",
+    "}",
+    "if (Object.keys(model).length > 0) defaults.model = model;",
+    "else delete defaults.model;",
+    "if (Object.keys(allowedModels).length > 0) defaults.models = allowedModels;",
+    "else delete defaults.models;",
+    "if (Object.keys(defaults).length > 0) agents.defaults = defaults;",
+    "else delete agents.defaults;",
+    "if (Object.keys(agents).length > 0) current.agents = agents;",
+    "else delete current.agents;",
+    "writeConfig(current);",
+    "if (desiredDefaultModel) {",
+    "  fs.mkdirSync(path.dirname(markerPath), { recursive: true });",
+    "  fs.writeFileSync(markerPath, desiredDefaultModel + '\\n');",
+    "  fs.chmodSync(markerPath, 0o600);",
+    "} else {",
+    "  try { fs.rmSync(markerPath, { force: true }); } catch {}",
+    "}",
+    "",
+  ].join("\n");
+}
+
+function buildOpenClawPrestartScript() {
+  return [
+    "#!/bin/sh",
+    "set -eu",
+    ...environmentLoaderLines(OPENCLAW_ENV_FILE),
+    "node /opt/openclaw-runtime/lib/build-auth.js",
+    buildOpenClawGatewayPairingCommand(),
+    `node ${OPENCLAW_PRESTART_RECONCILER_FILE}`,
+    buildOpenClawAuthImportFromFileCommand({ requireCli: false }),
+    "",
+  ].join("\n");
+}
+
+function buildHermesPrestartScript() {
+  return [
+    "#!/bin/sh",
+    "set -eu",
+    ...environmentLoaderLines(HERMES_ENV_FILE),
+    buildHermesRuntimeConfigBootstrapCommand(),
+    `touch ${shellSingleQuote(`${HERMES_HOME}/.nora-bootstrap-complete`)}`,
+    `chmod 0600 ${shellSingleQuote(`${HERMES_HOME}/.nora-bootstrap-complete`)}`,
+    "",
+  ].join("\n");
+}
+
+function buildSystemdPrestartDropin(prestartPath) {
+  return ["[Service]", `ExecStartPre=${prestartPath}`, ""].join("\n");
+}
+
+function buildNoopProviderBootstrapScript() {
+  return "#!/bin/sh\nset -eu\n# Provider state is reconciled by the secret-free systemd prestart hook.\n";
+}
+
+function normalizeManagedEnvNames(names = []) {
+  const normalized = [];
+  for (const rawName of Array.isArray(names) ? names : []) {
+    const name = String(rawName || "").trim();
+    if (!name) continue;
+    if (!ENV_NAME_RE.test(name)) {
+      throw new Error(`Invalid managed runtime environment variable name: ${name}`);
+    }
+    if (!normalized.includes(name)) normalized.push(name);
+  }
+  return normalized.sort();
+}
+
+async function buildTarArchive(files = []) {
+  const tar = require("tar-stream");
+  const pack = tar.pack();
+  const chunks = [];
+  const archive = new Promise((resolve, reject) => {
+    pack.on("data", (chunk) => chunks.push(chunk));
+    pack.on("end", () => resolve(Buffer.concat(chunks)));
+    pack.on("error", reject);
+  });
+  for (const file of files) {
+    await new Promise((resolve, reject) => {
+      pack.entry(
+        {
+          name: String(file.name),
+          type: "file",
+          mode: Number(file.mode || 0o600),
+          uid: 0,
+          gid: 0,
+        },
+        Buffer.isBuffer(file.content) ? file.content : Buffer.from(String(file.content || "")),
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+  }
+  pack.finalize();
+  return archive;
 }
 
 function openClawManagedConfigMergeLines(filePath, { removeAfter = false, replaceKeys = [] } = {}) {
@@ -293,6 +601,12 @@ function missingLxcError(vmid, operation) {
   return error;
 }
 
+function taskCompletionUnconfirmedError(message) {
+  const error = new Error(message);
+  error.code = "PROXMOX_TASK_COMPLETION_UNCONFIRMED";
+  return error;
+}
+
 function safeHostname(name, fallback) {
   return (
     String(name || fallback || "")
@@ -304,55 +618,14 @@ function safeHostname(name, fallback) {
   );
 }
 
-function derivePairedDevice(gatewayToken) {
-  const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
-  const PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
-  const seed = crypto
-    .createHash("sha256")
-    .update("openclaw-device:" + gatewayToken)
-    .digest();
-  const privateDer = Buffer.concat([PKCS8_PREFIX, seed]);
-  const privateKey = crypto.createPrivateKey({ key: privateDer, format: "der", type: "pkcs8" });
-  const publicKey = crypto.createPublicKey(privateKey);
-  const spki = publicKey.export({ type: "spki", format: "der" });
-  const rawPub = spki.subarray(ED25519_SPKI_PREFIX.length);
-  const deviceId = crypto.createHash("sha256").update(rawPub).digest("hex");
-  const pubB64 = rawPub
-    .toString("base64")
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replace(/=+$/g, "");
-  const allScopes = [
-    "operator.admin",
-    "operator.read",
-    "operator.write",
-    "operator.approvals",
-    "operator.pairing",
-  ];
-  const nowMs = Date.now();
-  return JSON.stringify({
-    [deviceId]: {
-      deviceId,
-      publicKey: pubB64,
-      platform: "linux",
-      clientId: "gateway-client",
-      clientMode: "backend",
-      role: "operator",
-      roles: ["operator"],
-      scopes: allScopes,
-      approvedScopes: allScopes,
-      tokens: {
-        operator: {
-          token: crypto.randomBytes(32).toString("hex"),
-          role: "operator",
-          scopes: allScopes,
-          createdAtMs: nowMs,
-        },
-      },
-      createdAtMs: nowMs,
-      approvedAtMs: nowMs,
-    },
-  });
+function safeDescriptionLabel(value, fallback) {
+  return (
+    String(value || fallback || "agent")
+      .replace(/[\r\n\u2028\u2029]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 200) || "agent"
+  );
 }
 
 function proxmoxAuthErrorMessage(statusCode) {
@@ -381,6 +654,7 @@ class ProxmoxBackend extends ProvisionerBackend {
     this.sshPort = Number(process.env.PROXMOX_SSH_PORT || "22");
     this.pctCommand = process.env.PROXMOX_PCT_COMMAND || "pct";
     this.sudoPrefix = process.env.PROXMOX_SUDO || (this.sshUser === "root" ? "" : "sudo -n ");
+    this.offlineStageCommand = String(process.env[PROXMOX_OFFLINE_STAGE_HELPER_ENV] || "").trim();
   }
 
   _apiBaseUrl() {
@@ -473,6 +747,10 @@ class ProxmoxBackend extends ProvisionerBackend {
       config.hostVerifier = (key) => timingSafeEqualText(keyFingerprint(key), expectedFingerprint);
     }
     return config;
+  }
+
+  _createSshClient() {
+    return new Client();
   }
 
   async _request(method, requestPath, payload, options = {}) {
@@ -576,41 +854,111 @@ class ProxmoxBackend extends ProvisionerBackend {
   }
 
   async _waitForTask(upid, options = {}) {
-    if (!upid) return;
+    const taskId = typeof upid === "string" ? upid.trim() : "";
+    if (!taskId) {
+      throw taskCompletionUnconfirmedError(
+        "Proxmox API did not return a task id; operation completion cannot be confirmed",
+      );
+    }
     for (let i = 0; i < 120; i++) {
       const status = await this._requestData(
         "GET",
-        `/nodes/${this.node}/tasks/${encodeURIComponent(upid)}/status`,
+        `/nodes/${this.node}/tasks/${encodeURIComponent(taskId)}/status`,
         null,
         options,
       );
       if (status?.status === "stopped") {
-        if (status.exitstatus && status.exitstatus !== "OK") {
-          throw new Error(`Proxmox task failed: ${status.exitstatus}`);
+        const exitStatus = String(status.exitstatus || "").trim();
+        if (!exitStatus) {
+          throw taskCompletionUnconfirmedError(
+            `Proxmox task ${taskId} stopped without a confirmed exit status`,
+          );
+        }
+        if (exitStatus !== "OK") {
+          throw new Error(`Proxmox task failed: ${exitStatus}`);
         }
         return;
       }
       await abortableSleep(1000, options.signal, "waiting for Proxmox task");
     }
-    throw new Error("Timed out waiting for Proxmox task");
+    throw taskCompletionUnconfirmedError(`Timed out waiting for Proxmox task ${taskId}`);
   }
 
   _sshExec(command, { timeout = 120000, signal, input = null } = {}) {
     this._assertConfigured();
     return new Promise((resolve, reject) => {
       throwIfAborted(signal, "Proxmox SSH command");
-      const conn = new Client();
+      const conn = this._createSshClient();
+      let remoteStream = null;
       let timer = null;
+      let killTimer = null;
+      let terminationTimer = null;
+      let terminationReason = null;
+      let observedExitCode = null;
+      let commandRequested = false;
       let settled = false;
+      const unconfirmedError = (message, cause = null) => {
+        const error = new Error(message, cause ? { cause } : undefined);
+        error.code = "PROXMOX_SSH_EXEC_TERMINATION_UNCONFIRMED";
+        return error;
+      };
       const finish = (callback, value) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
+        if (terminationTimer) clearTimeout(terminationTimer);
         signal?.removeEventListener("abort", onAbort);
-        conn.end();
+        try {
+          conn.end();
+        } catch {
+          // The SSH transport may already be closed.
+        }
         callback(value);
       };
-      const onAbort = () => finish(reject, abortError(signal, "Proxmox SSH command"));
+      const requestTermination = (reason) => {
+        if (settled || terminationReason) return;
+        terminationReason = reason;
+        if (!remoteStream) {
+          finish(
+            reject,
+            commandRequested
+              ? unconfirmedError(
+                  `Proxmox SSH command termination could not be confirmed after dispatch: ${reason.message}`,
+                  reason,
+                )
+              : reason,
+          );
+          return;
+        }
+        try {
+          remoteStream.signal("TERM");
+        } catch {
+          // The SSH server may not support channel signals. Escalate below.
+        }
+        killTimer = setTimeout(() => {
+          try {
+            remoteStream.signal("KILL");
+          } catch {
+            // Missing signal support is reported as unconfirmed termination.
+          }
+          terminationTimer = setTimeout(() => {
+            try {
+              remoteStream.close();
+            } catch {
+              // The channel may already be closed.
+            }
+            finish(
+              reject,
+              unconfirmedError(
+                `Proxmox SSH command termination could not be confirmed: ${reason.message}`,
+                reason,
+              ),
+            );
+          }, 500);
+        }, 500);
+      };
+      const onAbort = () => requestTermination(abortError(signal, "Proxmox SSH command"));
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) {
         onAbort();
@@ -619,13 +967,25 @@ class ProxmoxBackend extends ProvisionerBackend {
       conn
         .on("ready", () => {
           timer = setTimeout(() => {
-            finish(reject, new Error(`SSH command timed out after ${timeout}ms`));
+            requestTermination(new Error(`SSH command timed out after ${timeout}ms`));
           }, timeout);
+          commandRequested = true;
           conn.exec(command, (err, stream) => {
             if (err) {
               finish(reject, err);
               return;
             }
+            if (settled) {
+              try {
+                stream.signal("TERM");
+                stream.signal("KILL");
+                stream.close();
+              } catch {
+                // The already-rejected operation remains explicitly unconfirmed.
+              }
+              return;
+            }
+            remoteStream = stream;
             let stdout = "";
             let stderr = "";
             stream.on("data", (chunk) => {
@@ -634,22 +994,82 @@ class ProxmoxBackend extends ProvisionerBackend {
             stream.stderr.on("data", (chunk) => {
               stderr += chunk.toString();
             });
+            stream.on("exit", (code) => {
+              if (Number.isInteger(code)) observedExitCode = code;
+            });
+            stream.on("error", (error) => {
+              if (terminationReason && Number.isInteger(observedExitCode)) {
+                finish(reject, terminationReason);
+                return;
+              }
+              finish(
+                reject,
+                unconfirmedError(
+                  `Proxmox SSH command stream failed before exit was confirmed: ${error.message}`,
+                  terminationReason || error,
+                ),
+              );
+            });
             stream.on("close", (code) => {
-              if (code !== 0) {
+              const finalCode = Number.isInteger(code) ? code : observedExitCode;
+              if (terminationReason) {
                 finish(
                   reject,
-                  new Error(stderr.trim() || stdout.trim() || `SSH command exited with ${code}`),
+                  Number.isInteger(finalCode)
+                    ? terminationReason
+                    : unconfirmedError(
+                        `Proxmox SSH command termination could not be confirmed: ${terminationReason.message}`,
+                        terminationReason,
+                      ),
                 );
                 return;
               }
-              finish(resolve, { stdout, stderr, code });
+              if (!Number.isInteger(finalCode)) {
+                finish(
+                  reject,
+                  unconfirmedError(
+                    "Proxmox SSH channel closed without a confirmed remote command exit status",
+                  ),
+                );
+                return;
+              }
+              if (finalCode !== 0) {
+                finish(
+                  reject,
+                  new Error(
+                    stderr.trim() || stdout.trim() || `SSH command exited with ${finalCode}`,
+                  ),
+                );
+                return;
+              }
+              finish(resolve, { stdout, stderr, code: finalCode });
             });
             if (input != null) {
               stream.end(Buffer.isBuffer(input) ? input : Buffer.from(String(input)));
             }
           });
         })
-        .on("error", (error) => finish(reject, error))
+        .on("error", (error) =>
+          finish(
+            reject,
+            remoteStream || commandRequested
+              ? unconfirmedError(
+                  `Proxmox SSH transport failed before remote command exit was confirmed: ${error.message}`,
+                  terminationReason || error,
+                )
+              : error,
+          ),
+        )
+        .on("close", () => {
+          if (!settled && (remoteStream || commandRequested)) {
+            finish(
+              reject,
+              unconfirmedError(
+                "Proxmox SSH transport closed before remote command exit was confirmed",
+              ),
+            );
+          }
+        })
         .connect(this._sshConfig());
     });
   }
@@ -681,6 +1101,305 @@ class ProxmoxBackend extends ProvisionerBackend {
         input: Buffer.isBuffer(content) ? content : Buffer.from(String(content)),
       },
     );
+  }
+
+  _assertOfflineStagePrivilege() {
+    if (this.sshUser === "root") return { mode: "root" };
+    if (!this.offlineStageCommand) {
+      const error = new Error(
+        `Stopped Proxmox LXC reconciliation requires root SSH or a strict helper configured with ${PROXMOX_OFFLINE_STAGE_HELPER_ENV}`,
+      );
+      error.code = "PROXMOX_OFFLINE_STAGE_PRIVILEGE_REQUIRED";
+      error.statusCode = 503;
+      throw error;
+    }
+    if (!SAFE_HOST_HELPER_RE.test(this.offlineStageCommand)) {
+      const error = new Error(
+        `${PROXMOX_OFFLINE_STAGE_HELPER_ENV} must be a single absolute executable path`,
+      );
+      error.code = "PROXMOX_OFFLINE_STAGE_HELPER_INVALID";
+      error.statusCode = 500;
+      throw error;
+    }
+    return { mode: "helper", command: this.offlineStageCommand };
+  }
+
+  _buildOfflineStageHostScript(vmid, runtimeFamily, nonce, replaceManagedState) {
+    const normalizedVmid = normalizeVmid(vmid);
+    if (!SAFE_HOST_EXECUTABLE_RE.test(this.pctCommand)) {
+      const error = new Error(
+        "PROXMOX_PCT_COMMAND must be a single command name or absolute path for offline staging",
+      );
+      error.code = "PROXMOX_OFFLINE_STAGE_PCT_COMMAND_INVALID";
+      throw error;
+    }
+    const hermes = runtimeFamily === "hermes";
+    const envPath = hermes ? HERMES_ENV_FILE : OPENCLAW_ENV_FILE;
+    const managedNamesPath = hermes
+      ? HERMES_MANAGED_ENV_NAMES_FILE
+      : OPENCLAW_MANAGED_ENV_NAMES_FILE;
+    const dropinDir = hermes ? HERMES_PRESTART_DROPIN_DIR : OPENCLAW_PRESTART_DROPIN_DIR;
+    const dropinFile = hermes ? HERMES_PRESTART_DROPIN_FILE : OPENCLAW_PRESTART_DROPIN_FILE;
+    const serviceFile = hermes
+      ? "/etc/systemd/system/nora-hermes.service"
+      : "/etc/systemd/system/nora-openclaw.service";
+    const extraInstalls = hermes
+      ? [
+          ["prestart.sh", HERMES_PRESTART_FILE, "0700", envPath],
+          ["dropin.conf", dropinFile, "0644", serviceFile],
+        ]
+      : [
+          ["build-auth.js", "/opt/openclaw-runtime/lib/build-auth.js", "0600", envPath],
+          ["prestart.sh", OPENCLAW_PRESTART_FILE, "0700", envPath],
+          [
+            "prestart-reconcile.js",
+            OPENCLAW_PRESTART_RECONCILER_FILE,
+            "0600",
+            "/opt/openclaw-runtime/lib/build-auth.js",
+          ],
+          ["provider-bootstrap.sh", OPENCLAW_PROVIDER_BOOTSTRAP_FILE, "0700", envPath],
+          ["mcp-wrapper", OPENCLAW_MCP_WRAPPER_FILE, "0755", envPath],
+          ["dropin.conf", dropinFile, "0644", serviceFile],
+        ];
+
+    return [
+      "set -eu",
+      `vmid=${shellSingleQuote(normalizedVmid)}`,
+      `pct_cmd=${shellSingleQuote(this.pctCommand)}`,
+      `nonce=${shellSingleQuote(nonce)}`,
+      `replace_managed_state=${replaceManagedState ? "1" : "0"}`,
+      'stage="$(mktemp -d /run/nora-proxmox-stage.XXXXXXXX)"',
+      "mounted=0",
+      "config_locked=0",
+      "cleanup() {",
+      "  rc=$?",
+      "  set +e",
+      '  rm -rf -- "$stage"',
+      '  if [ "$config_locked" = 1 ]; then flock -u 9 || rc=125; config_locked=0; fi',
+      '  if [ "$mounted" = 1 ]; then',
+      "    cd /",
+      '    "$pct_cmd" unmount "$vmid" >/dev/null 2>&1 || rc=125',
+      "  fi",
+      "  trap - EXIT HUP INT TERM",
+      '  exit "$rc"',
+      "}",
+      "trap cleanup EXIT HUP INT TERM",
+      "umask 077",
+      'tar --extract --file=- --directory="$stage" --no-same-owner --no-same-permissions',
+      'test -z "$(find "$stage" -mindepth 1 ! -type f -print -quit)"',
+      'test "$("$pct_cmd" status "$vmid")" = "status: stopped"',
+      '"$pct_cmd" mount "$vmid" >/dev/null',
+      "mounted=1",
+      'test "$("$pct_cmd" status "$vmid")" = "status: stopped"',
+      'config_lock="/run/lock/lxc/pve-config-$vmid.lock"',
+      'exec 9>"$config_lock"',
+      "flock -x 9",
+      "config_locked=1",
+      'test "$("$pct_cmd" status "$vmid")" = "status: stopped"',
+      'root="$(readlink -f -- "/var/lib/lxc/$vmid/rootfs")"',
+      'test -n "$root" && test -d "$root"',
+      "confined_parent() {",
+      '  rel="$1"',
+      '  case "$rel" in ""|/*|*".."*) return 64;; esac',
+      '  parent_rel="${rel%/*}"',
+      '  [ "$parent_rel" != "$rel" ] || parent_rel=.',
+      '  parent="$(readlink -f -- "$root/$parent_rel")" || return 65',
+      '  case "$parent/" in "$root/"*) printf \'%s\\n\' "$parent";; *) return 66;; esac',
+      "}",
+      "safe_existing() {",
+      '  rel="$1"',
+      '  parent="$(confined_parent "$rel")" || return $?',
+      '  base="${rel##*/}"',
+      '  target="$parent/$base"',
+      '  [ ! -L "$target" ] && [ -e "$target" ] || return 67',
+      "  printf '%s\\n' \"$target\"",
+      "}",
+      "ensure_dir() {",
+      '  rel="$1"; reference_rel="$2"; mode="$3"',
+      '  parent="$(confined_parent "$rel")" || return $?',
+      '  base="${rel##*/}"',
+      '  target="$parent/$base"',
+      '  [ ! -L "$target" ] || return 68',
+      '  reference="$(safe_existing "$reference_rel")" || return $?',
+      '  if [ ! -d "$target" ]; then mkdir -- "$target"; fi',
+      '  chown --reference="$reference" "$target"',
+      '  chmod "$mode" "$target"',
+      "}",
+      "install_file() {",
+      '  source_name="$1"; rel="$2"; mode="$3"; reference_rel="$4"',
+      '  source="$stage/$source_name"',
+      '  [ -f "$source" ] && [ ! -L "$source" ] || return 69',
+      '  parent="$(confined_parent "$rel")" || return $?',
+      '  base="${rel##*/}"',
+      '  target="$parent/$base"',
+      '  [ ! -L "$target" ] || return 70',
+      '  reference="$(safe_existing "$reference_rel")" || return $?',
+      '  temporary="$parent/.nora-stage-$nonce-$base"',
+      '  rm -f -- "$temporary"',
+      '  cp -- "$source" "$temporary"',
+      '  chown --reference="$reference" "$temporary"',
+      '  chmod "$mode" "$temporary"',
+      '  mv -fT -- "$temporary" "$target"',
+      "}",
+      `env_rel=${shellSingleQuote(envPath.replace(/^\//, ""))}`,
+      `names_rel=${shellSingleQuote(managedNamesPath.replace(/^\//, ""))}`,
+      'current_env="$(safe_existing "$env_rel")"',
+      'names_parent="$(confined_parent "$names_rel")"',
+      'names_target="$names_parent/${names_rel##*/}"',
+      'test ! -L "$names_target"',
+      'cp -- "$stage/env.keys" "$stage/effective.keys"',
+      'sort -u "$stage/effective.keys" -o "$stage/effective.keys"',
+      'awk -F= \'NR==FNR { if ($1 != "") managed[$1]=1; next } !($1 in managed)\' "$stage/effective.keys" "$current_env" > "$stage/env.merged"',
+      'awk \'NF { print }\' "$stage/env.patch" >> "$stage/env.merged"',
+      '  : > "$stage/names.merged"',
+      '  if [ -f "$names_target" ]; then cat -- "$names_target" >> "$stage/names.merged"; fi',
+      '  cat -- "$stage/env.scope" >> "$stage/names.merged"',
+      'sort -u "$stage/names.merged" -o "$stage/names.merged"',
+      'install_file env.merged "$env_rel" 0600 "$env_rel"',
+      'install_file names.merged "$names_rel" 0600 "$env_rel"',
+      `ensure_dir ${shellSingleQuote(dropinDir.replace(/^\//, ""))} ${shellSingleQuote(
+        path.posix.dirname(dropinDir).replace(/^\//, ""),
+      )} 0755`,
+      ...extraInstalls.map(
+        ([source, target, mode, reference]) =>
+          `install_file ${shellSingleQuote(source)} ${shellSingleQuote(
+            target.replace(/^\//, ""),
+          )} ${mode} ${shellSingleQuote(reference.replace(/^\//, ""))}`,
+      ),
+      "cd /",
+      "flock -u 9",
+      "config_locked=0",
+      '"$pct_cmd" unmount "$vmid" >/dev/null',
+      "mounted=0",
+      'rm -rf -- "$stage"',
+      "trap - EXIT HUP INT TERM",
+      "",
+    ].join("\n");
+  }
+
+  async _stageManagedStateWhileStopped(
+    vmid,
+    entries,
+    replacementNames,
+    { agentId, runtimeFamily = "openclaw", replaceManagedState = false, signal } = {},
+  ) {
+    const normalizedVmid = normalizeVmid(vmid);
+    const normalizedRuntimeFamily = runtimeFamily === "hermes" ? "hermes" : "openclaw";
+    const privilege = this._assertOfflineStagePrivilege();
+    const nonce = crypto.randomBytes(12).toString("hex");
+    const archiveFiles = [
+      { name: "env.patch", content: serializeEnvironment(entries), mode: 0o600 },
+      { name: "env.keys", content: `${replacementNames.join("\n")}\n`, mode: 0o600 },
+      { name: "env.scope", content: `${replacementNames.join("\n")}\n`, mode: 0o600 },
+    ];
+    if (normalizedRuntimeFamily === "hermes") {
+      archiveFiles.push(
+        { name: "prestart.sh", content: buildHermesPrestartScript(), mode: 0o700 },
+        {
+          name: "dropin.conf",
+          content: buildSystemdPrestartDropin(HERMES_PRESTART_FILE),
+          mode: 0o644,
+        },
+      );
+    } else {
+      archiveFiles.push(
+        { name: "build-auth.js", content: buildOpenClawAuthBuilderScript(), mode: 0o600 },
+        { name: "prestart.sh", content: buildOpenClawPrestartScript(), mode: 0o700 },
+        {
+          name: "prestart-reconcile.js",
+          content: buildOpenClawPrestartReconcilerScript(),
+          mode: 0o600,
+        },
+        {
+          name: "provider-bootstrap.sh",
+          content: buildNoopProviderBootstrapScript(),
+          mode: 0o700,
+        },
+        {
+          name: "mcp-wrapper",
+          content: buildMcpServerWrapperScript(),
+          mode: 0o755,
+        },
+        {
+          name: "dropin.conf",
+          content: buildSystemdPrestartDropin(OPENCLAW_PRESTART_FILE),
+          mode: 0o644,
+        },
+      );
+    }
+    const archive = await buildTarArchive(archiveFiles);
+    const hostScript = this._buildOfflineStageHostScript(
+      normalizedVmid,
+      normalizedRuntimeFamily,
+      nonce,
+      replaceManagedState,
+    );
+    const command =
+      privilege.mode === "root"
+        ? `/bin/sh -lc ${shellSingleQuote(hostScript)}`
+        : `${this.sudoPrefix}${shellSingleQuote(privilege.command)} ${normalizedVmid} ${normalizedRuntimeFamily} ${replaceManagedState ? "1" : "0"}`;
+
+    try {
+      await this._sshExec(command, { timeout: 180000, signal, input: archive });
+    } catch (cause) {
+      const error = new Error(
+        `Stopped Proxmox LXC ${normalizedVmid} managed-state staging could not be confirmed: ${cause.message}`,
+        { cause },
+      );
+      error.code = "PROXMOX_OFFLINE_STAGE_UNCONFIRMED";
+      error.containerId = normalizedVmid;
+      throw error;
+    }
+
+    let config;
+    let current;
+    try {
+      config = await this._requestData(
+        "GET",
+        `/nodes/${this.node}/lxc/${normalizedVmid}/config`,
+        null,
+        signal ? { signal } : {},
+      );
+      current = await this._requestData(
+        "GET",
+        `/nodes/${this.node}/lxc/${normalizedVmid}/status/current`,
+        null,
+        signal ? { signal } : {},
+      );
+    } catch (cause) {
+      const error = new Error(
+        `Stopped Proxmox LXC ${normalizedVmid} post-stage state could not be verified: ${cause.message}`,
+        { cause },
+      );
+      error.code = "PROXMOX_OFFLINE_STAGE_UNCONFIRMED";
+      error.containerId = normalizedVmid;
+      throw error;
+    }
+    const normalizedAgentId = normalizeAgentId(agentId);
+    if (
+      !descriptionHasOwnershipMarkers(
+        config?.description,
+        buildAgentOwnershipMarker(normalizedAgentId),
+      )
+    ) {
+      throw ownershipMismatchError(normalizedVmid, normalizedAgentId, "verify offline staging for");
+    }
+    if (String(config?.lock || "").trim()) {
+      const error = new Error(
+        `Proxmox LXC ${normalizedVmid} remains locked after offline managed-state staging`,
+      );
+      error.code = "PROXMOX_OFFLINE_STAGE_LOCK_REMAINS";
+      error.containerId = normalizedVmid;
+      throw error;
+    }
+    if (current?.status !== "stopped") {
+      const error = new Error(
+        `Proxmox LXC ${normalizedVmid} is not confirmed stopped after managed-state staging`,
+      );
+      error.code = "PROXMOX_OFFLINE_STAGE_STATUS_UNCONFIRMED";
+      error.containerId = normalizedVmid;
+      throw error;
+    }
   }
 
   _templateFor(runtimeFamily, sandboxProfile, image) {
@@ -735,7 +1454,7 @@ class ProxmoxBackend extends ProvisionerBackend {
     const agentOwnershipMarker = buildAgentOwnershipMarker(id);
     const createOwnershipMarker = buildCreateOwnershipMarker();
     const description = [
-      `Nora ${normalizedRuntimeFamily} agent ${name || id}`,
+      `Nora ${normalizedRuntimeFamily} agent ${safeDescriptionLabel(name, id)}`,
       agentOwnershipMarker,
       createOwnershipMarker,
     ].join("\n");
@@ -1001,10 +1720,12 @@ class ProxmoxBackend extends ProvisionerBackend {
     await this._prepareOpenClawBase(vmid, { signal });
     throwIfAborted(signal, "OpenClaw Proxmox bootstrap");
     const gatewayToken = crypto.randomBytes(32).toString("hex");
-    const pairedJson = derivePairedDevice(gatewayToken);
+    const mcpManagedEnv = buildMcpManagedEnv(mcpServers);
+    const mcpManagedEnvNames = buildMcpManagedEnvNames(mcpServers);
     const managedMcpServers = buildMcpServersConfig(mcpServers);
     const runtimeEnv = normalizeEnv({
       ...(env || {}),
+      ...mcpManagedEnv,
       ...buildRuntimeEnv(),
       OPENCLAW_CLI_PATH: "/usr/local/bin/openclaw",
       OPENCLAW_TSX_BIN: "/usr/local/bin/tsx",
@@ -1015,6 +1736,13 @@ class ProxmoxBackend extends ProvisionerBackend {
     });
     await this._writeFile(
       vmid,
+      OPENCLAW_MANAGED_ENV_NAMES_FILE,
+      `${mcpManagedEnvNames.join("\n")}${mcpManagedEnvNames.length > 0 ? "\n" : ""}`,
+      "0600",
+      { signal },
+    );
+    await this._writeFile(
+      vmid,
       OPENCLAW_GATEWAY_CONFIG_FILE,
       `${JSON.stringify(
         {
@@ -1023,7 +1751,6 @@ class ProxmoxBackend extends ProvisionerBackend {
             bind: "lan",
             mode: "local",
             reload: { mode: "hot" },
-            auth: { password: gatewayToken },
           },
           // Nora owns this block. An empty object deliberately removes MCP
           // entries baked into a prepared template; a populated object is the
@@ -1057,12 +1784,10 @@ class ProxmoxBackend extends ProvisionerBackend {
       "0755",
       { signal },
     );
-    await this._writeFile(vmid, "/root/.openclaw/devices/paired.json", pairedJson, "0600", {
+    await this._writeFile(vmid, OPENCLAW_MCP_WRAPPER_FILE, buildMcpServerWrapperScript(), "0755", {
       signal,
     });
-    await this._writeFile(vmid, "/root/.openclaw/devices/pending.json", "{}\n", "0600", { signal });
-    const buildAuthScript =
-      "var m={ANTHROPIC_API_KEY:'anthropic',OPENAI_API_KEY:'openai',GEMINI_API_KEY:'google',GROQ_API_KEY:'groq',MISTRAL_API_KEY:'mistral',DEEPSEEK_API_KEY:'deepseek',OPENROUTER_API_KEY:'openrouter',TOGETHER_API_KEY:'together',COHERE_API_KEY:'cohere',XAI_API_KEY:'xai',MOONSHOT_API_KEY:'moonshot',ZAI_API_KEY:'zai',OLLAMA_API_KEY:'ollama',MINIMAX_API_KEY:'minimax',COPILOT_GITHUB_TOKEN:'github-copilot',HF_TOKEN:'huggingface',CEREBRAS_API_KEY:'cerebras',NVIDIA_API_KEY:'nvidia',MICROSOFT_FOUNDRY_API_KEY:'microsoft-foundry'},e={NVIDIA_API_KEY:'https://integrate.api.nvidia.com/v1'},f={MICROSOFT_FOUNDRY_API_KEY:'MICROSOFT_FOUNDRY_BASE_URL'},av={MICROSOFT_FOUNDRY_API_KEY:'MICROSOFT_FOUNDRY_API_VERSION'},s={version:1,profiles:{},order:{},lastGood:{}};Object.entries(m).forEach(function(x){var k=x[0],p=x[1],v=process.env[k];if(!v)return;var id=p+':default';s.profiles[id]={type:'api_key',provider:p,key:v};if(e[k])s.profiles[id].endpoint=e[k];if(f[k]&&process.env[f[k]])s.profiles[id].endpoint=process.env[f[k]];if(av[k]&&process.env[av[k]])s.profiles[id].api_version=process.env[av[k]];s.order[p]=[id];s.lastGood[p]=id;});require('fs').mkdirSync('/root/.openclaw/agents/main/agent',{recursive:true});require('fs').writeFileSync('/root/.openclaw/agents/main/agent/auth-profiles.json',JSON.stringify(s));require('fs').chmodSync('/root/.openclaw/agents/main/agent/auth-profiles.json',0o600);";
+    const buildAuthScript = buildOpenClawAuthBuilderScript();
     await this._writeFile(
       vmid,
       "/opt/openclaw-runtime/lib/build-auth.js",
@@ -1071,16 +1796,30 @@ class ProxmoxBackend extends ProvisionerBackend {
       { signal },
     );
     const openClawPackage = process.env.PROXMOX_OPENCLAW_PACKAGE || getStandardDockerPackageSpec();
-    const customProviders = buildOpenClawCustomProviders(env || {});
-    if (Object.keys(customProviders).length > 0) {
-      await this._writeFile(
-        vmid,
-        OPENCLAW_CUSTOM_PROVIDERS_FILE,
-        `${JSON.stringify({ models: { providers: customProviders } }, null, 2)}\n`,
-        "0600",
-        { signal },
-      );
-    }
+    await this._writeFile(
+      vmid,
+      OPENCLAW_PROVIDER_BOOTSTRAP_FILE,
+      buildNoopProviderBootstrapScript(),
+      "0700",
+      { signal },
+    );
+    await this._writeFile(
+      vmid,
+      OPENCLAW_PRESTART_RECONCILER_FILE,
+      buildOpenClawPrestartReconcilerScript(),
+      "0600",
+      { signal },
+    );
+    await this._writeFile(vmid, OPENCLAW_PRESTART_FILE, buildOpenClawPrestartScript(), "0700", {
+      signal,
+    });
+    await this._writeFile(
+      vmid,
+      OPENCLAW_PRESTART_DROPIN_FILE,
+      buildSystemdPrestartDropin(OPENCLAW_PRESTART_FILE),
+      "0644",
+      { signal },
+    );
     const startupScript = [
       "#!/bin/sh",
       "set -eu",
@@ -1090,21 +1829,10 @@ class ProxmoxBackend extends ProvisionerBackend {
       ...openClawManagedConfigMergeLines(OPENCLAW_GATEWAY_CONFIG_FILE, {
         replaceKeys: ["mcpServers"],
       }),
-      "if [ ! -f /root/.openclaw/.nora-proxmox-bootstrap-complete ]; then",
-      // Register provision-time custom providers once. Live auth sync owns
-      // later provider changes; replaying the original env on every restart
-      // would overwrite a rotated Foundry endpoint or deployment.
-      ...(Object.keys(customProviders).length > 0
-        ? openClawManagedConfigMergeLines(OPENCLAW_CUSTOM_PROVIDERS_FILE, {
-            removeAfter: true,
-          })
-        : []),
-      "  touch /root/.openclaw/.nora-proxmox-bootstrap-complete",
-      "fi",
       "touch /var/log/openclaw-agent.log",
-      '"$OPENCLAW_TSX_BIN" /opt/openclaw-runtime/lib/agent.ts >> /var/log/openclaw-agent.log 2>&1 &',
-      'if [ ! -f /root/.openclaw/agents/main/agent/auth-profiles.json ]; then "$OPENCLAW_TSX_BIN" /opt/openclaw-runtime/lib/build-auth.js; fi',
+      '"$OPENCLAW_TSX_BIN" /opt/openclaw-runtime/lib/build-auth.js',
       buildOpenClawAuthImportFromFileCommand({ requireCli: true }),
+      '"$OPENCLAW_TSX_BIN" /opt/openclaw-runtime/lib/agent.ts >> /var/log/openclaw-agent.log 2>&1 &',
       `exec "$OPENCLAW_CLI_PATH" gateway --port ${OPENCLAW_GATEWAY_PORT}`,
       "",
     ].join("\n");
@@ -1195,6 +1923,17 @@ class ProxmoxBackend extends ProvisionerBackend {
     await this._writeFile(vmid, HERMES_ENV_FILE, serializeEnvironment(runtimeEnv), "0600", {
       signal,
     });
+    await this._writeFile(vmid, HERMES_MANAGED_ENV_NAMES_FILE, "", "0600", { signal });
+    await this._writeFile(vmid, HERMES_PRESTART_FILE, buildHermesPrestartScript(), "0700", {
+      signal,
+    });
+    await this._writeFile(
+      vmid,
+      HERMES_PRESTART_DROPIN_FILE,
+      buildSystemdPrestartDropin(HERMES_PRESTART_FILE),
+      "0644",
+      { signal },
+    );
     const dashboardEnabled = process.env.PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD === "true";
     const dashboardHost = dashboardEnabled ? "0.0.0.0" : "127.0.0.1";
     const startupScript = [
@@ -1217,7 +1956,12 @@ class ProxmoxBackend extends ProvisionerBackend {
     });
     await this._pctExec(
       vmid,
-      `chown hermes:hermes ${shellSingleQuote(HERMES_ENV_FILE)} && chown root:hermes /opt/nora-hermes/start.sh`,
+      [
+        `chown hermes:hermes ${shellSingleQuote(HERMES_ENV_FILE)}`,
+        `chown hermes:hermes ${shellSingleQuote(HERMES_MANAGED_ENV_NAMES_FILE)}`,
+        `chown hermes:hermes ${shellSingleQuote(HERMES_PRESTART_FILE)}`,
+        "chown root:hermes /opt/nora-hermes/start.sh",
+      ].join(" && "),
       { signal },
     );
     await this._writeFile(
@@ -1428,37 +2172,146 @@ class ProxmoxBackend extends ProvisionerBackend {
   async updateEnv(containerId, envVars = {}, options = {}) {
     const vmid = normalizeVmid(containerId);
     const entries = normalizeEnv(envVars);
-    if (Object.keys(entries).length === 0) return;
+    const managedEnvNames = normalizeManagedEnvNames(options.managedEnvNames);
+    const replacementNames = [...new Set([...managedEnvNames, ...Object.keys(entries)])].sort();
+    if (replacementNames.length === 0) return;
     await this._assertOwnedLxc(vmid, options, { operation: "update the environment of" });
-    const envFile = options.runtimeFamily === "hermes" ? HERMES_ENV_FILE : OPENCLAW_ENV_FILE;
-    const resetHermesBootstrap =
-      options.runtimeFamily === "hermes" &&
-      Object.keys(entries).some((key) => key.startsWith("NORA_HERMES_"));
-    const patchFile = `/tmp/nora-env-${crypto.randomBytes(8).toString("hex")}.patch`;
-    await this._writeFile(vmid, patchFile, serializeEnvironment(entries), "0600");
+    const runtimeFamily = options.runtimeFamily === "hermes" ? "hermes" : "openclaw";
+    const current = await this._requestData(
+      "GET",
+      `/nodes/${this.node}/lxc/${vmid}/status/current`,
+      null,
+      options.signal ? { signal: options.signal } : {},
+    );
+    if (current?.status === "stopped") {
+      return this._stageManagedStateWhileStopped(vmid, entries, replacementNames, {
+        ...options,
+        runtimeFamily,
+        replaceManagedState: options.replaceManagedState === true,
+      });
+    }
+    if (current?.status !== "running") {
+      const error = new Error(
+        `Proxmox LXC ${vmid} environment cannot be updated because its status is unconfirmed`,
+      );
+      error.code = "PROXMOX_RUNTIME_STATUS_UNCONFIRMED";
+      throw error;
+    }
+
+    const envFile = runtimeFamily === "hermes" ? HERMES_ENV_FILE : OPENCLAW_ENV_FILE;
+    const managedNamesFile =
+      runtimeFamily === "hermes" ? HERMES_MANAGED_ENV_NAMES_FILE : OPENCLAW_MANAGED_ENV_NAMES_FILE;
+    const nonce = crypto.randomBytes(8).toString("hex");
+    const patchFile = `/tmp/nora-env-${nonce}.patch`;
+    const keysFile = `/tmp/nora-env-${nonce}.keys`;
+    const scopeFile = `/tmp/nora-env-${nonce}.scope`;
     try {
+      await this._writeFile(vmid, patchFile, serializeEnvironment(entries), "0600", options);
+      await this._writeFile(vmid, keysFile, `${replacementNames.join("\n")}\n`, "0600", options);
+      await this._writeFile(vmid, scopeFile, `${replacementNames.join("\n")}\n`, "0600", options);
       await this._pctExec(
         vmid,
         [
           "set -eu",
           `current=${shellSingleQuote(envFile)}`,
           `patch=${shellSingleQuote(patchFile)}`,
+          `keys=${shellSingleQuote(keysFile)}`,
+          `scope=${shellSingleQuote(scopeFile)}`,
+          `managed_names=${shellSingleQuote(managedNamesFile)}`,
+          `replace_managed_state=${options.replaceManagedState === true ? "1" : "0"}`,
           'mkdir -p "$(dirname "$current")"',
           'touch "$current"',
+          'touch "$managed_names"',
+          'effective_keys="$(mktemp)"',
+          'cat "$keys" > "$effective_keys"',
+          'sort -u "$effective_keys" -o "$effective_keys"',
           'tmp="$(mktemp)"',
-          'awk -F= \'NR==FNR { keys[$1]=1; next } !($1 in keys)\' "$patch" "$current" > "$tmp"',
-          'cat "$patch" >> "$tmp"',
+          'awk -F= \'NR==FNR { if ($1 != "") managed[$1]=1; next } !($1 in managed)\' "$effective_keys" "$current" > "$tmp"',
+          'awk \'NF { print }\' "$patch" >> "$tmp"',
           'install -m 0600 "$tmp" "$current"',
-          options.runtimeFamily === "hermes" ? 'chown hermes:hermes "$current"' : "true",
-          resetHermesBootstrap
-            ? `rm -f ${shellSingleQuote(`${HERMES_HOME}/.nora-bootstrap-complete`)}`
-            : "true",
-          'rm -f "$tmp" "$patch"',
+          'names_tmp="$(mktemp)"',
+          'cat "$managed_names" > "$names_tmp"',
+          'cat "$scope" >> "$names_tmp"',
+          'sort -u "$names_tmp" -o "$names_tmp"',
+          'install -m 0600 "$names_tmp" "$managed_names"',
+          runtimeFamily === "hermes" ? 'chown hermes:hermes "$current" "$managed_names"' : "true",
+          'rm -f "$tmp" "$names_tmp" "$effective_keys" "$patch" "$keys" "$scope"',
         ].join("\n"),
+        options,
       );
+
+      if (runtimeFamily === "hermes") {
+        await this._writeFile(
+          vmid,
+          HERMES_PRESTART_FILE,
+          buildHermesPrestartScript(),
+          "0700",
+          options,
+        );
+        await this._writeFile(
+          vmid,
+          HERMES_PRESTART_DROPIN_FILE,
+          buildSystemdPrestartDropin(HERMES_PRESTART_FILE),
+          "0644",
+          options,
+        );
+        await this._pctExec(
+          vmid,
+          `chown hermes:hermes ${shellSingleQuote(HERMES_PRESTART_FILE)} && systemctl daemon-reload`,
+          options,
+        );
+      } else {
+        await this._writeFile(
+          vmid,
+          "/opt/openclaw-runtime/lib/build-auth.js",
+          buildOpenClawAuthBuilderScript(),
+          "0600",
+          options,
+        );
+        await this._writeFile(
+          vmid,
+          OPENCLAW_PRESTART_RECONCILER_FILE,
+          buildOpenClawPrestartReconcilerScript(),
+          "0600",
+          options,
+        );
+        await this._writeFile(
+          vmid,
+          OPENCLAW_PRESTART_FILE,
+          buildOpenClawPrestartScript(),
+          "0700",
+          options,
+        );
+        await this._writeFile(
+          vmid,
+          OPENCLAW_PROVIDER_BOOTSTRAP_FILE,
+          buildNoopProviderBootstrapScript(),
+          "0700",
+          options,
+        );
+        await this._writeFile(
+          vmid,
+          OPENCLAW_MCP_WRAPPER_FILE,
+          buildMcpServerWrapperScript(),
+          "0755",
+          options,
+        );
+        await this._writeFile(
+          vmid,
+          OPENCLAW_PRESTART_DROPIN_FILE,
+          buildSystemdPrestartDropin(OPENCLAW_PRESTART_FILE),
+          "0644",
+          options,
+        );
+        await this._pctExec(vmid, "systemctl daemon-reload", options);
+      }
     } catch (error) {
       try {
-        await this._pctExec(vmid, `rm -f ${shellSingleQuote(patchFile)}`);
+        await this._pctExec(
+          vmid,
+          `rm -f ${shellSingleQuote(patchFile)} ${shellSingleQuote(keysFile)} ${shellSingleQuote(scopeFile)}`,
+          options,
+        );
       } catch {
         // Best-effort removal of a secret-bearing patch file.
       }
@@ -1472,18 +2325,25 @@ class ProxmoxBackend extends ProvisionerBackend {
     const tail = normalizeTail(opts.tail);
     const follow = opts.follow !== false ? "-f" : "";
     const command = `${this.sudoPrefix}${this.pctCommand} exec ${vmid} -- journalctl -u nora-openclaw.service -u nora-hermes.service -n ${tail} ${follow} --no-pager`;
-    return this._openSshStream(command).stream;
+    return this._openSshStream(command, {
+      signal: opts.signal,
+      requireSuccess: true,
+    }).stream;
   }
 
-  _openSshStream(command, { interactive = false, tty = false, signal } = {}) {
+  _openSshStream(
+    command,
+    { interactive = false, tty = false, signal, requireSuccess = false } = {},
+  ) {
     this._assertConfigured();
     throwIfAborted(signal, "Proxmox SSH stream");
     const output = new PassThrough();
     const input = interactive ? new PassThrough() : null;
-    const conn = new Client();
+    const conn = this._createSshClient();
     let remoteStream = null;
     let running = true;
     let exitCode = null;
+    let observedExitCode = null;
     let resolveExit;
     const exitPromise = new Promise((resolve) => {
       resolveExit = resolve;
@@ -1491,23 +2351,41 @@ class ProxmoxBackend extends ProvisionerBackend {
     const finish = (code = 0) => {
       if (!running) return;
       running = false;
-      exitCode = Number.isInteger(code) ? code : code == null ? 0 : 1;
+      exitCode = Number.isInteger(code) ? code : null;
       signal?.removeEventListener("abort", onAbort);
       resolveExit({ Running: false, ExitCode: exitCode });
-      if (!output.destroyed) output.end();
+      if (!output.destroyed) {
+        if (requireSuccess && exitCode !== 0) {
+          const error = Number.isInteger(exitCode)
+            ? new Error(`Proxmox SSH stream command exited with ${exitCode}`)
+            : new Error("Proxmox SSH stream closed without a confirmed remote exit status");
+          if (!Number.isInteger(exitCode)) {
+            error.code = "PROXMOX_SSH_EXEC_TERMINATION_UNCONFIRMED";
+          }
+          output.destroy(error);
+        } else {
+          output.end();
+        }
+      }
       conn.end();
     };
     const fail = (error) => {
-      if (running) {
-        running = false;
-        exitCode = 1;
-        signal?.removeEventListener("abort", onAbort);
-        resolveExit({ Running: false, ExitCode: 1 });
-      }
+      if (!running) return;
+      running = false;
+      exitCode = null;
+      signal?.removeEventListener("abort", onAbort);
+      resolveExit({ Running: false, ExitCode: null });
       if (!output.destroyed) output.destroy(error);
       conn.end();
     };
-    const onAbort = () => fail(abortError(signal, "Proxmox SSH stream"));
+    const onAbort = () => {
+      try {
+        remoteStream?.signal("TERM");
+      } catch {
+        // Worker commands use a second fixed cleanup exec to prove termination.
+      }
+      fail(abortError(signal, "Proxmox SSH stream"));
+    };
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
     if (!running) {
@@ -1525,11 +2403,30 @@ class ProxmoxBackend extends ProvisionerBackend {
             fail(err);
             return;
           }
+          if (!running) {
+            try {
+              stream.signal("TERM");
+              stream.close();
+            } catch {
+              // The caller already receives an unconfirmed exit state.
+            }
+            return;
+          }
           remoteStream = stream;
           stream.on("data", (chunk) => output.write(chunk));
           stream.stderr.on("data", (chunk) => output.write(chunk));
-          stream.on("close", (code) => finish(code));
-          stream.on("error", fail);
+          stream.on("exit", (code) => {
+            if (Number.isInteger(code)) observedExitCode = code;
+          });
+          stream.on("close", (code) => finish(Number.isInteger(code) ? code : observedExitCode));
+          stream.on("error", (error) => {
+            const unconfirmed = new Error(
+              `Proxmox SSH stream failed before exit was confirmed: ${error.message}`,
+              { cause: error },
+            );
+            unconfirmed.code = "PROXMOX_SSH_EXEC_TERMINATION_UNCONFIRMED";
+            fail(unconfirmed);
+          });
           if (input) {
             input.on("data", (chunk) => {
               if (remoteStream?.writable) remoteStream.write(chunk);
@@ -1549,10 +2446,34 @@ class ProxmoxBackend extends ProvisionerBackend {
           conn.exec(command, callback);
         }
       })
-      .on("error", fail)
+      .on("error", (error) => {
+        if (!remoteStream) {
+          fail(error);
+          return;
+        }
+        const unconfirmed = new Error(
+          `Proxmox SSH transport failed before remote command exit was confirmed: ${error.message}`,
+          { cause: error },
+        );
+        unconfirmed.code = "PROXMOX_SSH_EXEC_TERMINATION_UNCONFIRMED";
+        fail(unconfirmed);
+      })
+      .on("close", () => {
+        if (!running) return;
+        const unconfirmed = new Error(
+          "Proxmox SSH transport closed before remote command exit was confirmed",
+        );
+        unconfirmed.code = "PROXMOX_SSH_EXEC_TERMINATION_UNCONFIRMED";
+        fail(unconfirmed);
+      })
       .connect(this._sshConfig());
     const originalDestroy = output.destroy.bind(output);
     output.destroy = (...args) => {
+      try {
+        remoteStream?.signal("TERM");
+      } catch {
+        // The SSH server may not implement channel signals.
+      }
       try {
         remoteStream?.close();
       } catch {
@@ -1560,9 +2481,9 @@ class ProxmoxBackend extends ProvisionerBackend {
       }
       if (running) {
         running = false;
-        exitCode = 130;
+        exitCode = null;
         signal?.removeEventListener("abort", onAbort);
-        resolveExit({ Running: false, ExitCode: 130 });
+        resolveExit({ Running: false, ExitCode: null });
       }
       conn.end();
       return originalDestroy(...args);

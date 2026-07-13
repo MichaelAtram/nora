@@ -12,7 +12,8 @@ const { Client: SshClient } = require("ssh2");
 
 const db = require("./db");
 const billing = require("./billing");
-const { addBackupJob, addDeploymentJob } = require("./redisQueue");
+const { addBackupJob, addDeploymentJob, cancelDeploymentJobsForAgent } = require("./redisQueue");
+const containerManager = require("./containerManager");
 const { getBackupSettings, getBackupStorageConfig } = require("./platformSettings");
 const {
   buildMigrationManifestFromAgent,
@@ -20,6 +21,7 @@ const {
   materializeManagedMigrationState,
   packMigrationBundle,
   parseUploadedMigrationBuffer,
+  persistMigrationManifestForAgent,
 } = require("./agentMigrations");
 const {
   createEmptyTemplatePayload,
@@ -30,8 +32,14 @@ const {
 const { getDefaultAgentImage } = require("../agent-runtime/lib/agentImages");
 const { getRuntimeSelectionStatus } = require("../agent-runtime/lib/backendCatalog");
 const { assertKubernetesExecutionTargetAvailable } = require("./kubernetesClusters");
-const { assertRemoteHostExecutionTargetAvailable } = require("./remoteHosts");
+const {
+  assertRemoteHostAgentUse,
+  assertRemoteHostExecutionTargetAvailable,
+  isRemoteDockerAgent,
+  toPublicRemoteHostAuthorizationError,
+} = require("./remoteHosts");
 const { buildAgentRuntimeFields, resolveRequestedRuntimeFields } = require("./agentRuntimeFields");
+const { acquireAgentProvisionLock } = require("./agentProvisionLock");
 const { buildPostgresCliConfig } = require("./lib/connectionConfig");
 
 const gzipAsync = promisify(gzip);
@@ -41,6 +49,10 @@ const BACKUP_ARCHIVE_FORMAT = "nora-backup-archive/v1";
 const READY_STATUSES = new Set(["ready", "ready_with_warnings"]);
 const BACKUP_SCHEDULE_FREQUENCIES = new Set(["hourly", "daily", "weekly"]);
 const BACKUP_KINDS = new Set(["agent", "installation"]);
+const REMOTE_HOST_AUTH_RECHECK_MS = Math.max(
+  250,
+  Number.parseInt(process.env.REMOTE_HOST_AUTH_RECHECK_MS || "1000", 10) || 1000,
+);
 
 function createHttpError(message, statusCode = 400, code = null, options = {}) {
   const error = new Error(message);
@@ -631,6 +643,11 @@ async function createAgentBackup({ userId, agentId, actorId = userId, name = "" 
   const agent = await loadOwnedAgent(agentId, userId);
   if (!agent) throw createHttpError("Agent not found", 404);
 
+  // Reject before persisting/queueing a backup. The archive path may use live
+  // runtime HTTP or Docker-over-SSH, both of which require the current host
+  // owner's positive grant rather than stale agent ownership alone.
+  await assertRemoteHostAgentUse(agent, { includeProfile: false });
+
   const limits = await billing.enforceBackupLimits(userId, { agentId });
   if (!limits.allowed) {
     const error = createHttpError(limits.error, 402);
@@ -1089,7 +1106,132 @@ function backupAgentMetadata(agent = {}) {
   };
 }
 
-async function buildAgentBackupArchive(backup, { signal } = {}) {
+function isRemoteHostAuthorizationError(error) {
+  const code = String(error?.code || "");
+  return (
+    code === "REMOTE_HOST_ACCESS_REVOKED" ||
+    code === "REMOTE_HOST_RETEST_REQUIRED" ||
+    code.endsWith("AUTH_CHECK_FAILED")
+  );
+}
+
+async function withRemoteHostCaptureAuthorization(
+  agent,
+  { signal, authorizationRecheckMs = REMOTE_HOST_AUTH_RECHECK_MS } = {},
+  capture,
+) {
+  throwIfAborted(signal, "agent archive build");
+  if (!isRemoteDockerAgent(agent)) return capture(signal);
+
+  const controller = new AbortController();
+  let authorizationTimer = null;
+  let authorizationInFlight = null;
+  let authorizationError = null;
+  let captureSettled = false;
+  const abortFromParent = () => {
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  if (signal) {
+    if (signal.aborted) abortFromParent();
+    else {
+      signal.addEventListener("abort", abortFromParent, { once: true });
+      if (signal.aborted) abortFromParent();
+    }
+  }
+
+  const checkAuthorization = () => {
+    if (captureSettled || authorizationInFlight || authorizationError) {
+      return authorizationInFlight;
+    }
+    authorizationInFlight = Promise.resolve()
+      .then(() => assertRemoteHostAgentUse(agent, { includeProfile: false }))
+      .catch((error) => {
+        authorizationError = toPublicRemoteHostAuthorizationError(error);
+        if (!controller.signal.aborted) controller.abort(authorizationError);
+      })
+      .finally(() => {
+        authorizationInFlight = null;
+      });
+    return authorizationInFlight;
+  };
+
+  try {
+    await checkAuthorization();
+    if (authorizationError) throw authorizationError;
+    throwIfAborted(controller.signal, "agent archive build");
+
+    authorizationTimer = setInterval(
+      () => {
+        void checkAuthorization();
+      },
+      Math.max(1, authorizationRecheckMs),
+    );
+    authorizationTimer.unref?.();
+
+    let captured;
+    try {
+      captured = await capture(controller.signal);
+    } catch (error) {
+      if (authorizationError) throw authorizationError;
+      throwIfAborted(controller.signal, "agent archive build");
+      throw error;
+    }
+
+    // Stop scheduling checks, wait for one that raced completion, then require
+    // one final positive grant before accepting the fully packed archive.
+    captureSettled = true;
+    clearInterval(authorizationTimer);
+    authorizationTimer = null;
+    const pendingAuthorization = authorizationInFlight;
+    if (pendingAuthorization) await pendingAuthorization;
+    if (authorizationError) throw authorizationError;
+    throwIfAborted(signal, "agent archive build");
+    try {
+      await assertRemoteHostAgentUse(agent, { includeProfile: false });
+    } catch (error) {
+      throw toPublicRemoteHostAuthorizationError(error);
+    }
+    throwIfAborted(signal, "agent archive build");
+    return captured;
+  } finally {
+    captureSettled = true;
+    if (authorizationTimer) clearInterval(authorizationTimer);
+    signal?.removeEventListener("abort", abortFromParent);
+  }
+}
+
+async function captureAgentArchive(
+  agent,
+  backup,
+  sourceKind,
+  { signal, authorizationRecheckMs } = {},
+) {
+  return withRemoteHostCaptureAuthorization(
+    agent,
+    { signal, authorizationRecheckMs },
+    async (captureSignal) => {
+      throwIfAborted(captureSignal, "agent archive build");
+      const manifest = await buildMigrationManifestFromAgent(agent, {
+        userId: agent.user_id,
+        signal: captureSignal,
+      });
+      manifest.source = {
+        ...(manifest.source || {}),
+        kind: sourceKind,
+        backup: {
+          backupId: backup.id,
+          capturedAt: new Date().toISOString(),
+          agent: backupAgentMetadata(agent),
+        },
+      };
+      const buffer = await packMigrationBundle(manifest);
+      throwIfAborted(captureSignal, "agent archive build");
+      return { manifest, buffer };
+    },
+  );
+}
+
+async function buildAgentBackupArchive(backup, { signal, authorizationRecheckMs } = {}) {
   throwIfAborted(signal, "agent archive build");
   const result = await db.query("SELECT * FROM agents WHERE id = $1 AND user_id = $2", [
     backup.agent_id,
@@ -1098,20 +1240,13 @@ async function buildAgentBackupArchive(backup, { signal } = {}) {
   const agent = result.rows[0];
   if (!agent) throw createHttpError("Agent not found", 404);
 
-  throwIfAborted(signal, "agent archive build");
-  const manifest = await buildMigrationManifestFromAgent(agent, { userId: agent.user_id });
-  manifest.source = {
-    ...(manifest.source || {}),
-    kind: "nora-backup",
-    backup: {
-      backupId: backup.id,
-      capturedAt: new Date().toISOString(),
-      agent: backupAgentMetadata(agent),
-    },
-  };
+  const { manifest, buffer } = await captureAgentArchive(agent, backup, "nora-backup", {
+    signal,
+    authorizationRecheckMs,
+  });
 
   return {
-    buffer: await packMigrationBundle(manifest),
+    buffer,
     summary: {
       runtimeFamily: manifest.runtimeFamily,
       sourceAgentId: agent.id,
@@ -1249,10 +1384,17 @@ async function packInstallationArchive({ manifest, databaseDump, agentArchives }
   return gzipAsync(tarBuffer);
 }
 
-async function buildInstallationBackupArchive(backup, { signal } = {}) {
+async function buildInstallationBackupArchive(
+  backup,
+  {
+    signal,
+    databaseDumpBuilder = buildPostgresDump,
+    authorizationRecheckMs = REMOTE_HOST_AUTH_RECHECK_MS,
+  } = {},
+) {
   throwIfAborted(signal, "installation archive build");
   const [databaseDump, agentsResult] = await Promise.all([
-    buildPostgresDump({ signal }),
+    databaseDumpBuilder({ signal }),
     db.query("SELECT * FROM agents ORDER BY created_at ASC"),
   ]);
   const warnings = [];
@@ -1260,26 +1402,35 @@ async function buildInstallationBackupArchive(backup, { signal } = {}) {
   for (const agent of agentsResult.rows) {
     throwIfAborted(signal, "installation archive build");
     try {
-      const manifest = await buildMigrationManifestFromAgent(agent, { userId: agent.user_id });
-      manifest.source = {
-        ...(manifest.source || {}),
-        kind: "nora-installation-backup",
-        backup: {
-          backupId: backup.id,
-          capturedAt: new Date().toISOString(),
-          agent: backupAgentMetadata(agent),
-        },
-      };
+      // Installation backups may complete partially, but Remote Docker
+      // authorization remains live for the entire capture. Revocation or a
+      // fail-closed auth-check error omits the agent instead of silently using
+      // stale stored-template state.
+      const captured = await captureAgentArchive(agent, backup, "nora-installation-backup", {
+        signal,
+        authorizationRecheckMs,
+      });
       agentArchives.push({
         agentId: agent.id,
-        buffer: await packMigrationBundle(manifest),
+        buffer: captured.buffer,
       });
     } catch (error) {
+      throwIfAborted(signal, "installation archive build");
+      const remoteAccessRevoked = error?.code === "REMOTE_HOST_ACCESS_REVOKED";
+      const remoteAuthorizationFailed = isRemoteHostAuthorizationError(error);
       warnings.push({
-        code: "agent_backup_failed",
+        code: remoteAccessRevoked
+          ? "agent_backup_remote_host_access_revoked"
+          : remoteAuthorizationFailed
+            ? "agent_backup_remote_host_auth_check_failed"
+            : "agent_backup_failed",
         agentId: agent.id,
         agentName: agent.name,
-        message: error.message || "Agent backup failed",
+        message: remoteAccessRevoked
+          ? "Remote Docker access was revoked before live state could be captured; this agent archive was omitted from the installation backup."
+          : remoteAuthorizationFailed
+            ? "Remote Docker authorization could not be verified through live capture; this agent archive was omitted from the installation backup."
+            : error.message || "Agent backup failed",
       });
     }
   }
@@ -1459,6 +1610,150 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
   }
 }
 
+async function persistRestoreTerminalRuntimeState(
+  agentId,
+  { queryable = db, returning = false, status = "stopped" } = {},
+) {
+  const result = await queryable.query(
+    `UPDATE agents
+        SET status = $2,
+            container_id = NULL,
+            host = NULL,
+            runtime_host = NULL,
+            runtime_port = NULL,
+            gateway_host = NULL,
+            gateway_port = NULL,
+            gateway_host_port = NULL,
+            gateway_token = NULL,
+            dashboard_port = NULL
+      WHERE id = $1${returning ? " RETURNING *" : ""}`,
+    [agentId, status],
+  );
+  return returning ? result.rows[0] || null : null;
+}
+
+function createRestoreCompensationError(agentId, phase, cause) {
+  const error = new Error(
+    `Restore compensation could not safely fence agent ${agentId} during ${phase}`,
+  );
+  error.code = "RESTORE_COMPENSATION_FAILED";
+  error.statusCode = 500;
+  error.cause = cause;
+  return error;
+}
+
+async function compensateRestoreFailure(
+  agentId,
+  {
+    backupId = null,
+    previousRestoreMetadata = null,
+    restoreBackupMetadata = false,
+    restoreTransitionStarted = false,
+    deploymentEnqueueAttempted = false,
+    provisionLock = null,
+  } = {},
+) {
+  const activeProvisionLock =
+    provisionLock ||
+    (await acquireAgentProvisionLock(agentId, {
+      applicationName: "nora-backend-restore-lock",
+    }));
+  const ownsProvisionLock = !provisionLock;
+
+  try {
+    // addDeploymentJob may fail after Redis accepted the job. Re-cancel while
+    // holding the provisioner lock. Active jobs cannot be removed by BullMQ,
+    // so the stopped/warning status persisted below is also a durable fence:
+    // the provisioner rejects those states before it can create a runtime.
+    try {
+      const canceledJobs = await cancelDeploymentJobsForAgent(agentId);
+      if (canceledJobs.active > 0) {
+        console.warn(
+          `[backups] restore compensation fenced ${canceledJobs.active} BullMQ-active deployment job(s) for agent ${agentId}`,
+        );
+      }
+    } catch (error) {
+      console.error(
+        `[backups] failed to cancel restore deployment work for agent ${agentId}; durable status fencing will still be applied: ${error?.message || error}`,
+      );
+    }
+
+    let runtimeCleanupError = null;
+    if (restoreTransitionStarted || deploymentEnqueueAttempted) {
+      const currentResult = await activeProvisionLock.query("SELECT * FROM agents WHERE id = $1", [
+        agentId,
+      ]);
+      const currentAgent = currentResult.rows[0];
+      const hasRuntimeIdentity = Boolean(
+        currentAgent?.container_id ||
+        currentAgent?.host ||
+        currentAgent?.runtime_host ||
+        currentAgent?.gateway_host ||
+        currentAgent?.dashboard_port,
+      );
+      if (hasRuntimeIdentity && containerManager.canDestroy(currentAgent)) {
+        try {
+          await containerManager.destroy(currentAgent);
+        } catch (error) {
+          runtimeCleanupError = error;
+          console.error(
+            `[backups] failed to destroy runtime during restore compensation for agent ${agentId}: ${error?.message || error}`,
+          );
+        }
+      }
+    }
+
+    try {
+      let fencedAgent;
+      if (runtimeCleanupError) {
+        const result = await activeProvisionLock.query(
+          "UPDATE agents SET status = 'warning' WHERE id = $1 RETURNING id",
+          [agentId],
+        );
+        fencedAgent = result.rows[0];
+      } else {
+        fencedAgent = await persistRestoreTerminalRuntimeState(agentId, {
+          queryable: activeProvisionLock,
+          returning: true,
+          status: "stopped",
+        });
+      }
+      if (!fencedAgent) {
+        throw new Error(`Agent ${agentId} disappeared during restore compensation`);
+      }
+    } catch (error) {
+      throw createRestoreCompensationError(agentId, "agent status fencing", error);
+    }
+
+    try {
+      await activeProvisionLock.query(
+        "UPDATE deployments SET status = 'failed' WHERE agent_id = $1 AND status IN ('queued', 'deploying')",
+        [agentId],
+      );
+    } catch (error) {
+      throw createRestoreCompensationError(agentId, "deployment status fencing", error);
+    }
+
+    if (restoreBackupMetadata && backupId) {
+      try {
+        await activeProvisionLock.query(
+          `UPDATE backups
+              SET restore_metadata = $2,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [backupId, previousRestoreMetadata],
+        );
+      } catch (error) {
+        console.error(
+          `[backups] failed to roll back restore metadata for backup ${backupId}: ${error?.message || error}`,
+        );
+      }
+    }
+  } finally {
+    if (ownsProvisionLock) await activeProvisionLock.release();
+  }
+}
+
 async function restoreBackupInPlace({ backupId, targetAgentId, confirmAgentName, actor } = {}) {
   const backup = await loadBackup(backupId);
   if (!backup || backup.kind !== "agent") throw createHttpError("Backup not found", 404);
@@ -1508,12 +1803,12 @@ async function restoreBackupInPlace({ backupId, targetAgentId, confirmAgentName,
   // owner's registered host, not the admin actor.
   await assertKubernetesExecutionTargetAvailable(runtimeFields);
   await assertRemoteHostExecutionTargetAvailable(runtimeFields, { ownerUserId: target.user_id });
-  const containerName = resolveContainerName({
+  let containerName = resolveContainerName({
     currentName: target.container_name,
     agentName: target.name,
     runtimeSelection: runtimeFields,
   });
-  const image =
+  let image =
     target.image ||
     sourceAgentMeta.image ||
     getDefaultAgentImage({
@@ -1524,74 +1819,209 @@ async function restoreBackupInPlace({ backupId, targetAgentId, confirmAgentName,
     manifest.runtimeFamily === "openclaw"
       ? manifest.templatePayload || createEmptyTemplatePayload({ source: "backup-restore" })
       : createEmptyTemplatePayload({ source: "backup-restore", backupId: backup.id });
-
-  await db.query("DELETE FROM integrations WHERE agent_id = $1", [target.id]);
-  await db.query("DELETE FROM channels WHERE agent_id = $1", [target.id]);
-  await materializeManagedMigrationState(target.user_id, target.id, manifest);
-
-  if (manifest.runtimeFamily === "openclaw") {
-    const hasManagedWiring =
-      (manifest.managed?.channels || []).length > 0 ||
-      (manifest.managed?.integrations || []).length > 0;
-    if (!hasManagedWiring) {
-      await materializeTemplateWiring(target.id, manifest.templatePayload || {});
-    }
-  }
-
-  const updated = await db.query(
-    `UPDATE agents
-        SET status = 'queued',
-            container_id = NULL,
-            host = NULL,
-            runtime_host = NULL,
-            runtime_port = NULL,
-            gateway_host = NULL,
-            gateway_port = NULL,
-            gateway_host_port = NULL,
-            gateway_token = NULL,
-            template_payload = $2,
-            container_name = $3,
-            image = $4
-      WHERE id = $1
-      RETURNING *`,
-    [target.id, JSON.stringify(templatePayload), containerName, image],
-  );
-  const agent = updated.rows[0];
-
-  await db.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [agent.id]);
-  await addDeploymentJob({
-    id: agent.id,
-    name: agent.name,
-    userId: agent.user_id,
-    backend: runtimeFields.backend_type,
-    sandbox: runtimeFields.sandbox_profile,
-    specs: {
-      vcpu: agent.vcpu || sourceAgentMeta.vcpu || 1,
-      ram_mb: agent.ram_mb || sourceAgentMeta.ram_mb || 1024,
-      disk_gb: agent.disk_gb || sourceAgentMeta.disk_gb || 10,
-    },
-    container_name: containerName,
-    image,
-    backup_restore_id: backup.id,
+  const previousRestoreMetadata =
+    backup.restore_metadata == null
+      ? null
+      : typeof backup.restore_metadata === "string"
+        ? backup.restore_metadata
+        : JSON.stringify(backup.restore_metadata);
+  const restoreMetadata = JSON.stringify({
+    mode: "in_place",
+    targetAgentId: target.id,
+    restoredAt: new Date().toISOString(),
+    actorId: actor?.id || null,
   });
 
-  await db.query(
-    `UPDATE backups
-        SET restore_metadata = $2,
-            updated_at = NOW()
-      WHERE id = $1`,
-    [
-      backup.id,
-      JSON.stringify({
-        mode: "in_place",
-        targetAgentId: agent.id,
-        restoredAt: new Date().toISOString(),
-        actorId: actor?.id || null,
-      }),
-    ],
-  );
+  // Serialize the entire destructive transition with the same advisory lock
+  // used by the provisioner. The lock stays held through queue publication, so
+  // no worker can create a runtime from partially restored control-plane state.
+  const provisionLock = await acquireAgentProvisionLock(target.id, {
+    applicationName: "nora-backend-restore-lock",
+  });
+  let agent = null;
+  try {
+    const canceledJobs = await cancelDeploymentJobsForAgent(target.id);
+    if (canceledJobs.active > 0) {
+      throw createHttpError(
+        "An earlier deployment is still active for this agent. Try the restore again shortly.",
+        409,
+      );
+    }
 
-  return serializeAgent(agent);
+    // Refresh the row after taking the lock. A deployment that completed while
+    // the request was reading/decrypting the backup may have changed identity;
+    // cleanup must always target the latest durable runtime.
+    const lockedTargetResult = await db.query("SELECT * FROM agents WHERE id = $1", [target.id]);
+    const lockedTarget = lockedTargetResult.rows[0];
+    if (!lockedTarget) throw createHttpError("Target agent disappeared during restore", 409);
+    if (String(confirmAgentName || "") !== String(lockedTarget.name || "")) {
+      throw createHttpError("Target agent changed while the restore was being prepared", 409);
+    }
+    const lockedRuntimeFields = buildAgentRuntimeFields(lockedTarget);
+    const runtimeSelectionChanged = [
+      "runtime_family",
+      "deploy_target",
+      "execution_target_id",
+      "sandbox_profile",
+    ].some((field) => lockedRuntimeFields[field] !== runtimeFields[field]);
+    if (lockedTarget.user_id !== target.user_id || runtimeSelectionChanged) {
+      throw createHttpError(
+        "Target agent placement changed while the restore was being prepared",
+        409,
+      );
+    }
+
+    containerName = resolveContainerName({
+      currentName: lockedTarget.container_name,
+      agentName: lockedTarget.name,
+      runtimeSelection: runtimeFields,
+    });
+    image =
+      lockedTarget.image ||
+      sourceAgentMeta.image ||
+      getDefaultAgentImage({
+        runtime_family: runtimeFields.runtime_family,
+        sandbox_profile: runtimeFields.sandbox_profile,
+      });
+
+    const destroyableRuntime = containerManager.canDestroy(lockedTarget);
+    let cleanupConfirmed = !destroyableRuntime;
+    let restoreTransitionStarted = false;
+    let restoreMetadataUpdated = false;
+    let deploymentEnqueueAttempted = false;
+    try {
+      if (destroyableRuntime) {
+        await containerManager.destroy(lockedTarget);
+        cleanupConfirmed = true;
+      }
+
+      // Once cleanup is confirmed, immediately make the durable row truthful
+      // and worker-ineligible. It becomes queued only after every backup state
+      // component has been durably materialized.
+      restoreTransitionStarted = true;
+      const terminalAgent = await persistRestoreTerminalRuntimeState(lockedTarget.id, {
+        returning: true,
+        status: "stopped",
+      });
+      if (!terminalAgent) throw createHttpError("Target agent disappeared during restore", 409);
+
+      await db.query("DELETE FROM integrations WHERE agent_id = $1", [lockedTarget.id]);
+      await db.query("DELETE FROM channels WHERE agent_id = $1", [lockedTarget.id]);
+      await materializeManagedMigrationState(lockedTarget.user_id, lockedTarget.id, manifest);
+
+      if (manifest.runtimeFamily === "hermes") {
+        // The provisioner already reads the newest attached agent_migrations
+        // manifest when constructing a Hermes seed archive. Persist the backup
+        // manifest into that durable handoff instead of queueing an unused id.
+        await persistMigrationManifestForAgent({
+          userId: lockedTarget.user_id,
+          agentId: lockedTarget.id,
+          manifest,
+          sourceKind: "backup",
+          sourceTransport: "managed-backup",
+        });
+      } else {
+        const hasManagedWiring =
+          (manifest.managed?.channels || []).length > 0 ||
+          (manifest.managed?.integrations || []).length > 0;
+        if (!hasManagedWiring) {
+          await materializeTemplateWiring(lockedTarget.id, manifest.templatePayload || {});
+        }
+      }
+
+      const updated = await db.query(
+        `UPDATE agents
+            SET status = 'queued',
+                container_id = NULL,
+                host = NULL,
+                runtime_host = NULL,
+                runtime_port = NULL,
+                gateway_host = NULL,
+                gateway_port = NULL,
+                gateway_host_port = NULL,
+                gateway_token = NULL,
+                dashboard_port = NULL,
+                template_payload = $2,
+                container_name = $3,
+                image = $4
+          WHERE id = $1
+          RETURNING *`,
+        [lockedTarget.id, JSON.stringify(templatePayload), containerName, image],
+      );
+      agent = updated.rows[0];
+      if (!agent) throw createHttpError("Target agent disappeared during restore", 409);
+
+      await db.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [agent.id]);
+      // Treat this write as ambiguous until compensation proves otherwise: a
+      // connection can fail after PostgreSQL committed the metadata update.
+      restoreMetadataUpdated = true;
+      await db.query(
+        `UPDATE backups
+            SET restore_metadata = $2,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [backup.id, restoreMetadata],
+      );
+
+      // Re-cancel any legacy or already-published work before publishing the
+      // restored deployment. Current replacement producers share this lock;
+      // an already-active job is fenced by compensation before unlock.
+      const competingJobs = await cancelDeploymentJobsForAgent(lockedTarget.id);
+      if (competingJobs.active > 0) {
+        throw createHttpError(
+          "A deployment raced the restore. The agent was left stopped; retry the restore.",
+          409,
+          "RESTORE_DEPLOYMENT_RACE",
+        );
+      }
+
+      deploymentEnqueueAttempted = true;
+      await addDeploymentJob({
+        id: agent.id,
+        name: agent.name,
+        // Deployment credentials and Remote Docker grants belong to the durable
+        // agent owner, never the admin/editor who initiated the restore.
+        userId: lockedTarget.user_id,
+        backend: runtimeFields.backend_type,
+        runtime_family: runtimeFields.runtime_family,
+        deploy_target: runtimeFields.deploy_target,
+        execution_target_id: runtimeFields.execution_target_id,
+        sandbox_profile: runtimeFields.sandbox_profile,
+        sandbox: runtimeFields.sandbox_profile,
+        specs: {
+          vcpu: agent.vcpu || sourceAgentMeta.vcpu || 1,
+          ram_mb: agent.ram_mb || sourceAgentMeta.ram_mb || 1024,
+          disk_gb: agent.disk_gb || sourceAgentMeta.disk_gb || 10,
+        },
+        container_name: containerName,
+        image,
+      });
+    } catch (error) {
+      // Destroy failed means the old identity may still be live and must remain
+      // available for cleanup. Every failure after confirmed cleanup is fenced
+      // while this same provisioner lock is still held.
+      if (cleanupConfirmed && restoreTransitionStarted) {
+        try {
+          await compensateRestoreFailure(lockedTarget.id, {
+            backupId: backup.id,
+            previousRestoreMetadata,
+            restoreBackupMetadata: restoreMetadataUpdated,
+            restoreTransitionStarted,
+            deploymentEnqueueAttempted,
+            provisionLock,
+          });
+        } catch (compensationError) {
+          compensationError.restoreError = error;
+          throw compensationError;
+        }
+      }
+      throw error;
+    }
+
+    return serializeAgent(agent);
+  } finally {
+    await provisionLock.release();
+  }
 }
 
 async function pruneExpiredBackups() {
@@ -1660,4 +2090,5 @@ module.exports = {
   storageKeyForBackup,
   syncInstallationScheduleFromSettings,
   updateAgentBackupSchedule,
+  __test: Object.freeze({ buildInstallationBackupArchive }),
 };

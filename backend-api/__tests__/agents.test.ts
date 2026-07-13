@@ -24,6 +24,8 @@ const mockDockerPing = jest.fn((callback) => callback(null));
 const mockDockerInspect = jest.fn();
 const mockStats = jest.fn();
 const mockSyncAuthToUserAgents = jest.fn().mockResolvedValue([]);
+const mockResumeAgentWithProviderAuth = jest.fn();
+const mockWithProviderStateLock = jest.fn();
 const mockPersistLifecycleRuntimeAddress = jest.fn();
 const mockRunContainerCommand = jest.fn();
 const mockListHermesChannels = jest.fn();
@@ -74,6 +76,13 @@ const mockGetDeploymentDefaults = jest.fn().mockResolvedValue({
 });
 const mockGetAgentHubSourceApiKey = jest.fn().mockResolvedValue("nora_hub_test_key");
 const mockAssertKubernetesExecutionTargetAvailable = jest.fn().mockResolvedValue();
+const mockGetAgentVersion = jest.fn();
+const mockRecordAgentVersion = jest.fn();
+const mockRecordAgentVersionBestEffort = jest.fn();
+const mockAgentProvisionLockRelease = jest.fn().mockResolvedValue(undefined);
+const mockAcquireAgentProvisionLock = jest.fn().mockResolvedValue({
+  release: mockAgentProvisionLockRelease,
+});
 jest.mock("../db", () => mockDb);
 jest.mock("pg", () => ({
   ...jest.requireActual("pg"),
@@ -101,12 +110,22 @@ jest.mock("../redisQueue", () => ({
   getDLQJobs: jest.fn(),
   retryDLQJob: jest.fn(),
 }));
+jest.mock("../agentProvisionLock", () => ({
+  ...jest.requireActual("../agentProvisionLock"),
+  acquireAgentProvisionLock: mockAcquireAgentProvisionLock,
+}));
 jest.mock("../kubernetesClusters", () => ({
   assertKubernetesExecutionTargetAvailable: mockAssertKubernetesExecutionTargetAvailable,
   listKubernetesExecutionTargets: jest.fn().mockResolvedValue([]),
 }));
 jest.mock("../scheduler", () => ({
   selectNode: jest.fn().mockResolvedValue({ name: "worker-01" }),
+}));
+jest.mock("../agentVersions", () => ({
+  getVersion: mockGetAgentVersion,
+  listVersions: jest.fn().mockResolvedValue([]),
+  recordVersion: mockRecordAgentVersion,
+  recordVersionBestEffort: mockRecordAgentVersionBestEffort,
 }));
 jest.mock("../containerManager", () => ({
   start: jest.fn().mockResolvedValue({}),
@@ -202,6 +221,16 @@ jest.mock("../integrations", () => ({
     status: "needs_reconnect",
   })),
 }));
+jest.mock("../mcpServers", () => ({
+  ...jest.requireActual("../mcpServers"),
+  getEnabledMcpRuntimeState: jest.fn().mockResolvedValue({
+    enabledIds: [],
+    entries: [],
+    desiredServers: {},
+    env: {},
+    managedEnvNames: [],
+  }),
+}));
 jest.mock("../monitoring", () => ({
   getMetrics: jest.fn().mockResolvedValue({}),
   logEvent: jest.fn(),
@@ -227,6 +256,7 @@ jest.mock("../llmProviders", () => ({
   addProvider: jest.fn(),
   ensureDemoProvider: mockEnsureDemoProvider,
   providerMutationLockKey: jest.fn((userId) => `nora:llm-providers:${userId}`),
+  withProviderStateLock: mockWithProviderStateLock,
   updateProvider: jest.fn(),
   deleteProvider: jest.fn(),
   getProviderKeys: jest.fn().mockResolvedValue([]),
@@ -279,6 +309,10 @@ jest.mock("../platformSettings", () => {
 });
 jest.mock("../authSync", () => ({
   syncAuthToUserAgents: mockSyncAuthToUserAgents,
+  resumeAgentWithProviderAuth: mockResumeAgentWithProviderAuth,
+  isProviderAuthStatusHoldReason: (value) =>
+    value === "provider_auth_reconciliation_pending" ||
+    value === "provider_auth_reconciliation_failed",
   runContainerCommand: mockRunContainerCommand,
 }));
 jest.mock("../hermesUi", () => ({
@@ -318,6 +352,12 @@ const userToken = jwt.sign({ id: "user-1", email: "user@nora.test", role: "user"
   expiresIn: "1h",
 });
 const auth = (req) => req.set("Authorization", `Bearer ${userToken}`);
+const editorToken = jwt.sign(
+  { id: "workspace-editor-1", email: "editor@nora.test", role: "user" },
+  JWT_SECRET,
+  { expiresIn: "1h" },
+);
+const editorAuth = (req) => req.set("Authorization", `Bearer ${editorToken}`);
 const hubKeyAuth = (req) => req.set("Authorization", "Bearer nora_hub_test_key");
 
 function mockValidHubApiKey() {
@@ -367,6 +407,10 @@ beforeEach(() => {
   mockDb.connect.mockReset().mockResolvedValue(mockDbClient);
   mockDbClient.query.mockReset().mockResolvedValue({ rows: [] });
   mockDbClient.release.mockReset();
+  mockAcquireAgentProvisionLock.mockReset().mockResolvedValue({
+    release: mockAgentProvisionLockRelease,
+  });
+  mockAgentProvisionLockRelease.mockReset().mockResolvedValue(undefined);
   mockPgClient.mockReset().mockImplementation(() => mockActivationLockClient);
   mockActivationLockClient.connect.mockReset().mockResolvedValue(undefined);
   mockActivationLockClient.query.mockReset().mockResolvedValue({ rows: [] });
@@ -382,6 +426,14 @@ beforeEach(() => {
   mockDockerPing.mockReset().mockImplementation((callback) => callback(null));
   mockDockerInspect.mockReset();
   mockSyncAuthToUserAgents.mockReset().mockResolvedValue([]);
+  mockWithProviderStateLock
+    .mockReset()
+    .mockImplementation(async (_userId, operation) => operation());
+  mockResumeAgentWithProviderAuth.mockReset().mockImplementation(async (agent) => ({
+    agent: { ...agent, status: "running", paused_reason: null },
+    lifecycleResult: null,
+    syncResult: { agentId: agent.id, status: "synced" },
+  }));
   mockPersistLifecycleRuntimeAddress.mockReset().mockImplementation(async (_db, agent, result) => {
     const host = typeof result?.host === "string" ? result.host.trim() : "";
     const runtimeHost = typeof result?.runtimeHost === "string" ? result.runtimeHost.trim() : host;
@@ -445,6 +497,13 @@ beforeEach(() => {
     ram_mb: 1024,
     disk_gb: 10,
   });
+  mockGetAgentVersion.mockReset();
+  mockRecordAgentVersion.mockReset().mockResolvedValue({
+    id: "version-restored",
+    versionNumber: 3,
+    config: {},
+  });
+  mockRecordAgentVersionBestEffort.mockReset().mockResolvedValue(null);
   delete process.env.ENABLED_BACKENDS;
   delete process.env.ENABLED_RUNTIME_FAMILIES;
   delete process.env.ENABLED_SANDBOX_PROFILES;
@@ -583,6 +642,35 @@ describe("GET /agents/:id", () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("status", "running");
   });
+
+  it.each(["provider_auth_reconciliation_pending", "provider_auth_reconciliation_failed"])(
+    "does not live-promote an agent held for provider auth (%s)",
+    async (pausedReason) => {
+      const containerManager = require("../containerManager");
+      mockDb.query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-provider-auth-held",
+            name: "Provider Auth Held",
+            status: "error",
+            paused_reason: pausedReason,
+            user_id: "user-1",
+            container_id: "container-provider-auth-held",
+            effective_role: "owner",
+          },
+        ],
+      });
+
+      const res = await auth(request(app).get("/agents/a-provider-auth-held"));
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(
+        expect.objectContaining({ status: "error", paused_reason: pausedReason }),
+      );
+      expect(containerManager.status).not.toHaveBeenCalled();
+      expect(mockDb.query).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("includes Kubernetes pod replica status in agent details", async () => {
     const containerManager = require("../containerManager");
@@ -1567,7 +1655,9 @@ describe("Hermes integration sync routes", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1", "a-hermes-integration");
+    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1", "a-hermes-integration", {
+      providerLockHeld: true,
+    });
     expect(mockRunContainerCommand).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "a-hermes-integration",
@@ -1579,7 +1669,7 @@ describe("Hermes integration sync routes", () => {
     expect(mockRunContainerCommand.mock.calls.at(-1)[1]).toContain("nora-integration-tool");
   });
 
-  it("does not restart OpenClaw auth sync for non-LLM integrations", async () => {
+  it("reconciles exact managed auth state for non-LLM OpenClaw integrations", async () => {
     const integrationsModule = require("../integrations");
     integrationsModule.connectIntegration.mockResolvedValueOnce({
       id: "int-openclaw-slack",
@@ -1623,7 +1713,9 @@ describe("Hermes integration sync routes", () => {
       "http://runtime-host:9090/integrations/sync",
       expect.objectContaining({ method: "POST" }),
     );
-    expect(mockSyncAuthToUserAgents).not.toHaveBeenCalled();
+    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1", "a-openclaw-integration", {
+      providerLockHeld: true,
+    });
   });
 
   it("returns a 502 when Hermes integration sync fails after disconnect", async () => {
@@ -1675,7 +1767,9 @@ describe("Hermes integration sync routes", () => {
     );
 
     expect(res.status).toBe(502);
-    expect(res.body.error).toBe("Hermes restart failed");
+    expect(res.body.error).toBe(
+      "Integration deleted, but 1 runtime could not be stopped and quarantined after credential reconciliation failed",
+    );
   });
 });
 
@@ -1788,6 +1882,16 @@ describe("Twitter/X integration OAuth routes", () => {
             runtime_family: "openclaw",
           },
         ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-twitter",
+            user_id: "user-1",
+            status: "stopped",
+            runtime_family: "openclaw",
+          },
+        ],
       });
 
     const res = await auth(
@@ -1828,6 +1932,7 @@ describe("Twitter/X integration OAuth routes", () => {
 
 describe("agent audit logging", () => {
   it("logs owner detail when starting an agent", async () => {
+    const containerManager = require("../containerManager");
     const monitoringModule = require("../monitoring");
     mockDb.query
       .mockResolvedValueOnce({
@@ -1847,17 +1952,39 @@ describe("agent audit logging", () => {
             name: "Start Agent",
             user_id: "user-1",
             container_id: "container-start-1",
+            status: "stopped",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-1",
+            name: "Start Agent",
+            user_id: "user-1",
+            container_id: "container-start-1",
             status: "running",
           },
         ],
       });
+    mockSyncAuthToUserAgents.mockResolvedValueOnce([
+      { agentId: "agent-start-1", status: "synced" },
+    ]);
 
     const res = await auth(request(app).post("/agents/agent-start-1/start"));
 
     expect(res.status).toBe(200);
-    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1", "agent-start-1", {
-      onlyIfAuthPresent: true,
-    });
+    expect(mockResumeAgentWithProviderAuth).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "agent-start-1", user_id: "user-1" }),
+      "start",
+    );
+    expect(mockAcquireAgentProvisionLock.mock.invocationCallOrder[0]).toBeLessThan(
+      mockResumeAgentWithProviderAuth.mock.invocationCallOrder[0],
+    );
+    expect(mockResumeAgentWithProviderAuth.mock.invocationCallOrder[0]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
+    expect(containerManager.start).not.toHaveBeenCalled();
     expect(monitoringModule.logEvent).toHaveBeenCalledWith(
       "agent_started",
       expect.stringContaining("Start Agent"),
@@ -1883,15 +2010,127 @@ describe("agent audit logging", () => {
       }),
     );
   });
+
+  it("uses the durable owner and reconciles empty auth when a workspace editor starts an agent", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-editor-start",
+            name: "Shared Start Agent",
+            user_id: "owner-1",
+            container_id: "container-editor-start",
+            status: "stopped",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [{ role: "editor" }] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-editor-start",
+            name: "Shared Start Agent",
+            user_id: "owner-1",
+            container_id: "container-editor-start",
+            status: "stopped",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [{ role: "editor" }] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-editor-start",
+            name: "Shared Start Agent",
+            user_id: "owner-1",
+            container_id: "container-editor-start",
+            status: "running",
+          },
+        ],
+      });
+    mockSyncAuthToUserAgents.mockResolvedValueOnce([
+      { agentId: "agent-editor-start", status: "synced" },
+    ]);
+
+    const res = await editorAuth(request(app).post("/agents/agent-editor-start/start"));
+
+    expect(res.status).toBe(200);
+    expect(mockResumeAgentWithProviderAuth).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "agent-editor-start", user_id: "owner-1" }),
+      "start",
+    );
+  });
+
+  it("stops the runtime when resume auth reconciliation fails", async () => {
+    const containerManager = require("../containerManager");
+    const monitoringModule = require("../monitoring");
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-auth-failure",
+            name: "Auth Failure Agent",
+            user_id: "user-1",
+            container_id: "container-auth-failure",
+            status: "stopped",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-auth-failure",
+            name: "Auth Failure Agent",
+            user_id: "user-1",
+            container_id: "container-auth-failure",
+            status: "stopped",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-auth-failure",
+            name: "Auth Failure Agent",
+            user_id: "user-1",
+            container_id: "container-auth-failure",
+            status: "running",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+    mockResumeAgentWithProviderAuth.mockRejectedValueOnce(
+      Object.assign(new Error("Current provider authentication could not be reconciled"), {
+        statusCode: 502,
+        code: "AGENT_AUTH_RECONCILIATION_FAILED",
+      }),
+    );
+
+    const res = await auth(request(app).post("/agents/agent-start-auth-failure/start"));
+
+    expect(res.status).toBe(502);
+    expect(containerManager.stop).not.toHaveBeenCalled();
+    expect(monitoringModule.logEvent).not.toHaveBeenCalledWith(
+      "agent_started",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
 });
 
 describe("agent lifecycle address persistence", () => {
   it("persists a refreshed runtime address before start auth sync", async () => {
     const containerManager = require("../containerManager");
-    containerManager.start.mockResolvedValueOnce({
-      host: "10.20.30.41",
-      runtimeHost: "10.20.30.41",
-    });
+    mockResumeAgentWithProviderAuth.mockImplementationOnce(async (agent) => ({
+      agent: {
+        ...agent,
+        status: "running",
+        paused_reason: null,
+        host: "10.20.30.41",
+        runtime_host: "10.20.30.41",
+      },
+      lifecycleResult: { host: "10.20.30.41", runtimeHost: "10.20.30.41" },
+    }));
     mockDb.query
       .mockResolvedValueOnce({
         rows: [
@@ -1914,35 +2153,55 @@ describe("agent lifecycle address persistence", () => {
             user_id: "user-1",
             backend_type: "proxmox",
             container_id: "201",
+            status: "stopped",
+            host: "10.20.30.10",
+            runtime_host: "10.20.30.10",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-start-address",
+            name: "Start Address Agent",
+            user_id: "user-1",
+            backend_type: "proxmox",
+            container_id: "201",
             status: "running",
             host: "10.20.30.41",
             runtime_host: "10.20.30.41",
           },
         ],
       });
+    mockSyncAuthToUserAgents.mockResolvedValueOnce([
+      { agentId: "agent-start-address", status: "synced" },
+    ]);
 
     const res = await auth(request(app).post("/agents/agent-start-address/start"));
 
     expect(res.status).toBe(200);
-    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
-      mockDb,
-      expect.objectContaining({ id: "agent-start-address" }),
-      { host: "10.20.30.41", runtimeHost: "10.20.30.41" },
-    );
     expect(res.body).toEqual(
       expect.objectContaining({ host: "10.20.30.41", runtime_host: "10.20.30.41" }),
     );
-    expect(mockPersistLifecycleRuntimeAddress.mock.invocationCallOrder[0]).toBeLessThan(
-      mockSyncAuthToUserAgents.mock.invocationCallOrder[0],
+    expect(mockResumeAgentWithProviderAuth).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "agent-start-address" }),
+      "start",
     );
+    expect(containerManager.start).not.toHaveBeenCalled();
   });
 
   it("persists a refreshed runtime address after restart", async () => {
     const containerManager = require("../containerManager");
-    containerManager.restart.mockResolvedValueOnce({
-      host: "10.20.30.42",
-      runtimeHost: "10.20.30.42",
-    });
+    mockResumeAgentWithProviderAuth.mockImplementationOnce(async (agent) => ({
+      agent: {
+        ...agent,
+        status: "running",
+        paused_reason: null,
+        host: "10.20.30.42",
+        runtime_host: "10.20.30.42",
+      },
+      lifecycleResult: { host: "10.20.30.42", runtimeHost: "10.20.30.42" },
+    }));
     mockDb.query
       .mockResolvedValueOnce({
         rows: [
@@ -1957,16 +2216,112 @@ describe("agent lifecycle address persistence", () => {
           },
         ],
       })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-restart-address",
+            name: "Restart Address Agent",
+            user_id: "user-1",
+            backend_type: "proxmox",
+            container_id: "202",
+            status: "running",
+            host: "10.20.30.11",
+            runtime_host: "10.20.30.11",
+          },
+        ],
+      })
       .mockResolvedValueOnce({ rows: [] });
+    mockSyncAuthToUserAgents.mockResolvedValueOnce([
+      { agentId: "agent-restart-address", status: "synced" },
+    ]);
 
     const res = await auth(request(app).post("/agents/agent-restart-address/restart"));
 
     expect(res.status).toBe(200);
-    expect(mockPersistLifecycleRuntimeAddress).toHaveBeenCalledWith(
-      mockDb,
+    expect(res.body).toEqual({ success: true });
+    expect(mockResumeAgentWithProviderAuth).toHaveBeenCalledWith(
       expect.objectContaining({ id: "agent-restart-address" }),
-      { host: "10.20.30.42", runtimeHost: "10.20.30.42" },
+      "restart",
     );
+    expect(mockResumeAgentWithProviderAuth.mock.invocationCallOrder[0]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
+    expect(containerManager.restart).not.toHaveBeenCalled();
+  });
+
+  it("uses the durable owner when a workspace editor restarts an agent", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-editor-restart",
+            name: "Shared Restart Agent",
+            user_id: "owner-1",
+            container_id: "container-editor-restart",
+            status: "running",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [{ role: "editor" }] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-editor-restart",
+            name: "Shared Restart Agent",
+            user_id: "owner-1",
+            container_id: "container-editor-restart",
+            status: "running",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [{ role: "editor" }] })
+      .mockResolvedValueOnce({ rows: [] });
+    mockSyncAuthToUserAgents.mockResolvedValueOnce([
+      { agentId: "agent-editor-restart", status: "synced" },
+    ]);
+
+    const res = await editorAuth(request(app).post("/agents/agent-editor-restart/restart"));
+
+    expect(res.status).toBe(200);
+    expect(mockResumeAgentWithProviderAuth).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "agent-editor-restart", user_id: "owner-1" }),
+      "restart",
+    );
+  });
+});
+
+describe("agent lifecycle provision locking", () => {
+  it.each([
+    ["start", "queued"],
+    ["start", "deploying"],
+    ["stop", "queued"],
+    ["stop", "deploying"],
+    ["restart", "queued"],
+    ["restart", "deploying"],
+  ])("rejects %s when the locked agent row is %s", async (action, lockedStatus) => {
+    const containerManager = require("../containerManager");
+    const agentId = `agent-${action}-${lockedStatus}`;
+    const visibleAgent = {
+      id: agentId,
+      name: "Lifecycle Locked Agent",
+      user_id: "user-1",
+      status: "running",
+      container_id: `container-${action}-${lockedStatus}`,
+    };
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [visibleAgent] })
+      .mockResolvedValueOnce({ rows: [{ ...visibleAgent, status: lockedStatus }] });
+
+    const res = await auth(request(app).post(`/agents/${agentId}/${action}`));
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/queued or in progress/i);
+    expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith(agentId, {
+      applicationName: `nora-backend-agent-${action}`,
+    });
+    expect(containerManager[action]).not.toHaveBeenCalled();
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2533,12 +2888,20 @@ describe("POST /agents/activate-demo", () => {
       ram_mb: 1024,
       disk_gb: 10,
     };
-    const queuedAgent = { ...failedAgent, status: "queued", container_id: null };
+    const queuedAgent = {
+      ...failedAgent,
+      status: "queued",
+      container_id: null,
+      container_name: null,
+    };
     const client = {
       connect: jest.fn().mockResolvedValue(undefined),
       end: jest.fn().mockResolvedValue(undefined),
       query: jest.fn(async (sql) => {
         if (sql.includes("FROM agents") && sql.includes("template_payload @>")) {
+          return { rows: [failedAgent] };
+        }
+        if (sql === "SELECT * FROM agents WHERE id = $1") {
           return { rows: [failedAgent] };
         }
         if (sql.includes("UPDATE agents") && sql.includes("SET status = 'queued'")) {
@@ -2562,12 +2925,22 @@ describe("POST /agents/activate-demo", () => {
       ([sql]) => sql.includes("UPDATE agents") && sql.includes("SET status = 'queued'"),
     );
     expect(resetCallIndex).toBeGreaterThanOrEqual(0);
+    expect(client.query.mock.calls[resetCallIndex][0]).toContain("container_name = NULL");
     expect(containerManager.destroy.mock.invocationCallOrder[0]).toBeLessThan(
       client.query.mock.invocationCallOrder[resetCallIndex],
     );
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
       expect.objectContaining({ id: failedAgent.id, llm_provider_id: "provider-demo" }),
       { jobId: `demo-activation-${failedAgent.id}` },
+    );
+    expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith(failedAgent.id, {
+      applicationName: "nora-backend-demo-activation-retry",
+    });
+    expect(mockAcquireAgentProvisionLock.mock.invocationCallOrder[0]).toBeLessThan(
+      mockCancelDeploymentJobsForAgent.mock.invocationCallOrder[0],
+    );
+    expect(mockAddDeploymentJob.mock.invocationCallOrder[0]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
     );
   });
 
@@ -2589,11 +2962,15 @@ describe("POST /agents/activate-demo", () => {
     const client = {
       connect: jest.fn().mockResolvedValue(undefined),
       end: jest.fn().mockResolvedValue(undefined),
-      query: jest.fn(async (sql) =>
-        sql.includes("FROM agents") && sql.includes("template_payload @>")
-          ? { rows: [failedAgent] }
-          : { rows: [] },
-      ),
+      query: jest.fn(async (sql) => {
+        if (sql.includes("FROM agents") && sql.includes("template_payload @>")) {
+          return { rows: [failedAgent] };
+        }
+        if (sql === "SELECT * FROM agents WHERE id = $1") {
+          return { rows: [failedAgent] };
+        }
+        return { rows: [] };
+      }),
     };
     mockPgClient.mockImplementation(() => client);
     mockCancelDeploymentJobsForAgent.mockResolvedValue({ removed: 0, active: 1 });
@@ -2615,39 +2992,101 @@ describe("POST /agents/activate-demo", () => {
         ([sql]) => sql.includes("UPDATE deployments") && sql.includes("status = 'queued'"),
       ),
     ).toBe(false);
+    expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith(failedAgent.id, {
+      applicationName: "nora-backend-demo-activation-retry",
+    });
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
-  it("preserves an intentionally stopped demo agent for the agent-detail Start action", async () => {
-    const stoppedAgent = {
-      id: "agent-demo-stopped",
+  it.each([
+    ["running", { status: "synced" }],
+    ["warning", { status: "synced" }],
+    ["stopped", { status: "synced", staged: true }],
+  ])(
+    "reconciles a %s demo agent after recreating its built-in provider",
+    async (status, syncResult) => {
+      const stoppedAgent = {
+        id: "agent-demo-stopped",
+        user_id: "user-1",
+        name: "Demo Agent",
+        status,
+        backend_type: "docker",
+        runtime_family: "openclaw",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+        sandbox_profile: "standard",
+        container_id: "stopped-demo-container",
+      };
+      const client = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        end: jest.fn().mockResolvedValue(undefined),
+        query: jest.fn(async (sql) =>
+          sql.includes("FROM agents") && sql.includes("template_payload @>")
+            ? { rows: [stoppedAgent] }
+            : { rows: [] },
+        ),
+      };
+      mockPgClient.mockImplementation(() => client);
+      mockEnsureDemoProvider.mockResolvedValueOnce({
+        id: "provider-demo-recreated",
+        provider: "demo",
+        model: "nora-demo-1",
+        is_default: true,
+      });
+      mockSyncAuthToUserAgents.mockResolvedValueOnce([{ agentId: stoppedAgent.id, ...syncResult }]);
+
+      const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual(expect.objectContaining({ id: stoppedAgent.id, status }));
+      expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1", stoppedAgent.id, {
+        providerLockHeld: true,
+      });
+      expect(mockCancelDeploymentJobsForAgent).not.toHaveBeenCalled();
+      expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not return stale ready state when demo provider reconciliation fails", async () => {
+    const existingAgent = {
+      id: "agent-demo-reconcile-failed",
       user_id: "user-1",
       name: "Demo Agent",
-      status: "stopped",
+      status: "running",
       backend_type: "docker",
       runtime_family: "openclaw",
       deploy_target: "docker",
       execution_target_id: "docker",
       sandbox_profile: "standard",
-      container_id: "stopped-demo-container",
+      container_id: "demo-runtime",
     };
     const client = {
       connect: jest.fn().mockResolvedValue(undefined),
       end: jest.fn().mockResolvedValue(undefined),
       query: jest.fn(async (sql) =>
         sql.includes("FROM agents") && sql.includes("template_payload @>")
-          ? { rows: [stoppedAgent] }
+          ? { rows: [existingAgent] }
           : { rows: [] },
       ),
     };
     mockPgClient.mockImplementation(() => client);
+    mockSyncAuthToUserAgents.mockResolvedValueOnce([
+      {
+        agentId: existingAgent.id,
+        status: "failed",
+        error: "runtime unavailable",
+        runtimeStopped: true,
+        quarantinePersisted: true,
+      },
+    ]);
 
     const response = await auth(request(app).post("/agents/activate-demo").send({}));
 
-    expect(response.status).toBe(200);
-    expect(response.body).toEqual(
-      expect.objectContaining({ id: stoppedAgent.id, status: "stopped" }),
-    );
-    expect(mockCancelDeploymentJobsForAgent).not.toHaveBeenCalled();
+    expect(response.status).toBe(502);
+    expect(response.body.error).toMatch(/could not be reconciled/i);
+    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1", existingAgent.id, {
+      providerLockHeld: true,
+    });
     expect(mockAddDeploymentJob).not.toHaveBeenCalled();
   });
 
@@ -4663,8 +5102,11 @@ describe("Agent Hub browse, share, download, and report", () => {
 
 describe("POST /agents/:id/stop", () => {
   it("stops a running agent", async () => {
-    // db.query calls: SELECT agent, UPDATE status
+    // db.query calls: initial visibility, locked revalidation, UPDATE status
     mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "a1", status: "running", container_id: null, user_id: "user-1" }],
+      })
       .mockResolvedValueOnce({
         rows: [{ id: "a1", status: "running", container_id: null, user_id: "user-1" }],
       })
@@ -4695,6 +5137,23 @@ describe("POST /agents/:id/stop", () => {
           },
         ],
       })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-k8s-stop",
+            name: "K8s Stop",
+            status: "running",
+            user_id: "user-1",
+            runtime_family: "openclaw",
+            backend_type: "k8s",
+            deploy_target: "k8s",
+            execution_target_id: "k8s:test-cluster",
+            sandbox_profile: "standard",
+            container_id: null,
+            container_name: "nora-oclaw-k8s-stop",
+          },
+        ],
+      })
       .mockResolvedValueOnce({ rows: [{ id: "a-k8s-stop", status: "stopped" }] });
 
     const res = await auth(request(app).post("/agents/a-k8s-stop/stop"));
@@ -4707,67 +5166,93 @@ describe("POST /agents/:id/stop", () => {
       }),
     );
     expect(res.body).toHaveProperty("status", "stopped");
+    const statusUpdateIndex = mockDb.query.mock.calls.findIndex(
+      ([sql]) => String(sql) === "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
+    );
+    expect(statusUpdateIndex).toBeGreaterThanOrEqual(0);
+    expect(containerManager.stop.mock.invocationCallOrder[0]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
+    expect(mockDb.query.mock.invocationCallOrder[statusUpdateIndex]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
   });
 
   it("keeps a Kubernetes agent running in Nora when Kubernetes stop fails", async () => {
     const containerManager = require("../containerManager");
     containerManager.stop.mockRejectedValueOnce(new Error("Kubernetes patch failed"));
-    mockDb.query.mockResolvedValueOnce({
-      rows: [
-        {
-          id: "a-k8s-stop-fail",
-          name: "K8s Stop Fail",
-          status: "running",
-          user_id: "user-1",
-          runtime_family: "openclaw",
-          backend_type: "k8s",
-          deploy_target: "k8s",
-          execution_target_id: "k8s:test-cluster",
-          sandbox_profile: "standard",
-          container_id: null,
-          container_name: "nora-oclaw-k8s-stop-fail",
-        },
-      ],
-    });
+    const agent = {
+      id: "a-k8s-stop-fail",
+      name: "K8s Stop Fail",
+      status: "running",
+      user_id: "user-1",
+      runtime_family: "openclaw",
+      backend_type: "k8s",
+      deploy_target: "k8s",
+      execution_target_id: "k8s:test-cluster",
+      sandbox_profile: "standard",
+      container_id: null,
+      container_name: "nora-oclaw-k8s-stop-fail",
+    };
+    mockDb.query.mockResolvedValueOnce({ rows: [agent] }).mockResolvedValueOnce({ rows: [agent] });
 
     const res = await auth(request(app).post("/agents/a-k8s-stop-fail/stop"));
 
     expect(res.status).toBe(500);
-    expect(res.body.error).toMatch(/Kubernetes patch failed/i);
-    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(res.body.error).toBe("Internal server error");
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockDb.query).not.toHaveBeenCalledWith(
+      "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
+      [agent.id],
+    );
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a Proxmox agent running when shutdown fails", async () => {
     const containerManager = require("../containerManager");
     containerManager.stop.mockRejectedValueOnce(new Error("Proxmox shutdown task failed"));
-    mockDb.query.mockResolvedValueOnce({
-      rows: [
-        {
-          id: "a-proxmox-stop-fail",
-          name: "Proxmox Stop Fail",
-          status: "running",
-          user_id: "user-1",
-          runtime_family: "openclaw",
-          backend_type: "proxmox",
-          deploy_target: "proxmox",
-          execution_target_id: "proxmox",
-          sandbox_profile: "standard",
-          container_id: "301",
-        },
-      ],
-    });
+    const agent = {
+      id: "a-proxmox-stop-fail",
+      name: "Proxmox Stop Fail",
+      status: "running",
+      user_id: "user-1",
+      runtime_family: "openclaw",
+      backend_type: "proxmox",
+      deploy_target: "proxmox",
+      execution_target_id: "proxmox",
+      sandbox_profile: "standard",
+      container_id: "301",
+    };
+    mockDb.query.mockResolvedValueOnce({ rows: [agent] }).mockResolvedValueOnce({ rows: [agent] });
 
     const res = await auth(request(app).post("/agents/a-proxmox-stop-fail/stop"));
 
     expect(res.status).toBe(500);
-    expect(res.body.error).toMatch(/Proxmox shutdown task failed/i);
-    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(res.body.error).toBe("Internal server error");
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockDb.query).not.toHaveBeenCalledWith(
+      "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
+      [agent.id],
+    );
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
   it("marks an already stopped runtime as stopped idempotently", async () => {
     const containerManager = require("../containerManager");
     containerManager.stop.mockRejectedValueOnce(new Error("Container is not running"));
     mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-already-stopped",
+            name: "Already Stopped",
+            status: "running",
+            user_id: "user-1",
+            backend_type: "docker",
+            container_id: "container-stopped",
+          },
+        ],
+      })
       .mockResolvedValueOnce({
         rows: [
           {
@@ -4798,11 +5283,19 @@ describe("POST /agents/:id/redeploy", () => {
             id: "a-warning",
             name: "Warning Agent",
             status: "warning",
+            runtime_family: "openclaw",
+            backend_type: "docker",
+            deploy_target: "docker",
+            execution_target_id: "docker",
+            sandbox_profile: "standard",
             sandbox_type: "standard",
             vcpu: 2,
             ram_mb: 2048,
             disk_gb: 20,
+            container_id: "warning-container-old",
             container_name: "oclaw-agent-warning",
+            host: "172.18.0.10",
+            image: "nora-openclaw-agent:local",
             user_id: "user-1",
           },
         ],
@@ -4816,17 +5309,18 @@ describe("POST /agents/:id/redeploy", () => {
     expect(res.body).toEqual({ success: true, status: "queued" });
     expect(mockDb.query).toHaveBeenNthCalledWith(
       2,
-      expect.stringContaining("runtime_host = NULL"),
+      expect.stringContaining("SET status = 'queued'"),
       [
         "a-warning",
+        "warning",
+        "warning-container-old",
+        "oclaw-agent-warning",
         "docker",
-        "standard",
         "openclaw",
         "docker",
         "docker",
         "standard",
-        expect.stringMatching(/^nora-oclaw-warning-agent-/),
-        "nora-openclaw-agent:local",
+        "172.18.0.10",
       ],
     );
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
@@ -4835,11 +5329,73 @@ describe("POST /agents/:id/redeploy", () => {
         name: "Warning Agent",
         userId: "user-1",
         backend: "docker",
+        runtime_family: "openclaw",
+        deploy_target: "docker",
         execution_target_id: "docker",
+        sandbox_profile: "standard",
         sandbox: "standard",
+        replace_existing_runtime: true,
+        previous_container_id: "warning-container-old",
+        previous_container_name: "oclaw-agent-warning",
+        previous_host: "172.18.0.10",
+        previous_backend: "docker",
+        previous_runtime_family: "openclaw",
+        previous_deploy_target: "docker",
+        previous_execution_target_id: "docker",
+        previous_sandbox_profile: "standard",
         specs: { vcpu: 2, ram_mb: 2048, disk_gb: 20 },
         container_name: expect.stringMatching(/^nora-oclaw-warning-agent-/),
+        image: "nora-openclaw-agent:local",
       }),
+    );
+  });
+
+  it("queues a workspace editor redeploy with the persisted owner and full runtime selection", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-shared-redeploy",
+            name: "Shared Agent",
+            status: "warning",
+            user_id: "owner-1",
+            runtime_family: "openclaw",
+            backend_type: "docker",
+            deploy_target: "docker",
+            execution_target_id: "docker",
+            sandbox_profile: "standard",
+            sandbox_type: "standard",
+            vcpu: 4,
+            ram_mb: 4096,
+            disk_gb: 40,
+            container_name: "nora-oclaw-shared-agent-existing",
+            image: "nora-openclaw-agent:local",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [{ role: "editor" }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await editorAuth(request(app).post("/agents/a-shared-redeploy/redeploy"));
+
+    expect(res.status).toBe(200);
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "a-shared-redeploy",
+        userId: "owner-1",
+        backend: "docker",
+        runtime_family: "openclaw",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+        sandbox_profile: "standard",
+        sandbox: "standard",
+        replace_existing_runtime: true,
+        specs: { vcpu: 4, ram_mb: 4096, disk_gb: 40 },
+      }),
+    );
+    expect(mockAddDeploymentJob).not.toHaveBeenCalledWith(
+      expect.objectContaining({ userId: "workspace-editor-1" }),
     );
   });
 
@@ -4855,12 +5411,16 @@ describe("POST /agents/:id/redeploy", () => {
             name: "Nemo Agent",
             status: "stopped",
             runtime_family: "openclaw",
+            backend_type: "docker",
             deploy_target: "docker",
+            execution_target_id: "docker",
             sandbox_profile: "nemoclaw",
             vcpu: 2,
             ram_mb: 2048,
             disk_gb: 20,
+            container_id: "nemo-container-old",
             container_name: "oclaw-agent-nemo",
+            host: "172.18.0.11",
             image: null,
             user_id: "user-1",
           },
@@ -4877,23 +5437,41 @@ describe("POST /agents/:id/redeploy", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ success: true, status: "queued" });
-    expect(mockDb.query).toHaveBeenNthCalledWith(2, expect.stringContaining("deploy_target = $5"), [
-      "a-nemo-redeploy",
-      "k8s",
-      "standard",
-      "openclaw",
-      "k8s",
-      "k8s:test-cluster",
-      "standard",
-      expect.stringMatching(/^nora-oclaw-nemo-agent-/),
-      "node:24-slim",
-    ]);
+    expect(mockDb.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("SET status = 'queued'"),
+      [
+        "a-nemo-redeploy",
+        "stopped",
+        "nemo-container-old",
+        "oclaw-agent-nemo",
+        "docker",
+        "openclaw",
+        "docker",
+        "docker",
+        "nemoclaw",
+        "172.18.0.11",
+      ],
+    );
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "a-nemo-redeploy",
         backend: "k8s",
+        runtime_family: "openclaw",
+        deploy_target: "k8s",
         execution_target_id: "k8s:test-cluster",
+        sandbox_profile: "standard",
         sandbox: "standard",
+        replace_existing_runtime: true,
+        previous_container_id: "nemo-container-old",
+        previous_container_name: "oclaw-agent-nemo",
+        previous_host: "172.18.0.11",
+        previous_backend: "docker",
+        previous_runtime_family: "openclaw",
+        previous_deploy_target: "docker",
+        previous_execution_target_id: "docker",
+        previous_sandbox_profile: "nemoclaw",
+        container_name: expect.stringMatching(/^nora-oclaw-nemo-agent-/),
         image: "node:24-slim",
       }),
     );
@@ -4943,6 +5521,7 @@ describe("POST /agents/:id/redeploy", () => {
         previous_deploy_target: "k8s",
         previous_execution_target_id: "k8s:test-cluster",
         previous_sandbox_profile: "standard",
+        replace_existing_runtime: true,
       }),
     );
   });
@@ -4958,12 +5537,16 @@ describe("POST /agents/:id/redeploy", () => {
             name: "Docker Agent",
             status: "stopped",
             runtime_family: "openclaw",
+            backend_type: "docker",
             deploy_target: "docker",
+            execution_target_id: "docker",
             sandbox_profile: "standard",
             vcpu: 2,
             ram_mb: 2048,
             disk_gb: 20,
+            container_id: "docker-container-old",
             container_name: "oclaw-agent-docker",
+            host: "172.18.0.12",
             image: "nora-openclaw-agent:local",
             user_id: "user-1",
           },
@@ -4979,23 +5562,41 @@ describe("POST /agents/:id/redeploy", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockDb.query).toHaveBeenNthCalledWith(2, expect.stringContaining("image = $9"), [
-      "a-docker-redeploy",
-      "k8s",
-      "standard",
-      "openclaw",
-      "k8s",
-      "k8s:test-cluster",
-      "standard",
-      expect.stringMatching(/^nora-oclaw-docker-agent-/),
-      "node:24-slim",
-    ]);
+    expect(mockDb.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("SET status = 'queued'"),
+      [
+        "a-docker-redeploy",
+        "stopped",
+        "docker-container-old",
+        "oclaw-agent-docker",
+        "docker",
+        "openclaw",
+        "docker",
+        "docker",
+        "standard",
+        "172.18.0.12",
+      ],
+    );
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "a-docker-redeploy",
         backend: "k8s",
+        runtime_family: "openclaw",
+        deploy_target: "k8s",
         execution_target_id: "k8s:test-cluster",
+        sandbox_profile: "standard",
         sandbox: "standard",
+        replace_existing_runtime: true,
+        previous_container_id: "docker-container-old",
+        previous_container_name: "oclaw-agent-docker",
+        previous_host: "172.18.0.12",
+        previous_backend: "docker",
+        previous_runtime_family: "openclaw",
+        previous_deploy_target: "docker",
+        previous_execution_target_id: "docker",
+        previous_sandbox_profile: "standard",
+        container_name: expect.stringMatching(/^nora-oclaw-docker-agent-/),
         image: "node:24-slim",
       }),
     );
@@ -5013,12 +5614,16 @@ describe("POST /agents/:id/redeploy", () => {
             name: "Desk Bot",
             status: "stopped",
             runtime_family: "openclaw",
+            backend_type: "docker",
             deploy_target: "docker",
+            execution_target_id: "docker",
             sandbox_profile: "standard",
             vcpu: 2,
             ram_mb: 2048,
             disk_gb: 20,
+            container_id: "desk-bot-container-old",
             container_name: "oclaw-agent-desk-bot-old123",
+            host: "172.18.0.13",
             image: "nora-openclaw-agent:local",
             user_id: "user-1",
           },
@@ -5036,28 +5641,165 @@ describe("POST /agents/:id/redeploy", () => {
     expect(res.status).toBe(200);
     expect(mockDb.query).toHaveBeenNthCalledWith(
       2,
-      expect.stringContaining("container_name = $8"),
+      expect.stringContaining("SET status = 'queued'"),
       [
         "a-hermes-redeploy",
+        "stopped",
+        "desk-bot-container-old",
+        "oclaw-agent-desk-bot-old123",
+        "docker",
+        "openclaw",
+        "docker",
         "docker",
         "standard",
-        "hermes",
-        "docker",
-        "docker",
-        "standard",
-        expect.stringMatching(/^nora-hermes-desk-bot-/),
-        "nousresearch/hermes-agent:latest",
+        "172.18.0.13",
       ],
     );
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "a-hermes-redeploy",
         backend: "docker",
+        runtime_family: "hermes",
+        deploy_target: "docker",
         execution_target_id: "docker",
+        sandbox_profile: "standard",
+        sandbox: "standard",
         container_name: expect.stringMatching(/^nora-hermes-desk-bot-/),
+        replace_existing_runtime: true,
+        previous_container_id: "desk-bot-container-old",
+        previous_container_name: "oclaw-agent-desk-bot-old123",
+        previous_host: "172.18.0.13",
+        previous_backend: "docker",
+        previous_runtime_family: "openclaw",
+        previous_deploy_target: "docker",
+        previous_execution_target_id: "docker",
+        previous_sandbox_profile: "standard",
         image: "nousresearch/hermes-agent:latest",
       }),
     );
+  });
+
+  it("preserves previous runtime identity and restores status when enqueue is rejected", async () => {
+    mockAddDeploymentJob.mockRejectedValueOnce(new Error("queue unavailable"));
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-safe-redeploy",
+            name: "Safe Redeploy",
+            status: "stopped",
+            runtime_family: "openclaw",
+            backend_type: "docker",
+            deploy_target: "docker",
+            execution_target_id: "docker",
+            sandbox_profile: "standard",
+            container_id: "local-container-old",
+            container_name: "local-container-old-name",
+            host: "172.18.0.12",
+            image: "nora-openclaw-agent:local",
+            user_id: "user-1",
+          },
+        ],
+      })
+      .mockResolvedValue({ rows: [] });
+
+    const res = await auth(request(app).post("/agents/a-safe-redeploy/redeploy"));
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe("queue unavailable");
+    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledTimes(2);
+    expect(mockDb.query).toHaveBeenCalledWith(
+      "UPDATE agents SET status = $2 WHERE id = $1 AND status = 'queued'",
+      ["a-safe-redeploy", "stopped"],
+    );
+    expect(mockDb.query).toHaveBeenCalledWith(
+      "UPDATE deployments SET status = 'failed' WHERE agent_id = $1 AND status = 'queued'",
+      ["a-safe-redeploy"],
+    );
+    expect(
+      mockDb.query.mock.calls.some(([sql]) => String(sql).includes("container_id = NULL")),
+    ).toBe(false);
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replace_existing_runtime: true,
+        previous_container_id: "local-container-old",
+        previous_execution_target_id: "docker",
+      }),
+    );
+  });
+
+  it("restores the previous status when the deployment row cannot be inserted", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-insert-failure",
+            name: "Insert Failure",
+            status: "stopped",
+            runtime_family: "openclaw",
+            backend_type: "docker",
+            deploy_target: "docker",
+            execution_target_id: "docker",
+            sandbox_profile: "standard",
+            container_id: "local-container-old",
+            container_name: "local-container-old-name",
+            host: "172.18.0.12",
+            image: "nora-openclaw-agent:local",
+            user_id: "user-1",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockRejectedValueOnce(new Error("deployment insert unavailable"))
+      .mockResolvedValue({ rows: [] });
+
+    const res = await auth(request(app).post("/agents/a-insert-failure/redeploy"));
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe("deployment insert unavailable");
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledTimes(1);
+    expect(mockDb.query).toHaveBeenCalledWith(
+      "UPDATE agents SET status = $2 WHERE id = $1 AND status = 'queued'",
+      ["a-insert-failure", "stopped"],
+    );
+    expect(mockDb.query).not.toHaveBeenCalledWith(
+      "UPDATE deployments SET status = 'failed' WHERE agent_id = $1 AND status = 'queued'",
+      ["a-insert-failure"],
+    );
+  });
+
+  it("rejects a stale replacement producer after the runtime identity changes", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-stale-redeploy",
+            name: "Stale Redeploy",
+            status: "stopped",
+            runtime_family: "openclaw",
+            backend_type: "docker",
+            deploy_target: "docker",
+            execution_target_id: "docker",
+            sandbox_profile: "standard",
+            container_id: "old-runtime",
+            container_name: "old-runtime-name",
+            user_id: "user-1",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+    const res = await auth(request(app).post("/agents/a-stale-redeploy/redeploy"));
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/runtime state changed/i);
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    expect(mockDb.query).not.toHaveBeenCalledWith(
+      "INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')",
+      ["a-stale-redeploy"],
+    );
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
   it("rejects redeploy when the agent is still actively running", async () => {
@@ -5070,6 +5812,219 @@ describe("POST /agents/:id/redeploy", () => {
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/warning, error, or stopped/i);
     expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /agents/:id/rollback/:versionId", () => {
+  it("queues rollback from the locked row when a runtime appears while waiting for the lock", async () => {
+    const targetConfig = { files: [], memoryFiles: [], wiring: { channels: [], integrations: [] } };
+    const initialAgent = {
+      id: "a-shared-rollback",
+      name: "Shared Rollback Agent",
+      status: "stopped",
+      user_id: "owner-1",
+      runtime_family: "openclaw",
+      backend_type: "docker",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      sandbox_type: "standard",
+      vcpu: 3,
+      ram_mb: 3072,
+      disk_gb: 30,
+      container_id: null,
+      container_name: null,
+      host: null,
+      image: "nora-openclaw-agent:local",
+    };
+    const lockedAgent = {
+      ...initialAgent,
+      status: "running",
+      container_id: "container-before-rollback",
+      container_name: "nora-oclaw-shared-rollback-existing",
+      host: "172.18.0.10",
+    };
+    mockGetAgentVersion.mockResolvedValueOnce({
+      id: "version-2",
+      versionNumber: 2,
+      config: targetConfig,
+    });
+    mockRecordAgentVersion.mockResolvedValueOnce({
+      id: "version-3",
+      versionNumber: 3,
+      config: targetConfig,
+    });
+    let agentReadCount = 0;
+    mockDb.query.mockImplementation(async (sql) => {
+      const statement = String(sql);
+      if (statement === "SELECT * FROM agents WHERE id = $1") {
+        agentReadCount += 1;
+        return { rows: [agentReadCount === 1 ? initialAgent : lockedAgent] };
+      }
+      if (statement.includes("JOIN workspace_members")) {
+        return { rows: [{ role: "editor" }] };
+      }
+      if (statement === "SELECT template_payload FROM agents WHERE id = $1") {
+        return { rows: [{ template_payload: { files: [] } }] };
+      }
+      if (statement.includes("SET status = 'queued'")) {
+        return { rows: [{ id: lockedAgent.id }], rowCount: 1 };
+      }
+      return { rows: [] };
+    });
+
+    const res = await editorAuth(request(app).post("/agents/a-shared-rollback/rollback/version-2"));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expect.objectContaining({ redeployed: true }));
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "a-shared-rollback",
+        userId: "owner-1",
+        backend: "docker",
+        runtime_family: "openclaw",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+        sandbox_profile: "standard",
+        sandbox: "standard",
+        specs: { vcpu: 3, ram_mb: 3072, disk_gb: 30 },
+        previous_container_id: "container-before-rollback",
+        previous_container_name: "nora-oclaw-shared-rollback-existing",
+        previous_host: "172.18.0.10",
+        replace_existing_runtime: true,
+      }),
+    );
+    expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith("a-shared-rollback", {
+      applicationName: "nora-backend-agent-rollback",
+    });
+    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledTimes(1);
+    expect(mockAcquireAgentProvisionLock.mock.invocationCallOrder[0]).toBeLessThan(
+      mockCancelDeploymentJobsForAgent.mock.invocationCallOrder[0],
+    );
+    expect(mockAddDeploymentJob.mock.invocationCallOrder[0]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("restores the prior payload and wiring inside the shared lock when rollback enqueue fails", async () => {
+    const targetConfig = { files: [], memoryFiles: [], wiring: { channels: [], integrations: [] } };
+    const currentPayload = {
+      files: [{ path: "SOUL.md", content: "Prior rollback payload" }],
+      memoryFiles: [],
+      wiring: {
+        integrations: [
+          {
+            provider: "slack",
+            catalog_id: "slack",
+            config: { channel: "prior-alerts" },
+            status: "needs_reconnect",
+          },
+        ],
+        channels: [
+          {
+            type: "telegram",
+            name: "Prior Telegram",
+            config: { chat_id: "12345" },
+            enabled: true,
+          },
+        ],
+      },
+    };
+    const agent = {
+      id: "a-rollback-compensation",
+      name: "Rollback Compensation",
+      status: "running",
+      user_id: "owner-1",
+      runtime_family: "openclaw",
+      backend_type: "docker",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      sandbox_type: "standard",
+      container_id: "rollback-container",
+      container_name: "nora-oclaw-rollback-compensation",
+      image: "nora-openclaw-agent:local",
+    };
+    mockGetAgentVersion.mockResolvedValueOnce({
+      id: "version-2",
+      versionNumber: 2,
+      config: targetConfig,
+    });
+    mockRecordAgentVersion.mockResolvedValueOnce({
+      id: "version-3",
+      versionNumber: 3,
+      config: targetConfig,
+    });
+    mockAddDeploymentJob.mockRejectedValueOnce(new Error("queue unavailable"));
+    mockDb.query.mockImplementation(async (sql) => {
+      const statement = String(sql);
+      if (statement === "SELECT * FROM agents WHERE id = $1") {
+        return { rows: [agent] };
+      }
+      if (statement.includes("JOIN workspace_members")) {
+        return { rows: [{ role: "editor" }] };
+      }
+      if (statement === "SELECT template_payload FROM agents WHERE id = $1") {
+        return { rows: [{ template_payload: currentPayload }] };
+      }
+      if (statement.includes("SET status = 'queued'")) {
+        return { rows: [{ id: agent.id }], rowCount: 1 };
+      }
+      return { rows: [] };
+    });
+
+    const res = await editorAuth(request(app).post(`/agents/${agent.id}/rollback/version-2`));
+
+    expect(res.status).toBe(500);
+    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledTimes(2);
+    const compensationCallIndex = mockDb.query.mock.calls.findIndex(
+      ([sql]) =>
+        String(sql) === "UPDATE agents SET status = $2 WHERE id = $1 AND status = 'queued'",
+    );
+    expect(compensationCallIndex).toBeGreaterThanOrEqual(0);
+    expect(mockDb.query.mock.invocationCallOrder[compensationCallIndex]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
+    expect(mockDb.query).toHaveBeenCalledWith(
+      "UPDATE agents SET template_payload = $1::jsonb WHERE id = $2",
+      [JSON.stringify(targetConfig), agent.id],
+    );
+    expect(mockDb.query).toHaveBeenCalledWith(
+      "UPDATE agents SET template_payload = $1::jsonb WHERE id = $2",
+      [JSON.stringify(currentPayload), agent.id],
+    );
+    expect(mockDb.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO integrations"), [
+      agent.id,
+      "slack",
+      "slack",
+      JSON.stringify({ channel: "prior-alerts" }),
+      "needs_reconnect",
+    ]);
+    expect(mockDb.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO channels"), [
+      agent.id,
+      "telegram",
+      "Prior Telegram",
+      JSON.stringify({ chat_id: "12345" }),
+      true,
+    ]);
+    expect(mockRecordAgentVersionBestEffort).toHaveBeenLastCalledWith(
+      agent.id,
+      currentPayload,
+      expect.objectContaining({
+        message: expect.stringContaining("restored previous config"),
+        source: "rollback",
+      }),
+    );
+    const payloadRestoreIndex = mockDb.query.mock.calls.findIndex(
+      ([sql, params]) =>
+        String(sql) === "UPDATE agents SET template_payload = $1::jsonb WHERE id = $2" &&
+        params?.[0] === JSON.stringify(currentPayload),
+    );
+    expect(payloadRestoreIndex).toBeGreaterThanOrEqual(0);
+    expect(mockDb.query.mock.invocationCallOrder[payloadRestoreIndex]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 });
 

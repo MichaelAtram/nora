@@ -35,6 +35,10 @@ const AGENT_TERMINAL_FALLBACK_GRACE_MS = 100;
 // unless the gateway explicitly reports that fallback is exhausted.
 const AGENT_ERROR_FALLBACK_GRACE_MS = 16000;
 const RELAY_CONNECT_DELAY_MS = 750;
+const REMOTE_HOST_AUTH_RECHECK_MS = Math.max(
+  250,
+  Number.parseInt(process.env.REMOTE_HOST_AUTH_RECHECK_MS || "1000", 10) || 1000,
+);
 const DOCKER_GATEWAY_HOST_PORT_MIN = 19000;
 const DOCKER_GATEWAY_HOST_PORT_MAX = 19999;
 const K8S_NODE_PORT_MIN = 30000;
@@ -128,7 +132,7 @@ function isBlockedGatewayIP(address) {
 const EMPTY_ALLOWED_HOSTS = new Set();
 
 function assertRemoteGatewayAccessSupported(agent) {
-  if (normalizeDeployTargetName(agent?.deploy_target) !== "remote-docker") return;
+  if (!remoteHosts.isRemoteDockerAgent(agent)) return;
   if (
     String(process.env.PLATFORM_MODE || "selfhosted")
       .trim()
@@ -152,33 +156,26 @@ function assertRemoteGatewayAccessSupported(agent) {
 // A cross-tenant execution_target_id reference still can't reach a host that was
 // never shared to the agent owner. Blocked addresses (0.0.0.0, link-local, …) still apply.
 async function allowedRemoteHostsForAgent(agent) {
-  if (normalizeDeployTargetName(agent?.deploy_target) !== "remote-docker") {
+  if (!remoteHosts.isRemoteDockerAgent(agent)) {
     return EMPTY_ALLOWED_HOSTS;
   }
   // Fail before consulting the registry. This protects historical/imported
   // remote-agent rows too, and every caller (HTTP proxy, RPC pool, Hermes
   // embed, and WS relay) shares this boundary.
   assertRemoteGatewayAccessSupported(agent);
-  try {
-    const host = await remoteHosts.getRemoteHostByExecutionTarget(agent.execution_target_id);
-    if (!host) return EMPTY_ALLOWED_HOSTS;
-    // Trust the host only if the agent's owner may use it: direct owner, or an
-    // editor+ grant via a workspace the host is shared into (positive check). Fail
-    // closed on a null/foreign owner — never let the owner check short-circuit on a
-    // null owner into trusting the host.
-    if (agent.user_id && host.ownerUserId !== agent.user_id) {
-      const allowed = await remoteHosts.userCanUseRemoteHost(agent.user_id, host.id);
-      if (!allowed) return EMPTY_ALLOWED_HOSTS;
-    }
-    const allowed = new Set();
-    if (host.gatewayHost) allowed.add(String(host.gatewayHost).toLowerCase());
-    if (host.sshHost) allowed.add(String(host.sshHost).toLowerCase());
-    if (host.rawGatewayHost) allowed.add(String(host.rawGatewayHost).toLowerCase());
-    if (host.rawSshHost) allowed.add(String(host.rawSshHost).toLowerCase());
-    return allowed;
-  } catch {
-    return EMPTY_ALLOWED_HOSTS;
+  const host = await assertCurrentGatewayAccess(agent);
+  if (!host) {
+    const error = new Error("Unable to verify Remote Docker gateway host access");
+    error.code = "REMOTE_HOST_AUTH_CHECK_FAILED";
+    error.statusCode = 503;
+    throw error;
   }
+  const allowed = new Set();
+  if (host.gatewayHost) allowed.add(String(host.gatewayHost).toLowerCase());
+  if (host.sshHost) allowed.add(String(host.sshHost).toLowerCase());
+  if (host.rawGatewayHost) allowed.add(String(host.rawGatewayHost).toLowerCase());
+  if (host.rawSshHost) allowed.add(String(host.rawSshHost).toLowerCase());
+  return allowed;
 }
 
 // The host allowance for an agent's gateway, used identically by the HTTP,
@@ -197,7 +194,7 @@ async function allowedRemoteHostsForAgent(agent) {
 //  - docker / other: none — falls through to the RFC1918/loopback floor.
 async function allowedGatewayHostsForAgent(agent) {
   const target = normalizeDeployTargetName(agent?.deploy_target);
-  if (target === "remote-docker") return allowedRemoteHostsForAgent(agent);
+  if (remoteHosts.isRemoteDockerAgent(agent)) return allowedRemoteHostsForAgent(agent);
   if (target === "external" || target === "k8s") {
     const allowed = new Set();
     if (agent?.gateway_host) allowed.add(String(agent.gateway_host).toLowerCase());
@@ -211,6 +208,16 @@ async function allowedGatewayHostsForAgent(agent) {
   // trusted here, so a public docker gateway_host still hits the RFC1918 floor.
   const publishedHost = String(process.env.GATEWAY_HOST || "host.docker.internal").toLowerCase();
   return new Set([publishedHost]);
+}
+
+async function assertCurrentGatewayAccess(agent) {
+  if (!remoteHosts.isRemoteDockerAgent(agent)) return;
+  assertRemoteGatewayAccessSupported(agent);
+  try {
+    return await remoteHosts.assertRemoteHostAgentUse(agent, { includeProfile: false });
+  } catch (error) {
+    throw remoteHosts.toPublicRemoteHostAuthorizationError(error);
+  }
 }
 
 function isAllowedGatewayIP(address, hostname, extraAllowedHosts) {
@@ -302,7 +309,7 @@ async function resolveSafeGatewayHttpTarget(agent, gatewayPath = "", search = ""
     {
       publicOnly:
         String(process.env.PLATFORM_MODE || "selfhosted").toLowerCase() === "paas" &&
-        normalizeDeployTargetName(agent?.deploy_target) === "remote-docker",
+        remoteHosts.isRemoteDockerAgent(agent),
     },
   );
   // The connection is pinned to the validated, resolved IP (no re-resolution at
@@ -347,7 +354,7 @@ async function resolveSafeHermesDashboardTarget(agent) {
     {
       publicOnly:
         String(process.env.PLATFORM_MODE || "selfhosted").toLowerCase() === "paas" &&
-        normalizeDeployTargetName(agent?.deploy_target) === "remote-docker",
+        remoteHosts.isRemoteDockerAgent(agent),
     },
   );
   return { host: resolvedHost, port: addr.port };
@@ -448,7 +455,12 @@ function buildConnectDevice(identity, role, scopes, nonce) {
 // ─── WS-RPC Connection Pool ─────────────────────────────────────
 
 class GatewayConnection {
-  constructor(host, token, port, { resolveHost = null, sourceHost = null, agentId = null } = {}) {
+  constructor(
+    host,
+    token,
+    port,
+    { resolveHost = null, sourceHost = null, agentId = null, authorize = null } = {},
+  ) {
     this.host = host;
     this.token = token;
     this.port = port || GATEWAY_PORT;
@@ -470,6 +482,12 @@ class GatewayConnection {
     this._connectPromise = null;
     this._identity = deriveDeviceIdentity(token);
     this._retired = false;
+    this._authorize = typeof authorize === "function" ? authorize : null;
+    this._authorizationTimer = null;
+    this._authorizationInFlight = false;
+    this._authorizationRecheckMs = REMOTE_HOST_AUTH_RECHECK_MS;
+    this._retireListeners = new Set();
+    this._retireError = null;
 
     // Reconnection state
     this._reconnectAttempts = 0;
@@ -486,17 +504,83 @@ class GatewayConnection {
 
   /** Open WS, complete challenge-response handshake, resolve when ready. */
   connect() {
-    if (this._retired) return Promise.reject(new Error("Gateway connection retired"));
+    if (this._retired) {
+      return Promise.reject(this._retireError || new Error("Gateway connection retired"));
+    }
     if (this._connectPromise) return this._connectPromise;
-    this._connectPromise = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+    const connectPromise = this._connectWithAuthorization();
+    this._connectPromise = connectPromise;
+    void connectPromise.catch(() => {
+      if (this._connectPromise === connectPromise) this._connectPromise = null;
+      if (!this.connected) this._clearAuthorizationGuard();
+    });
+    return connectPromise;
+  }
+
+  async _connectWithAuthorization() {
+    try {
+      // Re-check after host resolution and immediately before opening a socket.
+      // A pending pooled connection must not inherit the grant observed by the
+      // request that began DNS/allowlist work several awaits earlier.
+      await this._assertAuthorized();
+    } catch (error) {
+      this.retire(error);
+      throw error;
+    }
+    if (this._retired) throw this._retireError || new Error("Gateway connection retired");
+
+    // Keep checking while the socket is CONNECTING and while the authenticated
+    // challenge handshake is pending, not only after it reaches ready state.
+    this._startAuthorizationGuard();
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let challengeResponsePending = false;
+      let timer = null;
+      let retireListener = null;
+      const cleanupSettlement = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (retireListener) {
+          this.offRetire(retireListener);
+          retireListener = null;
+        }
+      };
+      const settleReject = (error) => {
+        if (settled) return;
+        settled = true;
+        cleanupSettlement();
+        reject(error);
+      };
+      const settleResolve = () => {
+        if (settled) return;
+        settled = true;
+        cleanupSettlement();
+        resolve(this);
+      };
+      retireListener = (error) => settleReject(error);
+      this.onRetire(retireListener);
+      if (settled) return;
+
+      timer = setTimeout(() => {
+        const error = new Error("Gateway connect timeout");
+        settleReject(error);
         this.close();
-        reject(new Error("Gateway connect timeout"));
       }, CONNECT_TIMEOUT);
 
-      this.ws = new WebSocket(`ws://${this.host}:${this.port}`);
+      let socket;
+      try {
+        socket = new WebSocket(`ws://${this.host}:${this.port}`);
+        this.ws = socket;
+      } catch (error) {
+        settleReject(error);
+        this._clearAuthorizationGuard();
+        return;
+      }
 
-      this.ws.on("message", (raw) => {
+      socket.on("message", (raw) => {
         let msg;
         try {
           msg = JSON.parse(raw.toString());
@@ -506,51 +590,78 @@ class GatewayConnection {
 
         // Phase 1: Challenge → send connect frame with password + device identity.
         if (msg.type === "event" && msg.event === "connect.challenge") {
-          const nonce = msg.payload?.nonce || "";
-          const role = "operator";
-          const scopes = [
-            "operator.admin",
-            "operator.read",
-            "operator.write",
-            "operator.approvals",
-            "operator.pairing",
-          ];
-          const { device } = buildConnectDevice(this._identity, role, scopes, nonce);
-          this.ws.send(
-            JSON.stringify({
-              type: "req",
-              id: "__connect__",
-              method: "connect",
-              params: {
-                minProtocol: GATEWAY_MIN_PROTOCOL_VERSION,
-                maxProtocol: GATEWAY_MAX_PROTOCOL_VERSION,
-                client: {
-                  id: "gateway-client",
-                  version: "1.0.0",
-                  platform: "linux",
-                  mode: "backend",
-                },
-                role,
-                scopes,
-                caps: ["thinking-events"],
-                commands: [],
-                auth: this.token ? { password: this.token } : {},
-                device,
-              },
-            }),
-          );
+          if (challengeResponsePending) return;
+          challengeResponsePending = true;
+          void (async () => {
+            try {
+              // The challenge response is the first point where the decrypted
+              // gateway credential leaves this process. Re-check the current
+              // grant at that exact boundary, even if the pre-dial check passed.
+              await this._assertAuthorized();
+              if (
+                settled ||
+                this._retired ||
+                this.ws !== socket ||
+                socket.readyState !== WebSocket.OPEN
+              ) {
+                return;
+              }
+
+              const nonce = msg.payload?.nonce || "";
+              const role = "operator";
+              const scopes = [
+                "operator.admin",
+                "operator.read",
+                "operator.write",
+                "operator.approvals",
+                "operator.pairing",
+              ];
+              const { device } = buildConnectDevice(this._identity, role, scopes, nonce);
+              socket.send(
+                JSON.stringify({
+                  type: "req",
+                  id: "__connect__",
+                  method: "connect",
+                  params: {
+                    minProtocol: GATEWAY_MIN_PROTOCOL_VERSION,
+                    maxProtocol: GATEWAY_MAX_PROTOCOL_VERSION,
+                    client: {
+                      id: "gateway-client",
+                      version: "1.0.0",
+                      platform: "linux",
+                      mode: "backend",
+                    },
+                    role,
+                    scopes,
+                    caps: ["thinking-events"],
+                    commands: [],
+                    auth: this.token ? { password: this.token } : {},
+                    device,
+                  },
+                }),
+              );
+            } catch (error) {
+              settleReject(error);
+              this.retire(error);
+            }
+          })();
           return;
         }
 
         // Phase 2: Connect response
         if (msg.id === "__connect__") {
-          clearTimeout(timer);
+          if (this._retired || this.ws !== socket || socket.readyState !== WebSocket.OPEN) {
+            settleReject(this._retireError || new Error("Gateway connection retired"));
+            return;
+          }
           if (msg.ok) {
             this.connected = true;
-            resolve(this);
+            settleResolve();
             this._restoreSessionMessageSubscriptions();
           } else {
-            reject(new Error(`Gateway handshake failed: ${msg.error?.message || "unknown"}`));
+            const error = new Error(`Gateway handshake failed: ${msg.error?.message || "unknown"}`);
+            settleReject(error);
+            this.close();
           }
           return;
         }
@@ -571,39 +682,37 @@ class GatewayConnection {
         }
       });
 
-      this.ws.on("error", (err) => {
-        clearTimeout(timer);
+      socket.on("error", (err) => {
         this.connected = false;
         this._connectPromise = null;
-        reject(err);
+        this._clearAuthorizationGuard();
+        settleReject(err);
       });
 
-      this.ws.on("close", () => {
+      socket.on("close", () => {
         const wasConnected = this.connected;
         this.connected = false;
         this._connectPromise = null;
+        this._clearAuthorizationGuard();
         for (const entry of this.sessionMessageSubscriptions.values()) {
           entry.subscribed = false;
           entry.subscriptionAttempted = false;
           entry.subscriptionSupported = null;
         }
-        // Reject all pending
-        for (const [id, { reject: rej, timer: t }] of this.pending) {
-          clearTimeout(t);
-          rej(new Error("Gateway connection closed"));
-        }
-        this.pending.clear();
+        const closeError = this._retireError || new Error("Gateway connection closed");
+        this._rejectPending(closeError);
+        settleReject(closeError);
         // Attempt background reconnect if we were previously connected
         if (wasConnected) {
           this._scheduleBackgroundReconnect();
         }
       });
     });
-    return this._connectPromise;
   }
 
   /** Send an RPC call and await the response. */
-  call(method, params = {}, timeout = CALL_TIMEOUT) {
+  async call(method, params = {}, timeout = CALL_TIMEOUT) {
+    await this._assertAuthorized();
     return new Promise((resolve, reject) => {
       if (!this.connected || this.ws?.readyState !== WebSocket.OPEN) {
         return reject(new Error("Not connected"));
@@ -614,8 +723,79 @@ class GatewayConnection {
         reject(new Error(`RPC timeout: ${method}`));
       }, timeout);
       this.pending.set(id, { resolve, reject, timer });
-      this.ws.send(JSON.stringify({ type: "req", id, method, params }));
+      try {
+        this.ws.send(JSON.stringify({ type: "req", id, method, params }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
+  }
+
+  async _assertAuthorized() {
+    if (this._retired) {
+      throw this._retireError || new Error("Gateway connection retired");
+    }
+    if (!this._authorize) return;
+
+    // Authorization storage can be slow or unavailable. Retirement must still
+    // reject a connect/call immediately instead of leaving it pinned to an
+    // unresolved authorization promise after the host grant is revoked.
+    await new Promise((resolve, reject) => {
+      let finished = false;
+      const finish = (handler, value) => {
+        if (finished) return;
+        finished = true;
+        this.offRetire(onRetire);
+        handler(value);
+      };
+      const onRetire = (error) => finish(reject, error);
+      this.onRetire(onRetire);
+      if (finished) return;
+
+      Promise.resolve()
+        .then(() => this._authorize())
+        .then(
+          (value) => finish(resolve, value),
+          (error) => finish(reject, error),
+        );
+    });
+
+    if (this._retired) {
+      throw this._retireError || new Error("Gateway connection retired");
+    }
+  }
+
+  _startAuthorizationGuard() {
+    if (!this._authorize || this._authorizationTimer || this._retired) return;
+    this._authorizationTimer = setInterval(async () => {
+      if (this._authorizationInFlight || this._retired) return;
+      this._authorizationInFlight = true;
+      try {
+        await this._assertAuthorized();
+      } catch (error) {
+        this.retire(error);
+      } finally {
+        this._authorizationInFlight = false;
+      }
+    }, this._authorizationRecheckMs);
+    this._authorizationTimer.unref?.();
+  }
+
+  _clearAuthorizationGuard() {
+    if (this._authorizationTimer) {
+      clearInterval(this._authorizationTimer);
+      this._authorizationTimer = null;
+    }
+  }
+
+  _rejectPending(error) {
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(error);
+    }
+    this.pending.clear();
   }
 
   /** Subscribe to gateway events. */
@@ -626,6 +806,19 @@ class GatewayConnection {
 
   off(event, callback) {
     this.eventListeners.get(event)?.delete(callback);
+  }
+
+  onRetire(callback) {
+    if (typeof callback !== "function") return;
+    if (this._retired) {
+      callback(this._retireError || new Error("Gateway connection retired"));
+      return;
+    }
+    this._retireListeners.add(callback);
+  }
+
+  offRetire(callback) {
+    this._retireListeners.delete(callback);
   }
 
   _sessionMessageSubscriptionTarget(key) {
@@ -816,6 +1009,7 @@ class GatewayConnection {
   /** Attempt reconnection with exponential backoff, respecting circuit breaker. */
   async reconnect() {
     if (this._retired) throw new Error("Gateway connection retired");
+    await this._assertAuthorized();
     if (this._circuitState === "open") {
       if (Date.now() - this._circuitOpenedAt < this._circuitCooldown) {
         throw new Error("Circuit breaker open — gateway temporarily unavailable");
@@ -835,6 +1029,7 @@ class GatewayConnection {
     );
     await new Promise((r) => setTimeout(r, delay));
     if (this._retired) throw new Error("Gateway connection retired");
+    await this._assertAuthorized();
     this._reconnectAttempts++;
 
     // The cached IP may belong to a replaced pod — refresh it from the
@@ -849,7 +1044,14 @@ class GatewayConnection {
           );
           this.host = nextHost;
         }
-      } catch {
+      } catch (error) {
+        if (
+          error?.code === "REMOTE_HOST_ACCESS_REVOKED" ||
+          error?.code === "REMOTE_HOST_AUTH_CHECK_FAILED"
+        ) {
+          this.retire(error);
+          throw error;
+        }
         // DNS not answering right now — retry with the old address.
       }
     }
@@ -891,6 +1093,7 @@ class GatewayConnection {
   close() {
     this.connected = false;
     this._connectPromise = null;
+    this._clearAuthorizationGuard();
     for (const entry of this.sessionMessageSubscriptions.values()) {
       entry.subscribed = false;
       entry.subscriptionAttempted = false;
@@ -907,8 +1110,27 @@ class GatewayConnection {
   }
 
   /** Permanently retire a pooled connection and suppress delayed reconnects. */
-  retire() {
+  retire(error = null) {
+    if (this._retired) return;
     this._retired = true;
+    this._retireError =
+      error instanceof Error
+        ? error
+        : Object.assign(new Error("Gateway connection retired"), {
+            code: "GATEWAY_CONNECTION_RETIRED",
+          });
+    // A WebSocket close handshake is asynchronous. Remove and reject RPCs
+    // before initiating it so a late response cannot resolve work that was
+    // already revoked while the socket remains temporarily readable.
+    this._rejectPending(this._retireError);
+    for (const callback of this._retireListeners) {
+      try {
+        callback(this._retireError);
+      } catch {
+        // A response listener must not prevent socket retirement.
+      }
+    }
+    this._retireListeners.clear();
     this.eventListeners.clear();
     this.sessionMessageSubscriptions.clear();
     this.sessionMessageSubscriptionAliases.clear();
@@ -973,6 +1195,15 @@ async function getConnection(agent) {
   // process-static, but this keeps the hosted-mode contract fail closed even
   // if a process is reconfigured while an old remote connection is alive.
   assertRemoteGatewayAccessSupported(agent);
+  // Re-check before consulting either the pending or warm pool. A workspace
+  // unshare/role downgrade must retire the confused-deputy path immediately;
+  // the fact that this agent once opened an authenticated socket is not a grant.
+  try {
+    await assertCurrentGatewayAccess(agent);
+  } catch (error) {
+    evictConnection(agent, error);
+    throw error;
+  }
   const rawAddr = resolveGatewayAddress(agent);
   if (!rawAddr) throw new Error("Agent gateway not yet provisioned");
   const addr = assertSafeAgentAddress(rawAddr);
@@ -1036,10 +1267,14 @@ async function getConnection(agent) {
       if (pendingState.retired) throw new Error("Gateway connection retired");
 
       conn = new GatewayConnection(connectHost, token, addr.port, {
-        resolveHost: () =>
-          resolveGatewayHostForProxy(addr.host, "agent gateway", extraAllowedHosts),
+        resolveHost: async () => {
+          await assertCurrentGatewayAccess(agent);
+          const currentAllowedHosts = await allowedGatewayHostsForAgent(agent);
+          return resolveGatewayHostForProxy(addr.host, "agent gateway", currentAllowedHosts);
+        },
         sourceHost: addr.host,
         agentId: agent.id,
+        authorize: () => assertCurrentGatewayAccess(agent),
       });
       pendingState.connection = conn;
       if (pendingState.retired) {
@@ -1300,6 +1535,7 @@ function createGatewayRouter(options = {}) {
         let streamTimeout = null;
         let agentTerminalFallbackTimer = null;
         let sessionMessageSubscriptionHeld = false;
+        let connectionRetireError = null;
         const pendingEvents = [];
 
         const completeStream = (reason) => {
@@ -1484,6 +1720,35 @@ function createGatewayRouter(options = {}) {
         streamCompletion = new Promise((resolve) => {
           resolveStreamCompletion = resolve;
         });
+        const handleConnectionRetire = (error) => {
+          connectionRetireError = error || new Error("Gateway connection retired");
+          completeStream("connection-retired");
+          if (!res.writableEnded && !res.destroyed) {
+            const message = connectionRetireError.message || "Gateway connection retired";
+            const code = connectionRetireError.code || "GATEWAY_CONNECTION_RETIRED";
+            res.write(
+              `data: ${JSON.stringify({
+                type: "error",
+                state: "error",
+                code,
+                runId,
+                sessionKey,
+                error: message,
+                errorMessage: message,
+              })}\n\n`,
+            );
+            res.write("data: [DONE]\n\n");
+            res.end();
+          }
+          metrics
+            .recordMetric(req.agent.id, req.user.id, "error", 1, {
+              code: connectionRetireError.code || "GATEWAY_CONNECTION_RETIRED",
+              error: connectionRetireError.message || "Gateway connection retired",
+              runId,
+            })
+            .catch(() => {});
+        };
+        conn.onRetire(handleConnectionRetire);
         const handleClientClose = () => completeStream("client-close");
         res.once("close", handleClientClose);
         if (res.writableEnded || res.destroyed) completeStream("client-close");
@@ -1502,6 +1767,7 @@ function createGatewayRouter(options = {}) {
         // flight. Do not dispatch a new model turn for a client that is gone.
         if (streamSettled) {
           releaseSessionMessageSubscription();
+          conn.offRetire(handleConnectionRetire);
           res.off("close", handleClientClose);
           return;
         }
@@ -1532,6 +1798,7 @@ function createGatewayRouter(options = {}) {
           pendingEvents.length = 0;
           conn.off("chat", chatStreamHandler);
           conn.off("agent", agentStreamHandler);
+          conn.offRetire(handleConnectionRetire);
           releaseSessionMessageSubscription();
           res.off("close", handleClientClose);
           if (!res.writableEnded && !res.destroyed) {
@@ -1563,6 +1830,7 @@ function createGatewayRouter(options = {}) {
 
         conn.off("chat", chatStreamHandler);
         conn.off("agent", agentStreamHandler);
+        conn.offRetire(handleConnectionRetire);
         releaseSessionMessageSubscription();
 
         if (
@@ -2010,8 +2278,23 @@ function attachGatewayWS(server) {
   });
 
   wss.on("connection", async (ws, _req, agentId, user) => {
+    let relayClientClosed = typeof ws.readyState === "number" && ws.readyState !== WebSocket.OPEN;
+    const relayClientIsOpen = () =>
+      !relayClientClosed && (typeof ws.readyState !== "number" || ws.readyState === WebSocket.OPEN);
+    const markRelayClientClosed = () => {
+      relayClientClosed = true;
+    };
+    // Install this before the first database await. Otherwise a client that
+    // disconnects during authorization/DNS can still cause an authenticated
+    // upstream gateway socket to be opened after it is already gone.
+    if (typeof ws.once === "function") {
+      ws.once("close", markRelayClientClosed);
+      ws.once("error", markRelayClientClosed);
+    }
+
     try {
       const agent = await resolveAgent(agentId, user.id);
+      if (!relayClientIsOpen()) return;
       if (!agent) {
         ws.send(JSON.stringify({ type: "error", message: "Agent not found" }));
         ws.close();
@@ -2026,6 +2309,13 @@ function attachGatewayWS(server) {
         return;
       }
 
+      // Authorize before decrypting the runtime password. Historical rows that
+      // only carry backend_type/execution_target_id are still Remote Docker and
+      // must not bypass the current-grant check.
+      await assertCurrentGatewayAccess(agent);
+      if (!relayClientIsOpen()) return;
+      const initialRelayAuthorizationCheckedAt = Date.now();
+
       // Decrypt once; reused for the device identity and the relay connect auth.
       const gatewayToken = decrypt(agent.gateway_token);
       const identity = deriveDeviceIdentity(gatewayToken);
@@ -2035,6 +2325,7 @@ function attachGatewayWS(server) {
       const clientQueue = []; // buffer client messages until handshake is done
       let relayConnectNonce = "";
       let relayConnectSent = false;
+      let relayConnectPromise = null;
       let relayConnectTimer = null;
 
       const addr = assertSafeAgentAddress(resolveGatewayAddress(agent));
@@ -2049,7 +2340,12 @@ function attachGatewayWS(server) {
         "agent gateway",
         relayExtraAllowedHosts,
       );
+      if (!relayClientIsOpen()) return;
       const gwWs = new WebSocket(`ws://${relayHost}:${addr.port}`);
+      const requiresRelayAuthorization = remoteHosts.isRemoteDockerAgent(agent);
+      let relayAuthorizationTimer = null;
+      let relayAuthorizationPromise = null;
+      let relayAuthorizationCheckedAt = initialRelayAuthorizationCheckedAt;
       const role = "operator";
       const scopes = [
         "operator.admin",
@@ -2066,41 +2362,120 @@ function attachGatewayWS(server) {
         }
       }
 
-      function sendRelayConnect() {
+      function clearRelayAuthorizationTimer() {
+        if (relayAuthorizationTimer) {
+          clearInterval(relayAuthorizationTimer);
+          relayAuthorizationTimer = null;
+        }
+      }
+
+      async function ensureRelayAuthorized({ force = false } = {}) {
+        if (!requiresRelayAuthorization) return true;
+        if (!force && Date.now() - relayAuthorizationCheckedAt < REMOTE_HOST_AUTH_RECHECK_MS) {
+          return true;
+        }
+        if (relayAuthorizationPromise) return relayAuthorizationPromise;
+        relayAuthorizationPromise = (async () => {
+          try {
+            await assertCurrentGatewayAccess(agent);
+            relayAuthorizationCheckedAt = Date.now();
+            return true;
+          } catch (error) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: error.message,
+                  code: error.code || "REMOTE_HOST_ACCESS_REVOKED",
+                }),
+              );
+              ws.close();
+            }
+            if (gwWs.readyState === WebSocket.OPEN || gwWs.readyState === WebSocket.CONNECTING) {
+              gwWs.close();
+            }
+            return false;
+          } finally {
+            relayAuthorizationPromise = null;
+          }
+        })();
+        return relayAuthorizationPromise;
+      }
+
+      if (requiresRelayAuthorization) {
+        relayAuthorizationTimer = setInterval(() => {
+          ensureRelayAuthorized({ force: true }).catch(() => {});
+        }, REMOTE_HOST_AUTH_RECHECK_MS);
+        relayAuthorizationTimer.unref?.();
+      }
+
+      async function sendRelayConnect() {
         if (relayConnectSent || gwWs.readyState !== WebSocket.OPEN) return;
-        relayConnectSent = true;
-        clearRelayConnectTimer();
-        const { device } = buildConnectDevice(identity, role, scopes, relayConnectNonce);
-        gwWs.send(
-          JSON.stringify({
-            type: "req",
-            id: "__relay_connect__",
-            method: "connect",
-            params: {
-              minProtocol: GATEWAY_MIN_PROTOCOL_VERSION,
-              maxProtocol: GATEWAY_MAX_PROTOCOL_VERSION,
-              client: {
-                id: "gateway-client",
-                version: "1.0.0",
-                platform: "linux",
-                mode: "backend",
+        if (relayConnectPromise) return relayConnectPromise;
+
+        relayConnectPromise = (async () => {
+          // This frame carries the decrypted runtime credential. A cached
+          // authorization result is insufficient after DNS and socket setup:
+          // re-check the durable host grant at the actual send boundary.
+          if (!(await ensureRelayAuthorized({ force: true }))) return;
+          if (
+            relayConnectSent ||
+            gwWs.readyState !== WebSocket.OPEN ||
+            ws.readyState !== WebSocket.OPEN
+          ) {
+            return;
+          }
+
+          relayConnectSent = true;
+          clearRelayConnectTimer();
+          const { device } = buildConnectDevice(identity, role, scopes, relayConnectNonce);
+          gwWs.send(
+            JSON.stringify({
+              type: "req",
+              id: "__relay_connect__",
+              method: "connect",
+              params: {
+                minProtocol: GATEWAY_MIN_PROTOCOL_VERSION,
+                maxProtocol: GATEWAY_MAX_PROTOCOL_VERSION,
+                client: {
+                  id: "gateway-client",
+                  version: "1.0.0",
+                  platform: "linux",
+                  mode: "backend",
+                },
+                role,
+                scopes,
+                caps: ["thinking-events"],
+                commands: [],
+                auth: gatewayToken ? { password: gatewayToken } : {},
+                device,
               },
-              role,
-              scopes,
-              caps: ["thinking-events"],
-              commands: [],
-              auth: gatewayToken ? { password: gatewayToken } : {},
-              device,
-            },
-          }),
-        );
+            }),
+          );
+        })().finally(() => {
+          relayConnectPromise = null;
+        });
+
+        return relayConnectPromise;
+      }
+
+      async function sendRelayConnectSafely() {
+        try {
+          await sendRelayConnect();
+        } catch (error) {
+          console.error(`[gatewayProxy] WS relay connect failed for ${agentId}:`, error.message);
+          if (ws.readyState === WebSocket.OPEN) ws.close();
+          if (gwWs.readyState === WebSocket.OPEN || gwWs.readyState === WebSocket.CONNECTING) {
+            gwWs.close();
+          }
+        }
       }
 
       function queueRelayConnect() {
         if (relayConnectSent) return;
         clearRelayConnectTimer();
         relayConnectTimer = setTimeout(() => {
-          sendRelayConnect();
+          void sendRelayConnectSafely();
         }, RELAY_CONNECT_DELAY_MS);
       }
 
@@ -2120,7 +2495,8 @@ function attachGatewayWS(server) {
         queueRelayConnect();
       });
 
-      gwWs.on("message", (raw) => {
+      gwWs.on("message", async (raw) => {
+        if (!(await ensureRelayAuthorized())) return;
         const str = raw.toString();
         if (!handshakeComplete) {
           let msg;
@@ -2135,7 +2511,7 @@ function attachGatewayWS(server) {
             if (ws.readyState === WebSocket.OPEN) ws.send(str);
             if (!relayConnectSent && typeof msg.payload?.nonce === "string" && msg.payload.nonce) {
               relayConnectNonce = msg.payload.nonce;
-              sendRelayConnect();
+              await sendRelayConnectSafely();
             }
             return;
           }
@@ -2172,7 +2548,8 @@ function attachGatewayWS(server) {
         if (ws.readyState === WebSocket.OPEN) ws.send(str);
       });
 
-      ws.on("message", (data) => {
+      ws.on("message", async (data) => {
+        if (!(await ensureRelayAuthorized())) return;
         const str = data.toString();
         try {
           const msg = JSON.parse(str);
@@ -2199,6 +2576,7 @@ function attachGatewayWS(server) {
 
       gwWs.on("close", (code, reason) => {
         clearRelayConnectTimer();
+        clearRelayAuthorizationTimer();
         const reasonStr = reason ? reason.toString() : "";
         const phase = handshakeComplete ? "after auth" : "before auth";
         console.error(
@@ -2216,18 +2594,25 @@ function attachGatewayWS(server) {
       });
       gwWs.on("error", (err) => {
         clearRelayConnectTimer();
+        clearRelayAuthorizationTimer();
         console.error(`[gatewayProxy] WS relay error for agent ${agentId}:`, err.message);
         if (ws.readyState === WebSocket.OPEN) ws.close();
       });
-      ws.on("close", () => {
+      const closeGatewayForClient = () => {
+        relayClientClosed = true;
         clearRelayConnectTimer();
+        clearRelayAuthorizationTimer();
         if (gwWs.readyState === WebSocket.OPEN || gwWs.readyState === WebSocket.CONNECTING)
           gwWs.close();
-      });
+      };
+      ws.on("close", closeGatewayForClient);
+      ws.on("error", closeGatewayForClient);
     } catch (err) {
       console.error(`[gatewayProxy] WS error:`, err.message);
-      ws.send(JSON.stringify({ type: "error", message: err.message }));
-      ws.close();
+      if (relayClientIsOpen()) {
+        ws.send(JSON.stringify({ type: "error", message: err.message }));
+        ws.close();
+      }
     }
   });
 
@@ -2236,7 +2621,7 @@ function attachGatewayWS(server) {
 
 /** Evict a cached gateway connection so the next request creates a fresh one.
  *  Called after authSync restarts an agent container. */
-function evictConnection(target) {
+function evictConnection(target, error = null) {
   const address =
     typeof target === "string" ? { host: target } : resolveGatewayAddress(target || {});
   const targetAgentId = typeof target === "object" && target?.id != null ? String(target.id) : null;
@@ -2249,7 +2634,7 @@ function evictConnection(target) {
       conn._sourceHost === address.host &&
       (!address.port || conn.port === Number(address.port));
     if (matchesAgent || matchesAddress) {
-      conn.retire();
+      conn.retire(error);
       pool.delete(key);
       console.log(
         `[gatewayProxy] Evicted connection for ${conn._sourceHost}:${conn.port}` +
@@ -2266,13 +2651,14 @@ function evictConnection(target) {
       (!address.port || pending.port === Number(address.port));
     if (matchesAgent || matchesAddress) {
       pending.retired = true;
-      pending.connection?.retire();
+      pending.connection?.retire(error);
       pendingConnections.delete(key);
     }
   }
 }
 
 module.exports = {
+  GatewayConnection,
   createGatewayRouter,
   attachGatewayWS,
   rpcCall,

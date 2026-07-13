@@ -15,6 +15,10 @@ const smokeScript = fs.readFileSync(
   path.resolve(__dirname, "../../e2e/scripts/run-proxmox-smoke.sh"),
   "utf8",
 );
+const docs = fs.readFileSync(
+  path.resolve(__dirname, "../../docs/configuration/provisioner-backends/proxmox.mdx"),
+  "utf8",
+);
 
 const SECURE_PRODUCTION_ENV = {
   NODE_ENV: "production",
@@ -106,5 +110,13 @@ describe("Proxmox real-hardware release gate", () => {
     expect(smokeScript).toContain("PROXMOX_SMOKE_KEEP_ON_FAILURE");
     expect(smokeScript).toContain('compose_exec_args+=(--env "$env_name")');
     expect(smokeScript).toContain('getBackendStatus("proxmox")');
+  });
+
+  it("requires confirmed exec completion and keeps public maturity claims experimental", () => {
+    expect(smokeScript).toContain("state?.Running !== false || !Number.isInteger(state?.ExitCode)");
+    expect(smokeScript).toContain("Proxmox exec output ended without a confirmed remote command");
+    expect(smokeScript).toContain('catalogStatus.maturityTier === "experimental"');
+    expect(docs).toContain("Proxmox support is experimental");
+    expect(docs).toContain("does not automatically promote Proxmox beyond **Experimental**");
   });
 });

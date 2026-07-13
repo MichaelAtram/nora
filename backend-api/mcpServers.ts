@@ -19,6 +19,11 @@
 
 const db = require("./db");
 const { loadCatalog } = require("./integrations/catalog/catalogLoader");
+const {
+  buildMcpManagedEnv,
+  buildMcpManagedEnvNames,
+  buildMcpServersConfig,
+} = require("../agent-runtime/lib/mcpServersConfig");
 
 // provider id -> how to turn its decrypted credential into MCP server env.
 //   primaryEnv: the env var the MCP server reads the access token from.
@@ -70,6 +75,18 @@ function normalizeEnabledIds(value) {
     }
   }
   return out;
+}
+
+function getManagedMcpEnvNames() {
+  const placeholders = [];
+  for (const [provider, mapping] of Object.entries(SUPPORTED_MCP_PROVIDERS)) {
+    const env = {};
+    if (mapping.primaryEnv) env[mapping.primaryEnv] = "managed";
+    for (const envName of Object.values(mapping.configEnv || {}))
+      if (envName) env[envName] = "managed";
+    placeholders.push({ name: provider, npmPackage: "managed", env });
+  }
+  return buildMcpManagedEnvNames(placeholders);
 }
 
 async function getAgentMcpServerIds(agentId, { dbClient = db } = {}) {
@@ -131,13 +148,55 @@ function resolveMcpEntries({ enabledIds = [], integrationsByProvider = {}, catal
   return entries;
 }
 
+async function getEnabledMcpRuntimeState(
+  agentId,
+  { dbClient = db, integrationsModule = null, catalog } = {},
+) {
+  const enabledIds = (await getAgentMcpServerIds(agentId, { dbClient })) || [];
+  // Always return the complete supported alias universe. Once an MCP server is
+  // disabled its id disappears from enabledIds, but its previous managed alias
+  // still has to be explicitly removed from an existing runtime.
+  const managedEnvNames = getManagedMcpEnvNames();
+  if (enabledIds.length === 0) {
+    return { enabledIds, entries: [], desiredServers: {}, env: {}, managedEnvNames };
+  }
+
+  const active = await dbClient.query(
+    "SELECT id, provider FROM integrations WHERE agent_id = $1 AND status = 'active'",
+    [agentId],
+  );
+  const enabled = new Set(enabledIds);
+  const integrationApi = integrationsModule || require("./integrations");
+  const integrationsByProvider = {};
+  for (const row of active.rows || []) {
+    if (!enabled.has(row.provider) || integrationsByProvider[row.provider]) continue;
+    const decrypted = await integrationApi.getDecryptedIntegration(row.id, agentId);
+    if (!decrypted) continue;
+    integrationsByProvider[row.provider] = {
+      token: decrypted.access_token || "",
+      config: decrypted.config || {},
+    };
+  }
+
+  const entries = resolveMcpEntries({ enabledIds, integrationsByProvider, catalog });
+  return {
+    enabledIds,
+    entries,
+    desiredServers: buildMcpServersConfig(entries),
+    env: buildMcpManagedEnv(entries),
+    managedEnvNames,
+  };
+}
+
 module.exports = {
   SUPPORTED_MCP_PROVIDERS,
   isSupportedProvider,
   loadMcpCatalog,
   normalizeEnabledIds,
+  getManagedMcpEnvNames,
   getAgentMcpServerIds,
   setAgentMcpServerIds,
   getAvailableMcpServers,
   resolveMcpEntries,
+  getEnabledMcpRuntimeState,
 };

@@ -231,7 +231,11 @@ function createProviderMutationClient() {
   return new Client(clientConfig);
 }
 
-async function withProviderMutationLock(userId, operation, { afterCommit } = {}) {
+async function withProviderStateLock(userId, operation) {
+  if (!userId || typeof operation !== "function") {
+    throw new Error("userId and operation are required for the provider state lock");
+  }
+
   // This must not borrow from the main backend pool: afterCommit performs
   // provider/runtime reads through that pool, and holding its last available
   // connection here would deadlock installations configured with DB_POOL_MAX=1.
@@ -239,30 +243,12 @@ async function withProviderMutationLock(userId, operation, { afterCommit } = {})
   const lockKey = providerMutationLockKey(userId);
   let connected = false;
   let lockHeld = false;
-  let transactionOpen = false;
   try {
     await client.connect();
     connected = true;
-    // Use a session lock rather than an xact lock so the post-commit runtime
-    // synchronization remains serialized with deployment finalization. The
-    // database mutation is committed before afterCommit runs, allowing auth
-    // sync to read the durable provider state while the same lock is held.
     await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [lockKey]);
     lockHeld = true;
-    await client.query("BEGIN");
-    transactionOpen = true;
-    const result = await operation(client);
-    await client.query("COMMIT");
-    transactionOpen = false;
-    if (typeof afterCommit === "function") {
-      await afterCommit(result);
-    }
-    return result;
-  } catch (error) {
-    if (transactionOpen) {
-      await client.query("ROLLBACK").catch(() => {});
-    }
-    throw error;
+    return await operation(client);
   } finally {
     if (lockHeld) {
       await client
@@ -283,6 +269,33 @@ async function withProviderMutationLock(userId, operation, { afterCommit } = {})
         );
     }
   }
+}
+
+async function withProviderMutationLock(userId, operation, { afterCommit } = {}) {
+  return withProviderStateLock(userId, async (client) => {
+    let transactionOpen = false;
+    try {
+      // Use a session lock rather than an xact lock so the post-commit runtime
+      // synchronization remains serialized with deployment finalization and
+      // lifecycle resume reconciliation. The database mutation is committed
+      // before afterCommit runs, allowing auth sync to read durable provider
+      // state while the same lock is still held.
+      await client.query("BEGIN");
+      transactionOpen = true;
+      const result = await operation(client);
+      await client.query("COMMIT");
+      transactionOpen = false;
+      if (typeof afterCommit === "function") {
+        await afterCommit(result);
+      }
+      return result;
+    } catch (error) {
+      if (transactionOpen) {
+        await client.query("ROLLBACK").catch(() => {});
+      }
+      throw error;
+    }
+  });
 }
 
 async function ensureUserDefaultProvider(userId, queryable) {
@@ -726,6 +739,7 @@ module.exports = {
   addProvider,
   ensureDemoProvider,
   providerMutationLockKey,
+  withProviderStateLock,
   getDeploymentProvider,
   updateProvider,
   deleteProvider,

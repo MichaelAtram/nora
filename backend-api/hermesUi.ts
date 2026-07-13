@@ -4,6 +4,7 @@ const containerManager = require("./containerManager");
 const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
 const { runContainerCommand } = require("./authSync");
 const { waitForAgentReadiness } = require("./healthChecks");
+const { assertRemoteHostAgentUse } = require("./remoteHosts");
 const { buildHermesRuntimeBootstrapEnv } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
 
 const HERMES_CHANNEL_REDACTED = "[REDACTED]";
@@ -1007,6 +1008,7 @@ async function restartHermesRuntime(agent) {
       checkGateway: false,
     },
     {
+      beforeAttempt: () => assertRemoteHostAgentUse(agent, { includeProfile: false }),
       runtime: {
         attempts: 8,
         intervalMs: 5000,

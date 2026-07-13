@@ -6,6 +6,27 @@ const ok = (description, schema) => ({
   200: { description, ...(schema ? { content: { "application/json": { schema } } } : {}) },
 });
 
+const committedReconciliationFailure = {
+  502: {
+    description:
+      "The provider mutation committed, but runtime credential reconciliation or containment could not be confirmed.",
+    content: {
+      "application/json": {
+        schema: {
+          type: "object",
+          required: ["error", "committed", "sync_results"],
+          properties: {
+            error: { type: "string" },
+            committed: { type: "boolean", const: true },
+            sync_results: { type: "array", items: { type: "object" } },
+          },
+          additionalProperties: true,
+        },
+      },
+    },
+  },
+};
+
 module.exports = {
   "/llm-providers/available": {
     get: {
@@ -26,7 +47,7 @@ module.exports = {
       tags: ["LLM Providers"],
       summary: "Store a provider API key",
       description:
-        "Keys are AES-256-GCM encrypted at rest. The first provider becomes the default. For provider 'demo' the apiKey is omitted — the control plane derives a token for its built-in stub.",
+        "Keys are AES-256-GCM encrypted at rest. The first provider becomes the default. For provider 'demo' the apiKey is omitted — the control plane derives a token for its built-in stub. The request waits for exact running-runtime reconciliation or confirmed stop-and-quarantine containment.",
       requestBody: {
         required: true,
         content: {
@@ -44,7 +65,7 @@ module.exports = {
           },
         },
       },
-      responses: ok("The stored provider record"),
+      responses: { ...ok("The stored provider record"), ...committedReconciliationFailure },
     },
   },
   "/llm-providers/{id}": {
@@ -52,13 +73,13 @@ module.exports = {
       tags: ["LLM Providers"],
       summary: "Update a stored provider (key, model, default flag)",
       parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
-      responses: ok("Updated record"),
+      responses: { ...ok("Updated record"), ...committedReconciliationFailure },
     },
     delete: {
       tags: ["LLM Providers"],
       summary: "Delete a stored provider key",
       parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
-      responses: ok("Deletion result"),
+      responses: { ...ok("Deletion result"), ...committedReconciliationFailure },
     },
   },
   "/llm-providers/sync": {

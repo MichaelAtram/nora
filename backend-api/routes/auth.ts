@@ -32,20 +32,26 @@ function getPublicPlatformMode() {
     : "selfhosted";
 }
 
+function parsePositiveIntegerEnv(name, fallback) {
+  const raw = String(process.env[name] || "").trim();
+  if (!/^[1-9]\d*$/.test(raw)) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : fallback;
+}
+
+function getAuthRateLimitConfig() {
+  return {
+    windowMs: parsePositiveIntegerEnv("AUTH_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000),
+    max: parsePositiveIntegerEnv("AUTH_RATE_LIMIT_MAX", 20),
+  };
+}
+
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
+  ...getAuthRateLimitConfig(),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many attempts, please try again later" },
 });
-
-function parsePositiveIntegerEnv(name, fallback) {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 const signupBurstLimiter = rateLimit({
   windowMs: parsePositiveIntegerEnv("SIGNUP_RATE_LIMIT_BURST_WINDOW_MS", 10 * 60 * 1000),
@@ -682,3 +688,4 @@ router.post("/logout", (req, res) => {
 });
 
 module.exports = router;
+module.exports.__test = Object.freeze({ getAuthRateLimitConfig, parsePositiveIntegerEnv });

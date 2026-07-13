@@ -35,7 +35,7 @@ licensed for editorial use. Questions: open an issue on
 > Azure, GCP, Anthropic, OpenAI, and more), and observe each agent through chat, streaming
 > logs, live metrics, and a browser terminal. Two runtime families are supported — OpenClaw
 > (the broadest operator path) and Hermes — plus an experimental NVIDIA NemoClaw secure-sandbox
-> profile for GPU-backed execution. Proxmox unprivileged LXC placement is experimental for
+> profile for policy-enforced execution with NVIDIA/Nemotron-backed inference. Proxmox unprivileged LXC placement is experimental for
 > OpenClaw and prepared Hermes images, with secure API TLS, pinned SSH, and a required
 > real-hardware smoke gate before production; NemoClaw on Proxmox remains blocked. Nora is open
 > source under Apache-2.0, which means teams can
@@ -48,7 +48,7 @@ licensed for editorial use. Questions: open an issue on
 - **Current release:** [latest GitHub release](https://github.com/solomon2773/nora/releases/latest)
 - **Install:** one-line installer (`curl … | bash` / `iwr … | iex`) or Docker Compose
 - **Stack:** Node 24 LTS; Express control plane; Next.js operator/admin/marketing UIs;
-  PostgreSQL 15; Redis 7 + BullMQ; worker-provisioner with pluggable backend adapters
+  PostgreSQL 15; Redis 7 + BullMQ; worker-provisioner with adapter-based deployment targets
 - **First proof:** built-in deterministic demo provider and demo agent; no external API key or model bill
 - **Integrations:** 69 credential/connectivity entries (developer tools, cloud, comms, analytics, data, LLMs); executable tools depend on runtime skills or MCP adapters
 - **Security:** AES-256-GCM key encryption, bcrypt password hashing, constant-time auth,

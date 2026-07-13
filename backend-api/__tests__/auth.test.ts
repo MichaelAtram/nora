@@ -121,6 +121,7 @@ jest.mock("../metrics", () => ({
 const apiKeys = require("../apiKeys");
 const mockVerifyApiKey = jest.spyOn(apiKeys, "verifyApiKey");
 const app = require("../server");
+const { __test: authRouteTestHelpers } = require("../routes/auth");
 
 function jsonResponse(body, ok = true, status = ok ? 200 : 400) {
   return {
@@ -175,6 +176,53 @@ beforeEach(() => {
 
 afterAll(() => {
   mockVerifyApiKey.mockRestore();
+});
+
+describe("auth rate limit configuration", () => {
+  const originalWindowMs = process.env.AUTH_RATE_LIMIT_WINDOW_MS;
+  const originalMax = process.env.AUTH_RATE_LIMIT_MAX;
+
+  beforeEach(() => {
+    delete process.env.AUTH_RATE_LIMIT_WINDOW_MS;
+    delete process.env.AUTH_RATE_LIMIT_MAX;
+  });
+
+  afterAll(() => {
+    if (originalWindowMs === undefined) delete process.env.AUTH_RATE_LIMIT_WINDOW_MS;
+    else process.env.AUTH_RATE_LIMIT_WINDOW_MS = originalWindowMs;
+    if (originalMax === undefined) delete process.env.AUTH_RATE_LIMIT_MAX;
+    else process.env.AUTH_RATE_LIMIT_MAX = originalMax;
+  });
+
+  it("uses secure defaults when overrides are unset", () => {
+    expect(authRouteTestHelpers.getAuthRateLimitConfig()).toEqual({
+      windowMs: 15 * 60 * 1000,
+      max: 20,
+    });
+  });
+
+  it("accepts positive integer overrides", () => {
+    process.env.AUTH_RATE_LIMIT_WINDOW_MS = " 60000 ";
+    process.env.AUTH_RATE_LIMIT_MAX = "250";
+
+    expect(authRouteTestHelpers.getAuthRateLimitConfig()).toEqual({
+      windowMs: 60000,
+      max: 250,
+    });
+  });
+
+  it.each(["0", "-1", "1.5", "20requests", "9007199254740992"])(
+    "falls back when an override is not a positive safe integer: %s",
+    (invalidValue) => {
+      process.env.AUTH_RATE_LIMIT_WINDOW_MS = invalidValue;
+      process.env.AUTH_RATE_LIMIT_MAX = invalidValue;
+
+      expect(authRouteTestHelpers.getAuthRateLimitConfig()).toEqual({
+        windowMs: 15 * 60 * 1000,
+        max: 20,
+      });
+    },
+  );
 });
 
 describe("POST /auth/signup", () => {

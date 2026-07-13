@@ -3,6 +3,7 @@ const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
 const integrations = require("../integrations");
+const llmProviders = require("../llmProviders");
 const mcpServers = require("../mcpServers");
 const { runtimeAuthHeaders } = require("../runtimeAuth");
 const { encrypt, decrypt } = require("../crypto");
@@ -31,6 +32,89 @@ const TWITTER_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_EMAIL_CRON_PROMPT =
   "Look for any new emails or calendar invites I should be aware of and summarize anything important for me.";
 const SINGLETON_INTEGRATION_PROVIDERS = new Set(["wecom"]);
+
+function integrationMutationCommittedError(message, cause = null, syncResults = []) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.statusCode = 502;
+  error.code = "INTEGRATION_RUNTIME_REVOCATION_UNCONFIRMED";
+  error.committed = true;
+  error.syncResults = Array.isArray(syncResults) ? syncResults : [];
+  return error;
+}
+
+function sendIntegrationRouteError(res, error) {
+  res.status(error.statusCode || 500).json({
+    error: error.message,
+    ...(error.committed ? { committed: true } : {}),
+    ...(Array.isArray(error.syncResults) ? { sync_results: error.syncResults } : {}),
+  });
+}
+
+async function withIntegrationProviderStateLock(agent, _provider, operation) {
+  if (!agent?.user_id || typeof llmProviders.withProviderStateLock !== "function") {
+    throw new Error("Integration provider-state locking is unavailable");
+  }
+  return llmProviders.withProviderStateLock(agent.user_id, () =>
+    operation({ providerLockHeld: true }),
+  );
+}
+
+async function reconcileIntegrationAuth(
+  agent,
+  { providerLockHeld = false, extraManagedEnvNames = [], committedAction = "saved" } = {},
+) {
+  let results;
+  try {
+    results = await syncAuthToUserAgents(agent.user_id, agent.id, {
+      providerLockHeld,
+      ...(extraManagedEnvNames.length > 0 ? { extraManagedEnvNames } : {}),
+    });
+  } catch (error) {
+    throw integrationMutationCommittedError(
+      `Integration ${committedAction}, but runtime credential reconciliation could not be confirmed`,
+      error,
+    );
+  }
+
+  const failed = (Array.isArray(results) ? results : []).filter(
+    (result) => result?.status === "failed",
+  );
+  const unsafe = failed.filter(
+    (result) => result.runtimeStopped !== true || result.quarantinePersisted !== true,
+  );
+  if (unsafe.length > 0) {
+    throw integrationMutationCommittedError(
+      `Integration ${committedAction}, but ${unsafe.length} runtime${unsafe.length === 1 ? "" : "s"} could not be stopped and quarantined after credential reconciliation failed`,
+      null,
+      results,
+    );
+  }
+
+  return {
+    sync_results: results,
+    ...(failed.length > 0
+      ? {
+          sync_warning: `${failed.length} runtime${failed.length === 1 ? " was" : "s were"} stopped and quarantined after credential reconciliation failed`,
+        }
+      : {}),
+  };
+}
+
+async function captureIntegrationCredentialEnvState(agentId) {
+  const [integrationEnv, mcpRuntimeState] = await Promise.all([
+    integrations.getIntegrationEnvVars(agentId),
+    typeof mcpServers.getEnabledMcpRuntimeState === "function"
+      ? mcpServers.getEnabledMcpRuntimeState(agentId)
+      : Promise.resolve({ managedEnvNames: [] }),
+  ]);
+  const gatewayEnvNames = Object.keys(integrationEnv || {});
+  return {
+    gatewayEnvNames,
+    managedEnvNames: [
+      ...new Set([...gatewayEnvNames, ...(mcpRuntimeState?.managedEnvNames || [])]),
+    ],
+  };
+}
 
 // Editor floor — integration configs include sensitive credentials, so viewers
 // don't see them. Per-route GET could be relaxed to viewer in a follow-up if
@@ -260,25 +344,15 @@ async function getAgentIntegrationRuntimeTarget(agentId) {
   return agentResult.rows[0] || null;
 }
 
-async function syncIntegrationsToAgent(agentId, { strict = false, strictHermes = false } = {}) {
+async function syncIntegrationsToAgent(
+  agentId,
+  { strict = false, strictHermes = false, previousEnvNames = [] } = {},
+) {
   const agent = await getAgentIntegrationRuntimeTarget(agentId);
   if (!agent) return null;
 
   if (resolveAgentRuntimeFamily(agent) === "hermes") {
     const syncData = await integrations.getIntegrationsForSync(agentId).catch(() => []);
-    const syncResults = await syncAuthToUserAgents(agent.user_id, agent.id);
-    const failedResult = Array.isArray(syncResults)
-      ? syncResults.find((entry) => entry?.agentId === agent.id && entry?.status === "failed")
-      : null;
-
-    if (strictHermes && failedResult) {
-      const error = new Error(
-        failedResult.error || "Failed to sync Hermes integrations to runtime",
-      );
-      error.statusCode = 502;
-      throw error;
-    }
-
     let manifestStatus = "skipped";
     let manifestError = null;
     if (agent.container_id && ["running", "warning"].includes(agent.status)) {
@@ -302,15 +376,19 @@ async function syncIntegrationsToAgent(agentId, { strict = false, strictHermes =
 
     return {
       runtimeFamily: "hermes",
-      syncResults,
       manifestStatus,
       ...(manifestError ? { manifestError } : {}),
     };
   }
 
+  const activeRuntime = ["running", "warning"].includes(agent.status);
+  if (!activeRuntime) {
+    return { runtimeFamily: resolveAgentRuntimeFamily(agent), manifestStatus: "skipped" };
+  }
+
   const runtimeUrl = runtimeUrlForAgent(agent, "/integrations/sync");
   if (!runtimeUrl) {
-    if (strict && ["running", "warning"].includes(agent.status)) {
+    if (strict) {
       const error = new Error("Agent runtime not yet provisioned");
       error.statusCode = 409;
       throw error;
@@ -354,13 +432,22 @@ async function syncIntegrationsToAgent(agentId, { strict = false, strictHermes =
   // this block deliberately omits the error message and env contents — the
   // payload may include credentials, and an echoing runtime error would leak
   // them into clear-text logs. Status code (success/failure) is enough.
-  if (agent.status === "running") {
+  if (activeRuntime) {
     let envCount = 0;
+    let patchCount = 0;
     let pushOk = false;
     try {
       const envVars = await integrations.getIntegrationEnvVars(agentId);
       envCount = Object.keys(envVars).length;
-      if (envCount > 0) {
+      const envPatch = Object.fromEntries(
+        (Array.isArray(previousEnvNames) ? previousEnvNames : [])
+          .map((name) => String(name || "").trim())
+          .filter(Boolean)
+          .map((name) => [name, null]),
+      );
+      Object.assign(envPatch, envVars);
+      patchCount = Object.keys(envPatch).length;
+      if (patchCount > 0) {
         const configSnapshot = await rpcCall(agent, "config.get");
         const baseHash =
           typeof configSnapshot?.hash === "string" && configSnapshot.hash.trim()
@@ -368,7 +455,7 @@ async function syncIntegrationsToAgent(agentId, { strict = false, strictHermes =
             : null;
         if (!baseHash) throw new Error("runtime config hash unavailable");
         await rpcCall(agent, "config.patch", {
-          raw: JSON.stringify({ env: envVars }),
+          raw: JSON.stringify({ env: envPatch }),
           baseHash,
         });
         pushOk = true;
@@ -378,9 +465,9 @@ async function syncIntegrationsToAgent(agentId, { strict = false, strictHermes =
     } catch {
       pushOk = false;
     }
-    if (pushOk && envCount > 0) {
+    if (pushOk && patchCount > 0) {
       console.log(
-        `[sync-integrations] Pushed ${envCount} integration env var(s) to agent ${agentId} gateway`,
+        `[sync-integrations] Reconciled ${envCount} current integration env var(s) across ${patchCount} managed key(s) for agent ${agentId} gateway`,
       );
     } else if (!pushOk) {
       console.warn(`[sync-integrations] Gateway env push failed for agent ${agentId}`);
@@ -392,6 +479,50 @@ async function syncIntegrationsToAgent(agentId, { strict = false, strictHermes =
     manifestStatus,
     ...(manifestError ? { manifestError } : {}),
   };
+}
+
+async function replaceOAuthIntegrationAndReconcile(agent, provider, accessToken, config) {
+  if (!agent) {
+    const error = new Error("Agent not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  const runtimeFamily = resolveAgentRuntimeFamily(agent);
+  let result;
+  await withIntegrationProviderStateLock(agent, provider, async ({ providerLockHeld }) => {
+    let mutationCommitted = false;
+    try {
+      const previousEnvState = await captureIntegrationCredentialEnvState(agent.id);
+      result = await integrations.replaceIntegration(agent.id, provider, accessToken, config);
+      mutationCommitted = true;
+      if (runtimeFamily === "hermes") {
+        await syncIntegrationsToAgent(agent.id, {
+          strictHermes: true,
+          previousEnvNames: previousEnvState.gatewayEnvNames,
+        });
+      } else {
+        await syncIntegrationsToAgent(agent.id, {
+          strict: true,
+          previousEnvNames: previousEnvState.gatewayEnvNames,
+        });
+      }
+      await reconcileIntegrationAuth(agent, {
+        providerLockHeld,
+        extraManagedEnvNames: previousEnvState.managedEnvNames,
+        committedAction: "saved",
+      });
+    } catch (error) {
+      if (mutationCommitted && !error?.committed) {
+        throw integrationMutationCommittedError(
+          "Integration saved, but runtime reconciliation could not be confirmed",
+          error,
+          error?.syncResults,
+        );
+      }
+      throw error;
+    }
+  });
+  return result;
 }
 
 async function invokeAgentIntegrationTool(agentId, payload = {}) {
@@ -680,8 +811,8 @@ router.get("/integrations/linkedin/oauth/callback", async (req, res) => {
       default_username: defaultUsername,
     };
 
-    await integrations.replaceIntegration(oauthState.agent_id, "linkedin", accessToken, config);
-    await syncIntegrationsToAgent(oauthState.agent_id, { strict: true });
+    const agent = await getAgentIntegrationRuntimeTarget(oauthState.agent_id);
+    await replaceOAuthIntegrationAndReconcile(agent, "linkedin", accessToken, config);
 
     return res.redirect(
       appendQuery(redirectPath, {
@@ -698,6 +829,7 @@ router.get("/integrations/linkedin/oauth/callback", async (req, res) => {
         integration: "linkedin",
         status: "error",
         error: e.message || "LinkedIn OAuth failed",
+        ...(e.committed ? { committed: "true" } : {}),
       }),
     );
   }
@@ -856,26 +988,54 @@ router.post("/agents/:id/integrations", async (req, res) => {
     const { provider, token, config } = req.body;
     if (!provider) return res.status(400).json({ error: "Provider required" });
     const agent = await getAgentIntegrationRuntimeTarget(req.params.id);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
     const runtimeFamily = resolveAgentRuntimeFamily(agent || {});
-    let result = SINGLETON_INTEGRATION_PROVIDERS.has(String(provider))
-      ? await integrations.replaceIntegration(req.params.id, provider, token, config)
-      : await integrations.connectIntegration(req.params.id, provider, token, config);
+    let result;
+    let authSync = null;
+    await withIntegrationProviderStateLock(agent, provider, async ({ providerLockHeld }) => {
+      let mutationCommitted = false;
+      try {
+        const previousEnvState = await captureIntegrationCredentialEnvState(req.params.id);
+        result = SINGLETON_INTEGRATION_PROVIDERS.has(String(provider))
+          ? await integrations.replaceIntegration(req.params.id, provider, token, config)
+          : await integrations.connectIntegration(req.params.id, provider, token, config);
+        mutationCommitted = true;
 
-    if (provider === "wecom" && runtimeFamily === "openclaw" && result?.id) {
-      const latestAgent = await getAgentIntegrationRuntimeTarget(req.params.id);
-      result = await activateWecomIntegration(latestAgent || agent, req.params.id, result.id);
-    }
+        if (provider === "wecom" && runtimeFamily === "openclaw" && result?.id) {
+          const latestAgent = await getAgentIntegrationRuntimeTarget(req.params.id);
+          result = await activateWecomIntegration(latestAgent || agent, req.params.id, result.id);
+        }
 
-    if (runtimeFamily === "hermes") {
-      await syncIntegrationsToAgent(req.params.id, { strictHermes: true });
-    } else {
-      await syncIntegrationsToAgent(req.params.id, { strict: true });
-      // Only LLM-backed integrations affect OpenClaw auth-profiles.json.
-      // Non-LLM integrations are already pushed through integration sync and
-      // gateway env RPC; restarting here can race a following sync request.
-      if (integrations.integrationProviderAffectsLlmAuth(provider)) {
-        syncAuthToUserAgents(req.user.id, req.params.id).catch(() => {});
+        if (runtimeFamily === "hermes") {
+          await syncIntegrationsToAgent(req.params.id, {
+            strictHermes: true,
+            previousEnvNames: previousEnvState.gatewayEnvNames,
+          });
+        } else {
+          await syncIntegrationsToAgent(req.params.id, {
+            strict: true,
+            previousEnvNames: previousEnvState.gatewayEnvNames,
+          });
+        }
+        authSync = await reconcileIntegrationAuth(agent, {
+          providerLockHeld,
+          extraManagedEnvNames: previousEnvState.managedEnvNames,
+          committedAction: "saved",
+        });
+      } catch (error) {
+        if (mutationCommitted && !error?.committed) {
+          throw integrationMutationCommittedError(
+            "Integration saved, but runtime reconciliation could not be confirmed",
+            error,
+            error?.syncResults,
+          );
+        }
+        throw error;
       }
+    });
+
+    if (authSync && result && typeof result === "object") {
+      result = { ...result, ...authSync };
     }
 
     if (provider === "email" && result?.id) {
@@ -905,13 +1065,14 @@ router.post("/agents/:id/integrations", async (req, res) => {
 
     res.json(result);
   } catch (e) {
-    res.status(e.statusCode || 500).json({ error: e.message });
+    sendIntegrationRouteError(res, e);
   }
 });
 
 router.delete("/agents/:id/integrations/:iid", async (req, res) => {
   try {
     const agent = await getAgentIntegrationRuntimeTarget(req.params.id);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
     const runtimeFamily = resolveAgentRuntimeFamily(agent || {});
     const existing = await integrations.listIntegrations(req.params.id);
     const current = Array.isArray(existing)
@@ -929,16 +1090,46 @@ router.delete("/agents/:id/integrations/:iid", async (req, res) => {
       await deactivateWecomForOpenClawAgent(agent, { rpcCall, runContainerCommand });
     }
 
-    const removed = await integrations.removeIntegration(req.params.iid, req.params.id);
+    let removed;
+    let authSync = null;
+    await withIntegrationProviderStateLock(
+      agent,
+      current?.provider,
+      async ({ providerLockHeld }) => {
+        let mutationCommitted = false;
+        try {
+          const previousEnvState = await captureIntegrationCredentialEnvState(req.params.id);
+          removed = await integrations.removeIntegration(req.params.iid, req.params.id);
+          mutationCommitted = true;
 
-    if (runtimeFamily === "hermes") {
-      await syncIntegrationsToAgent(req.params.id, { strictHermes: true });
-    } else {
-      await syncIntegrationsToAgent(req.params.id, { strict: true });
-      if (integrations.integrationProviderAffectsLlmAuth(removed?.provider)) {
-        syncAuthToUserAgents(req.user.id, req.params.id).catch(() => {});
-      }
-    }
+          if (runtimeFamily === "hermes") {
+            await syncIntegrationsToAgent(req.params.id, {
+              strictHermes: true,
+              previousEnvNames: previousEnvState.gatewayEnvNames,
+            });
+          } else {
+            await syncIntegrationsToAgent(req.params.id, {
+              strict: true,
+              previousEnvNames: previousEnvState.gatewayEnvNames,
+            });
+          }
+          authSync = await reconcileIntegrationAuth(agent, {
+            providerLockHeld,
+            extraManagedEnvNames: previousEnvState.managedEnvNames,
+            committedAction: "deleted",
+          });
+        } catch (error) {
+          if (mutationCommitted && !error?.committed) {
+            throw integrationMutationCommittedError(
+              "Integration deleted, but runtime credential revocation could not be confirmed",
+              error,
+              error?.syncResults,
+            );
+          }
+          throw error;
+        }
+      },
+    );
 
     const fallbackCronJobId = removed?.cron_job_id || linkedCronJobId;
     const fallbackRuntimeCronJobIds =
@@ -947,15 +1138,16 @@ router.delete("/agents/:id/integrations/:iid", async (req, res) => {
       await removeEmailCronJobs(agent, [fallbackCronJobId, ...fallbackRuntimeCronJobIds]);
     }
 
-    res.json({ success: true });
+    res.json({ success: true, ...(authSync || {}) });
   } catch (e) {
-    res.status(e.statusCode || 500).json({ error: e.message });
+    sendIntegrationRouteError(res, e);
   }
 });
 
 router.put("/agents/:id/integrations/:iid", async (req, res) => {
   try {
     const agent = await getAgentIntegrationRuntimeTarget(req.params.id);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
     const runtimeFamily = resolveAgentRuntimeFamily(agent || {});
     const existing = await integrations.listIntegrations(req.params.id);
     const current = Array.isArray(existing)
@@ -963,25 +1155,59 @@ router.put("/agents/:id/integrations/:iid", async (req, res) => {
       : null;
     if (!current) return res.status(404).json({ error: "Integration not found" });
 
-    let result = await integrations.updateIntegration(
-      req.params.iid,
-      req.params.id,
-      req.body?.token,
-      req.body?.config || {},
+    let result;
+    let authSync = null;
+    await withIntegrationProviderStateLock(
+      agent,
+      current?.provider,
+      async ({ providerLockHeld }) => {
+        let mutationCommitted = false;
+        try {
+          const previousEnvState = await captureIntegrationCredentialEnvState(req.params.id);
+          result = await integrations.updateIntegration(
+            req.params.iid,
+            req.params.id,
+            req.body?.token,
+            req.body?.config || {},
+          );
+          mutationCommitted = true;
+
+          if (result?.provider === "wecom" && runtimeFamily === "openclaw") {
+            const latestAgent = await getAgentIntegrationRuntimeTarget(req.params.id);
+            result = await activateWecomIntegration(latestAgent || agent, req.params.id, result.id);
+          }
+
+          if (runtimeFamily === "hermes") {
+            await syncIntegrationsToAgent(req.params.id, {
+              strictHermes: true,
+              previousEnvNames: previousEnvState.gatewayEnvNames,
+            });
+          } else {
+            await syncIntegrationsToAgent(req.params.id, {
+              strict: true,
+              previousEnvNames: previousEnvState.gatewayEnvNames,
+            });
+          }
+          authSync = await reconcileIntegrationAuth(agent, {
+            providerLockHeld,
+            extraManagedEnvNames: previousEnvState.managedEnvNames,
+            committedAction: "updated",
+          });
+        } catch (error) {
+          if (mutationCommitted && !error?.committed) {
+            throw integrationMutationCommittedError(
+              "Integration updated, but runtime credential reconciliation could not be confirmed",
+              error,
+              error?.syncResults,
+            );
+          }
+          throw error;
+        }
+      },
     );
 
-    if (result?.provider === "wecom" && runtimeFamily === "openclaw") {
-      const latestAgent = await getAgentIntegrationRuntimeTarget(req.params.id);
-      result = await activateWecomIntegration(latestAgent || agent, req.params.id, result.id);
-    }
-
-    if (runtimeFamily === "hermes") {
-      await syncIntegrationsToAgent(req.params.id, { strictHermes: true });
-    } else {
-      await syncIntegrationsToAgent(req.params.id, { strict: true });
-      if (integrations.integrationProviderAffectsLlmAuth(result?.provider)) {
-        syncAuthToUserAgents(req.user.id, req.params.id).catch(() => {});
-      }
+    if (authSync && result && typeof result === "object") {
+      result = { ...result, ...authSync };
     }
 
     if (result?.provider === "email") {
@@ -1012,7 +1238,7 @@ router.put("/agents/:id/integrations/:iid", async (req, res) => {
 
     res.json(result);
   } catch (e) {
-    res.status(e.statusCode || 500).json({ error: e.message });
+    sendIntegrationRouteError(res, e);
   }
 });
 
@@ -1112,8 +1338,8 @@ router.get("/integrations/twitter/oauth/callback", async (req, res) => {
       default_username: defaultUsername,
     };
 
-    await integrations.replaceIntegration(oauthState.agent_id, "twitter", accessToken, config);
-    await syncIntegrationsToAgent(oauthState.agent_id, { strict: true });
+    const agent = await getAgentIntegrationRuntimeTarget(oauthState.agent_id);
+    await replaceOAuthIntegrationAndReconcile(agent, "twitter", accessToken, config);
 
     return res.redirect(
       appendQuery(redirectPath, {
@@ -1130,6 +1356,7 @@ router.get("/integrations/twitter/oauth/callback", async (req, res) => {
         integration: "twitter",
         status: "error",
         error: e.message || "Twitter/X OAuth failed",
+        ...(e.committed ? { committed: "true" } : {}),
       }),
     );
   }
@@ -1209,7 +1436,12 @@ router.post("/agents/:id/integrations/tools/invoke", async (req, res) => {
     // effort: a transient sync failure shouldn't block tool invocations
     // whose providers don't require a refresh.
     try {
-      await syncIntegrationsToAgent(req.params.id, { strict: false });
+      const agent = await getAgentIntegrationRuntimeTarget(req.params.id);
+      if (agent) {
+        await withIntegrationProviderStateLock(agent, null, () =>
+          syncIntegrationsToAgent(req.params.id, { strict: false }),
+        );
+      }
     } catch (syncError) {
       console.warn(
         `[integrations/tools/invoke] pre-invoke sync failed for agent ${req.params.id}: ${syncError?.message ?? syncError}`,

@@ -40,7 +40,7 @@ Those platforms own tracing, evaluations, datasets, and guardrails at the LLM-ca
 
 _Microsandbox and similar isolation tooling_
 
-Dedicated sandbox projects focus on the isolation primitive itself. Nora packages isolation as part of operations: each agent runs in its own container with configurable CPU/RAM/disk on Docker or Kubernetes, with an experimental NemoClaw sandbox profile layered on top. Proxmox unprivileged LXC placement is experimental for OpenClaw and prepared Hermes images, uses secure API TLS plus pinned SSH, and still requires real-hardware smoke before production. NemoClaw on Proxmox remains blocked. See the [security architecture](/concepts/security) page for the full isolation and trust story.
+Dedicated sandbox projects focus on the isolation primitive itself. Nora packages isolation as part of operations: each agent runs in its own container, with CPU/RAM limits on Docker and Remote Docker and workload plus provisioned-storage requests on Kubernetes. Docker `disk_gb` remains metadata rather than a quota. An experimental NemoClaw sandbox profile layers additional restrictions on supported targets. Proxmox unprivileged LXC placement is experimental for OpenClaw and prepared Hermes images, uses secure API TLS plus pinned SSH, and still requires real-hardware smoke before production. NemoClaw on Proxmox remains blocked. See the [security architecture](/concepts/security) page for the full isolation and trust story.
 
 ## Nora vs. integration and tool catalogs
 

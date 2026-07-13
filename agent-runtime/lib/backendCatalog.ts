@@ -125,9 +125,9 @@ const EXECUTION_TARGET_METADATA = Object.freeze({
     label: "Remote Docker host",
     shortLabel: "Remote host",
     summary:
-      "Run agents on your own remote machine — Mac, Windows, VPS, or cloud instance — reached over SSH instead of the local Docker host.",
+      "Run agents on an operator-owned Linux Docker server, VPS, or cloud VM reached over SSH instead of the local Docker host.",
     detail:
-      "Nora connects to the remote machine's Docker daemon over SSH and runs the selected runtime there. Register a host in the operator console to make it selectable.",
+      "Nora connects to the remote machine's Docker daemon over SSH and runs the selected runtime there. Other Docker host types require operator validation because Nora does not publish a certified cross-OS host matrix.",
     badges: ["Bring your own compute", "SSH", "Remote daemon"],
   }),
   proxmox: Object.freeze({

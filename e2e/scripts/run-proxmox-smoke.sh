@@ -45,6 +45,7 @@ PROXMOX_EXEC_ENV_VARS=(
   PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY
   PROXMOX_PCT_COMMAND
   PROXMOX_SUDO
+  PROXMOX_OFFLINE_STAGE_COMMAND
   PROXMOX_NODE_MAJOR
   PROXMOX_OPENCLAW_PACKAGE
   PROXMOX_HERMES_BIN
@@ -65,8 +66,9 @@ for env_name in "${PROXMOX_EXEC_ENV_VARS[@]}"; do
 done
 
 docker compose exec "${compose_exec_args[@]}" worker-provisioner sh -lc '
-  smoke_file="$(mktemp /tmp/nora-proxmox-smoke.XXXXXX.ts)"
-  trap '\''rm -f "$smoke_file"'\'' EXIT
+  smoke_dir="$(mktemp -d /tmp/nora-proxmox-smoke.XXXXXX)"
+  smoke_file="$smoke_dir/smoke.ts"
+  trap '\''rm -rf "$smoke_dir"'\'' EXIT
   cat > "$smoke_file"
   ./node_modules/.bin/tsx "$smoke_file"
 ' <<'NORA_PROXMOX_SMOKE'
@@ -124,7 +126,10 @@ async function collectExec(result, timeoutMs = 30000) {
   });
   const state = await result.exec.inspect();
   const output = Buffer.concat(chunks).toString("utf8");
-  if (state?.ExitCode !== 0) {
+  if (state?.Running !== false || !Number.isInteger(state?.ExitCode)) {
+    throw new Error("Proxmox exec output ended without a confirmed remote command exit status");
+  }
+  if (state.ExitCode !== 0) {
     throw new Error(output.trim() || `Proxmox exec exited with ${state?.ExitCode}`);
   }
   return output;
@@ -234,9 +239,35 @@ async function runCell(runtimeFamily) {
       !(await backend.status(result.containerId, ownershipOptions)).running,
       "stop did not halt the LXC",
     );
+    const offlineMarker = `${marker}-offline`;
+    await backend.updateEnv(
+      result.containerId,
+      { NORA_PROXMOX_SMOKE_MARKER: offlineMarker },
+      {
+        runtimeFamily,
+        agentId,
+        managedEnvNames: ["NORA_PROXMOX_SMOKE_MARKER"],
+        replaceManagedState: true,
+      },
+    );
     const started = await backend.start(result.containerId, ownershipOptions);
     result = { ...result, ...(started || {}) };
     await waitUntilReady(runtimeFamily, result);
+    const offlineEnvOutput = await collectExec(
+      await backend.exec(result.containerId, {
+        cmd: [
+          "/bin/sh",
+          "-lc",
+          `pid="$(systemctl show -p MainPID --value ${serviceName})"; tr '\0' '\n' < "/proc/$pid/environ" | grep -Fx ${JSON.stringify(`NORA_PROXMOX_SMOKE_MARKER=${offlineMarker}`)}`,
+        ],
+        tty: false,
+        agentId,
+      }),
+    );
+    assert(
+      offlineEnvOutput.trim() === `NORA_PROXMOX_SMOKE_MARKER=${offlineMarker}`,
+      "stopped-LXC env replacement did not apply before start",
+    );
 
     await backend.destroy(result.containerId, ownershipOptions);
     destroyed = true;

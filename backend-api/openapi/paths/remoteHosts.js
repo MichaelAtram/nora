@@ -76,6 +76,25 @@ module.exports = {
       responses: jsonResponse("Host with refreshed connection-test status", remoteHostSchema),
     },
   },
+  "/remote-hosts/{id}/reset-host-key": {
+    post: {
+      ...session("Reset an owned remote host SSH key pin", [hostParam]),
+      description:
+        "Explicit recovery for a verified host rebuild or SSH key rotation. Clears the pin and previous Test result only; active use remains blocked until Test succeeds and pins the replacement key.",
+      requestBody: jsonBody({
+        type: "object",
+        required: ["confirmation"],
+        properties: {
+          confirmation: {
+            type: "string",
+            description: "Exact remote-host label or id.",
+          },
+        },
+        additionalProperties: false,
+      }),
+      responses: jsonResponse("Host with cleared pin and Test state", remoteHostSchema),
+    },
+  },
   "/remote-hosts/{id}/shares": {
     get: {
       ...session("List workspaces an owned remote host is shared with", [hostParam]),

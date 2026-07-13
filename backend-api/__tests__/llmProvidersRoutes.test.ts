@@ -59,7 +59,13 @@ beforeEach(() => {
 describe("PUT/DELETE /llm-providers/:id", () => {
   it("awaits update sync and reports per-agent failures", async () => {
     mockSyncAuthToUserAgents.mockResolvedValue([
-      { agentId: "agent-1", status: "failed", error: "runtime unavailable" },
+      {
+        agentId: "agent-1",
+        status: "failed",
+        error: "runtime unavailable",
+        runtimeStopped: true,
+        quarantinePersisted: true,
+      },
     ]);
 
     const response = await request(app)
@@ -73,27 +79,53 @@ describe("PUT/DELETE /llm-providers/:id", () => {
       { model: "gpt-5.5-pro" },
       { afterCommit: expect.any(Function) },
     );
-    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1");
+    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1", null, {
+      providerLockHeld: true,
+    });
     expect(response.body.sync_warning).toMatch(/1 running agent/i);
     expect(response.body.sync_results[0]).toEqual(
       expect.objectContaining({ agentId: "agent-1", status: "failed" }),
     );
   });
 
-  it("awaits delete sync and returns a warning when synchronization rejects", async () => {
+  it("reports a committed failure when delete synchronization rejects", async () => {
     mockSyncAuthToUserAgents.mockRejectedValue(new Error("runtime sync crashed"));
 
     const response = await request(app).delete("/llm-providers/provider-openai");
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(502);
     expect(mockDeleteProvider).toHaveBeenCalledWith("provider-openai", "user-1", {
       afterCommit: expect.any(Function),
     });
     expect(response.body).toEqual(
       expect.objectContaining({
-        success: true,
+        committed: true,
         sync_results: [],
-        sync_warning: expect.stringMatching(/provider deleted/i),
+        error: expect.stringMatching(/provider deleted/i),
+      }),
+    );
+  });
+
+  it("returns a committed 502 when stale runtime credentials could not be contained", async () => {
+    mockSyncAuthToUserAgents.mockResolvedValue([
+      {
+        agentId: "agent-1",
+        status: "failed",
+        error: "environment update failed",
+        runtimeStopped: false,
+        quarantinePersisted: true,
+        stopError: "remote stop failed",
+      },
+    ]);
+
+    const response = await request(app).delete("/llm-providers/provider-openai");
+
+    expect(response.status).toBe(502);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        committed: true,
+        error: expect.stringMatching(/could not be stopped and quarantined/i),
+        sync_results: [expect.objectContaining({ agentId: "agent-1", status: "failed" })],
       }),
     );
   });
@@ -103,7 +135,13 @@ describe("POST /llm-providers", () => {
   it("awaits runtime sync after saving a real provider and returns per-agent warnings", async () => {
     mockSyncAuthToUserAgents.mockResolvedValue([
       { agentId: "agent-1", status: "synced" },
-      { agentId: "agent-2", status: "failed", error: "runtime unavailable" },
+      {
+        agentId: "agent-2",
+        status: "failed",
+        error: "runtime unavailable",
+        runtimeStopped: true,
+        quarantinePersisted: true,
+      },
     ]);
 
     const response = await request(app).post("/llm-providers").send({
@@ -121,7 +159,9 @@ describe("POST /llm-providers", () => {
       undefined,
       { afterCommit: expect.any(Function) },
     );
-    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1");
+    expect(mockSyncAuthToUserAgents).toHaveBeenCalledWith("user-1", null, {
+      providerLockHeld: true,
+    });
     expect(response.body).toEqual(
       expect.objectContaining({
         id: "provider-openai",
@@ -133,7 +173,7 @@ describe("POST /llm-providers", () => {
     );
   });
 
-  it("keeps the successful save response when runtime sync rejects", async () => {
+  it("reports a committed failure when save synchronization rejects", async () => {
     mockSyncAuthToUserAgents.mockRejectedValue(new Error("runtime sync crashed"));
 
     const response = await request(app).post("/llm-providers").send({
@@ -141,12 +181,12 @@ describe("POST /llm-providers", () => {
       apiKey: "sk-live",
     });
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(502);
     expect(response.body).toEqual(
       expect.objectContaining({
-        id: "provider-openai",
+        committed: true,
         sync_results: [],
-        sync_warning: expect.stringMatching(/provider saved/i),
+        error: expect.stringMatching(/provider saved/i),
       }),
     );
   });

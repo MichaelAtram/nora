@@ -52,6 +52,34 @@ const INTEGRATION_TOOL_WRAPPER_SOURCE = [
 const INTEGRATION_TOOL_WRAPPER_B64 = Buffer.from(INTEGRATION_TOOL_WRAPPER_SOURCE, "utf8").toString(
   "base64",
 );
+const MCP_SERVER_WRAPPER_SOURCE = [
+  "#!/usr/bin/env sh",
+  "set -eu",
+  'if [ "$#" -ne 1 ]; then echo "usage: nora-mcp-server <config-b64>" >&2; exit 64; fi',
+  "exec node - \"$1\" <<'__NORA_MCP_SERVER_WRAPPER__'",
+  'const { spawn } = require("node:child_process");',
+  "const payload = JSON.parse(Buffer.from(process.argv[2], 'base64').toString('utf8'));",
+  "if (!payload || typeof payload.npmPackage !== 'string' || !payload.npmPackage.trim()) process.exit(64);",
+  "const args = Array.isArray(payload.args) ? payload.args.map(String) : [];",
+  "const aliases = payload.envAliases && typeof payload.envAliases === 'object' && !Array.isArray(payload.envAliases) ? payload.envAliases : {};",
+  "const validName = /^[A-Za-z_][A-Za-z0-9_]*$/;",
+  "const env = { ...process.env };",
+  "for (const [target, alias] of Object.entries(aliases)) {",
+  "  if (!validName.test(target) || !validName.test(String(alias))) throw new Error('Invalid MCP environment alias');",
+  "  if (Object.prototype.hasOwnProperty.call(process.env, alias)) env[target] = process.env[alias];",
+  "  else delete env[target];",
+  "}",
+  "const child = spawn('npx', ['-y', payload.npmPackage, ...args], { env, stdio: 'inherit' });",
+  "for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));",
+  "child.on('error', (error) => { console.error(error.message); process.exit(1); });",
+  "child.on('exit', (code, signal) => {",
+  "  if (signal) { process.kill(process.pid, signal); return; }",
+  "  process.exit(Number.isInteger(code) ? code : 1);",
+  "});",
+  "__NORA_MCP_SERVER_WRAPPER__",
+  "",
+].join("\n");
+const MCP_SERVER_WRAPPER_B64 = Buffer.from(MCP_SERVER_WRAPPER_SOURCE, "utf8").toString("base64");
 
 const OPENCLAW_WORKSPACE_ROOT = "/root/.openclaw/workspace";
 const OPENCLAW_LEGACY_AGENT_TEMPLATE_ROOT = "/root/.openclaw/agents/main/agent";
@@ -113,6 +141,64 @@ function buildRuntimeBootstrapFiles() {
 
 function buildIntegrationToolWrapperScript() {
   return INTEGRATION_TOOL_WRAPPER_SOURCE;
+}
+
+function buildMcpServerWrapperScript() {
+  return MCP_SERVER_WRAPPER_SOURCE;
+}
+
+function buildOpenClawGatewayPairingCommand(options = {}) {
+  const defaultHome = String(options.defaultHome || "/root");
+  return [
+    "node <<'__NORA_OPENCLAW_GATEWAY_IDENTITY__'",
+    "const crypto = require('crypto');",
+    "const fs = require('fs');",
+    "const path = require('path');",
+    `const defaultHome = ${JSON.stringify(defaultHome)};`,
+    "const gatewayToken = String(process.env.OPENCLAW_GATEWAY_TOKEN || '').trim();",
+    "if (!gatewayToken) throw new Error('OPENCLAW_GATEWAY_TOKEN is required');",
+    "const home = String(process.env.HOME || defaultHome);",
+    "const stateRoot = path.join(home, '.openclaw');",
+    "const configPath = path.join(stateRoot, 'openclaw.json');",
+    "const devicesDir = path.join(stateRoot, 'devices');",
+    "function isPlainObject(value) { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }",
+    "function writeJsonAtomic(targetPath, value) {",
+    "  fs.mkdirSync(path.dirname(targetPath), { recursive: true });",
+    "  const temporaryPath = `${targetPath}.nora-${process.pid}-${Date.now()}.tmp`;",
+    "  try {",
+    "    fs.writeFileSync(temporaryPath, JSON.stringify(value, null, 2) + '\\n', { mode: 0o600 });",
+    "    fs.chmodSync(temporaryPath, 0o600);",
+    "    fs.renameSync(temporaryPath, targetPath);",
+    "  } finally { try { fs.rmSync(temporaryPath, { force: true }); } catch {} }",
+    "}",
+    "let config = {};",
+    "try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch { config = {}; }",
+    "if (!isPlainObject(config)) config = {};",
+    "if (!isPlainObject(config.gateway)) config.gateway = {};",
+    "if (!isPlainObject(config.gateway.auth)) config.gateway.auth = {};",
+    "config.gateway.auth.password = gatewayToken;",
+    "writeJsonAtomic(configPath, config);",
+    "const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');",
+    "const PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');",
+    "const seed = crypto.createHash('sha256').update(`openclaw-device:${gatewayToken}`).digest();",
+    "const privateKey = crypto.createPrivateKey({ key: Buffer.concat([PKCS8_PREFIX, seed]), format: 'der', type: 'pkcs8' });",
+    "const rawPublicKey = crypto.createPublicKey(privateKey).export({ type: 'spki', format: 'der' }).subarray(ED25519_SPKI_PREFIX.length);",
+    "const deviceId = crypto.createHash('sha256').update(rawPublicKey).digest('hex');",
+    "const publicKey = rawPublicKey.toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/g, '');",
+    "const operatorToken = crypto.createHmac('sha256', gatewayToken).update('nora-openclaw-operator-token').digest('hex');",
+    "const scopes = ['operator.admin', 'operator.read', 'operator.write', 'operator.approvals', 'operator.pairing'];",
+    "const now = Date.now();",
+    "writeJsonAtomic(path.join(devicesDir, 'paired.json'), {",
+    "  [deviceId]: {",
+    "    deviceId, publicKey, platform: 'linux', clientId: 'gateway-client', clientMode: 'backend',",
+    "    role: 'operator', roles: ['operator'], scopes, approvedScopes: scopes,",
+    "    tokens: { operator: { token: operatorToken, role: 'operator', scopes, createdAtMs: now } },",
+    "    createdAtMs: now, approvedAtMs: now,",
+    "  },",
+    "});",
+    "writeJsonAtomic(path.join(devicesDir, 'pending.json'), {});",
+    "__NORA_OPENCLAW_GATEWAY_IDENTITY__",
+  ].join("\n");
 }
 
 // Allowlist: alphanumerics, dot, underscore, dash, and forward slash only.
@@ -491,6 +577,10 @@ function buildOpenClawCustomProviders(env = {}) {
 // internal "demo" id so a future builtin OpenClaw provider can't collide.
 const DEMO_OPENCLAW_PROVIDER_ID = "nora-demo";
 const DEMO_OPENCLAW_MODEL_ID = "nora-demo-1";
+const OPENCLAW_MANAGED_CUSTOM_PROVIDER_IDS = Object.freeze([
+  FOUNDRY_OPENCLAW_PROVIDER_ID,
+  DEMO_OPENCLAW_PROVIDER_ID,
+]);
 
 // Maps Nora's internal LLM provider id to the OpenClaw provider id that
 // must appear in model strings (e.g. `<provider>/<deployment>`). Only Foundry
@@ -499,6 +589,34 @@ const NORA_TO_OPENCLAW_PROVIDER_ID = Object.freeze({
   "microsoft-foundry": FOUNDRY_OPENCLAW_PROVIDER_ID,
   demo: DEMO_OPENCLAW_PROVIDER_ID,
 });
+
+// Nora reserves `<provider>:default` for profiles projected from its provider
+// catalog. Other profile ids (for example `<provider>:manual`) belong to the
+// operator and must survive managed-state reconciliation.
+const OPENCLAW_MANAGED_AUTH_PROVIDER_IDS = Object.freeze([
+  "anthropic",
+  "openai",
+  "google",
+  "groq",
+  "mistral",
+  "deepseek",
+  "openrouter",
+  "together",
+  "cohere",
+  "xai",
+  "moonshot",
+  "zai",
+  "ollama",
+  "minimax",
+  "github-copilot",
+  "huggingface",
+  "cerebras",
+  "nvidia",
+  "microsoft-foundry",
+  FOUNDRY_OPENCLAW_PROVIDER_ID,
+  "demo",
+  DEMO_OPENCLAW_PROVIDER_ID,
+]);
 
 function mapNoraProviderIdToOpenClaw(noraProviderId) {
   if (!noraProviderId) return noraProviderId;
@@ -601,10 +719,210 @@ function normalizeOpenClawAuthProfiles(authProfiles = {}) {
   return normalized;
 }
 
+function normalizeManagedOpenClawAuthProfileId(profileId) {
+  const value = String(profileId || "").trim();
+  if (!value.endsWith(":default")) return "";
+
+  const rawProvider = value.slice(0, -":default".length).trim();
+  if (!rawProvider) return "";
+
+  return `${rawProvider}:default`;
+}
+
+function expandManagedOpenClawAuthProfileIds(profileId) {
+  const normalizedProfileId = normalizeManagedOpenClawAuthProfileId(profileId);
+  if (!normalizedProfileId) return [];
+
+  const rawProvider = normalizedProfileId.slice(0, -":default".length);
+  const provider = OPENCLAW_SQLITE_AUTH_PROVIDER_ALIASES[rawProvider] || rawProvider;
+  const legacyAliasProfileIds = Object.entries(OPENCLAW_SQLITE_AUTH_PROVIDER_ALIASES)
+    .filter(([, openClawProvider]) => openClawProvider === provider)
+    .map(([noraProvider]) => `${noraProvider}:default`);
+  return [...new Set([normalizedProfileId, `${provider}:default`, ...legacyAliasProfileIds])];
+}
+
+function resolveManagedOpenClawAuthProfileIds(authProfiles = {}, options = {}) {
+  const profiles =
+    authProfiles.profiles &&
+    typeof authProfiles.profiles === "object" &&
+    !Array.isArray(authProfiles.profiles)
+      ? authProfiles.profiles
+      : {};
+  const hasExplicitManagedScope =
+    Array.isArray(options.managedProfileIds) || Array.isArray(options.managedProviderIds);
+  const configuredProfileIds = Array.isArray(options.managedProfileIds)
+    ? options.managedProfileIds
+    : [];
+  const configuredProviderIds = (
+    Array.isArray(options.managedProviderIds)
+      ? options.managedProviderIds
+      : hasExplicitManagedScope
+        ? []
+        : OPENCLAW_MANAGED_AUTH_PROVIDER_IDS
+  ).map((providerId) => `${providerId}:default`);
+
+  return [
+    ...new Set(
+      [...configuredProfileIds, ...configuredProviderIds, ...Object.keys(profiles)]
+        .flatMap(expandManagedOpenClawAuthProfileIds)
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function buildOpenClawAuthSqliteReconcileCommand({ authPath, agentDir, managedProfileIds }) {
+  const normalizedManagedProfileIds = [
+    ...new Set(
+      (Array.isArray(managedProfileIds) ? managedProfileIds : [])
+        .flatMap(expandManagedOpenClawAuthProfileIds)
+        .filter(Boolean),
+    ),
+  ];
+  if (normalizedManagedProfileIds.length === 0) return "";
+
+  return [
+    "node <<'__NORA_OPENCLAW_AUTH_SQLITE_RECONCILE__'",
+    "const fs = require('fs');",
+    "const path = require('path');",
+    `const authPath = ${JSON.stringify(authPath)};`,
+    `const agentDir = ${JSON.stringify(agentDir)};`,
+    `const managedProfileIds = new Set(${JSON.stringify(normalizedManagedProfileIds)});`,
+    "function isPlainObject(value) { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }",
+    "function parsePayload(raw, label, fallback) {",
+    "  if (raw == null) return fallback;",
+    "  let parsed;",
+    "  try { parsed = JSON.parse(raw); } catch (error) { throw new Error(`${label} is not valid JSON: ${error.message}`); }",
+    "  if (!isPlainObject(parsed)) throw new Error(`${label} must contain a JSON object`);",
+    "  return parsed;",
+    "}",
+    "function pruneManagedStateReferences(payload) {",
+    "  if (payload.order !== undefined) {",
+    "    if (!isPlainObject(payload.order)) throw new Error('OpenClaw auth order must be an object');",
+    "    const order = {};",
+    "    for (const [provider, profileIds] of Object.entries(payload.order)) {",
+    "      if (!Array.isArray(profileIds)) throw new Error(`OpenClaw auth order for ${provider} must be an array`);",
+    "      const kept = profileIds.map(String).filter((profileId) => !managedProfileIds.has(profileId));",
+    "      if (kept.length > 0) order[provider] = kept;",
+    "    }",
+    "    if (Object.keys(order).length > 0) payload.order = order;",
+    "    else delete payload.order;",
+    "  }",
+    "  if (payload.lastGood !== undefined) {",
+    "    if (!isPlainObject(payload.lastGood)) throw new Error('OpenClaw auth lastGood must be an object');",
+    "    const lastGood = Object.fromEntries(",
+    "      Object.entries(payload.lastGood).filter(([, profileId]) => !managedProfileIds.has(String(profileId))),",
+    "    );",
+    "    if (Object.keys(lastGood).length > 0) payload.lastGood = lastGood;",
+    "    else delete payload.lastGood;",
+    "  }",
+    "  if (payload.usageStats !== undefined) {",
+    "    if (!isPlainObject(payload.usageStats)) throw new Error('OpenClaw auth usageStats must be an object');",
+    "    const usageStats = Object.fromEntries(",
+    "      Object.entries(payload.usageStats).filter(([profileId]) => !managedProfileIds.has(profileId)),",
+    "    );",
+    "    if (Object.keys(usageStats).length > 0) payload.usageStats = usageStats;",
+    "    else delete payload.usageStats;",
+    "  }",
+    "}",
+    "function mergeDesiredState(state, auth, desiredProfiles) {",
+    "  if (isPlainObject(auth.order)) {",
+    "    for (const [provider, profileIds] of Object.entries(auth.order)) {",
+    "      if (!Array.isArray(profileIds)) continue;",
+    "      const desired = profileIds",
+    "        .map(String)",
+    "        .filter((profileId) => managedProfileIds.has(profileId) && desiredProfiles[profileId]);",
+    "      if (desired.length === 0) continue;",
+    "      const existing = Array.isArray(state.order?.[provider]) ? state.order[provider] : [];",
+    "      state.order = state.order || {};",
+    "      state.order[provider] = [...new Set([...desired, ...existing])];",
+    "    }",
+    "  }",
+    "  if (isPlainObject(auth.lastGood)) {",
+    "    for (const [provider, profileIdValue] of Object.entries(auth.lastGood)) {",
+    "      const profileId = String(profileIdValue);",
+    "      if (!managedProfileIds.has(profileId) || !desiredProfiles[profileId]) continue;",
+    "      state.lastGood = state.lastGood || {};",
+    "      if (!state.lastGood[provider]) state.lastGood[provider] = profileId;",
+    "    }",
+    "  }",
+    "}",
+    "const databasePath = path.join(agentDir, 'openclaw-agent.sqlite');",
+    "let DatabaseSync;",
+    "try { ({ DatabaseSync } = require('node:sqlite')); } catch (error) {",
+    "  if (fs.existsSync(databasePath)) throw new Error(`Existing OpenClaw SQLite auth store cannot be reconciled because node:sqlite is unavailable: ${error.message}`);",
+    "  process.stderr.write('node:sqlite unavailable and no SQLite auth store exists; using normalized auth-profiles.json fallback\\n');",
+    "  process.exit(0);",
+    "}",
+    "if (!fs.existsSync(databasePath)) process.exit(0);",
+    "const auth = parsePayload(fs.readFileSync(authPath, 'utf8'), 'Nora auth profile file', {});",
+    "const sourceProfiles = isPlainObject(auth.profiles) ? auth.profiles : {};",
+    "const desiredProfiles = Object.fromEntries(",
+    "  Object.entries(sourceProfiles).filter(([profileId, profile]) => managedProfileIds.has(profileId) && isPlainObject(profile)),",
+    ");",
+    "const database = new DatabaseSync(databasePath);",
+    "try {",
+    "  database.exec('PRAGMA busy_timeout = 15000;');",
+    "  const tables = new Set(",
+    "    database",
+    "      .prepare(\"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('auth_profile_store', 'auth_profile_state')\")",
+    "      .all()",
+    "      .map((row) => row.name),",
+    "  );",
+    "  if (!tables.has('auth_profile_store') || !tables.has('auth_profile_state')) {",
+    "    throw new Error('Existing OpenClaw SQLite auth schema is missing the managed auth tables');",
+    "  }",
+    "  database.exec('BEGIN IMMEDIATE;');",
+    "  try {",
+    "    const storeRow = database",
+    "      .prepare(\"SELECT store_json FROM auth_profile_store WHERE store_key = 'primary'\")",
+    "      .get();",
+    "    const stateRow = database",
+    "      .prepare(\"SELECT state_json FROM auth_profile_state WHERE state_key = 'primary'\")",
+    "      .get();",
+    "    const store = parsePayload(storeRow?.store_json, 'OpenClaw auth profile store', { version: 1, profiles: {} });",
+    "    const state = parsePayload(stateRow?.state_json, 'OpenClaw auth profile state', { version: 1 });",
+    "    if (!isPlainObject(store.profiles)) throw new Error('OpenClaw auth profile store profiles must be an object');",
+    "    const profiles = { ...store.profiles };",
+    "    for (const profileId of managedProfileIds) delete profiles[profileId];",
+    "    Object.assign(profiles, desiredProfiles);",
+    "    store.version = Number(store.version) > 0 ? Number(store.version) : 1;",
+    "    store.profiles = profiles;",
+    "    pruneManagedStateReferences(store);",
+    "    pruneManagedStateReferences(state);",
+    "    mergeDesiredState(state, auth, desiredProfiles);",
+    "    const now = Date.now();",
+    "    if (storeRow || Object.keys(desiredProfiles).length > 0) {",
+    "      database",
+    "        .prepare(\"INSERT INTO auth_profile_store (store_key, store_json, updated_at) VALUES ('primary', ?, ?) ON CONFLICT(store_key) DO UPDATE SET store_json = excluded.store_json, updated_at = excluded.updated_at\")",
+    "        .run(JSON.stringify(store), now);",
+    "    }",
+    "    const stateKeys = Object.keys(state).filter((key) => key !== 'version');",
+    "    if (stateKeys.length > 0) {",
+    "      state.version = Number(state.version) > 0 ? Number(state.version) : 1;",
+    "      database",
+    "        .prepare(\"INSERT INTO auth_profile_state (state_key, state_json, updated_at) VALUES ('primary', ?, ?) ON CONFLICT(state_key) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at\")",
+    "        .run(JSON.stringify(state), now);",
+    "    } else if (stateRow) {",
+    "      database.prepare(\"DELETE FROM auth_profile_state WHERE state_key = 'primary'\").run();",
+    "    }",
+    "    database.exec('COMMIT;');",
+    "  } catch (error) {",
+    "    try { database.exec('ROLLBACK;'); } catch {}",
+    "    throw error;",
+    "  }",
+    "} finally {",
+    "  database.close();",
+    "}",
+    "__NORA_OPENCLAW_AUTH_SQLITE_RECONCILE__",
+  ].join("\n");
+}
+
 function buildOpenClawAuthImportFromFileCommand(options = {}) {
   const authPath = options.authPath || OPENCLAW_AUTH_PROFILES_PATH;
+  const agentDir = options.agentDir || authPath.slice(0, authPath.lastIndexOf("/")) || ".";
   const agentId = options.agentId || "main";
   const requireCli = options.requireCli === true;
+  const managedProfileIds = resolveManagedOpenClawAuthProfileIds({}, options);
 
   return [
     'OPENCLAW_BIN="${OPENCLAW_CLI_PATH:-/usr/local/bin/openclaw}"',
@@ -665,6 +983,11 @@ function buildOpenClawAuthImportFromFileCommand(options = {}) {
     "}",
     "__NORA_OPENCLAW_AUTH_SQLITE_IMPORT__",
     requireCli ? "" : "fi",
+    buildOpenClawAuthSqliteReconcileCommand({
+      authPath,
+      agentDir,
+      managedProfileIds,
+    }),
   ]
     .filter((line) => line !== "")
     .join("\n");
@@ -673,17 +996,24 @@ function buildOpenClawAuthImportFromFileCommand(options = {}) {
 function buildOpenClawAuthProfilesWriteCommand(authProfiles, options = {}) {
   const authPath = options.authPath || OPENCLAW_AUTH_PROFILES_PATH;
   const authDir = authPath.slice(0, authPath.lastIndexOf("/")) || ".";
-  const authJsonB64 = Buffer.from(
-    JSON.stringify(normalizeOpenClawAuthProfiles(authProfiles)),
-  ).toString("base64");
+  const normalizedAuthProfiles = normalizeOpenClawAuthProfiles(authProfiles);
+  const managedProfileIds = resolveManagedOpenClawAuthProfileIds(normalizedAuthProfiles, options);
+  const authJsonB64 = Buffer.from(JSON.stringify(normalizedAuthProfiles)).toString("base64");
 
   return [
     "set -eu",
     `mkdir -p ${shellSingleQuote(authDir)}`,
     `printf '%s' '${authJsonB64}' | base64 -d > ${shellSingleQuote(authPath)}`,
     `chmod 0600 ${shellSingleQuote(authPath)}`,
-    buildOpenClawAuthImportFromFileCommand({ ...options, authPath }),
-  ].join("\n");
+    buildOpenClawAuthImportFromFileCommand({
+      ...options,
+      authPath,
+      agentDir: options.agentDir || authDir,
+      managedProfileIds,
+    }),
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function buildOpenClawConfigMergeScript(gatewayConfig) {
@@ -748,10 +1078,327 @@ function buildOpenClawDefaultModelCommand(fullModel) {
   });
 }
 
+function buildOpenClawManagedCustomProvidersCommand(customProviders = {}, options = {}) {
+  const configPath = options.configPath || "/root/.openclaw/openclaw.json";
+  const managedProviderIds = [
+    ...new Set(
+      (Array.isArray(options.managedProviderIds)
+        ? options.managedProviderIds
+        : OPENCLAW_MANAGED_CUSTOM_PROVIDER_IDS
+      )
+        .map((providerId) => String(providerId || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+  const managedProviderIdSet = new Set(managedProviderIds);
+  const desiredProviders = Object.fromEntries(
+    Object.entries(
+      customProviders && typeof customProviders === "object" && !Array.isArray(customProviders)
+        ? customProviders
+        : {},
+    ).filter(([providerId]) => managedProviderIdSet.has(providerId)),
+  );
+
+  return [
+    "set -eu",
+    "node <<'__NORA_RECONCILE_OPENCLAW_CUSTOM_PROVIDERS__'",
+    "const fs = require('fs');",
+    "const path = require('path');",
+    `const configPath = ${JSON.stringify(configPath)};`,
+    `const managedProviderIds = new Set(${JSON.stringify(managedProviderIds)});`,
+    `const desiredProviders = ${JSON.stringify(desiredProviders)};`,
+    "function isPlainObject(value) { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }",
+    "function readConfig() {",
+    "  if (!fs.existsSync(configPath)) return {};",
+    "  const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));",
+    "  if (!isPlainObject(parsed)) throw new Error('OpenClaw config must contain a JSON object');",
+    "  return parsed;",
+    "}",
+    "function writeConfig(config) {",
+    "  fs.mkdirSync(path.dirname(configPath), { recursive: true });",
+    "  const temporaryPath = `${configPath}.nora-${process.pid}-${Date.now()}.tmp`;",
+    "  try {",
+    "    fs.writeFileSync(temporaryPath, JSON.stringify(config, null, 2) + '\\n');",
+    "    fs.chmodSync(temporaryPath, 0o600);",
+    "    fs.renameSync(temporaryPath, configPath);",
+    "  } finally {",
+    "    try { fs.rmSync(temporaryPath, { force: true }); } catch {}",
+    "  }",
+    "}",
+    "const current = readConfig();",
+    "if (current.models !== undefined && !isPlainObject(current.models)) {",
+    "  throw new Error('OpenClaw models config must be an object');",
+    "}",
+    "const models = { ...(current.models || {}) };",
+    "if (models.providers !== undefined && !isPlainObject(models.providers)) {",
+    "  throw new Error('OpenClaw custom providers config must be an object');",
+    "}",
+    "const providers = { ...(models.providers || {}) };",
+    "for (const providerId of managedProviderIds) delete providers[providerId];",
+    "for (const [providerId, providerConfig] of Object.entries(desiredProviders)) {",
+    "  if (managedProviderIds.has(providerId)) providers[providerId] = providerConfig;",
+    "}",
+    "if (Object.keys(providers).length > 0) models.providers = providers;",
+    "else delete models.providers;",
+    "if (Object.keys(models).length > 0) current.models = models;",
+    "else delete current.models;",
+    "writeConfig(current);",
+    "__NORA_RECONCILE_OPENCLAW_CUSTOM_PROVIDERS__",
+  ].join("\n");
+}
+
+function buildOpenClawManagedDefaultModelCommand(fullModel, options = {}) {
+  const desiredDefaultModel = String(fullModel || "").trim();
+  const configPath = options.configPath || "/root/.openclaw/openclaw.json";
+  const markerPath = options.markerPath || "/root/.openclaw/.nora-managed-default-model";
+  const desiredProviderId = desiredDefaultModel.split("/", 1)[0] || "";
+  const managedProviderIds = [
+    ...new Set(
+      [
+        ...(Array.isArray(options.managedProviderIds)
+          ? options.managedProviderIds
+          : OPENCLAW_MANAGED_AUTH_PROVIDER_IDS),
+        desiredProviderId,
+      ]
+        .map((providerId) => String(providerId || "").trim())
+        .filter(Boolean),
+    ),
+  ];
+
+  return [
+    "set -eu",
+    "node <<'__NORA_RECONCILE_OPENCLAW_DEFAULT_MODEL__'",
+    "const fs = require('fs');",
+    "const path = require('path');",
+    `const configPath = ${JSON.stringify(configPath)};`,
+    `const markerPath = ${JSON.stringify(markerPath)};`,
+    `const desiredDefaultModel = ${JSON.stringify(desiredDefaultModel)};`,
+    `const managedProviderIds = new Set(${JSON.stringify(managedProviderIds)});`,
+    "function isPlainObject(value) { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }",
+    "function readConfig() {",
+    "  if (!fs.existsSync(configPath)) return {};",
+    "  const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));",
+    "  if (!isPlainObject(parsed)) throw new Error('OpenClaw config must contain a JSON object');",
+    "  return parsed;",
+    "}",
+    "function writeConfig(config) {",
+    "  fs.mkdirSync(path.dirname(configPath), { recursive: true });",
+    "  const temporaryPath = `${configPath}.nora-${process.pid}-${Date.now()}.tmp`;",
+    "  try {",
+    "    fs.writeFileSync(temporaryPath, JSON.stringify(config, null, 2) + '\\n');",
+    "    fs.chmodSync(temporaryPath, 0o600);",
+    "    fs.renameSync(temporaryPath, configPath);",
+    "  } finally {",
+    "    try { fs.rmSync(temporaryPath, { force: true }); } catch {}",
+    "  }",
+    "}",
+    "function readOptionalObject(value, label) {",
+    "  if (value === undefined) return {};",
+    "  if (!isPlainObject(value)) throw new Error(`${label} must be an object`);",
+    "  return { ...value };",
+    "}",
+    "function deleteIfEmpty(parent, key) {",
+    "  if (isPlainObject(parent[key]) && Object.keys(parent[key]).length === 0) delete parent[key];",
+    "}",
+    "const current = readConfig();",
+    "const agents = readOptionalObject(current.agents, 'OpenClaw agents config');",
+    "const defaults = readOptionalObject(agents.defaults, 'OpenClaw agent defaults config');",
+    "const model = readOptionalObject(defaults.model, 'OpenClaw default model config');",
+    "const models = readOptionalObject(defaults.models, 'OpenClaw allowed models config');",
+    "const currentPrimary = String(model.primary || '').trim();",
+    "let previousManagedModel = '';",
+    "try { previousManagedModel = String(fs.readFileSync(markerPath, 'utf8') || '').trim(); } catch {}",
+    "if (previousManagedModel) delete models[previousManagedModel];",
+    "if (desiredDefaultModel) {",
+    "  model.primary = desiredDefaultModel;",
+    "  if (!isPlainObject(models[desiredDefaultModel])) models[desiredDefaultModel] = {};",
+    "} else if (previousManagedModel && currentPrimary === previousManagedModel) {",
+    "  delete model.primary;",
+    "}",
+    "if (Object.keys(model).length > 0) defaults.model = model;",
+    "else delete defaults.model;",
+    "if (Object.keys(models).length > 0) defaults.models = models;",
+    "else delete defaults.models;",
+    "if (Object.keys(defaults).length > 0) agents.defaults = defaults;",
+    "else delete agents.defaults;",
+    "if (Object.keys(agents).length > 0) current.agents = agents;",
+    "else delete current.agents;",
+    "deleteIfEmpty(current, 'agents');",
+    "writeConfig(current);",
+    "if (desiredDefaultModel) {",
+    "  fs.mkdirSync(path.dirname(markerPath), { recursive: true });",
+    "  fs.writeFileSync(markerPath, desiredDefaultModel + '\\n');",
+    "  fs.chmodSync(markerPath, 0o600);",
+    "} else {",
+    "  try { fs.rmSync(markerPath, { force: true }); } catch {}",
+    "}",
+    "__NORA_RECONCILE_OPENCLAW_DEFAULT_MODEL__",
+  ].join("\n");
+}
+
+function buildOpenClawManagedProviderStateCommand({
+  customProviders = {},
+  defaultModel = null,
+  managedProviderIds = [FOUNDRY_OPENCLAW_PROVIDER_ID, DEMO_OPENCLAW_PROVIDER_ID],
+  managedModelProviderIds = OPENCLAW_MANAGED_AUTH_PROVIDER_IDS,
+  configPath = "/root/.openclaw/openclaw.json",
+  markerPath = "/root/.openclaw/.nora-managed-default-model",
+} = {}) {
+  return [
+    buildOpenClawManagedCustomProvidersCommand(customProviders, {
+      configPath,
+      managedProviderIds,
+    }),
+    buildOpenClawManagedDefaultModelCommand(defaultModel, {
+      configPath,
+      markerPath,
+      managedProviderIds: managedModelProviderIds,
+    }),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function buildOpenClawManagedConfigEnvPruneCommand(managedNames = [], options = {}) {
+  const envNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  const normalizedManagedNames = [
+    ...new Set(
+      (Array.isArray(managedNames) ? managedNames : [])
+        .map((name) => String(name || "").trim())
+        .filter(Boolean),
+    ),
+  ].sort();
+  for (const name of normalizedManagedNames) {
+    if (!envNamePattern.test(name)) {
+      throw new Error(`Invalid managed OpenClaw config env name: ${name}`);
+    }
+  }
+  const managedStateEnvName = String(options.managedStateEnvName || "").trim();
+  if (managedStateEnvName && !envNamePattern.test(managedStateEnvName)) {
+    throw new Error(`Invalid managed OpenClaw state env name: ${managedStateEnvName}`);
+  }
+  const configPath = String(options.configPath || "").trim();
+  const defaultHome = String(options.defaultHome || "/root");
+
+  return [
+    "set -eu",
+    "node <<'__NORA_PRUNE_MANAGED_OPENCLAW_CONFIG_ENV__'",
+    "const fs = require('fs');",
+    "const path = require('path');",
+    `const configuredNames = ${JSON.stringify(normalizedManagedNames)};`,
+    `const managedStateEnvName = ${JSON.stringify(managedStateEnvName)};`,
+    configPath
+      ? `const configPath = ${JSON.stringify(configPath)};`
+      : `const configPath = path.join(String(process.env.HOME || ${JSON.stringify(defaultHome)}), '.openclaw', 'openclaw.json');`,
+    "const validName = /^[A-Za-z_][A-Za-z0-9_]*$/;",
+    "const managedNames = new Set(configuredNames);",
+    "if (managedStateEnvName) {",
+    "  const encoded = String(process.env[managedStateEnvName] || '');",
+    "  if (encoded) {",
+    "    let state;",
+    "    try { state = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')); } catch (error) { throw new Error(`Invalid managed OpenClaw state: ${error.message}`); }",
+    "    if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('Managed OpenClaw state must be an object');",
+    "    if (!Array.isArray(state.managedNames)) throw new Error('Managed OpenClaw state names must be an array');",
+    "    for (const name of state.managedNames) managedNames.add(String(name || '').trim());",
+    "  }",
+    "}",
+    "for (const name of managedNames) { if (!validName.test(name)) throw new Error(`Invalid managed OpenClaw config env name: ${name}`); }",
+    "if (managedNames.size === 0 || !fs.existsSync(configPath)) process.exit(0);",
+    "let config;",
+    "try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch (error) { throw new Error(`OpenClaw config is not valid JSON: ${error.message}`); }",
+    "if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('OpenClaw config must contain a JSON object');",
+    "if (config.env === undefined) process.exit(0);",
+    "if (!config.env || typeof config.env !== 'object' || Array.isArray(config.env)) throw new Error('OpenClaw config env must contain a JSON object');",
+    "let changed = false;",
+    "for (const name of managedNames) { if (Object.prototype.hasOwnProperty.call(config.env, name)) { delete config.env[name]; changed = true; } }",
+    "if (!changed) process.exit(0);",
+    "if (Object.keys(config.env).length === 0) delete config.env;",
+    "fs.mkdirSync(path.dirname(configPath), { recursive: true });",
+    "const temporaryPath = `${configPath}.nora-${process.pid}-${Date.now()}.tmp`;",
+    "try {",
+    "  fs.writeFileSync(temporaryPath, JSON.stringify(config, null, 2) + '\\n', { mode: 0o600 });",
+    "  fs.chmodSync(temporaryPath, 0o600);",
+    "  fs.renameSync(temporaryPath, configPath);",
+    "} finally { try { fs.rmSync(temporaryPath, { force: true }); } catch {} }",
+    "__NORA_PRUNE_MANAGED_OPENCLAW_CONFIG_ENV__",
+  ].join("\n");
+}
+
+function sanitizeManagedMcpServers(desiredServers = {}) {
+  if (!desiredServers || typeof desiredServers !== "object" || Array.isArray(desiredServers)) {
+    return {};
+  }
+  const sanitized = {};
+  for (const [rawName, rawServer] of Object.entries(desiredServers)) {
+    const name = String(rawName || "").trim();
+    if (!name || !rawServer || typeof rawServer !== "object" || Array.isArray(rawServer)) continue;
+    const command = String(rawServer.command || "").trim();
+    if (!command) continue;
+    sanitized[name] = {
+      command,
+      args: (Array.isArray(rawServer.args) ? rawServer.args : []).map((value) => String(value)),
+    };
+  }
+  return sanitized;
+}
+
+const OPENCLAW_MANAGED_MCP_SERVERS_ENV = "NORA_MANAGED_MCP_SERVERS_B64";
+
+function encodeOpenClawManagedMcpServers(desiredServers = {}) {
+  return Buffer.from(JSON.stringify(sanitizeManagedMcpServers(desiredServers)), "utf8").toString(
+    "base64",
+  );
+}
+
+function decodeOpenClawManagedMcpServers(encoded = "") {
+  if (!encoded) return {};
+  try {
+    return sanitizeManagedMcpServers(
+      JSON.parse(Buffer.from(String(encoded), "base64").toString("utf8")),
+    );
+  } catch {
+    throw new Error("Invalid managed MCP server configuration");
+  }
+}
+
+function buildOpenClawManagedMcpServersCommand(desiredServers = {}, options = {}) {
+  const configPath = options.configPath || "/root/.openclaw/openclaw.json";
+  const sanitizedServers = sanitizeManagedMcpServers(desiredServers);
+  return [
+    "set -eu",
+    "node <<'__NORA_RECONCILE_OPENCLAW_MCP_SERVERS__'",
+    "const fs = require('fs');",
+    "const path = require('path');",
+    `const configPath = ${JSON.stringify(configPath)};`,
+    `const desiredServers = ${JSON.stringify(sanitizedServers)};`,
+    "function isPlainObject(value) { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }",
+    "let config = {};",
+    "try {",
+    "  if (fs.existsSync(configPath)) config = JSON.parse(fs.readFileSync(configPath, 'utf8'));",
+    "} catch { config = {}; }",
+    "if (!isPlainObject(config)) throw new Error('OpenClaw config must contain a JSON object');",
+    "if (Object.keys(desiredServers).length > 0) config.mcpServers = desiredServers;",
+    "else delete config.mcpServers;",
+    "fs.mkdirSync(path.dirname(configPath), { recursive: true });",
+    "const temporaryPath = `${configPath}.nora-${process.pid}-${Date.now()}.tmp`;",
+    "try {",
+    "  fs.writeFileSync(temporaryPath, JSON.stringify(config, null, 2) + '\\n', { mode: 0o600 });",
+    "  fs.chmodSync(temporaryPath, 0o600);",
+    "  fs.renameSync(temporaryPath, configPath);",
+    "} finally { try { fs.rmSync(temporaryPath, { force: true }); } catch {} }",
+    "__NORA_RECONCILE_OPENCLAW_MCP_SERVERS__",
+  ].join("\n");
+}
+
 // buildMcpServersConfig lives in its own dependency-free module so it can be
 // unit-tested without loading the rest of the bootstrap; re-exported here for
 // the worker/adapter consumers that already import from runtimeBootstrap.
-const { buildMcpServersConfig } = require("./mcpServersConfig");
+const {
+  buildMcpManagedEnv,
+  buildMcpManagedEnvNames,
+  buildMcpServerEnvAlias,
+  buildMcpServersConfig,
+} = require("./mcpServersConfig");
 
 function buildRuntimeBootstrapCommand() {
   return [
@@ -762,6 +1409,8 @@ function buildRuntimeBootstrapCommand() {
     ),
     `printf '%s' '${INTEGRATION_TOOL_WRAPPER_B64}' | base64 -d > /usr/local/bin/${NORA_INTEGRATION_TOOL_COMMAND} && `,
     `chmod 755 /usr/local/bin/${NORA_INTEGRATION_TOOL_COMMAND} && `,
+    `printf '%s' '${MCP_SERVER_WRAPPER_B64}' | base64 -d > /usr/local/bin/nora-mcp-server && `,
+    "chmod 755 /usr/local/bin/nora-mcp-server && ",
     "touch /var/log/openclaw-agent.log && ",
     'TSX_BIN="${OPENCLAW_TSX_BIN:-$(command -v tsx 2>/dev/null || true)}"; [ -n "$TSX_BIN" ] || TSX_BIN="tsx"; "$TSX_BIN" /opt/openclaw-runtime/lib/agent.ts >> /var/log/openclaw-agent.log 2>&1 & ',
   ].join("");
@@ -873,12 +1522,25 @@ module.exports = {
   buildRuntimeBootstrapCommand,
   buildRuntimeBootstrapFiles,
   buildIntegrationToolWrapperScript,
+  buildMcpServerWrapperScript,
+  buildOpenClawGatewayPairingCommand,
   buildOpenClawConfigMergeScript,
   buildOpenClawConfigMergeCommand,
   buildOpenClawDefaultModelCommand,
+  buildOpenClawManagedCustomProvidersCommand,
+  buildOpenClawManagedDefaultModelCommand,
+  buildOpenClawManagedProviderStateCommand,
+  buildOpenClawManagedConfigEnvPruneCommand,
+  buildOpenClawManagedMcpServersCommand,
+  OPENCLAW_MANAGED_MCP_SERVERS_ENV,
+  encodeOpenClawManagedMcpServers,
+  decodeOpenClawManagedMcpServers,
   buildOpenClawAuthImportFromFileCommand,
   buildOpenClawAuthProfilesWriteCommand,
   buildMcpServersConfig,
+  buildMcpManagedEnv,
+  buildMcpManagedEnvNames,
+  buildMcpServerEnvAlias,
   buildOpenClawCustomProviders,
   mapNoraProviderIdToOpenClaw,
   buildOpenClawModelForProvider,

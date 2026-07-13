@@ -4,6 +4,110 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.16.4](https://github.com/solomon2773/nora/releases/tag/v1.16.4) — 2026-07-13
+
+Remote Docker security and lifecycle patch: a current workspace grant now remains authoritative
+through long-running operations, revocation tears down Nora-mediated access instead of only blocking
+the next request, and recovery paths retain enough authority to remove orphaned workloads safely.
+
+### Added
+
+- Remote host owners can explicitly reset an SSH host-key pin after independently verifying an
+  expected rebuild or key rotation. The confirmation-gated API and operator UI audit the reset,
+  clear the previous successful test, and require **Test** to pin the replacement key before reuse.
+- The real-deploy matrix can exercise the standard OpenClaw Remote Docker lifecycle with reusable
+  operator credentials and an explicit registered-host target.
+
+### Changed
+
+- Remote Docker queueing, lifecycle, runtime, gateway, log, metric, terminal, backup, scheduled-run,
+  and ClawHub paths re-check the agent owner's current positive host grant; active streams also poll
+  authorization so unsharing takes effect without waiting for a reconnect.
+- Remote-host create, edit, Test, SSH-pin reset, delete, share, and unshare operations now serialize
+  per host id across backend replicas. Owner-only mutations re-check the expected owner inside that
+  fence, and Test holds it through one overall-bounded SSH/Docker probe and the trust-state write,
+  preventing stale requests or concurrent first-use checks from retargeting a recreated host or
+  publishing different host keys.
+- Redeploy, rollback, scheduled redeploy, destructive restore, and provisioning now use one
+  per-agent advisory-lock namespace so stale-job cancellation, runtime replacement, and queue
+  publication cannot race each other. Replacement jobs always reconcile credentials from the
+  durable agent owner rather than a requesting collaborator.
+- Operator, admin, and scheduled start/stop/restart actions now re-load lifecycle state while that
+  same provision lock is held, reject queued or deploying agents with a conflict, and keep the lock
+  through runtime mutation plus status persistence. Start and restart reconcile the durable
+  owner's complete current provider state before reporting success.
+- PaaS mode continues to reject Remote Docker registration and normal use, but can perform
+  cleanup-only stop/delete actions for already-persisted remote agents so a mode change cannot strand
+  workloads that Nora still owns.
+- The Remote Docker guide now documents the control and runtime network boundaries, host testing,
+  sharing and revocation semantics, backup/restore behavior, capacity limits, recovery, and an
+  operator promotion checklist. Docker disk sizing and Proxmox maturity claims are now explicit.
+- Password and OAuth login rate-limit windows and attempt budgets are now operator-configurable;
+  invalid overrides fall back to the existing secure 20-attempt, 15-minute defaults.
+- Release metadata advances the Gemini extension manifest to `1.16.4` and the Helm chart to `0.7.4`
+  for exact-tag publication.
+
+### Fixed
+
+- Revoking Remote Docker access now cancels in-flight HTTP and WebSocket work, retires gateway RPCs,
+  and terminates tracked remote command process groups instead of leaving work running after the
+  caller loses authorization or disconnects. When a direct Remote Hermes command cannot be canceled
+  independently, Nora fail-safe stops that container and records the agent as stopped.
+- Remote backup capture fails closed when a host grant changes, installation backups report omitted
+  live state honestly, and restore compensates for queue/create races while preserving cleanup
+  identity until destruction is confirmed.
+- Remote migration and backup capture reject truncated Docker streams, unconfirmed exec completion,
+  non-integer exit status, and unexpected archive failures instead of storing empty or stale state.
+  Only an explicitly missing optional runtime path becomes an empty archive.
+- Hermes restore seeding now sanitizes archive paths, repairs ownership, and restores the durable
+  manifest without allowing crafted entries to escape the managed runtime directory.
+- Backup restores use the durable agent owner's Remote Docker credentials and grant rather than the
+  admin or editor who initiated the restore, preventing cross-workspace credential confusion.
+- Proxmox API tasks and SSH operations now require confirmed completion with an integer zero exit
+  status; missing task ids, missing final task state, timeout, abort, transport close, or missing
+  exit confirmation fail closed instead of being treated as successful lifecycle actions. Runtime
+  description labels also strip line separators before Nora ownership markers are written.
+- Migration routes are session-only, and live Docker inspection is limited to platform admins on a
+  self-hosted control plane so workspace API keys and hosted users cannot read arbitrary containers
+  through the backend Docker socket. Live SSH pull is disabled until pinned host verification is
+  available; bundle upload remains the safe cross-host import path. Non-empty malformed imported
+  `auth-profiles.json` now rejects the draft instead of silently dropping provider credentials.
+- Browser deployment drafts recursively scrub password, key, credential, and token fields, discard
+  legacy SSH migration metadata, and persist only the supported Docker Live Pull source fields.
+  Deploy navigation also remains usable when browser session storage is disabled or unavailable.
+- Runtime replacement now compares the previous host as part of the complete optimistic tuple,
+  cleans Kubernetes resources through their deterministic name fallback when persisted container
+  ids are absent, and re-reads rollback state after locking. Failed rollback materialization or
+  queue publication restores the prior payload and wiring before releasing the lock.
+- Admin start and restart use the persisted agent owner's provider credentials; reconciliation
+  failure stops the runtime, persists a stopped state when cleanup is confirmed, and suppresses the
+  success audit instead of leaving stale authentication active.
+- Provider rotation and deletion now reconcile the exact Nora-managed environment, OpenClaw JSON
+  and SQLite auth profiles, custom providers, and default model, including an empty provider set.
+  Provider mutations, lifecycle resume, and deployment finalization share one per-user lock; failed
+  reconciliation stops and quarantines the runtime, while unconfirmed containment returns a
+  committed `502` instead of a false success.
+- New deployments start without provider or integration credentials and receive the current durable
+  state only while the shared mutation fence is held. Non-demo readiness failures no longer publish
+  a gateway-accessible warning before reconciliation, and start/restart stays non-runnable until
+  exact staging plus readiness succeeds.
+- Docker, Remote Docker, Kubernetes, NemoClaw, and Proxmox bootstrap artifacts no longer retain
+  provider, integration, gateway, pairing, or MCP secrets in immutable container metadata,
+  world-readable startup scripts, or ConfigMaps. Mutable credentials live in owner-only managed
+  state or Kubernetes Secrets and are replaced exactly without erasing invariant runtime metadata.
+- Stopped Proxmox LXCs now receive exact managed state through ownership-checked `pct mount` staging
+  before start. Secret-free OpenClaw/Hermes systemd prestart hooks rebuild auth and model state on
+  every launch, while mount, unmount, residual-lock, path, privilege, or SSH uncertainty fails closed.
+- Runtime sidecar APIs now disable sensitive routes when their gateway token is absent while keeping
+  health public, cap `/exec` request bodies at 64 KiB, and treat indeterminate child completion as a
+  failure. Gateway retirement rejects unresolved authorization/connect work immediately, cleans up
+  synchronous RPC send failures, and prevents an upstream authenticated socket from opening after
+  the relay client disconnects during authorization or DNS resolution.
+- Real-credential deploy-matrix cells now have unconditional verified teardown, so a failed serial
+  lifecycle step cannot skip cleanup or prevent independent later cells from running.
+- Failure cleanup remains available after revocation, while all ordinary Remote Docker actions stay
+  blocked, reducing the risk of orphaned containers without weakening the authorization boundary.
+
 ## [v1.16.3](https://github.com/solomon2773/nora/releases/tag/v1.16.3) — 2026-07-13
 
 Activation and Cloudflare Access compatibility patch: demo agents now prove a real warmed Gateway

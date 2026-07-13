@@ -10,6 +10,7 @@ const mockUpdateEnv = jest.fn();
 const mockRestart = jest.fn();
 const mockWaitForAgentReadiness = jest.fn();
 const mockPersistLifecycleRuntimeAddress = jest.fn();
+const mockAssertRemoteHostAgentUse = jest.fn();
 
 jest.mock("../db", () => mockDb);
 
@@ -28,6 +29,10 @@ jest.mock("../containerManager", () => ({
 
 jest.mock("../healthChecks", () => ({
   waitForAgentReadiness: mockWaitForAgentReadiness,
+}));
+
+jest.mock("../remoteHosts", () => ({
+  assertRemoteHostAgentUse: (...args) => mockAssertRemoteHostAgentUse(...args),
 }));
 
 const {
@@ -68,6 +73,7 @@ describe("Hermes helper execution", () => {
       runtime: { ok: true },
       gateway: { ok: true },
     });
+    mockAssertRemoteHostAgentUse.mockReset().mockResolvedValue(null);
     mockBuildHermesManagedEnvForAgent.mockReset().mockResolvedValue({});
     mockWriteHermesEnvToContainer.mockReset().mockResolvedValue(undefined);
     mockRunContainerCommand.mockReset().mockResolvedValue({
@@ -143,6 +149,29 @@ describe("Hermes helper execution", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it("rechecks a Remote Docker host grant before every Hermes readiness attempt", async () => {
+    const agent = {
+      id: "agent-hermes-remote",
+      user_id: "user-1",
+      container_id: "remote-hermes-1",
+      backend_type: "remote-docker",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:shared-host",
+      runtime_family: "hermes",
+      host: "203.0.113.10",
+      runtime_host: "203.0.113.10",
+      runtime_port: 8642,
+    };
+
+    await saveHermesChannel(agent, "telegram", { TELEGRAM_BOT_TOKEN: "tok-remote" });
+
+    const readinessOptions = mockWaitForAgentReadiness.mock.calls[0][1];
+    await readinessOptions.beforeAttempt();
+    expect(mockAssertRemoteHostAgentUse).toHaveBeenCalledWith(agent, {
+      includeProfile: false,
+    });
   });
 
   it("runs helper scripts from /opt/hermes inside the Hermes virtualenv", async () => {

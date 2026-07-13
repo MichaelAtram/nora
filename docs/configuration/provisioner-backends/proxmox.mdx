@@ -4,7 +4,9 @@
 
 Proxmox is an opt-in execution target for private infrastructure operators. Nora creates an unprivileged LXC through the Proxmox HTTPS API, then uses SSH with pinned host-key verification to bootstrap and operate the runtime through `pct`.
 
-Docker and Kubernetes remain the GA onboarding paths. Proxmox is visible only when `proxmox` is included in `ENABLED_BACKENDS` and every required security setting is valid.
+Docker and Kubernetes remain the GA onboarding paths. Including `proxmox` in `ENABLED_BACKENDS`
+exposes the target and its readiness state; missing or invalid security settings keep it unavailable
+for deployment until the operator fixes the reported preflight issue.
 
 <Warning>
   Proxmox support is experimental. The automated suite covers adapter behavior, but the repository
@@ -46,6 +48,10 @@ PROXMOX_SSH_USER=root
 PROXMOX_SSH_PORT=22
 PROXMOX_SSH_PRIVATE_KEY_PATH=/run/secrets/proxmox-key
 PROXMOX_SSH_HOST_FINGERPRINT=SHA256:<43-character-base64-fingerprint>
+
+# Required only when PROXMOX_SSH_USER is not root. This must be one absolute
+# path to a separately installed, narrowly scoped offline-staging helper.
+PROXMOX_OFFLINE_STAGE_COMMAND=/usr/local/libexec/nora-proxmox-stage
 ```
 
 `PROXMOX_TOKEN_ID` must use `user@realm!tokenname` API-token syntax. The API URL must use HTTPS and must not contain embedded credentials, query parameters, or a fragment. `PROXMOX_NODE` accepts letters, numbers, dots, underscores, and hyphens; `PROXMOX_SSH_PORT` must be an integer from 1 through 65535. Nora reads the configured CA and private-key files during catalog preflight, so an unreadable or empty file keeps the target unavailable instead of failing after a deployment is queued.
@@ -75,7 +81,9 @@ You may provide `PROXMOX_CA_CERT` and `PROXMOX_SSH_PRIVATE_KEY` inline instead o
 
 ## Required access
 
-The API token must be authorized on the selected node, storage, and bridge to create, inspect, start, stop, restart, configure, and delete LXCs. The SSH account must be allowed to run `pct` non-interactively. When the SSH user is not `root`, configure passwordless, narrowly scoped sudo and set `PROXMOX_SUDO` if the default `sudo -n ` prefix is not appropriate.
+The API token must be authorized on the selected node, storage, and bridge to create, inspect, start, stop, restart, configure, and delete LXCs. The SSH account must be allowed to run `pct` non-interactively.
+
+Root SSH is the supported direct path for stopped-LXC reconciliation. A non-root SSH account needs a separately installed, narrowly scoped helper configured through `PROXMOX_OFFLINE_STAGE_COMMAND`. The value must be one absolute executable path; Nora rejects generic `sudo sh -c`, arguments, and arbitrary shell prefixes. `PROXMOX_SUDO` still applies to ordinary fixed `pct` lifecycle commands, but it is not sufficient for mounting and safely editing a stopped root filesystem. If neither root SSH nor the strict helper is available, start and restart fail closed before the LXC can run stale credentials.
 
 Created containers are unprivileged and use DHCP on `PROXMOX_BRIDGE`. Ensure the bridge can provide an address and that the LXC can reach the package registries and providers required by the selected runtime.
 
@@ -98,6 +106,12 @@ The template must include:
 
 Nora creates the runtime directories, writes managed environment state with restricted permissions, and runs the service as `hermes`. Setting `PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD=true` changes the dashboard bind from `127.0.0.1` to `0.0.0.0`; leave it false unless you have a separate authenticated network boundary.
 
+## Credential staging and restart safety
+
+Nora stores mutable runtime credentials only in mode-`0600` managed state. The OpenClaw and Hermes systemd units use secret-free `ExecStartPre` hooks to rebuild Nora-owned auth, model, and environment state immediately before each launch. Generated service scripts do not contain provider keys.
+
+When an LXC is stopped, Nora verifies ownership and stopped status, mounts the root filesystem with `pct mount`, stages a root-only archive over SSH stdin, preserves the unprivileged-container ownership mapping, unmounts, and confirms that no mounted lock remains. A mount, unmount, SSH, ownership, path-confinement, or completion ambiguity blocks the subsequent start. This is why provider rotation and deletion remain fail closed even for a stopped Proxmox runtime.
+
 ## Verification
 
 First verify that the control plane reports the target as enabled, configured, available, and experimental:
@@ -114,7 +128,7 @@ PROXMOX_SMOKE_RUNTIME_FAMILIES=openclaw \
   e2e/scripts/run-proxmox-smoke.sh
 ```
 
-Use `PROXMOX_SMOKE_RUNTIME_FAMILIES=openclaw,hermes` only after `PROXMOX_HERMES_TEMPLATE` is ready. The smoke verifies create, readiness, exec, environment rotation, restart, logs, stop, start, and destroy. Set `PROXMOX_SMOKE_KEEP_ON_FAILURE=true` only when you intentionally want to preserve a failed LXC for diagnosis.
+Use `PROXMOX_SMOKE_RUNTIME_FAMILIES=openclaw,hermes` only after `PROXMOX_HERMES_TEMPLATE` is ready. The smoke verifies create, readiness, exec, live environment rotation, restart, logs, stopped-LXC offline environment replacement, start, and destroy. API operations fail if Proxmox omits the task id or final task exit status, and exec checks require a confirmed integer remote exit code. Set `PROXMOX_SMOKE_KEEP_ON_FAILURE=true` only when you intentionally want to preserve a failed LXC for diagnosis.
 
 The wrapper forwards host-side `PROXMOX_*` and `PROXMOX_SMOKE_*` values into the one-off process in `worker-provisioner`. This means the command-prefix overrides above take effect even when the running container was created earlier, and credential values do not need to be appended to the control-plane `.env` file.
 

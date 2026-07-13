@@ -123,6 +123,10 @@ test("effective provider fingerprints are canonical and detect runtime-relevant 
       model: "nora-demo-1",
       config: '{"baseUrl":"http://backend-api:4000/demo-llm/v1","nested":{"b":2,"a":1}}',
     },
+    integrations: [
+      { id: "integration-2", provider: "gitlab" },
+      { id: "integration-1", provider: "github" },
+    ],
   });
   const reordered = fingerprintEffectiveProviderState({
     envVars: {
@@ -138,6 +142,10 @@ test("effective provider fingerprints are canonical and detect runtime-relevant 
         baseUrl: "http://backend-api:4000/demo-llm/v1",
       },
     },
+    integrations: [
+      { provider: "github", id: "integration-1" },
+      { provider: "gitlab", id: "integration-2" },
+    ],
   });
   const changed = fingerprintEffectiveProviderState({
     envVars: {
@@ -167,6 +175,10 @@ test("effective provider fingerprints are canonical and detect runtime-relevant 
           baseUrl: "http://backend-api:4000/demo-llm/v1",
         },
       },
+      integrations: [
+        { id: "integration-1", provider: "github" },
+        { id: "integration-2", provider: "gitlab" },
+      ],
     }),
     false,
   );
@@ -288,28 +300,30 @@ test("readiness finalization waits for auth reconciliation to settle", async () 
   assert.deepEqual(order, ["readiness", "reconcile:start", "reconcile:end", "finalize"]);
 });
 
-test("failed initial readiness never reconciles or publishes running", async () => {
+test("failed initial readiness fails closed by default and never publishes warning or running", async () => {
   let reconciled = false;
   let finalized = false;
   let warned = false;
 
-  const result = await runProvisioningReadinessBarrier({
-    checkReadiness: async () => ({ ok: false, gateway: { error: "connection refused" } }),
-    onReadinessWarning: async () => {
-      warned = true;
-    },
-    reconcileAuth: async () => {
-      reconciled = true;
-      return { status: "synced" };
-    },
-    finalize: async () => {
-      finalized = true;
-      return { finalized: true };
-    },
-  });
+  await assert.rejects(
+    runProvisioningReadinessBarrier({
+      checkReadiness: async () => ({ ok: false, gateway: { error: "connection refused" } }),
+      onReadinessWarning: async () => {
+        warned = true;
+      },
+      reconcileAuth: async () => {
+        reconciled = true;
+        return { status: "synced" };
+      },
+      finalize: async () => {
+        finalized = true;
+        return { finalized: true };
+      },
+    }),
+    (error) => error.code === "INITIAL_RUNTIME_READINESS_FAILED",
+  );
 
-  assert.equal(result.status, "warning");
-  assert.equal(warned, true);
+  assert.equal(warned, false);
   assert.equal(reconciled, false);
   assert.equal(finalized, false);
 });
@@ -367,28 +381,24 @@ test("auth reconciliation failure never publishes running", async () => {
   assert.equal(finalized, false);
 });
 
-test("provider finalization retries drift and commits only while mutation state is stable", async () => {
+test("provider mutation lock spans reconcile, canary, fingerprint verification, and finalization", async () => {
   const order = [];
-  const fingerprints = ["provider-v2", "provider-v2"];
-  let reconcilePass = 0;
 
   const result = await reconcileProviderStateUntilStable({
     bootstrappedFingerprint: "provider-v1",
     reconcile: async (previousFingerprint) => {
       order.push(`reconcile:${previousFingerprint}`);
-      reconcilePass += 1;
       return {
         status: "synced",
-        providerFingerprint: reconcilePass === 1 ? "provider-v1" : "provider-v2",
+        providerFingerprint: "provider-v2",
       };
     },
     verify: async ({ pass, providerFingerprint }) => {
       order.push(`canary:${pass}:${providerFingerprint}`);
     },
     readFingerprint: async () => {
-      const fingerprint = fingerprints.shift();
-      order.push(`verify:${fingerprint}`);
-      return fingerprint;
+      order.push("verify:provider-v2");
+      return "provider-v2";
     },
     withMutationLock: async (operation) => {
       order.push("lock");
@@ -404,24 +414,19 @@ test("provider finalization retries drift and commits only while mutation state 
     },
   });
 
-  assert.equal(result.passes, 2);
+  assert.equal(result.passes, 1);
   assert.equal(result.finalization.finalized, true);
   assert.deepEqual(order, [
-    "reconcile:provider-v1",
-    "canary:1:provider-v1",
     "lock",
-    "verify:provider-v2",
-    "unlock",
     "reconcile:provider-v1",
-    "canary:2:provider-v2",
-    "lock",
+    "canary:1:provider-v2",
     "verify:provider-v2",
     "finalize",
     "unlock",
   ]);
 });
 
-test("provider verification failure prevents mutation locking and finalization", async () => {
+test("provider verification failure remains inside the mutation lock and prevents finalization", async () => {
   const order = [];
 
   await assert.rejects(
@@ -441,7 +446,11 @@ test("provider verification failure prevents mutation locking and finalization",
       },
       withMutationLock: async (operation) => {
         order.push("lock");
-        return operation();
+        try {
+          return await operation();
+        } finally {
+          order.push("unlock");
+        }
       },
       finalize: async () => {
         order.push("finalize");
@@ -451,11 +460,10 @@ test("provider verification failure prevents mutation locking and finalization",
     /activation reply missing/,
   );
 
-  assert.deepEqual(order, ["reconcile", "canary"]);
+  assert.deepEqual(order, ["lock", "reconcile", "canary", "unlock"]);
 });
 
-test("provider finalization fails closed when mutations never settle", async () => {
-  let version = 1;
+test("provider finalization fails closed on an impossible fingerprint mismatch under lock", async () => {
   let finalized = false;
 
   await assert.rejects(
@@ -463,15 +471,14 @@ test("provider finalization fails closed when mutations never settle", async () 
       bootstrappedFingerprint: "provider-v0",
       reconcile: async () => ({
         status: "synced",
-        providerFingerprint: `provider-v${version++}`,
+        providerFingerprint: "provider-v1",
       }),
-      readFingerprint: async () => `provider-v${version++}`,
+      readFingerprint: async () => "provider-v2",
       withMutationLock: async (operation) => operation(),
       finalize: async () => {
         finalized = true;
         return { finalized: true };
       },
-      maxPasses: 2,
     }),
     (error) => {
       assert.equal(error.code, "PROVIDER_STATE_UNSTABLE");
