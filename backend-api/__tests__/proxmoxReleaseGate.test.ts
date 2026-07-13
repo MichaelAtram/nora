@@ -72,6 +72,11 @@ describe("Proxmox real-hardware release gate", () => {
     expect(workflow).toMatch(/^\s+e2e\/scripts\/run-proxmox-smoke\.sh\s*$/m);
     expect(workflow).not.toMatch(/^\s+push:/m);
     expect(workflow).not.toMatch(/^\s+pull_request:/m);
+    expect(workflow).not.toContain("${{ runner.temp }}");
+    expect(workflow).toContain("- name: Initialize qualification artifact paths");
+    expect(workflow).toContain(
+      'prefix="${RUNNER_TEMP}/nora-proxmox-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+    );
   });
 
   it("releases Proxmox secrets only after validating an exact default-branch SHA", () => {
