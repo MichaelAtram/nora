@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -62,6 +62,14 @@ function serviceSection(source, serviceName) {
   return match[1];
 }
 
+function nginxRequestMapSection(source, variableName) {
+  const match = source.match(
+    new RegExp(`map \\$request_uri \\$${variableName} \\{([\\s\\S]*?)\\n    \\}`),
+  );
+  assert.ok(match, `missing request map ${variableName}`);
+  return match[1];
+}
+
 function manifestDocument(source, kind, name) {
   const document = source
     .split(/^---\s*$/m)
@@ -112,8 +120,42 @@ test("marketing Compose services use an explicit environment allowlist", () => {
 });
 
 test("public nginx templates enforce marketing security and homepage cache headers", () => {
+  const cloudflareNetworks = [
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+  ];
   for (const file of ["infra/nginx_public.conf.template", "infra/nginx_tls.conf"]) {
     const source = read(file);
+    for (const network of cloudflareNetworks) {
+      assert.match(
+        source,
+        new RegExp(`^\\s*set_real_ip_from ${network.replaceAll(".", "\\.")};$`, "m"),
+        `${file} must trust Cloudflare network ${network}`,
+      );
+    }
+    assert.match(source, /^\s*real_ip_header CF-Connecting-IP;$/m);
+    assert.match(source, /^\s*real_ip_recursive on;$/m);
+    assert.doesNotMatch(source, /^\s*#\s*(set_real_ip_from|real_ip_header|real_ip_recursive)/m);
     assert.match(source, /server_tokens off;/, `${file} must suppress version disclosure`);
     assert.match(
       source,
@@ -124,6 +166,11 @@ test("public nginx templates enforce marketing security and homepage cache heade
       source,
       /Strict-Transport-Security[^;]*includeSubDomains/,
       `${file} must not pin unrelated subdomains by default`,
+    );
+    assert.match(
+      source,
+      /proxy_hide_header Strict-Transport-Security;/,
+      `${file} must hide upstream HSTS`,
     );
     assert.match(
       source,
@@ -142,8 +189,8 @@ test("public nginx templates enforce marketing security and homepage cache heade
       `${file} must choose frame policy by surface`,
     );
     assert.match(
-      source,
-      /map \$uri \$surface_x_frame_options \{[\s\S]*?~\^\/api\(\/\|\$\) "";[\s\S]*?~\^\/\(app\|admin\)\(\/\|\$\) "SAMEORIGIN";/,
+      nginxRequestMapSection(source, "surface_x_frame_options"),
+      /~\^\/api\(\/\|\\\?\|\$\) "";[\s\S]*?~\^\/\(app\|admin\)\(\/\|\\\?\|\$\) "SAMEORIGIN";/,
       `${file} must preserve backend embed headers and protect dashboards`,
     );
     assert.match(
@@ -151,18 +198,52 @@ test("public nginx templates enforce marketing security and homepage cache heade
       /"\/" "public, max-age=0, s-maxage=300, stale-while-revalidate=60";/,
       `${file} must mark only the homepage for shared caching`,
     );
-    assert.match(source, /location = \/ \{[\s\S]*?proxy_hide_header Cache-Control;/);
+    assert.match(
+      source,
+      /location = \/ \{[\s\S]*?proxy_hide_header Cache-Control;[\s\S]*?proxy_hide_header Strict-Transport-Security;/,
+    );
   }
 });
 
-test("every active nginx edge preserves backend embed framing headers", () => {
-  for (const file of ["nginx.conf", "infra/helm/nora/files/nginx-k8s.conf"]) {
+test("Next.js frontends suppress framework disclosure headers", () => {
+  for (const file of [
+    "frontend-marketing/next.config.ts",
+    "frontend-dashboard/next.config.ts",
+    "admin-dashboard/next.config.ts",
+  ]) {
+    assert.match(read(file), /poweredByHeader:\s*false/, `${file} must hide X-Powered-By`);
+  }
+});
+
+test("every active nginx edge preserves backend API-owned browser policy", () => {
+  for (const file of [
+    "nginx.conf",
+    "infra/nginx_public.conf.template",
+    "infra/nginx_tls.conf",
+    "infra/helm/nora/files/nginx-k8s.conf",
+  ]) {
     const source = read(file);
-    assert.match(source, /map \$uri \$surface_x_frame_options \{/);
-    assert.match(source, /~\^\/api\(\/\|\$\) "";/);
-    assert.match(source, /~\^\/\(app\|admin\)\(\/\|\$\) "SAMEORIGIN";/);
+    const frameMap = nginxRequestMapSection(source, "surface_x_frame_options");
+    assert.match(frameMap, /~\^\/api\(\/\|\\\?\|\$\) "";/);
+    assert.match(frameMap, /~\^\/\(app\|admin\)\(\/\|\\\?\|\$\) "SAMEORIGIN";/);
     assert.match(source, /add_header X-Frame-Options \$surface_x_frame_options always;/);
     assert.doesNotMatch(source, /add_header X-Frame-Options DENY always;/);
+    for (const [header, variable] of [
+      ["X-Content-Type-Options", "surface_x_content_type_options"],
+      ["Referrer-Policy", "surface_referrer_policy"],
+      ["Cross-Origin-Opener-Policy", "surface_cross_origin_opener_policy"],
+    ]) {
+      assert.match(
+        nginxRequestMapSection(source, variable),
+        /~\^\/api\(\/\|\\\?\|\$\) "";/,
+        `${file} must preserve backend ${header} on APIs`,
+      );
+      assert.match(
+        source,
+        new RegExp(`add_header ${header} \\$${variable} always;`),
+        `${file} must apply edge ${header} outside APIs`,
+      );
+    }
   }
 });
 
@@ -652,7 +733,7 @@ test("production update paths activate refreshed nginx config without touching c
   );
   assert.match(
     deployWorkflow,
-    /docker compose "\$\{compose_args\[@\]\}" run --rm --no-deps nginx nginx -t[\s\S]*?docker compose "\$\{compose_args\[@\]\}" up -d --build[\s\S]*?docker compose "\$\{compose_args\[@\]\}" up -d --force-recreate --no-deps nginx[\s\S]*?docker compose "\$\{compose_args\[@\]\}" exec -T nginx nginx -t/,
+    /docker compose "\$\{compose_args\[@\]\}" run --rm --no-deps --interactive=false -T nginx nginx -t[\s\S]*?docker compose "\$\{compose_args\[@\]\}" up -d --build[\s\S]*?docker compose "\$\{compose_args\[@\]\}" up -d --force-recreate --no-deps nginx[\s\S]*?docker compose "\$\{compose_args\[@\]\}" exec -T nginx nginx -t/,
   );
   assert.match(
     setupBash,
@@ -660,7 +741,7 @@ test("production update paths activate refreshed nginx config without touching c
   );
   assert.match(
     setupBash,
-    /docker compose run --rm --no-deps nginx nginx -t[\s\S]*?docker compose up -d --build[\s\S]*?docker compose up -d --force-recreate --no-deps nginx[\s\S]*?docker compose exec -T nginx nginx -t/,
+    /docker compose run --rm --no-deps --interactive=false -T nginx nginx -t[\s\S]*?docker compose up -d --build[\s\S]*?docker compose up -d --force-recreate --no-deps nginx[\s\S]*?docker compose exec -T nginx nginx -t/,
   );
   assert.match(
     setupPowerShell,
@@ -668,7 +749,7 @@ test("production update paths activate refreshed nginx config without touching c
   );
   assert.match(
     setupPowerShell,
-    /docker compose run --rm --no-deps nginx nginx -t[\s\S]*?docker compose up -d --build[\s\S]*?docker compose up -d --force-recreate --no-deps nginx[\s\S]*?docker compose exec -T nginx nginx -t/,
+    /docker compose run --rm --no-deps --interactive=false -T nginx nginx -t[\s\S]*?docker compose up -d --build[\s\S]*?docker compose up -d --force-recreate --no-deps nginx[\s\S]*?docker compose exec -T nginx nginx -t/,
   );
   assert.match(
     releaseUpgrade,
@@ -676,12 +757,47 @@ test("production update paths activate refreshed nginx config without touching c
   );
   assert.match(
     releaseUpgrade,
-    /docker compose "\$\{COMPOSE_ARGS\[@\]\}" run --rm --no-deps nginx nginx -t[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" up -d --build[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" up -d --force-recreate --no-deps nginx[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" exec -T nginx nginx -t/,
+    /docker compose "\$\{COMPOSE_ARGS\[@\]\}" run --rm --no-deps --interactive=false -T nginx nginx -t[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" up -d --build[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" up -d --force-recreate --no-deps nginx[\s\S]*?docker compose "\$\{COMPOSE_ARGS\[@\]\}" exec -T nginx nginx -t/,
   );
   assert.match(
     setupTls,
     /certbot renew --quiet[\s\S]*?docker compose exec -T nginx nginx -t[\s\S]*?docker compose exec -T nginx nginx -s reload/,
   );
+
+  const remoteValidation = deployWorkflow.match(
+    /^\s*(docker compose "\$\{compose_args\[@\]\}" run --rm --no-deps --interactive=false -T nginx nginx -t)\s*$/m,
+  );
+  assert.ok(remoteValidation, "deploy workflow must expose a non-interactive nginx preflight");
+  const stdinFixture = mkdtempSync(path.join(tmpdir(), "nora-nginx-preflight-stdin-"));
+  try {
+    const fakeDocker = path.join(stdinFixture, "docker");
+    const marker = path.join(stdinFixture, "continued");
+    writeFileSync(
+      fakeDocker,
+      `#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " != *" --interactive=false "* ]]; then
+  cat >/dev/null
+fi
+`,
+    );
+    chmodSync(fakeDocker, 0o755);
+    const remoteScript = `set -euo pipefail
+compose_args=()
+${remoteValidation[1]}
+printf continued > ${JSON.stringify(marker)}
+`;
+    const result = spawnSync("bash", ["-s"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      input: remoteScript,
+      env: { ...process.env, PATH: `${stdinFixture}:${process.env.PATH}` },
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(readFileSync(marker, "utf8"), "continued");
+  } finally {
+    rmSync(stdinFixture, { recursive: true, force: true });
+  }
 
   runChecked("bash", [
     "-c",
