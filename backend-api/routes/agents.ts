@@ -27,6 +27,7 @@ const {
   resolveContainerName,
   sanitizeAgentName,
   serializeAgent,
+  stripInternalTemplateMetadata,
 } = require("../agentPayloads");
 const {
   attachDraftToAgent,
@@ -80,8 +81,12 @@ const {
   resumeAgentWithProviderAuth,
   syncAuthToUserAgents,
 } = require("../authSync");
-const { findAccessibleAgent } = require("../middleware/ownership");
-const { scopeByMethod } = require("../middleware/auth");
+const {
+  apiKeyWorkspaceId,
+  findAccessibleAgentForRequest,
+  requireApiKeyAgentScope,
+} = require("../middleware/ownership");
+const { requireSession, scopeByMethod } = require("../middleware/auth");
 const agentVersions = require("../agentVersions");
 const { assertKubernetesExecutionTargetAvailable } = require("../kubernetesClusters");
 const {
@@ -98,9 +103,37 @@ const {
 
 const router = express.Router();
 router.use(createMutationFailureAuditMiddleware("agent"));
-// API-key requests need agents:read for GET/HEAD, agents:write for everything
-// else. Session-authenticated requests skip this check (req.apiKey is unset).
-router.use(scopeByMethod("agents:read", "agents:write"));
+const coreAgentScope = scopeByMethod("agents:read", "agents:write");
+const ROUTE_SPECIFIC_SCOPE_SEGMENTS = new Set([
+  "backups",
+  "channels",
+  "cost",
+  "export",
+  "files",
+  "integrations",
+  "mcp-servers",
+  "metrics",
+]);
+
+// Core agent routes use agents:read/write. Nested resources with their own
+// public scope contract must reach that router without accidentally requiring
+// both scopes. Session-only backup, export, and live-filesystem routes likewise
+// need to return their explicit session_required result without a scope or DB lookup.
+router.use((req, res, next) => {
+  if (req.apiKey) {
+    const segments = String(req.path || "")
+      .split("/")
+      .filter(Boolean);
+    if (
+      segments[0] === "activate-demo" ||
+      (segments.length > 1 && ROUTE_SPECIFIC_SCOPE_SEGMENTS.has(segments[1]))
+    ) {
+      return next();
+    }
+  }
+  return coreAgentScope(req, res, next);
+});
+router.param("id", requireApiKeyAgentScope("id"));
 
 const DEMO_ACTIVATION_MARKER = "local-docker-demo-v1";
 
@@ -120,6 +153,35 @@ function createAgentNotFoundError() {
   return error;
 }
 
+function createApiKeyWorkspaceBindingError() {
+  const error = new Error("API key has no workspace binding");
+  error.statusCode = 403;
+  error.code = "wrong_workspace";
+  return error;
+}
+
+async function insertAgentForRequest(req, insertSql, params) {
+  if (!req.apiKey) return db.query(insertSql, params);
+
+  const workspaceId = apiKeyWorkspaceId(req);
+  if (!workspaceId) throw createApiKeyWorkspaceBindingError();
+  const workspaceParam = `$${params.length + 1}`;
+  return db.query(
+    `WITH created_agent AS (
+       ${insertSql}
+     ), workspace_assignment AS (
+       INSERT INTO workspace_agents(workspace_id, agent_id, role)
+       SELECT ${workspaceParam}, id, 'member'
+         FROM created_agent
+       RETURNING agent_id
+     )
+     SELECT created_agent.*
+       FROM created_agent
+       JOIN workspace_assignment ON workspace_assignment.agent_id = created_agent.id`,
+    [...params, workspaceId],
+  );
+}
+
 function assertLifecycleNotProvisioning(agent) {
   if (!["queued", "deploying"].includes(agent?.status)) return;
   const error = new Error(
@@ -131,15 +193,15 @@ function assertLifecycleNotProvisioning(agent) {
 }
 
 async function withAccessibleAgentLifecycleLock(
-  { agentId, userId, role = "editor", applicationName },
+  { agentId, req, role = "editor", applicationName },
   callback,
 ) {
-  const visible = await findAccessibleAgent(agentId, userId, role);
+  const visible = await findAccessibleAgentForRequest(req, agentId, role);
   if (!visible) throw createAgentNotFoundError();
 
   const provisionLock = await acquireAgentProvisionLock(agentId, { applicationName });
   try {
-    const agent = await findAccessibleAgent(agentId, userId, role);
+    const agent = await findAccessibleAgentForRequest(req, agentId, role);
     if (!agent) throw createAgentNotFoundError();
     assertLifecycleNotProvisioning(agent);
     return await callback(agent);
@@ -322,6 +384,11 @@ async function findDemoActivationAgent(queryable, userId) {
        FROM agents
       WHERE user_id = $1
         AND template_payload @> $2::jsonb
+        AND runtime_family = 'openclaw'
+        AND deploy_target = 'docker'
+        AND execution_target_id = 'docker'
+        AND sandbox_profile = 'standard'
+        AND backend_type = 'docker'
       ORDER BY created_at, id
       LIMIT 1`,
     [userId, demoActivationMarkerPayload()],
@@ -439,6 +506,19 @@ async function assertRuntimeTargetAvailable(runtimeFields, ownerUserId) {
   return status;
 }
 
+function requireSessionForRemoteDockerPlacement(req, res, ...runtimeSelections) {
+  const targetsRemoteDocker = runtimeSelections.some(
+    (runtimeFields) => runtimeFields?.deploy_target === "remote-docker",
+  );
+  if (!req.apiKey || !targetsRemoteDocker) return true;
+
+  res.status(403).json({
+    error: "Remote Docker placement requires session authentication",
+    code: "session_required",
+  });
+  return false;
+}
+
 function normalizeGatewayHost(value) {
   const raw = String(value || "").trim();
   if (!raw) return null;
@@ -542,7 +622,17 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const scope = req.query.scope === "owned" ? "owned" : "accessible";
-    const agents = await workspaces.listAccessibleAgents(req.user.id, { scope });
+    const listOptions = { scope };
+    if (req.apiKey) {
+      const workspaceId = apiKeyWorkspaceId(req);
+      if (!workspaceId) {
+        return res
+          .status(403)
+          .json({ error: "API key has no workspace binding", code: "wrong_workspace" });
+      }
+      listOptions.workspaceId = workspaceId;
+    }
+    const agents = await workspaces.listAccessibleAgents(req.user.id, listOptions);
     res.json(agents.map(serializeAgent));
   }),
 );
@@ -550,7 +640,7 @@ router.get(
 router.get(
   "/:id",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     let runtimeStatus = null;
 
@@ -590,7 +680,7 @@ router.get(
 router.get(
   "/:id/stats/history",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
 
     const rangeMap = {
@@ -642,7 +732,7 @@ function agentAuditMetadata(req, agent, extra = {}) {
 router.get(
   "/:id/gateway-url",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, {
       ownerEmail: req.user.email || null,
@@ -742,7 +832,7 @@ function createStatusCodeError(message, statusCode) {
 }
 
 async function loadHermesUiAgent(req, { requiredRole = "viewer" } = {}) {
-  const agent = await findAccessibleAgent(req.params.id, req.user.id, requiredRole);
+  const agent = await findAccessibleAgentForRequest(req, req.params.id, requiredRole);
   if (!agent) {
     throw createStatusCodeError("Agent not found", 404);
   }
@@ -1609,13 +1699,13 @@ router.post(
 router.get(
   "/:id/stats",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.json(await buildAgentStatsResponse(agent));
   }),
 );
 
-router.post("/activate-demo", async (req, res) => {
+router.post("/activate-demo", requireSession, async (req, res) => {
   const userId = req.user.id;
   const lockKey = llmProviders.providerMutationLockKey(userId);
   let client;
@@ -1802,14 +1892,14 @@ router.post("/deploy", async (req, res) => {
   try {
     const requestBody = req.body || {};
     const clawhubSkills = normalizeClawhubSkills(requestBody.clawhub_skills);
-    // Enforce billing limits
-    const limits = await billing.enforceLimits(req.user.id);
-    if (!limits.allowed)
-      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
-
-    const sub = limits.subscription;
     let migrationDraft = null;
     if (requestBody.migration_draft_id) {
+      if (req.apiKey) {
+        return res.status(403).json({
+          error: "Migration-draft deployment requires session authentication",
+          code: "session_required",
+        });
+      }
       migrationDraft = await getOwnedMigrationDraft(requestBody.migration_draft_id, req.user.id);
       if (!migrationDraft) {
         return res.status(404).json({ error: "Migration draft not found" });
@@ -1839,6 +1929,14 @@ router.post("/deploy", async (req, res) => {
         runtime_family: runtimeFamily || DEFAULT_RUNTIME_FAMILY,
       },
     });
+    if (!requireSessionForRemoteDockerPlacement(req, res, runtimeFields)) return;
+    // Enforce billing only after authorization has rejected session-only
+    // Remote Docker placement for workspace API keys.
+    const limits = await billing.enforceLimits(req.user.id);
+    if (!limits.allowed)
+      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
+
+    const sub = limits.subscription;
     const containerName = resolveContainerName({
       requestedName: requestBody.container_name,
       agentName: name,
@@ -1871,39 +1969,42 @@ router.post("/deploy", async (req, res) => {
       requestedImage: requestBody.image,
       runtimeFields,
     });
-    const templatePayload = migrationDraft
-      ? migrationDraft.manifest.runtimeFamily === "openclaw"
-        ? migrationDraft.manifest.templatePayload ||
-          ensureCoreTemplateFiles(
-            createEmptyTemplatePayload({
+    const templatePayload = stripInternalTemplateMetadata(
+      migrationDraft
+        ? migrationDraft.manifest.runtimeFamily === "openclaw"
+          ? migrationDraft.manifest.templatePayload ||
+            ensureCoreTemplateFiles(
+              createEmptyTemplatePayload({
+                source: "migration-draft",
+              }),
+              {
+                name,
+                sourceType: "platform",
+                includeBootstrap: true,
+              },
+            )
+          : createEmptyTemplatePayload({
               source: "migration-draft",
-            }),
-            {
-              name,
-              sourceType: "platform",
-              includeBootstrap: true,
-            },
-          )
-        : createEmptyTemplatePayload({
-            source: "migration-draft",
-            migrationDraftId: migrationDraft.id,
-          })
-      : runtimeFields.runtime_family === "openclaw"
-        ? ensureCoreTemplateFiles(
-            createEmptyTemplatePayload({
+              migrationDraftId: migrationDraft.id,
+            })
+        : runtimeFields.runtime_family === "openclaw"
+          ? ensureCoreTemplateFiles(
+              createEmptyTemplatePayload({
+                source: "blank-deploy",
+              }),
+              {
+                name,
+                sourceType: "platform",
+                includeBootstrap: true,
+              },
+            )
+          : createEmptyTemplatePayload({
               source: "blank-deploy",
             }),
-            {
-              name,
-              sourceType: "platform",
-              includeBootstrap: true,
-            },
-          )
-        : createEmptyTemplatePayload({
-            source: "blank-deploy",
-          });
+    );
 
-    const result = await db.query(
+    const result = await insertAgentForRequest(
+      req,
       `INSERT INTO agents(
          user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
          container_name, image, template_payload, clawhub_skills, runtime_family, deploy_target,
@@ -2075,7 +2176,8 @@ router.post("/adopt", async (req, res) => {
     // 'running' (optimistic); the external health-poll (Phase C2) reconciles it.
     // dashboard_port mirrors the published port so resolveHermesDashboardAddress is
     // correct even via its runtime_host fallback (not just the gateway_host branch).
-    const result = await db.query(
+    const result = await insertAgentForRequest(
+      req,
       `INSERT INTO agents(
          user_id, name, status, runtime_family, deploy_target, execution_target_id,
          sandbox_profile, sandbox_type, backend_type, gateway_host, gateway_port,
@@ -2108,7 +2210,7 @@ router.post("/adopt", async (req, res) => {
 router.patch(
   "/:id",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
 
     const name = sanitizeAgentName(req.body.name, agent.name || "OpenClaw-Agent");
@@ -2138,12 +2240,7 @@ router.post(
   "/:id/duplicate",
   asyncHandler(async (req, res) => {
     const requestBody = req.body || {};
-    const limits = await billing.enforceLimits(req.user.id);
-    if (!limits.allowed) {
-      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
-    }
-
-    const sourceAgent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const sourceAgent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!sourceAgent) return res.status(404).json({ error: "Agent not found" });
     const sourceRuntime = buildAgentRuntimeFields(sourceAgent);
     res.locals.auditContext = buildAgentContext(sourceAgent, {
@@ -2174,6 +2271,11 @@ router.post(
       },
       fallback: sourceRuntime,
     });
+    if (!requireSessionForRemoteDockerPlacement(req, res, sourceRuntime, runtimeFields)) return;
+    const limits = await billing.enforceLimits(req.user.id);
+    if (!limits.allowed) {
+      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
+    }
     await assertRuntimeTargetAvailable(runtimeFields, req.user.id);
     const node = await scheduler.selectNode({
       fallback: runtimeFields.deploy_target,
@@ -2202,7 +2304,8 @@ router.post(
       return res.status(409).json({ error: err.message });
     }
 
-    const inserted = await db.query(
+    const inserted = await insertAgentForRequest(
+      req,
       `INSERT INTO agents(
        user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
        container_name, image, template_payload, runtime_family, deploy_target,
@@ -2275,7 +2378,7 @@ router.post("/:id/start", async (req, res, next) => {
     const result = await withAccessibleAgentLifecycleLock(
       {
         agentId: req.params.id,
-        userId: req.user.id,
+        req,
         applicationName: "nora-backend-agent-start",
       },
       async (agent) => {
@@ -2314,7 +2417,7 @@ router.post("/:id/stop", async (req, res, next) => {
     const result = await withAccessibleAgentLifecycleLock(
       {
         agentId: req.params.id,
-        userId: req.user.id,
+        req,
         applicationName: "nora-backend-agent-stop",
       },
       async (agent) => {
@@ -2353,54 +2456,74 @@ router.post("/:id/stop", async (req, res, next) => {
   }
 });
 
-async function destroyAgent(agentId, userId, req, res) {
-  const agent = await findAccessibleAgent(agentId, userId, "viewer");
-  if (!agent) return res.status(404).json({ error: "Agent not found" });
-  if (agent.user_id !== userId) {
+async function destroyAgent(agentId, req, res) {
+  const visibleAgent = await findAccessibleAgentForRequest(req, agentId, "viewer");
+  if (!visibleAgent) return res.status(404).json({ error: "Agent not found" });
+  if (visibleAgent.user_id !== req.user.id) {
     return res.status(403).json({
       error:
         "Only the direct agent owner can delete this agent. Remove the workspace assignment instead.",
     });
   }
-  res.locals.auditContext = buildAgentContext(agent, {
-    ownerEmail: req.user.email || null,
+
+  const provisionLock = await acquireAgentProvisionLock(visibleAgent.id, {
+    applicationName: "nora-backend-agent-delete",
   });
-
-  // Remove waiting/delayed retries before deleting the durable row. Active
-  // BullMQ jobs cannot be removed while locked; the provisioner rechecks the
-  // row and cleans up any just-created runtime, making those jobs harmless.
-  await cancelDeploymentJobsForAgent(agent.id);
-
-  if (containerManager.canDestroy(agent)) {
-    try {
-      await containerManager.destroy(agent);
-    } catch (error) {
-      console.error("Container cleanup error:", error.message);
-      return res.status(error.statusCode || 500).json({
+  try {
+    // The agent may have been redeployed or its workspace access may have
+    // changed while this request waited for an active provisioner. Reload the
+    // complete row while holding the shared lock so cleanup always targets the
+    // authoritative placement, including a newly created Remote Docker runtime.
+    const agent = await findAccessibleAgentForRequest(req, agentId, "viewer");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    if (agent.user_id !== req.user.id) {
+      return res.status(403).json({
         error:
-          error.message || "Failed to delete runtime resources; agent record was kept for retry.",
+          "Only the direct agent owner can delete this agent. Remove the workspace assignment instead.",
       });
     }
-  }
+    res.locals.auditContext = buildAgentContext(agent, {
+      ownerEmail: req.user.email || null,
+    });
 
-  // Free the agent's reserved gateway port. The FK is ON DELETE CASCADE so the
-  // hard delete below already releases it, but release explicitly so the
-  // allocation can't leak if agent deletion ever becomes a soft-delete.
-  await releaseGatewayPort(agent.id).catch(() => {});
-  await db.query("DELETE FROM agents WHERE id = $1", [agent.id]);
-  await monitoring.logEvent(
-    "agent_deleted",
-    `Agent "${agent.name}" deleted`,
-    agentAuditMetadata(req, agent, {
-      result: { deleted: true },
-    }),
-  );
-  res.json({ success: true });
+    // Remove waiting/delayed retries before deleting the durable row. Holding
+    // the provision lock keeps a producer or worker from publishing a new
+    // runtime between this cancellation, cleanup, and the durable deletion.
+    await cancelDeploymentJobsForAgent(agent.id);
+
+    if (containerManager.canDestroy(agent)) {
+      try {
+        await containerManager.destroy(agent);
+      } catch (error) {
+        console.error("Container cleanup error:", error.message);
+        return res.status(error.statusCode || 500).json({
+          error:
+            error.message || "Failed to delete runtime resources; agent record was kept for retry.",
+        });
+      }
+    }
+
+    // Free the agent's reserved gateway port. The FK is ON DELETE CASCADE so the
+    // hard delete below already releases it, but release explicitly so the
+    // allocation can't leak if agent deletion ever becomes a soft-delete.
+    await releaseGatewayPort(agent.id).catch(() => {});
+    await db.query("DELETE FROM agents WHERE id = $1", [agent.id]);
+    await monitoring.logEvent(
+      "agent_deleted",
+      `Agent "${agent.name}" deleted`,
+      agentAuditMetadata(req, agent, {
+        result: { deleted: true },
+      }),
+    );
+    return res.json({ success: true });
+  } finally {
+    await provisionLock.release();
+  }
 }
 
 router.post("/:id/delete", async (req, res, next) => {
   try {
-    await destroyAgent(req.params.id, req.user.id, req, res);
+    await destroyAgent(req.params.id, req, res);
   } catch (e) {
     next(e);
   }
@@ -2408,7 +2531,7 @@ router.post("/:id/delete", async (req, res, next) => {
 
 router.delete("/:id", async (req, res, next) => {
   try {
-    await destroyAgent(req.params.id, req.user.id, req, res);
+    await destroyAgent(req.params.id, req, res);
   } catch (e) {
     next(e);
   }
@@ -2419,7 +2542,7 @@ router.post("/:id/restart", async (req, res, next) => {
     await withAccessibleAgentLifecycleLock(
       {
         agentId: req.params.id,
-        userId: req.user.id,
+        req,
         applicationName: "nora-backend-agent-restart",
       },
       async (agent) => {
@@ -2453,7 +2576,7 @@ router.post("/:id/restart", async (req, res, next) => {
 router.post("/:id/redeploy", async (req, res) => {
   try {
     const requestBody = req.body || {};
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, {
       ownerEmail: req.user.email || null,
@@ -2479,6 +2602,9 @@ router.post("/:id/redeploy", async (req, res) => {
       },
       fallback: currentRuntimeFields,
     });
+    if (!requireSessionForRemoteDockerPlacement(req, res, currentRuntimeFields, runtimeFields)) {
+      return;
+    }
     // Workspace editors may trigger a redeploy, but the runtime always belongs
     // to the persisted agent owner. Validate and queue using that owner so the
     // editor's provider credentials can never be selected by the worker.
@@ -2537,7 +2663,7 @@ router.post("/:id/redeploy", async (req, res) => {
 router.get(
   "/:id/budget",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.json({
       budgets: await agentBudgets.listBudgetsWithSpend(agent.id),
@@ -2549,7 +2675,7 @@ router.get(
 router.put(
   "/:id/budget",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, {
       ownerEmail: req.user.email || null,
@@ -2574,7 +2700,7 @@ router.put(
 router.delete(
   "/:id/budget/:budgetId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, {
       ownerEmail: req.user.email || null,
@@ -2595,7 +2721,7 @@ router.delete(
 router.get(
   "/:id/schedules",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.json(await agentSchedules.listSchedules(agent.id));
   }),
@@ -2604,7 +2730,7 @@ router.get(
 router.post(
   "/:id/schedules",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
     let schedule;
@@ -2628,7 +2754,7 @@ router.post(
 router.put(
   "/:id/schedules/:scheduleId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
     let schedule;
@@ -2657,7 +2783,7 @@ router.put(
 router.delete(
   "/:id/schedules/:scheduleId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
     const deleted = await agentSchedules.deleteSchedule(agent.id, req.params.scheduleId);
@@ -2674,7 +2800,7 @@ router.delete(
 router.get(
   "/:id/schedules/:scheduleId/runs",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 25));
     // Runs are recorded as agent.schedule.run events (audit-integrated).
@@ -2683,9 +2809,10 @@ router.get(
          FROM events
         WHERE type = 'agent.schedule.run'
           AND metadata #>> '{result,scheduleId}' = $1
+          AND metadata #>> '{result,agentId}' = $2
         ORDER BY created_at DESC
-        LIMIT $2`,
-      [req.params.scheduleId, limit],
+        LIMIT $3`,
+      [req.params.scheduleId, agent.id, limit],
     );
     res.json(result.rows);
   }),
@@ -2696,7 +2823,7 @@ router.get(
 router.get(
   "/:id/versions",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
     res.json(await agentVersions.listVersions(agent.id, { limit }));
@@ -2706,7 +2833,7 @@ router.get(
 router.get(
   "/:id/versions/:versionId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     const version = await agentVersions.getVersion(agent.id, req.params.versionId);
     if (!version) return res.status(404).json({ error: "Version not found" });
@@ -2721,8 +2848,10 @@ router.get(
 router.post(
   "/:id/rollback/:versionId",
   asyncHandler(async (req, res) => {
-    let agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    let agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
+    let currentRuntimeFields = buildAgentRuntimeFields(agent);
+    if (!requireSessionForRemoteDockerPlacement(req, res, currentRuntimeFields)) return;
     const target = await agentVersions.getVersion(agent.id, req.params.versionId);
     if (!target) return res.status(404).json({ error: "Version not found" });
 
@@ -2738,8 +2867,10 @@ router.post(
       // who cannot see the agent. Re-read after acquiring the shared lock so a
       // deployment that finished while rollback was waiting cannot make us
       // restore config without redeploying the now-running runtime.
-      agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+      agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
       if (!agent) throw createAgentNotFoundError();
+      currentRuntimeFields = buildAgentRuntimeFields(agent);
+      if (!requireSessionForRemoteDockerPlacement(req, res, currentRuntimeFields)) return;
       res.locals.auditContext = buildAgentContext(agent, {
         ownerEmail: req.user.email || null,
       });
@@ -2757,7 +2888,7 @@ router.post(
         // Validate while the shared lock is held and before mutating the
         // rollback config. A removed target must leave the current config and
         // runtime identity untouched.
-        runtimeFields = buildAgentRuntimeFields(agent);
+        runtimeFields = currentRuntimeFields;
         await assertRuntimeTargetAvailable(runtimeFields, agent.user_id);
       }
 

@@ -2,9 +2,14 @@
 const express = require("express");
 const llmProviders = require("../llmProviders");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { requireSession } = require("../middleware/auth");
 const { syncAuthToUserAgents } = require("../authSync");
 
 const router = express.Router();
+// Provider credentials and defaults are user-global. A workspace API key must
+// not inherit its issuer's access to mutate or reconcile credentials across
+// other workspaces (including Remote Docker agents).
+router.use(requireSession);
 
 async function syncAfterProviderSave(userId, successMessage = "Provider saved") {
   try {

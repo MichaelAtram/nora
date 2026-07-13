@@ -236,6 +236,39 @@ describe("auth sync", () => {
     expect(encodedMcpConfig).not.toContain("mcp-token");
   });
 
+  it("rejects API-key-scoped auth sync after assignment removal", async () => {
+    mockDb.query.mockResolvedValueOnce({ rows: [] });
+
+    await expect(
+      syncAuthToUserAgents("owner-1", "agent-1", {
+        apiKeyWorkspaceId: "00000000-0000-0000-0000-000000000001",
+      }),
+    ).rejects.toMatchObject({ code: "wrong_workspace", statusCode: 403 });
+    expect(mockGetProviderKeys).not.toHaveBeenCalled();
+    expect(mockExec).not.toHaveBeenCalled();
+  });
+
+  it("rejects API-key-scoped auth sync when current placement is Remote Docker", async () => {
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-remote",
+          backend_type: "remote-docker",
+          deploy_target: "remote-docker",
+          execution_target_id: "remote:host-1",
+        },
+      ],
+    });
+
+    await expect(
+      syncAuthToUserAgents("owner-1", "agent-remote", {
+        apiKeyWorkspaceId: "00000000-0000-0000-0000-000000000001",
+      }),
+    ).rejects.toMatchObject({ code: "session_required", statusCode: 403 });
+    expect(mockGetProviderKeys).not.toHaveBeenCalled();
+    expect(mockExec).not.toHaveBeenCalled();
+  });
+
   it("stages exact integration and MCP revocation while an OpenClaw runtime is stopped", async () => {
     const agent = {
       id: "agent-stopped-revocation",

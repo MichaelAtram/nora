@@ -33,6 +33,7 @@ const SECURE_PRODUCTION_ENV = {
   PROXMOX_SSH_USER: "nora-bootstrap",
   PROXMOX_SSH_PASSWORD: "secret",
   PROXMOX_SSH_HOST_FINGERPRINT: `SHA256:${"A".repeat(43)}`,
+  PROXMOX_OFFLINE_STAGE_COMMAND: "/usr/local/libexec/nora-proxmox-stage",
 };
 
 describe("Proxmox real-hardware release gate", () => {
@@ -103,6 +104,11 @@ describe("Proxmox real-hardware release gate", () => {
     expect(workflow).toContain('PROXMOX_VERIFY_TLS: "true"');
     expect(workflow).toContain('PROXMOX_ALLOW_INSECURE_HTTP: "false"');
     expect(workflow).toContain('PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY: "false"');
+    expect(workflow).toContain(
+      "PROXMOX_OFFLINE_STAGE_COMMAND: ${{ vars.PROXMOX_OFFLINE_STAGE_COMMAND }}",
+    );
+    expect(workflow).toContain('if [ "$PROXMOX_SSH_USER" != "root" ]; then');
+    expect(workflow).toContain("required+=(PROXMOX_OFFLINE_STAGE_COMMAND)");
   });
 
   it("forwards host smoke overrides without placing secret values in Docker CLI argv", () => {
@@ -118,5 +124,8 @@ describe("Proxmox real-hardware release gate", () => {
     expect(smokeScript).toContain('catalogStatus.maturityTier === "experimental"');
     expect(docs).toContain("Proxmox support is experimental");
     expect(docs).toContain("does not automatically promote Proxmox beyond **Experimental**");
+    expect(docs).toContain("Non-root offline staging helper contract");
+    expect(docs).toContain("MIGRATION_CAPTURE_UNSUPPORTED");
+    expect(docs).toContain("<helper> <numeric-vmid> <openclaw|hermes> <0|1>");
   });
 });

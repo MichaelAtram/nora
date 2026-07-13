@@ -47,7 +47,7 @@ module.exports = {
       tags: ["Auth"],
       summary: "Public runtime authentication bootstrap status",
       description:
-        "True until the first user registers (who becomes the platform admin), plus safe runtime OAuth, platform-mode, and signup-challenge metadata. Public; never exposes verification secrets.",
+        "Reports self-hosted first-account admin claim state plus safe runtime OAuth, platform-mode, and signup-challenge metadata. Hosted PaaS requires an explicit bootstrap administrator and never exposes public admin claim. Public; never exposes verification secrets.",
       security: [],
       responses: ok("Status", {
         type: "object",
@@ -79,7 +79,7 @@ module.exports = {
       tags: ["Auth"],
       summary: "Create an operator account",
       description:
-        "The first registered user becomes the platform admin. Rate-limited; optional bot-protection token when the operator configured Turnstile/reCAPTCHA.",
+        "The first registered user becomes platform admin only on an empty self-hosted installation. Hosted PaaS requires a pre-seeded administrator, so public signup creates regular users. Rate-limited and challenge-protected when configured.",
       security: [],
       requestBody: signupBody,
       responses: ok("Created user"),

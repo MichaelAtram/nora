@@ -47,6 +47,7 @@ type ApiJsonOptions = {
   token?: string | null;
   data?: unknown;
   failOnStatus?: boolean;
+  timeout?: number;
 };
 
 type ApiJsonResult<T = unknown> = {
@@ -106,7 +107,7 @@ function uniqueName(prefix = "Nora E2E") {
 async function apiJson<T = unknown>(
   request: APIRequestContext,
   path: string,
-  { method = "GET", token = null, data, failOnStatus = true }: ApiJsonOptions = {},
+  { method = "GET", token = null, data, failOnStatus = true, timeout }: ApiJsonOptions = {},
 ): Promise<ApiJsonResult<T>> {
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -116,6 +117,7 @@ async function apiJson<T = unknown>(
     method,
     headers,
     data,
+    timeout,
   });
   const raw = await response.text();
 

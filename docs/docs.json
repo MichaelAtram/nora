@@ -74,6 +74,7 @@
         "group": "Guides",
         "pages": [
           "guides/deploy-agent",
+          "guides/remote-docker",
           "guides/manage-providers",
           "guides/integrations",
           {

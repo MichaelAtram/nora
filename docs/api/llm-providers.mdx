@@ -4,6 +4,12 @@
 
 The LLM Providers API lets you associate API keys for language model services (OpenAI, Anthropic, and others) with your Nora account. Provider create, update, and delete requests reconcile the complete current provider state to running agents before the request reports success. Keys are encrypted at rest and **never returned in plain text** — all responses show a masked version of the key.
 
+<Warning>
+  This user-global API requires session authentication. Workspace API keys are rejected with `403
+  session_required`, regardless of scope, before provider credentials, defaults, or runtime
+  reconciliation can be changed.
+</Warning>
+
 <Note>
   You can also trigger the same reconciliation explicitly with `POST /llm-providers/sync`.
 </Note>

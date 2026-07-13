@@ -204,6 +204,16 @@ test("public nginx templates enforce marketing security and homepage cache heade
     );
     assert.match(
       source,
+      /"\/" "public, max-age=300, stale-while-revalidate=60";/,
+      `${file} must give Cloudflare an explicit homepage edge TTL`,
+    );
+    assert.match(
+      source,
+      /add_header Cloudflare-CDN-Cache-Control \$marketing_cloudflare_cache_control always;/,
+      `${file} must emit the homepage-only Cloudflare cache policy`,
+    );
+    assert.match(
+      source,
       /location = \/ \{[\s\S]*?proxy_hide_header Cache-Control;[\s\S]*?proxy_hide_header Strict-Transport-Security;/,
     );
     assert.match(
@@ -761,6 +771,57 @@ test "$(read_deploy_env_value "$1" NEMOCLAW_SANDBOX_IMAGE "")" = "nora-nemoclaw-
   }
 });
 
+test("production deploy rejects PaaS without complete signup bot protection", () => {
+  const workflow = read(".github/workflows/deploy-production.yml");
+  const validator = path.join(repoRoot, "scripts", "validate-paas-signup-protection.sh");
+  assert.match(workflow, /bash scripts\/validate-paas-signup-protection\.sh "\$DEPLOY_ENV_FILE"/);
+
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "nora-paas-signup-protection-"));
+  const envFile = path.join(fixtureDir, ".env");
+  const run = (lines) => {
+    writeFileSync(envFile, `${lines.join("\n")}\n`);
+    return spawnSync("bash", [validator, envFile], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    });
+  };
+
+  try {
+    assert.equal(run(["PLATFORM_MODE=selfhosted"]).status, 0);
+
+    const disabled = run(["PLATFORM_MODE=paas", "SIGNUP_BOT_PROTECTION_PROVIDER=none"]);
+    assert.notEqual(disabled.status, 0);
+    assert.match(disabled.stderr, /requires SIGNUP_BOT_PROTECTION_PROVIDER=turnstile or recaptcha/);
+
+    const incomplete = run([
+      "PLATFORM_MODE=paas",
+      "SIGNUP_BOT_PROTECTION_PROVIDER=turnstile",
+      "SIGNUP_TURNSTILE_SITE_KEY=site-key",
+      "SIGNUP_TURNSTILE_SECRET= # server-only",
+    ]);
+    assert.notEqual(incomplete.status, 0);
+    assert.match(incomplete.stderr, /requires both the public site key and server secret/);
+
+    const turnstile = run([
+      "PLATFORM_MODE=paas",
+      "SIGNUP_BOT_PROTECTION_PROVIDER=turnstile",
+      "SIGNUP_TURNSTILE_SITE_KEY=site-key",
+      "SIGNUP_TURNSTILE_SECRET=secret",
+    ]);
+    assert.equal(turnstile.status, 0, turnstile.stderr || turnstile.stdout);
+
+    const recaptchaAliases = run([
+      "PLATFORM_MODE=PAAS",
+      "NEXT_PUBLIC_SIGNUP_BOT_PROTECTION_PROVIDER=recaptcha",
+      "NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY=site-key",
+      "SIGNUP_RECAPTCHA_SECRET=secret",
+    ]);
+    assert.equal(recaptchaAliases.status, 0, recaptchaAliases.stderr || recaptchaAliases.stdout);
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
 test("setup separates new API hash secrets while preserving migration fallbacks", () => {
   const bashSetup = read("setup.sh");
   const powershellSetup = read("setup.ps1");
@@ -791,6 +852,7 @@ test("setup separates new API hash secrets while preserving migration fallbacks"
      source <(awk '/^secure_env_file_permissions\\(\\)/,/^}/' setup.sh)
      source <(awk '/^set_env_value\\(\\)/,/^}/' setup.sh)
      source <(awk '/^ensure_api_key_hash_secret_env\\(\\)/,/^}/' setup.sh)
+     source <(awk '/^decode_compose_env_literal\\(\\)/,/^}/' setup.sh)
      source <(awk '/^read_env_value\\(\\)/,/^}/' setup.sh)
      legacy_fixture="$(mktemp /tmp/nora-api-hash-legacy.XXXXXX)"
      existing_fixture="$(mktemp /tmp/nora-api-hash-existing.XXXXXX)"
@@ -1033,6 +1095,33 @@ test("setup and entrypoint retain fail-closed secret handling contracts", () => 
   ]);
 });
 
+test("Proxmox non-root offline staging stays wired through setup and the hardware gate", () => {
+  const bashSetup = read("setup.sh");
+  const powershellSetup = read("setup.ps1");
+  const proxmoxWorkflow = read(".github/workflows/proxmox-real-hardware.yml");
+
+  assert.match(
+    bashSetup,
+    /PROXMOX_OFFLINE_STAGE_COMMAND="\$\(read_env_value "\$ENV_FILE" "PROXMOX_OFFLINE_STAGE_COMMAND" ""\)"/,
+  );
+  assert.match(bashSetup, /^PROXMOX_OFFLINE_STAGE_COMMAND=\$\{PROXMOX_OFFLINE_STAGE_COMMAND\}$/m);
+  assert.match(
+    powershellSetup,
+    /\$PROXMOX_OFFLINE_STAGE_COMMAND = Read-EnvValue .* -Name "PROXMOX_OFFLINE_STAGE_COMMAND" -Default ""/,
+  );
+  assert.match(powershellSetup, /^PROXMOX_OFFLINE_STAGE_COMMAND=\$PROXMOX_OFFLINE_STAGE_COMMAND$/m);
+  assert.match(
+    proxmoxWorkflow,
+    /PROXMOX_OFFLINE_STAGE_COMMAND: \$\{\{ vars\.PROXMOX_OFFLINE_STAGE_COMMAND \}\}/,
+  );
+  assert.match(proxmoxWorkflow, /if \[ "\$PROXMOX_SSH_USER" != "root" \]; then/);
+  assert.match(proxmoxWorkflow, /required\+=\(PROXMOX_OFFLINE_STAGE_COMMAND\)/);
+  assert.match(
+    proxmoxWorkflow,
+    /PROXMOX_OFFLINE_STAGE_COMMAND must be one absolute helper path without arguments or traversal/,
+  );
+});
+
 test("release env refreshes and deduplicates the live Docker socket group", () => {
   runChecked("bash", [
     "-c",
@@ -1082,6 +1171,180 @@ test("release env refreshes and deduplicates the live Docker socket group", () =
      test "$(stat -c '%a' "$env_file")" = 600`,
   ]);
 });
+
+test("bootstrap admin validation is aligned across setup and backend startup", () => {
+  const bashSetup = read("setup.sh");
+  const powershellSetup = read("setup.ps1");
+  const bootstrapPolicy = read("backend-api/bootstrapAdmin.ts");
+  const server = read("backend-api/server.ts");
+  const authRoutes = read("backend-api/routes/auth.ts");
+
+  assert.match(bashSetup, /bootstrap_admin_email_is_valid/);
+  assert.match(bashSetup, /bootstrap_admin_password_is_forbidden/);
+  assert.match(powershellSetup, /function Test-BootstrapAdminEmail/);
+  assert.match(powershellSetup, /function Test-BootstrapAdminPasswordForbidden/);
+  assert.match(powershellSetup, /Read-Host \$Prompt -AsSecureString/);
+  assert.match(bootstrapPolicy, /looksLikePlaceholderSecret\(password\)/);
+  assert.match(bootstrapPolicy, /reason: "invalid_email"/);
+  assert.match(bootstrapPolicy, /allowsFirstAdminSignupClaim/);
+  assert.match(server, /BOOTSTRAP_ADMIN_CONFIGURATION_INVALID/);
+  assert.match(server, /PAAS_BOOTSTRAP_ADMIN_REQUIRED/);
+  assert.match(server, /if \(!allowsFirstAdminSignupClaim\(\)\)/);
+  assert.match(server, /await seedBootstrapAdminAccount\(\);\s*\n\s*const server = app\.listen/);
+  assert.match(authRoutes, /if \(!allowsFirstAdminSignupClaim\(\)\)/);
+  assert.match(authRoutes, /PAAS_BOOTSTRAP_ADMIN_REQUIRED/);
+  assert.match(bashSetup, /Bootstrap Admin Account \(Required for PaaS\)/);
+  assert.match(powershellSetup, /Bootstrap Admin Account \(Required for PaaS\)/);
+
+  runChecked("bash", [
+    "-c",
+    `set -euo pipefail
+     source <(awk '/^bootstrap_admin_email_is_valid\\(\\)/,/^}/' setup.sh)
+     source <(awk '/^bootstrap_admin_password_is_forbidden\\(\\)/,/^}/' setup.sh)
+     bootstrap_admin_email_is_valid 'operator@example.com'
+     ! bootstrap_admin_email_is_valid '<REPLACE_WITH_BOOTSTRAP_ADMIN_EMAIL>'
+     ! bootstrap_admin_email_is_valid 'not-an-email'
+     ! bootstrap_admin_password_is_forbidden 'StrongRandomPassword-2026!'
+     bootstrap_admin_password_is_forbidden 'Admin123-secure'
+     bootstrap_admin_password_is_forbidden '🔥Admin123-secure'
+     bootstrap_admin_password_is_forbidden '<REPLACE_WITH_STRONG_BOOTSTRAP_PASSWORD>'`,
+  ]);
+});
+
+test("bootstrap admin dotenv serialization round-trips Compose-sensitive characters", () => {
+  const bashSetup = read("setup.sh");
+  const powershellSetup = read("setup.ps1");
+  assert.match(bashSetup, /compose_env_literal/);
+  assert.match(bashSetup, /DEFAULT_ADMIN_PASSWORD=\$\{DEFAULT_ADMIN_PASSWORD_ENV\}/);
+  assert.match(powershellSetup, /function ConvertTo-ComposeEnvLiteral/);
+  assert.match(powershellSetup, /DEFAULT_ADMIN_PASSWORD=\$DEFAULT_ADMIN_PASSWORD_ENV/);
+
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "nora-bootstrap-env-"));
+  const email = "operator+promo@example.com";
+  const passwords = [
+    "Strong${MISSING} pa#ss'word\\tail",
+    "Strong${MISSING} trailing\\",
+    "Strong${MISSING} slash\\'quote",
+  ];
+  try {
+    for (const [index, password] of passwords.entries()) {
+      const caseEnvFile = path.join(fixtureDir, `.env.${index}`);
+      const caseComposeFile = path.join(fixtureDir, `compose.${index}.yml`);
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          `set -euo pipefail
+error() { printf '%s\\n' "$*" >&2; }
+source <(awk '/^compose_env_literal\\(\\)/,/^}/' setup.sh)
+source <(awk '/^decode_compose_env_literal\\(\\)/,/^}/' setup.sh)
+source <(awk '/^read_env_value\\(\\)/,/^}/' setup.sh)
+printf 'DEFAULT_ADMIN_EMAIL=%s\\nDEFAULT_ADMIN_PASSWORD=%s\\n' \
+  "$(compose_env_literal "$1")" "$(compose_env_literal "$2")" > "$3"
+test "$(read_env_value "$3" DEFAULT_ADMIN_EMAIL '')" = "$1"
+test "$(read_env_value "$3" DEFAULT_ADMIN_PASSWORD '')" = "$2"
+source <(awk '/^decode_compose_env_literal\\(\\)/,/^}/' scripts/materialize-compose-secrets.sh)
+source <(awk '/^read_env_value\\(\\)/,/^}/' scripts/materialize-compose-secrets.sh)
+test "$(read_env_value "$3" DEFAULT_ADMIN_PASSWORD '')" = "$2"`,
+          "nora-bootstrap-env",
+          email,
+          password,
+          caseEnvFile,
+        ],
+        { cwd: repoRoot, encoding: "utf8" },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      writeFileSync(
+        caseComposeFile,
+        [
+          "services:",
+          "  probe:",
+          "    image: alpine:3.20",
+          "    env_file:",
+          `      - ${path.basename(caseEnvFile)}`,
+        ].join("\n") + "\n",
+      );
+      const compose = spawnSync(
+        "docker",
+        ["compose", "-f", caseComposeFile, "config", "--format", "json"],
+        {
+          cwd: fixtureDir,
+          encoding: "utf8",
+        },
+      );
+      assert.equal(compose.status, 0, compose.stderr || compose.stdout);
+      const rendered = JSON.parse(compose.stdout);
+      assert.equal(
+        rendered.services.probe.environment.DEFAULT_ADMIN_EMAIL.replaceAll("$$", "$"),
+        email,
+      );
+      assert.equal(
+        rendered.services.probe.environment.DEFAULT_ADMIN_PASSWORD.replaceAll("$$", "$"),
+        password,
+      );
+    }
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test(
+  "PowerShell bootstrap admin validation rejects placeholders and hides password input",
+  { skip: !hasPowerShell },
+  () => {
+    runChecked("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "-"], {
+      input: `$ErrorActionPreference = "Stop"
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+  (Resolve-Path "setup.ps1"),
+  [ref]$tokens,
+  [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+foreach ($name in @("Test-BootstrapAdminEmail", "Test-BootstrapAdminPasswordForbidden", "Read-SecretText", "ConvertTo-ComposeEnvLiteral", "ConvertFrom-ComposeEnvLiteral", "Read-EnvValue")) {
+  $definition = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+  }, $true)
+  if (-not $definition) { throw "Missing function $name" }
+  Invoke-Expression $definition.Extent.Text
+}
+if (-not (Test-BootstrapAdminEmail -Value "operator@example.com")) { throw "Valid email rejected" }
+if (Test-BootstrapAdminEmail -Value "<REPLACE_WITH_BOOTSTRAP_ADMIN_EMAIL>") { throw "Placeholder email accepted" }
+if (-not (Test-BootstrapAdminPasswordForbidden -Value "Admin123-secure")) { throw "Default-derived password accepted" }
+if (-not (Test-BootstrapAdminPasswordForbidden -Value "<REPLACE_WITH_STRONG_BOOTSTRAP_PASSWORD>")) { throw "Placeholder password accepted" }
+if (Test-BootstrapAdminPasswordForbidden -Value "StrongRandomPassword-2026!") { throw "Strong password rejected" }
+if ((Get-Content setup.ps1 -Raw) -notmatch 'Read-Host \\$Prompt -AsSecureString') { throw "Password prompt is not hidden" }
+$passwords = @(
+  $env:NORA_TEST_BOOTSTRAP_PASSWORD,
+  $env:NORA_TEST_BOOTSTRAP_TRAILING_SLASH,
+  $env:NORA_TEST_BOOTSTRAP_SLASH_QUOTE
+)
+foreach ($password in $passwords) {
+  $fixture = Join-Path $env:TEMP ("nora-bootstrap-env-" + [guid]::NewGuid().ToString("N") + ".env")
+  try {
+    @(
+      "DEFAULT_ADMIN_EMAIL=$(ConvertTo-ComposeEnvLiteral -Value 'operator+promo@example.com')",
+      "DEFAULT_ADMIN_PASSWORD=$(ConvertTo-ComposeEnvLiteral -Value $password)"
+    ) | Set-Content -LiteralPath $fixture -Encoding utf8NoBOM
+    if ((Read-EnvValue -EnvPath $fixture -Name 'DEFAULT_ADMIN_PASSWORD' -Default '') -cne $password) {
+      throw "Compose dotenv password did not round-trip"
+    }
+  } finally {
+    Remove-Item -LiteralPath $fixture -Force -ErrorAction SilentlyContinue
+  }
+}`,
+      env: {
+        ...process.env,
+        NORA_TEST_BOOTSTRAP_PASSWORD: "Strong${MISSING} pa#ss'word\\tail",
+        NORA_TEST_BOOTSTRAP_TRAILING_SLASH: "Strong${MISSING} trailing\\",
+        NORA_TEST_BOOTSTRAP_SLASH_QUOTE: "Strong${MISSING} slash\\'quote",
+      },
+    });
+  },
+);
 
 test("production update paths activate refreshed nginx config without touching custom configs", () => {
   const deployWorkflow = read(".github/workflows/deploy-production.yml");
@@ -1352,6 +1615,298 @@ printf continued > ${JSON.stringify(setupMarker)}
   ]);
 });
 
+test("community response automation acknowledges and escalates every public thread type", () => {
+  const workflow = read(".github/workflows/community-response.yml");
+  const script = read(".github/workflows/scripts/community-response.mjs");
+  const support = read("SUPPORT.md");
+  const contributing = read("CONTRIBUTING.md");
+
+  for (const trigger of ["issues:", "pull_request_target:", "discussion:", "schedule:"]) {
+    assert.match(workflow, new RegExp(`^  ${trigger}$`, "m"));
+  }
+  assert.match(workflow, /^ {2}discussions: write$/m);
+  assert.match(workflow, /^ {2}issues: write$/m);
+  assert.match(workflow, /^ {2}pull-requests: read$/m);
+  assert.match(workflow, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+  assert.match(workflow, /persist-credentials: false/);
+  assert.match(workflow, /community-response\.mjs acknowledge/);
+  assert.match(workflow, /community-response\.mjs audit/);
+  assert.match(script, /nora-community-ack:v1/);
+  assert.match(script, /nora-community-reminder:v1/);
+  assert.match(script, /REMINDER_AFTER_MS = 12 \* DAY_MS/);
+  assert.match(script, /OVERDUE_AFTER_MS = 14 \* DAY_MS/);
+  assert.match(script, /addDiscussionComment/);
+  assert.match(script, /states: \[OPEN\]/);
+  assert.match(script, /pullRequestResponseStart/);
+  assert.match(script, /ready_for_review/);
+  assert.match(script, /thread\.draft === true/);
+  assert.match(script, /issues\/\$\{issue\.number\}\/timeline/);
+  assert.match(script, /query NoraDiscussionReplies/);
+  assert.match(script, /replies\(first: 100, after: \$cursor\)/);
+  assert.match(script, /OWNER", "MEMBER", "COLLABORATOR/);
+  assert.match(support, /automated\s+acknowledgement/i);
+  assert.match(support, /twelve days/i);
+  assert.match(contributing, /automated queue acknowledgement/i);
+  assert.match(contributing, /Draft pull requests enter the\s+response queue/i);
+  assert.match(contributing, /fourteen-day target/i);
+});
+
+test("release image publication is pinned to one resolved commit", () => {
+  const workflow = read(".github/workflows/release-docker.yml");
+  const workflowHeader = workflow.split("\njobs:", 1)[0];
+  const resolveJob = workflow.match(
+    /\n {2}resolve-target:\n([\s\S]*?)(?=\n {2}verify-required-ci:\n)/,
+  )?.[1];
+  const verifyJob = workflow.match(
+    /\n {2}verify-required-ci:\n([\s\S]*?)(?=\n {2}publish-images:\n)/,
+  )?.[1];
+  const publishJob = workflow.match(
+    /\n {2}publish-images:\n([\s\S]*?)(?=\n {2}promote-latest:\n)/,
+  )?.[1];
+  const promoteJob = workflow.match(/\n {2}promote-latest:\n([\s\S]*)$/)?.[1];
+
+  assert.ok(resolveJob, "release workflow must define the target resolution job");
+  assert.ok(verifyJob, "release workflow must define the CI verification job");
+  assert.ok(publishJob, "release workflow must define the image publication job");
+  assert.ok(promoteJob, "release workflow must define the latest-promotion job");
+  assert.match(workflowHeader, /^ {2}cancel-in-progress: false$/m);
+  assert.doesNotMatch(
+    workflowHeader,
+    /^ {2}packages: write$/m,
+    "package write access must not be granted to every release job",
+  );
+  assert.doesNotMatch(resolveJob, /^ {6}packages: write$/m);
+  assert.doesNotMatch(verifyJob, /^ {6}packages: write$/m);
+  assert.match(
+    publishJob,
+    /^ {4}permissions:\n {6}contents: read\n {6}packages: write$/m,
+    "only image publication should receive package write access",
+  );
+  assert.match(publishJob, /^ {4}environment: container-publish$/m);
+  assert.match(
+    promoteJob,
+    /^ {4}permissions:\n {6}contents: read\n {6}packages: write$/m,
+    "latest promotion needs package write access without broadening earlier jobs",
+  );
+  assert.match(promoteJob, /^ {4}environment: container-publish$/m);
+  assert.match(resolveJob, /TARGET_REF: \$\{\{ github\.event\.inputs\.ref \|\| github\.sha \}\}/);
+  assert.doesNotMatch(
+    resolveJob,
+    /run: \|[\s\S]*\$\{\{ github\.event\.inputs\.ref/,
+    "workflow-dispatch refs must enter shell only through an environment variable",
+  );
+  assert.match(resolveJob, /target_sha="\$\(git rev-parse HEAD\)"/);
+  assert.match(
+    resolveJob,
+    /git merge-base --is-ancestor "\$\{target_sha\}" "origin\/\$\{DEFAULT_BRANCH\}"/,
+    "tag and manual image publications must remain on default-branch history",
+  );
+  assert.doesNotMatch(
+    resolveJob,
+    /run: \|[\s\S]*\$\{\{\s*github\.ref/,
+    "event ref data must enter shell only through environment variables",
+  );
+  assert.match(
+    resolveJob,
+    /EVENT_TAG: \$\{\{ github\.ref_type == 'tag' && github\.ref_name \|\| '' \}\}/,
+  );
+  assert.doesNotMatch(resolveJob, /publish_latest/);
+  assert.match(
+    verifyJob,
+    /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+ref: \$\{\{ github\.workflow_sha \}\}/,
+    "the CI gate helper must come from the immutable workflow commit",
+  );
+  assert.doesNotMatch(
+    verifyJob,
+    /ref: \$\{\{ needs\.resolve-target\.outputs\.ref \}\}/,
+    "the CI gate must not reload a moving publish ref",
+  );
+  assert.match(
+    publishJob,
+    /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+ref: \$\{\{ needs\.resolve-target\.outputs\.sha \}\}/,
+    "image builds must check out the CI-gated target SHA",
+  );
+  assert.doesNotMatch(
+    publishJob,
+    /ref: \$\{\{ needs\.resolve-target\.outputs\.ref \}\}/,
+    "image builds must not reload a moving publish ref",
+  );
+  assert.match(
+    publishJob,
+    /type=raw,value=sha-\$\{\{ needs\.resolve-target\.outputs\.sha \}\}/,
+    "the immutable image tag must describe the resolved target SHA",
+  );
+  assert.match(
+    publishJob,
+    /org\.opencontainers\.image\.revision=\$\{\{ needs\.resolve-target\.outputs\.sha \}\}/,
+    "the image provenance label must describe the resolved target SHA",
+  );
+  assert.match(resolveJob, /tag: \$\{\{ steps\.sha\.outputs\.tag \}\}/);
+  assert.match(publishJob, /Revalidate target provenance before registry write/);
+  assert.match(
+    publishJob,
+    /git fetch --no-tags --force origin[\s\S]*refs\/tags\/\$\{TARGET_TAG\}:refs\/tags\/__nora_publish_target/,
+    "semantic image tags must be re-fetched before package write",
+  );
+  assert.match(
+    publishJob,
+    /current_tag_sha="\$\(git rev-parse 'refs\/tags\/__nora_publish_target\^\{commit\}'\)"/,
+  );
+  assert.doesNotMatch(publishJob, /value=latest/);
+  assert.doesNotMatch(publishJob, /\{\{is_default_branch\}\}/);
+  assert.doesNotMatch(
+    publishJob,
+    /type=sha(?:,|$)/m,
+    "metadata-action must not derive the SHA tag from the workflow event commit",
+  );
+  assert.match(promoteJob, /^ {4}concurrency:\n {6}group: release-docker-latest$/m);
+  assert.match(
+    promoteJob,
+    /git fetch --no-tags origin[\s\S]*refs\/heads\/\$\{DEFAULT_BRANCH\}:refs\/remotes\/origin\/\$\{DEFAULT_BRANCH\}/,
+  );
+  assert.match(promoteJob, /default_sha="\$\(git rev-parse "origin\/\$\{DEFAULT_BRANCH\}"\)"/);
+  assert.match(promoteJob, /if \[ "\$TARGET_SHA" != "\$default_sha" \]/);
+  assert.match(
+    promoteJob,
+    /docker buildx imagetools create[\s\S]*sha-\$\{TARGET_SHA\}/,
+    "latest must be promoted from the already-published immutable SHA tag",
+  );
+  assert.doesNotMatch(promoteJob, /docker\/build-push-action/);
+});
+
+test("release and security workflows pin kubeconform before execution", () => {
+  const securityWorkflow = read(".github/workflows/ci-security.yml");
+  const helmWorkflow = read(".github/workflows/release-helm.yml");
+
+  for (const [label, workflow] of [
+    ["CI Security", securityWorkflow],
+    ["Helm release", helmWorkflow],
+  ]) {
+    assert.match(workflow, /^ {2}KUBECONFORM_VERSION: v0\.7\.0$/m, `${label} pins version`);
+    assert.match(
+      workflow,
+      /^ {2}KUBECONFORM_CHECKSUMS_SHA256: [a-f0-9]{64}$/m,
+      `${label} pins the checksum manifest`,
+    );
+    assert.match(workflow, /curl --retry 3 --retry-all-errors -fsSLo/);
+    assert.match(
+      workflow,
+      /printf '%s[ ]{2}%s\\n' "\$\{KUBECONFORM_CHECKSUMS_SHA256\}"[\s\S]*sha256sum -c -/,
+      `${label} verifies the pinned checksum manifest before trusting it`,
+    );
+    assert.match(workflow, /sha256sum -c -[\s\S]*tar -xzf/);
+    assert.match(
+      workflow,
+      /expected="\$\(awk -v name="\$\{archive\}"[\s\S]*printf '%s[ ]{2}%s\\n' "\$\{expected\}" "\$\{install_dir\}\/\$\{archive\}" \| sha256sum -c -/,
+      `${label} verifies the downloaded archive by its absolute install path`,
+    );
+    assert.doesNotMatch(workflow, /curl[^\n]*\|\s*tar/);
+  }
+
+  assert.match(helmWorkflow, /Require the release commit on the default branch/);
+  assert.match(
+    helmWorkflow,
+    /git merge-base --is-ancestor "\$\{TARGET_SHA\}" "origin\/\$\{DEFAULT_BRANCH\}"/,
+  );
+  assert.match(helmWorkflow, /^ {4}environment: release-publish$/m);
+  const helmPublishJob = helmWorkflow.match(/\n {2}publish-chart:\n([\s\S]*)$/)?.[1];
+  assert.ok(helmPublishJob, "Helm workflow must define its privileged publisher job");
+  assert.match(helmPublishJob, /^ {6}- resolve-target$/m);
+  assert.match(helmPublishJob, /^ {6}contents: read$/m);
+  assert.match(helmPublishJob, /Revalidate release provenance after environment approval/);
+  assert.match(helmPublishJob, /EXPECTED_SHA: \$\{\{ needs\.resolve-target\.outputs\.sha \}\}/);
+  assert.match(helmPublishJob, /EXPECTED_TAG: \$\{\{ needs\.resolve-target\.outputs\.tag \}\}/);
+});
+
+test("package release workflows gate immutable artifacts before privileged publication", () => {
+  const npmWorkflow = read(".github/workflows/release-npm.yml");
+  const mcpWorkflow = read(".github/workflows/release-mcp-registry.yml");
+  const verifier = read(".github/workflows/scripts/verify-release-target.mjs");
+  const qualityWorkflow = read(".github/workflows/ci-quality.yml");
+  const npmPublishJob = npmWorkflow.match(/\n {2}publish:\n([\s\S]*)$/)?.[1];
+  const mcpPublishJob = mcpWorkflow.match(/\n {2}publish-mcp-registry:\n([\s\S]*)$/)?.[1];
+  const installStep = mcpWorkflow.match(
+    /- name: Install checksum-verified mcp-publisher\n([\s\S]*?)(?=\n {6}- name: Authenticate to the MCP Registry)/,
+  )?.[1];
+
+  assert.ok(npmPublishJob, "npm workflow must define its final publisher job");
+  assert.ok(mcpPublishJob, "MCP workflow must define its final publisher job");
+  assert.ok(installStep, "MCP Registry workflow must define its publisher install step");
+  for (const [label, workflow, publisher] of [
+    ["npm", npmWorkflow, npmPublishJob],
+    ["MCP", mcpWorkflow, mcpPublishJob],
+  ]) {
+    const workflowHeader = workflow.split("\njobs:", 1)[0];
+    assert.match(workflowHeader, /^ {2}contents: read$/m);
+    assert.doesNotMatch(workflowHeader, /id-token: write/);
+    assert.match(workflowHeader, /^ {2}cancel-in-progress: false$/m);
+    assert.match(workflow, /verify-release-target\.mjs resolve-release/);
+    assert.match(workflow, /Wait for required workflows on the exact release SHA/);
+    assert.match(workflow, /ref: \$\{\{ github\.workflow_sha \}\}/);
+    assert.match(workflow, /ref: \$\{\{ needs\.resolve-target\.outputs\.sha \}\}/);
+    assert.match(publisher, /^ {4}environment: release-publish$/m);
+    assert.match(publisher, /^ {6}id-token: write$/m);
+    assert.match(publisher, /Revalidate release provenance after environment approval/);
+    assert.match(publisher, /EXPECTED_SHA: \$\{\{ needs\.resolve-target\.outputs\.sha \}\}/);
+    assert.match(publisher, /EXPECTED_TAG: \$\{\{ needs\.resolve-target\.outputs\.tag \}\}/);
+    assert.match(
+      publisher,
+      /actions\/download-artifact@[0-9a-f]{40}/,
+      `${label} publisher must consume a previously validated artifact`,
+    );
+  }
+
+  assert.match(npmWorkflow, /npm pack "\$\{package_source\}" --ignore-scripts/);
+  assert.match(npmPublishJob, /npm publish "\$\{PACKAGE_TARBALL\}" --ignore-scripts --provenance/);
+  assert.doesNotMatch(npmPublishJob, /release-target\//);
+
+  assert.match(mcpWorkflow, /^ {2}MCP_PUBLISHER_VERSION: v1\.7\.9$/m);
+  assert.match(
+    mcpWorkflow,
+    /^ {2}MCP_PUBLISHER_CHECKSUMS_SHA256: [a-f0-9]{64}$/m,
+    "the upstream checksum manifest must itself be pinned",
+  );
+  assert.match(
+    installStep,
+    /curl --retry 3 --retry-all-errors -fsSLo "\$\{INSTALL_DIR\}\/\$\{archive\}"/,
+  );
+  assert.match(
+    installStep,
+    /curl --retry 3 --retry-all-errors -fsSLo "\$\{INSTALL_DIR\}\/\$\{checksums\}"/,
+  );
+  assert.match(
+    installStep,
+    /printf '%s[ ]{2}%s\\n' "\$\{MCP_PUBLISHER_CHECKSUMS_SHA256\}"[\s\S]*sha256sum -c -/,
+  );
+  assert.match(
+    installStep,
+    /awk -v name="\$\{archive\}"[\s\S]*'\$2 == name \{ print; found=1 \} END \{ if \(!found\) exit 1 \}'[\s\S]*sha256sum -c -/,
+    "the selected archive must match one exact checksum-manifest entry",
+  );
+  assert.match(installStep, /tar -xzf "\$\{archive\}" mcp-publisher/);
+  assert.doesNotMatch(installStep, /curl[^\n]*\|\s*tar/);
+  assert.ok(
+    installStep.indexOf("sha256sum -c -") < installStep.indexOf('tar -xzf "${archive}"'),
+    "integrity verification must complete before extraction",
+  );
+
+  assert.match(verifier, /releases\/tags\/\$\{encodeURIComponent\(tag\)\}/);
+  assert.match(verifier, /branch\.protected !== true/);
+  assert.match(verifier, /compare\/\$\{sha\}\.\.\.\$\{defaultBranchSha\}/);
+  assert.match(verifier, /EXPECTED_NPM_PACKAGES/);
+  assert.match(verifier, /EXPECTED_MCP_NAME = "io\.github\.solomon2773\/nora"/);
+  assert.match(
+    qualityWorkflow,
+    /- "\.github\/workflows\/release-npm\.yml"/,
+    "npm release workflow changes must trigger the quality gate",
+  );
+  assert.match(qualityWorkflow, /- "\.github\/workflows\/release-mcp-registry\.yml"/);
+  assert.match(
+    qualityWorkflow,
+    /node --test \.github\/workflows\/scripts\/verify-release-target\.test\.mjs/,
+  );
+});
+
 test("production deploy accepts only exact Nora product release tags", () => {
   const workflow = read(".github/workflows/deploy-production.yml");
   const setupBash = read("setup.sh");
@@ -1374,9 +1929,67 @@ test("production deploy accepts only exact Nora product release tags", () => {
   }
 
   assert.match(workflow, /git tag --points-at HEAD/);
+  assert.match(workflow, /^ {2}deployment-policy:$/m);
+  assert.match(workflow, /^ {4}needs: deployment-policy$/m);
+  assert.match(workflow, /needs\.deployment-policy\.outputs\.should_deploy == 'true'/);
+  assert.match(workflow, /Require an exact release tag for automatic deployment/);
+  assert.match(workflow, /Revalidate target provenance after approval/);
+  assert.match(
+    workflow,
+    /Deployment target .* is not reachable from \$DEFAULT_BRANCH/,
+    "manual and automatic targets must remain on the protected default-branch history",
+  );
+  assert.match(
+    workflow,
+    /Automatic deployment target no longer has an exact Nora product release tag/,
+  );
+  assert.match(workflow, /should_deploy=false/);
+  assert.match(workflow, /has no exact Nora product release tag/);
+  assert.match(workflow, /github\.event\.workflow_run\.event == 'push'/);
+  assert.doesNotMatch(workflow, /workflow_run\.head_branch == 'master'/);
+  assert.match(
+    workflow,
+    /refs\/heads\/\$\{DEFAULT_BRANCH\}:refs\/remotes\/origin\/\$\{DEFAULT_BRANCH\}/,
+  );
+  assert.match(workflow, /git merge-base --is-ancestor HEAD "origin\/\$DEFAULT_BRANCH"/);
+  assert.match(workflow, /is not reachable from \$DEFAULT_BRANCH/);
+  assert.match(workflow, /remote_version_commit/);
+  assert.match(
+    workflow,
+    /Release tag \$TARGET_VERSION no longer points at target commit \$TARGET_COMMIT/,
+  );
+  assert.match(workflow, /git checkout --detach "\$TARGET_COMMIT"/);
+  assert.match(workflow, /Remote checkout does not match validated target commit \$TARGET_COMMIT/);
+  assert.doesNotMatch(workflow, /git pull --ff-only origin "\$DEPLOY_REF"/);
+  assert.doesNotMatch(workflow, /DEPLOY_REF/);
+  assert.doesNotMatch(workflow, /steps\.target\.outputs\.ref/);
+  assert.doesNotMatch(
+    workflow,
+    /run: \|[\s\S]{0,500}\$\{\{ github\.event\.inputs\.ref/,
+    "workflow-dispatch refs must not be interpolated directly into shell",
+  );
+  const trustedCheckoutIndex = workflow.indexOf("ref: ${{ github.workflow_sha }}");
+  const inspectTargetIndex = workflow.indexOf(
+    "Inspect the requested deploy target without trusting its scripts",
+  );
+  const gateIndex = workflow.indexOf(
+    "run: node .github/workflows/scripts/require-workflow-success.mjs",
+  );
+  const sourceCheckoutIndex = workflow.indexOf("Check out the CI-gated deploy source");
+  assert.ok(trustedCheckoutIndex >= 0, "deploy gate helper must come from the workflow commit");
+  assert.ok(inspectTargetIndex > trustedCheckoutIndex);
+  assert.ok(gateIndex > inspectTargetIndex);
+  assert.ok(sourceCheckoutIndex > gateIndex);
+  assert.match(workflow, /path: \.deploy-target/);
+  assert.match(workflow, /working-directory: \.deploy-target/);
+  assert.match(
+    workflow,
+    /Check out the CI-gated deploy source[\s\S]*ref: \$\{\{ steps\.release_meta\.outputs\.commit \}\}/,
+  );
   assert.match(workflow, /Version override must be an exact Nora product tag/);
   assert.match(workflow, /Version override must name an existing Nora product tag/);
-  assert.match(workflow, /is not reachable from target commit/);
+  assert.match(workflow, /does not point at target commit/);
+  assert.doesNotMatch(workflow, /git merge-base --is-ancestor "\$version_commit" HEAD/);
   assert.doesNotMatch(workflow, /git describe --tags/);
   assert.doesNotMatch(workflow, /latest_tag=/);
   assert.match(setupBash, /resolve_current_release_version\(\)/);
@@ -1485,6 +2098,14 @@ test("production deploy accepts only exact Nora product release tags", () => {
     assert.equal(automaticSetupVersion.status, 0, automaticSetupVersion.stderr);
     assert.equal(automaticSetupVersion.stdout.trim(), "v1.16.0");
 
+    const exactManualProductVersion = runMetadata("v1.16.0");
+    assert.equal(
+      exactManualProductVersion.result.status,
+      0,
+      exactManualProductVersion.result.stderr,
+    );
+    assert.match(exactManualProductVersion.output, /^version=v1\.16\.0$/m);
+
     writeFileSync(path.join(fixtureRepo, "post-release.txt"), "post-release source checkout\n");
     runChecked("git", ["add", "post-release.txt"], { cwd: fixtureRepo });
     runChecked(
@@ -1506,8 +2127,11 @@ test("production deploy accepts only exact Nora product release tags", () => {
     assert.match(sourceCheckout.output, /^version=$/m);
 
     const manualProductVersion = runMetadata("v1.16.0");
-    assert.equal(manualProductVersion.result.status, 0, manualProductVersion.result.stderr);
-    assert.match(manualProductVersion.output, /^version=v1\.16\.0$/m);
+    assert.notEqual(manualProductVersion.result.status, 0);
+    assert.match(
+      `${manualProductVersion.result.stderr}${manualProductVersion.result.stdout}`,
+      /does not point at target commit/,
+    );
 
     const nonexistentManualVersion = runMetadata("v2.3.4");
     assert.notEqual(nonexistentManualVersion.result.status, 0);
@@ -1545,9 +2169,66 @@ test("production deploy accepts only exact Nora product release tags", () => {
     assert.notEqual(unrelatedManualVersion.result.status, 0);
     assert.match(
       `${unrelatedManualVersion.result.stderr}${unrelatedManualVersion.result.stdout}`,
-      /is not reachable from target commit/,
+      /does not point at target commit/,
     );
   } finally {
     rmSync(fixtureRepo, { recursive: true, force: true });
+  }
+});
+
+test("production deploy transports remote configuration as encoded arguments", () => {
+  const workflow = read(".github/workflows/deploy-production.yml");
+  const deployStepIndex = workflow.indexOf("- name: Deploy on remote host");
+  assert.ok(deployStepIndex >= 0, "deploy workflow must define the remote deployment step");
+  const deployStep = workflow.slice(deployStepIndex);
+  const transported = [
+    "DEPLOY_PATH",
+    "DEPLOY_ENV_FILE",
+    "DEPLOY_COMPOSE_FILES",
+    "TARGET_VERSION",
+    "TARGET_COMMIT",
+    "AUTOMATIC_DEPLOYMENT",
+    "DEFAULT_BRANCH",
+    "NORA_GITHUB_REPO",
+  ];
+
+  assert.match(deployStep, /encode_remote_arg\(\)/);
+  assert.match(deployStep, /decode_remote_arg\(\)/);
+  assert.match(deployStep, /base64 -w 0/);
+  assert.match(deployStep, /base64 --decode/);
+  assert.match(deployStep, /if \[ "\$#" -ne 8 \]/);
+  for (const name of transported) {
+    assert.match(deployStep, new RegExp(`${name}_B64=`));
+    assert.match(deployStep, new RegExp(`'\\$${name}_B64'`));
+    assert.match(deployStep, new RegExp(`${name}="\\$\\(decode_remote_arg`));
+    assert.doesNotMatch(
+      deployStep,
+      new RegExp(`${name}='\\$${name}'`),
+      `${name} must not be interpolated into the remote shell command`,
+    );
+  }
+
+  const fixture = mkdtempSync(path.join(tmpdir(), "nora-deploy-encoding-"));
+  try {
+    const marker = path.join(fixture, "injected");
+    const hostile = `deploy'; touch ${marker}; #`;
+    const encoded = Buffer.from(hostile, "utf8").toString("base64");
+    const decoded = spawnSync(
+      "bash",
+      [
+        "-c",
+        `set -euo pipefail
+decoded="$(printf '%s' "$1" | base64 --decode)"
+printf '%s' "$decoded"`,
+        "nora-deploy-decode",
+        encoded,
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(decoded.status, 0, decoded.stderr);
+    assert.equal(decoded.stdout, hostile);
+    assert.notEqual(spawnSync("test", ["-e", marker]).status, 0);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
   }
 });

@@ -6,6 +6,10 @@ const ok = (description, schema) => ({
   200: { description, ...(schema ? { content: { "application/json": { schema } } } : {}) },
 });
 
+const sessionOnly = {
+  "x-session-required": true,
+};
+
 const committedReconciliationFailure = {
   502: {
     description:
@@ -30,6 +34,7 @@ const committedReconciliationFailure = {
 module.exports = {
   "/llm-providers/available": {
     get: {
+      ...sessionOnly,
       tags: ["LLM Providers"],
       summary: "List supported providers",
       description:
@@ -39,11 +44,13 @@ module.exports = {
   },
   "/llm-providers": {
     get: {
+      ...sessionOnly,
       tags: ["LLM Providers"],
       summary: "List the caller's stored provider keys (masked)",
       responses: ok("Stored providers"),
     },
     post: {
+      ...sessionOnly,
       tags: ["LLM Providers"],
       summary: "Store a provider API key",
       description:
@@ -70,12 +77,14 @@ module.exports = {
   },
   "/llm-providers/{id}": {
     put: {
+      ...sessionOnly,
       tags: ["LLM Providers"],
       summary: "Update a stored provider (key, model, default flag)",
       parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
       responses: { ...ok("Updated record"), ...committedReconciliationFailure },
     },
     delete: {
+      ...sessionOnly,
       tags: ["LLM Providers"],
       summary: "Delete a stored provider key",
       parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
@@ -84,6 +93,7 @@ module.exports = {
   },
   "/llm-providers/sync": {
     post: {
+      ...sessionOnly,
       tags: ["LLM Providers"],
       summary: "Push the caller's provider keys to their running agents",
       responses: ok("Sync result"),

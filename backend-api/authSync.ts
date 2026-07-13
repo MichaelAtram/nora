@@ -1205,6 +1205,33 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
   const onlyIfAuthPresent = Boolean(options?.onlyIfAuthPresent);
   const includeProviderAuthPending = Boolean(options?.includeProviderAuthPending && agentId);
   const startupStateStaged = Boolean(options?.startupStateStaged && agentId);
+  const apiKeyWorkspaceId = String(options?.apiKeyWorkspaceId || "").trim() || null;
+  if (apiKeyWorkspaceId && !agentId) {
+    throw new Error("API-key-scoped auth sync requires one explicit agent");
+  }
+  if (apiKeyWorkspaceId) {
+    const scopedAgent = await db.query(
+      `SELECT a.id, a.backend_type, a.deploy_target, a.execution_target_id
+         FROM workspace_agents wa
+         JOIN agents a ON a.id = wa.agent_id
+        WHERE wa.workspace_id = $1 AND wa.agent_id = $2
+        LIMIT 1`,
+      [apiKeyWorkspaceId, agentId],
+    );
+    const currentAgent = scopedAgent.rows[0];
+    if (!currentAgent) {
+      const error = new Error("API key is not scoped to this agent's workspace");
+      error.statusCode = 403;
+      error.code = "wrong_workspace";
+      throw error;
+    }
+    if (isRemoteDockerAgent(currentAgent)) {
+      const error = new Error("Remote Docker agent operations require session authentication");
+      error.statusCode = 403;
+      error.code = "session_required";
+      throw error;
+    }
+  }
   const extraManagedEnvNames = Array.isArray(options?.extraManagedEnvNames)
     ? options.extraManagedEnvNames
     : [];
@@ -1239,6 +1266,13 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
               AND container_id IS NOT NULL
             )
             OR ($3::boolean = true AND paused_reason = $4)
+          )
+          AND (
+            $5::uuid IS NULL
+            OR EXISTS (
+              SELECT 1 FROM workspace_agents wa
+               WHERE wa.workspace_id = $5 AND wa.agent_id = agents.id
+            )
           )`
     : `SELECT id, user_id, name, container_id, container_name, backend_type, runtime_family, deploy_target,
               execution_target_id,
@@ -1261,9 +1295,15 @@ async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
             OR deploy_target = 'k8s'
           )`;
   const agentParams = agentId
-    ? [agentId, userId, includeProviderAuthPending, PROVIDER_AUTH_PENDING_REASON]
+    ? [agentId, userId, includeProviderAuthPending, PROVIDER_AUTH_PENDING_REASON, apiKeyWorkspaceId]
     : [userId];
   const agents = await db.query(agentQuery, agentParams);
+  if (apiKeyWorkspaceId && agents.rows.some((agent) => isRemoteDockerAgent(agent))) {
+    const error = new Error("Remote Docker agent operations require session authentication");
+    error.statusCode = 403;
+    error.code = "session_required";
+    throw error;
+  }
 
   // Evict stale gateway connections — the restart will invalidate them
   let evictConnection;

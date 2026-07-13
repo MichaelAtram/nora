@@ -6,6 +6,12 @@ Remote Docker is Nora's experimental bring-your-own-compute path for a standalon
 register the machine in the operator dashboard, run a narrow SSH/Docker connection test, and select
 its concrete `remote:<id>` execution target when deploying an agent.
 
+<Tip>
+  Want the shortest operator path? Follow [Connect a Remote Docker host](/guides/remote-docker) for
+  a registration-to-validation walkthrough, then return here for the full security, sharing,
+  capacity, backup, and retirement contract.
+</Tip>
+
 <Warning>
   Remote Docker is experimental. Validate lifecycle, readiness, networking, backups, and recovery on
   your exact host before placing production workloads on it. Remote agent ports bind to `0.0.0.0` on
@@ -13,6 +19,13 @@ its concrete `remote:<id>` execution target when deploying an agent.
   internet-reachable network. Remote Docker is available only from a self-hosted Nora control plane;
   hosted mode disables registration and use.
 </Warning>
+
+<Note>
+  If an existing installation is switched from self-hosted mode to hosted PaaS mode, Nora blocks new
+  Remote Docker registration, placement, and active use. Persisted Remote Docker agents retain only
+  the explicit **Stop** and **Delete** cleanup paths, and those paths still require the original
+  trusted SSH host-key pin.
+</Note>
 
 ## How it works
 
@@ -69,14 +82,28 @@ and a dedicated SSH identity, and protect that identity as a privileged credenti
 The Nora control plane must have a valid `ENCRYPTION_KEY`. Remote-host private keys, passwords, and
 key passphrases are encrypted before storage and are never returned by the API.
 
-```bash theme={null}
+<CodeGroup>
+```bash Docker Compose theme={null}
 # 32 random bytes encoded as 64 hexadecimal characters
 ENCRYPTION_KEY=<64-hex-character-key>
 
 ENABLED_RUNTIME_FAMILIES=openclaw
 ENABLED_BACKENDS=docker
 ENABLED_SANDBOX_PROFILES=standard
-```
+
+````
+
+```yaml Helm values theme={null}
+# Keep the chart's cluster-hosted sentinel; Remote Docker hosts are added dynamically.
+enabledRuntimeFamilies: openclaw
+enabledBackends: k8s
+enabledSandboxProfiles: standard
+````
+
+</CodeGroup>
+
+For Helm, provide `ENCRYPTION_KEY` through the chart's configured secret rather than placing it in
+`values.yaml`.
 
 Do not add `remote-docker` to `ENABLED_BACKENDS`. Successfully tested hosts are injected dynamically
 as concrete targets such as `remote:build-host`; `ENABLED_BACKENDS` controls only the static backend
@@ -139,6 +166,11 @@ details, credentials, Docker settings, or the gateway address clears the previou
 state, so the host must pass **Test** again. Credential rotation preserves the existing host-key pin.
 Changing the SSH host or port clears that pin because it identifies a different network endpoint.
 
+Changing **Gateway address** or the global Docker agent port range does not rewrite the endpoint or
+port reservations already persisted on existing agents. Drain and replace those agents before the
+change, and keep the old private route and firewall allowance in place until the old agents are
+deleted. Re-running **Test** validates the edited registration only; it does not migrate workloads.
+
 <Warning>
   Stop, migrate, or delete every workload on the registration before changing its SSH host or port,
   resetting its SSH pin, or intentionally changing the machine's SSH host identity. Those actions
@@ -183,9 +215,18 @@ Use a disposable agent deployment to verify the provisioner worker, image pull/b
 routing, readiness, and lifecycle path. If you rely on backups, run a backup and restore exercise as
 well. Watch the services that actually perform those operations:
 
-```bash theme={null}
+<CodeGroup>
+```bash Docker Compose theme={null}
 docker compose logs -f backend-api worker-provisioner worker-backup
 ```
+
+```bash Helm theme={null}
+kubectl logs -n <namespace> \
+  -l 'app.kubernetes.io/component in (backend-api,worker-provisioner,worker-backup)' \
+  --all-containers=true --prefix --max-log-requests=10 -f
+```
+
+</CodeGroup>
 
 ## SSH host-key security
 
@@ -205,6 +246,12 @@ has no pin, Nora refuses **Stop** and **Delete** instead of accepting an unknown
 destructive Docker operation. The remote container may therefore remain running. Verify the machine
 out of band, ask the host owner to run **Test** and restore trust when the same verified machine is
 still registered, or remove the runtime manually on the verified host.
+
+Manual container removal does not clear the Nora agent row, release its recorded placement, or make
+the host registration deletable. Nora has no force-delete bypass for a missing pin: restore trust on
+the same verified registration with **Test**, then retry agent deletion. If that machine and its
+identity are permanently unavailable, keep the residual record isolated and treat it as an orphan
+risk until you can reconcile it through an operator-controlled recovery.
 
 Do not use the reset action merely to make a mismatch disappear. If you cannot independently verify
 why the key changed, treat it as a possible interception attempt and leave the host blocked.
@@ -276,13 +323,14 @@ where it is shared. The new agent belongs directly to the deploying user; it is 
 assigned to the workspace that supplied host access.
 
 <Note>
-  All `/api/remote-hosts` management routes are session-only. Workspace API keys cannot register,
-  list, test, update, share, or delete remote hosts, and API responses never return stored SSH
-  private keys, passwords, or passphrases. `/api/agents/deploy` accepts an API key with
-  `agents:write`, but the host check uses the key's issuing user and a new agent is not
-  automatically attached to the key's bound workspace. Use a session JWT for the initial advanced
-  deployment, then assign the agent to a workspace explicitly if workspace-scoped access is
-  required.
+  All `/api/remote-hosts` management routes, Remote Docker placement mutations, and existing-agent
+  Remote Docker operations are session-only. Workspace API keys cannot register, list, test, update,
+  share, or delete remote hosts, and they receive `403 session_required` before host lookup,
+  persistence, queue publication, gateway/file access, lifecycle changes, or cleanup. This applies
+  when deploy, duplicate, redeploy, or rollback uses a Remote Docker source or destination and when
+  the persisted agent already runs there. API responses never return stored SSH private keys,
+  passwords, or passphrases. Use a session JWT for the advanced deployment, then assign the new
+  agent to a workspace explicitly when team access is required.
 </Note>
 
 See [Agents API: deploy an agent](/api/agents#deploy-an-agent) for the complete request contract.
@@ -306,6 +354,10 @@ Remote Docker is explicit placement, not a scheduler across your registered mach
   when a host becomes unreachable or overloaded.
 - Nora does not provide a host-centric workload inventory or drain lock. Sharing compute does not
   give the host owner access to agents deployed by workspace members.
+- Use one Nora registration and allocation authority per physical Docker daemon. Port reservations
+  are keyed by `remote:<id>`, not by daemon identity, so duplicate registrations can allocate the
+  same physical host port. Separate Nora control planes that intentionally share a daemon must use
+  non-overlapping `DOCKER_AGENT_PORT_RANGE_MIN`/`MAX` subranges.
 
 Monitor capacity on the remote machine and keep enough headroom for pulls, restarts, backups, and
 parallel deployments. Plan maintenance and recovery manually.
@@ -396,6 +448,12 @@ Use this drain procedure before removing a normal workspace grant:
 6. If retiring the host entirely, delete the registration after all non-deleted agents stop
    referencing it. Nora rejects host deletion with `409` while such references remain.
 
+The same drain rule applies before a platform admin deletes the host owner's user account. Nora
+returns `409 REMOTE_HOSTS_IN_USE` before destroying any of that user's agents when any non-deleted
+agent—including an agent owned by another workspace member—still references a Remote Docker host
+owned by the user. This prevents the account deletion from cascading away the registration and
+leaving a live workload without its SSH profile.
+
 For an urgent security incident, unshare to revoke Nora-mediated active use, then use the retained
 **Stop** or **Delete** cleanup path, close direct network access to the published ports, and rotate the
 SSH credential. This cleanup path still requires the previously trusted pin. If host identity cannot
@@ -405,25 +463,27 @@ from the remote machine.
 
 ## Troubleshooting
 
-| Symptom                                | Checks                                                                                                                                                                                                                                                                                                               |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Host is missing from Deploy            | Confirm it is enabled, configured, and its latest manual **Test** succeeded with a stored SSH pin. Legacy `Test: OK` rows without a pin must pass **Test** again. Confirm OpenClaw is selected. A viewer cannot deploy. The current Hermes picker does not merge registered remote hosts; use the advanced API path. |
-| Test passes but deployment fails       | The test ran only from `backend-api`. Inspect `worker-provisioner` logs, verify worker SSH/firewall reachability, image-registry egress, free host capacity, published ports, and the gateway address. Re-run **Test** because the stored success has no expiry.                                                     |
-| SSH connection times out or is refused | Check the address and port, SSH service, route or VPN, and firewall rules from `backend-api`, `worker-provisioner`, and `worker-backup` where applicable.                                                                                                                                                            |
-| Authentication fails                   | Confirm the SSH user and selected auth mode. Paste the complete private key, supply its passphrase when required, and check the server's authorized-key or password policy.                                                                                                                                          |
-| `docker version` fails                 | Install/start Docker and grant the SSH account non-interactive daemon access. Test with the same user and its default Docker context outside Nora.                                                                                                                                                                   |
-| Host-key mismatch                      | Stop and verify the machine identity and replacement key out of band. If rotation or rebuild was intentional, use the explicit **Reset SSH pin** confirmation flow, then run **Test** to pin the new key. Otherwise treat it as a possible interception attempt.                                                     |
-| Agent deploys but never becomes ready  | Verify **Gateway address**, allow the configured `19000-19999` subrange from Nora, and confirm the published container ports are listening on the remote host.                                                                                                                                                       |
-| Agent remains after unshare            | Expected: unshare removes only the grant. Follow the drain procedure above and explicitly migrate or delete the agent/container.                                                                                                                                                                                     |
-| Active use is denied after unshare     | Expected when the agent owner has no other qualifying grant. Nora blocks active operations and closes rechecked streams. **Stop** and **Delete** remain cleanup-only escape hatches when the original trusted SSH pin is still stored.                                                                               |
-| Stop or Delete reports a missing pin   | Nora will not accept an unknown SSH key for cleanup. The agent record is retained and the remote container may still be running. Verify the host out of band; restore the pin with **Test** on the same verified registration where possible, or remove the runtime manually.                                        |
-| Hermes dashboard cannot load           | Confirm both allocated runtime and dashboard ports are firewalled to and reachable from `backend-api`. Do not expose the dashboard directly to the internet.                                                                                                                                                         |
-| No free gateway port is available      | Remove stale agents/reservations where appropriate, free unrelated listeners, or widen the configured subrange while keeping it inside `19000-19999`.                                                                                                                                                                |
-| Remote host disk keeps growing         | `disk_gb` is not a Docker or Remote Docker storage quota. Inspect Docker images, volumes, container writable layers, and logs on the host, and monitor the underlying filesystem capacity.                                                                                                                           |
-| Image pull or provider calls fail      | Check the host architecture, remote-host DNS, outbound HTTPS, registry credentials, provider credentials, and any egress proxy or allowlist.                                                                                                                                                                         |
+| Symptom                                           | Checks                                                                                                                                                                                                                                                                                                               |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Host is missing from Deploy                       | Confirm it is enabled, configured, and its latest manual **Test** succeeded with a stored SSH pin. Legacy `Test: OK` rows without a pin must pass **Test** again. Confirm OpenClaw is selected. A viewer cannot deploy. The current Hermes picker does not merge registered remote hosts; use the advanced API path. |
+| Test passes but deployment fails                  | The test ran only from `backend-api`. Inspect `worker-provisioner` logs, verify worker SSH/firewall reachability, image-registry egress, free host capacity, published ports, and the gateway address. Re-run **Test** because the stored success has no expiry.                                                     |
+| SSH connection times out or is refused            | Check the address and port, SSH service, route or VPN, and firewall rules from `backend-api`, `worker-provisioner`, and `worker-backup` where applicable.                                                                                                                                                            |
+| Authentication fails                              | Confirm the SSH user and selected auth mode. Paste the complete private key, supply its passphrase when required, and check the server's authorized-key or password policy.                                                                                                                                          |
+| `docker version` fails                            | Install/start Docker and grant the SSH account non-interactive daemon access. Test with the same user and its default Docker context outside Nora.                                                                                                                                                                   |
+| Host-key mismatch                                 | Stop and verify the machine identity and replacement key out of band. If rotation or rebuild was intentional, use the explicit **Reset SSH pin** confirmation flow, then run **Test** to pin the new key. Otherwise treat it as a possible interception attempt.                                                     |
+| Agent deploys but never becomes ready             | Verify **Gateway address**, allow the configured `19000-19999` subrange from Nora, and confirm the published container ports are listening on the remote host.                                                                                                                                                       |
+| Agent remains after unshare                       | Expected: unshare removes only the grant. Follow the drain procedure above and explicitly migrate or delete the agent/container.                                                                                                                                                                                     |
+| Active use is denied after unshare                | Expected when the agent owner has no other qualifying grant. Nora blocks active operations and closes rechecked streams. **Stop** and **Delete** remain cleanup-only escape hatches when the original trusted SSH pin is still stored.                                                                               |
+| Stop or Delete reports a missing pin              | Nora will not accept an unknown SSH key for cleanup. The agent record is retained and the remote container may still be running. Verify the host out of band; restore the pin with **Test** on the same verified registration where possible, or remove the runtime manually.                                        |
+| Admin user deletion returns `REMOTE_HOSTS_IN_USE` | One or more agents still reference a Remote Docker host owned by that user. Inventory and migrate or delete every referenced agent, including agents owned by workspace members, before retrying account deletion.                                                                                                   |
+| Hermes dashboard cannot load                      | Confirm both allocated runtime and dashboard ports are firewalled to and reachable from `backend-api`. Do not expose the dashboard directly to the internet.                                                                                                                                                         |
+| No free gateway port is available                 | Remove stale agents/reservations where appropriate, free unrelated listeners, or widen the configured subrange while keeping it inside `19000-19999`.                                                                                                                                                                |
+| Remote host disk keeps growing                    | `disk_gb` is not a Docker or Remote Docker storage quota. Inspect Docker images, volumes, container writable layers, and logs on the host, and monitor the underlying filesystem capacity.                                                                                                                           |
+| Image pull or provider calls fail                 | Check the host architecture, remote-host DNS, outbound HTTPS, registry credentials, provider credentials, and any egress proxy or allowlist.                                                                                                                                                                         |
 
 ## Related references
 
+- [Connect a Remote Docker host](/guides/remote-docker)
 - [Choose a provisioner backend](/configuration/provisioner-backends)
 - [Deploy an agent](/guides/deploy-agent)
 - [Workspaces and Remote Docker grants](/concepts/workspaces#sharing-a-remote-docker-host)

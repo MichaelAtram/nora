@@ -16,9 +16,9 @@ npm run scaffold:backend -- --id acme-cloud --name "Acme Cloud"
 Use `--dry-run` to validate and list outputs without writing. The command creates:
 
 - `workers/provisioner/backends/acme-cloud.ts`: an unregistered adapter extending `ProvisionerBackend`
-- `backend-api/__tests__/acme-cloudBackend.test.ts`: contract shape, fail-closed baseline, and lifecycle test TODOs
+- `backend-api/__tests__/acme-cloudBackend.test.ts`: contract shape, fail-closed coverage for every required operation, and lifecycle test TODOs
 
-The generated adapter intentionally throws for every required lifecycle operation. It cannot become reachable merely because the file exists. This prevents a half-implemented deploy target from appearing in production or accepting jobs.
+The generated adapter intentionally throws for every required lifecycle, telemetry, log, and exec operation. It cannot become reachable merely because the file exists. This prevents a half-implemented deploy target from appearing in production or accepting jobs.
 
 ## Required contract
 

@@ -225,6 +225,29 @@ describe("auth rate limit configuration", () => {
   );
 });
 
+describe("bootstrap admin startup gate", () => {
+  it("refuses an empty hosted PaaS database without explicit bootstrap credentials", async () => {
+    const originalEmail = process.env.DEFAULT_ADMIN_EMAIL;
+    const originalPassword = process.env.DEFAULT_ADMIN_PASSWORD;
+    try {
+      process.env.PLATFORM_MODE = "paas";
+      process.env.DEFAULT_ADMIN_EMAIL = "";
+      process.env.DEFAULT_ADMIN_PASSWORD = "";
+      mockDb.query.mockResolvedValueOnce({ rows: [] });
+
+      await expect(app.__test.seedBootstrapAdminAccount()).rejects.toMatchObject({
+        code: "PAAS_BOOTSTRAP_ADMIN_REQUIRED",
+      });
+      expect(mockDb.query).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalEmail === undefined) delete process.env.DEFAULT_ADMIN_EMAIL;
+      else process.env.DEFAULT_ADMIN_EMAIL = originalEmail;
+      if (originalPassword === undefined) delete process.env.DEFAULT_ADMIN_PASSWORD;
+      else process.env.DEFAULT_ADMIN_PASSWORD = originalPassword;
+    }
+  });
+});
+
 describe("POST /auth/signup", () => {
   it("rejects missing email", async () => {
     const res = await signupRequest().send({ password: "testpassword123" });
@@ -266,6 +289,38 @@ describe("POST /auth/signup", () => {
     expect(res.body).toHaveProperty("id", "uuid-1");
     expect(res.body).toHaveProperty("email", "new@example.com");
     expect(res.body).toHaveProperty("role", "admin");
+  });
+
+  it("refuses public first-admin claim in hosted PaaS mode", async () => {
+    process.env.PLATFORM_MODE = "paas";
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "turnstile";
+    process.env.SIGNUP_TURNSTILE_SITE_KEY = "turnstile-site-key";
+    process.env.SIGNUP_TURNSTILE_SECRET = "turnstile-secret";
+    global.fetch.mockResolvedValueOnce(jsonResponse({ success: true }));
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ has_users: false }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await signupRequest().send({
+      email: "outside@example.com",
+      password: "validpassword123",
+      botProtectionToken: "verified-token",
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual(
+      expect.objectContaining({
+        code: "PAAS_BOOTSTRAP_ADMIN_REQUIRED",
+        error: expect.stringMatching(/bootstrap administrator/i),
+      }),
+    );
+    expect(mockDb.query).not.toHaveBeenCalledWith(
+      expect.stringMatching(/INSERT INTO users/i),
+      expect.anything(),
+    );
   });
 
   it("creates additional registered users as regular users", async () => {
@@ -746,6 +801,20 @@ describe("Protected auth routes", () => {
 
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ code: "session_required" });
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when hosted PaaS signup has no challenge provider", async () => {
+    process.env.PLATFORM_MODE = "paas";
+    process.env.SIGNUP_BOT_PROTECTION_PROVIDER = "none";
+
+    const res = await signupRequest().send({
+      email: "hosted-without-challenge@example.com",
+      password: "testpassword123",
+    });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe("Could not create account");
     expect(mockDb.query).not.toHaveBeenCalled();
   });
 
@@ -1252,6 +1321,17 @@ describe("GET /auth/bootstrap-status", () => {
     });
   });
 
+  it("never advertises public first-admin claim for an empty hosted PaaS database", async () => {
+    process.env.PLATFORM_MODE = "paas";
+    mockDb.query.mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app).get("/auth/bootstrap-status");
+
+    expect(res.status).toBe(200);
+    expect(res.body.needsFirstAdmin).toBe(false);
+    expect(res.body.platformMode).toBe("paas");
+  });
+
   it("reports runtime OAuth and hosted platform configuration", async () => {
     process.env.OAUTH_LOGIN_ENABLED = "true";
     process.env.PLATFORM_MODE = "PAAS";
@@ -1264,7 +1344,13 @@ describe("GET /auth/bootstrap-status", () => {
       needsFirstAdmin: false,
       oauthLoginEnabled: true,
       platformMode: "paas",
-      signupBotProtection: disabledSignupBotProtection,
+      signupBotProtection: {
+        enabled: true,
+        provider: null,
+        siteKey: null,
+        configured: false,
+        configurationError: expect.stringMatching(/required.*no challenge provider/i),
+      },
     });
   });
 

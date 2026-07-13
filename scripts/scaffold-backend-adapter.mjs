@@ -63,6 +63,10 @@ class ${className}Backend extends ProvisionerBackend {
     this._notImplemented("status");
   }
 
+  async stats(_containerId, _agent = null) {
+    this._notImplemented("stats");
+  }
+
   async stop(_containerId) {
     this._notImplemented("stop");
   }
@@ -73,6 +77,14 @@ class ${className}Backend extends ProvisionerBackend {
 
   async restart(_containerId) {
     this._notImplemented("restart");
+  }
+
+  async logs(_containerId, _options = {}) {
+    this._notImplemented("logs");
+  }
+
+  async exec(_containerId, _options = {}) {
+    this._notImplemented("exec");
   }
 }
 
@@ -105,11 +117,25 @@ describe(${JSON.stringify(`${name} backend contract`)}, () => {
     }
   });
 
-  it("fails closed until create is implemented", async () => {
+  it("fails closed until every required operation is implemented", async () => {
     const backend = new ${className}Backend({});
-    await expect(
-      backend.create({ id: "agent-1", name: "test" }),
-    ).rejects.toThrow(${JSON.stringify(`${name} backend create is not implemented`)});
+    const calls = [
+      ["create", [{ id: "agent-1", name: "test" }]],
+      ["destroy", ["runtime-1", { agentId: "agent-1" }]],
+      ["status", ["runtime-1"]],
+      ["stats", ["runtime-1", { id: "agent-1" }]],
+      ["stop", ["runtime-1"]],
+      ["start", ["runtime-1"]],
+      ["restart", ["runtime-1"]],
+      ["logs", ["runtime-1", { follow: false }]],
+      ["exec", ["runtime-1", { cmd: ["true"] }]],
+    ];
+
+    for (const [method, args] of calls) {
+      await expect(backend[method](...args)).rejects.toThrow(
+        ${JSON.stringify(`${name} backend`)} + " " + method + " is not implemented",
+      );
+    }
   });
 
   it.todo("creates a runtime and returns stable containerId/host metadata");

@@ -69,6 +69,7 @@ function configureProxmox() {
   process.env.PROXMOX_SSH_USER = "nora-bootstrap";
   process.env.PROXMOX_SSH_PASSWORD = "ssh-secret";
   process.env.PROXMOX_SSH_HOST_FINGERPRINT = fingerprintFor(hostKey);
+  process.env.PROXMOX_OFFLINE_STAGE_COMMAND = "/usr/local/libexec/nora-proxmox-stage";
   return hostKey;
 }
 
@@ -158,6 +159,44 @@ describe("ProxmoxBackend", () => {
     expect(sshConfig.hostVerifier(Buffer.from("different-host-key"))).toBe(false);
     expect(() => backend._assertConfigured()).not.toThrow();
   });
+
+  it("builds privileged pct commands from canonical validated tokens", async () => {
+    process.env.PROXMOX_PCT_COMMAND = "/usr/sbin/pct";
+    process.env.PROXMOX_SUDO = "/usr/bin/sudo -n";
+    const backend = new ProxmoxBackend();
+    backend._sshExec = jest.fn().mockResolvedValue({ stdout: "", stderr: "", code: 0 });
+
+    await backend._pctExec("108", "printf safe; uname", { timeout: 1234 });
+
+    expect(backend._sshExec).toHaveBeenCalledWith(
+      "'/usr/bin/sudo' '-n' '/usr/sbin/pct' 'exec' '108' '--' '/bin/sh' '-lc' 'printf safe; uname'",
+      { timeout: 1234 },
+    );
+  });
+
+  it.each(["pct --debug", "pct; touch /tmp/proxmox-command-injection", "pct\nid", "-pct"])(
+    "rejects unsafe PROXMOX_PCT_COMMAND value %p before SSH",
+    (value) => {
+      process.env.PROXMOX_PCT_COMMAND = value;
+      const sshFactory = jest.spyOn(ProxmoxBackend.prototype, "_createSshClient");
+
+      expect(() => new ProxmoxBackend()).toThrow(/PROXMOX_PCT_COMMAND.*single command name/i);
+      expect(sshFactory).not.toHaveBeenCalled();
+      sshFactory.mockRestore();
+    },
+  );
+
+  it.each(["sudo", "sudo -n -u root", "sudo -n; id", "sudo\t-n", "bash -n"])(
+    "rejects unsafe PROXMOX_SUDO value %p before SSH",
+    (value) => {
+      process.env.PROXMOX_SUDO = value;
+      const sshFactory = jest.spyOn(ProxmoxBackend.prototype, "_createSshClient");
+
+      expect(() => new ProxmoxBackend()).toThrow(/PROXMOX_SUDO/);
+      expect(sshFactory).not.toHaveBeenCalled();
+      sshFactory.mockRestore();
+    },
+  );
 
   it("does not translate an SSH channel close without an exit status into success", async () => {
     const backend = new ProxmoxBackend();
@@ -1236,6 +1275,7 @@ describe("ProxmoxBackend", () => {
   });
 
   it("fails closed for stopped LXC staging without root or a strict helper", async () => {
+    delete process.env.PROXMOX_OFFLINE_STAGE_COMMAND;
     const backend = new ProxmoxBackend();
     const agentId = "agent-offline-no-privilege";
     jest.spyOn(backend, "_requestData").mockImplementation(async (method, requestPath) => {
@@ -1279,7 +1319,7 @@ describe("ProxmoxBackend", () => {
     );
 
     expect(sshExec.mock.calls[0][0]).toBe(
-      "sudo -n '/usr/local/libexec/nora-proxmox-stage' 108 openclaw 1",
+      "'sudo' '-n' '/usr/local/libexec/nora-proxmox-stage' '108' 'openclaw' '1'",
     );
     expect(sshExec.mock.calls[0][0]).not.toContain("/bin/sh -lc");
   });
@@ -1368,7 +1408,9 @@ describe("ProxmoxBackend", () => {
       agentId,
     });
 
-    expect(open.mock.calls[0][0]).toContain("pct exec 106 -- /bin/sh -lc 'printf safe; uname'");
+    expect(open.mock.calls[0][0]).toContain(
+      "'pct' 'exec' '106' '--' '/bin/sh' '-lc' 'printf safe; uname'",
+    );
     expect(result.stream).toBe(stream);
     expect(result.stdin).toBe(stdin);
     await expect(result.exec.inspect()).resolves.toEqual({ Running: false, ExitCode: 0 });
@@ -1384,8 +1426,8 @@ describe("ProxmoxBackend", () => {
       .spyOn(backend, "_requestData")
       .mockResolvedValueOnce({ description: ownershipMarkerFor(agentId) });
     await backend.logs("107", { tail: 999999, follow: false, agentId });
-    expect(open.mock.calls[0][0]).toContain("-n 10000");
-    expect(open.mock.calls[0][0]).not.toContain(" -f ");
+    expect(open.mock.calls[0][0]).toContain("'-n' '10000'");
+    expect(open.mock.calls[0][0]).not.toContain("'-f'");
 
     const authError = Object.assign(new Error("forbidden"), { statusCode: 403 });
     requestData.mockRejectedValueOnce(authError);

@@ -30,6 +30,8 @@ const { shellSingleQuote } = require("../../../agent-runtime/lib/containerComman
 const {
   getProxmoxConfigIssue,
   getProxmoxProductionSecurityIssue,
+  normalizeProxmoxHostExecutable,
+  normalizeProxmoxSudoCommand,
 } = require("../../../agent-runtime/lib/backendCatalog");
 const { getStandardDockerPackageSpec } = require("../../../agent-runtime/lib/agentImages");
 const {
@@ -71,7 +73,6 @@ const PROXMOX_AGENT_OWNERSHIP_MARKER_PREFIX = "nora-agent:";
 const PROXMOX_CREATE_OWNERSHIP_MARKER_PREFIX = "nora-owner:";
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PROXMOX_TEMPLATE_RE = /^[A-Za-z0-9_.-]+:vztmpl\/[A-Za-z0-9._+~-]+\.tar\.zst$/;
-const SAFE_HOST_EXECUTABLE_RE = /^(?:\/[A-Za-z0-9_./-]+|[A-Za-z0-9_.-]+)$/;
 const SAFE_HOST_HELPER_RE = /^\/[A-Za-z0-9_./-]+$/;
 
 function sleep(ms) {
@@ -652,9 +653,24 @@ class ProxmoxBackend extends ProvisionerBackend {
     this.sshHost = process.env.PROXMOX_SSH_HOST;
     this.sshUser = process.env.PROXMOX_SSH_USER;
     this.sshPort = Number(process.env.PROXMOX_SSH_PORT || "22");
-    this.pctCommand = process.env.PROXMOX_PCT_COMMAND || "pct";
-    this.sudoPrefix = process.env.PROXMOX_SUDO || (this.sshUser === "root" ? "" : "sudo -n ");
+    this.pctCommand = normalizeProxmoxHostExecutable(
+      process.env.PROXMOX_PCT_COMMAND,
+      "PROXMOX_PCT_COMMAND",
+      "pct",
+    );
+    this.sudoCommand = normalizeProxmoxSudoCommand(process.env.PROXMOX_SUDO, this.sshUser);
     this.offlineStageCommand = String(process.env[PROXMOX_OFFLINE_STAGE_HELPER_ENV] || "").trim();
+  }
+
+  _hostCommand(executable, args = []) {
+    const command = normalizeProxmoxHostExecutable(
+      executable,
+      "Proxmox host executable",
+      executable,
+    );
+    return [...this.sudoCommand, command, ...args.map((arg) => String(arg))]
+      .map((token) => shellSingleQuote(token))
+      .join(" ");
   }
 
   _apiBaseUrl() {
@@ -1077,7 +1093,7 @@ class ProxmoxBackend extends ProvisionerBackend {
   _pctExec(vmid, command, options = {}) {
     const normalizedVmid = normalizeVmid(vmid);
     return this._sshExec(
-      `${this.sudoPrefix}${this.pctCommand} exec ${normalizedVmid} -- /bin/sh -lc ${shellSingleQuote(command)}`,
+      this._hostCommand(this.pctCommand, ["exec", normalizedVmid, "--", "/bin/sh", "-lc", command]),
       options,
     );
   }
@@ -1126,13 +1142,6 @@ class ProxmoxBackend extends ProvisionerBackend {
 
   _buildOfflineStageHostScript(vmid, runtimeFamily, nonce, replaceManagedState) {
     const normalizedVmid = normalizeVmid(vmid);
-    if (!SAFE_HOST_EXECUTABLE_RE.test(this.pctCommand)) {
-      const error = new Error(
-        "PROXMOX_PCT_COMMAND must be a single command name or absolute path for offline staging",
-      );
-      error.code = "PROXMOX_OFFLINE_STAGE_PCT_COMMAND_INVALID";
-      throw error;
-    }
     const hermes = runtimeFamily === "hermes";
     const envPath = hermes ? HERMES_ENV_FILE : OPENCLAW_ENV_FILE;
     const managedNamesPath = hermes
@@ -1336,8 +1345,12 @@ class ProxmoxBackend extends ProvisionerBackend {
     );
     const command =
       privilege.mode === "root"
-        ? `/bin/sh -lc ${shellSingleQuote(hostScript)}`
-        : `${this.sudoPrefix}${shellSingleQuote(privilege.command)} ${normalizedVmid} ${normalizedRuntimeFamily} ${replaceManagedState ? "1" : "0"}`;
+        ? this._hostCommand("/bin/sh", ["-lc", hostScript])
+        : this._hostCommand(privilege.command, [
+            normalizedVmid,
+            normalizedRuntimeFamily,
+            replaceManagedState ? "1" : "0",
+          ]);
 
     try {
       await this._sshExec(command, { timeout: 180000, signal, input: archive });
@@ -2323,8 +2336,20 @@ class ProxmoxBackend extends ProvisionerBackend {
     const vmid = normalizeVmid(containerId);
     await this._assertOwnedLxc(vmid, opts, { operation: "read logs from" });
     const tail = normalizeTail(opts.tail);
-    const follow = opts.follow !== false ? "-f" : "";
-    const command = `${this.sudoPrefix}${this.pctCommand} exec ${vmid} -- journalctl -u nora-openclaw.service -u nora-hermes.service -n ${tail} ${follow} --no-pager`;
+    const command = this._hostCommand(this.pctCommand, [
+      "exec",
+      vmid,
+      "--",
+      "journalctl",
+      "-u",
+      "nora-openclaw.service",
+      "-u",
+      "nora-hermes.service",
+      "-n",
+      String(tail),
+      ...(opts.follow !== false ? ["-f"] : []),
+      "--no-pager",
+    ]);
     return this._openSshStream(command, {
       signal: opts.signal,
       requireSuccess: true,
@@ -2520,7 +2545,7 @@ class ProxmoxBackend extends ProvisionerBackend {
     ];
     const shellCommand = Array.isArray(cmd)
       ? cmd.map((arg) => shellSingleQuote(arg)).join(" ")
-      : `/bin/sh -lc ${shellSingleQuote(String(cmd))}`;
+      : String(cmd);
     const rawEnv = Array.isArray(opts.env)
       ? opts.env
       : opts.env && typeof opts.env === "object"
@@ -2536,7 +2561,14 @@ class ProxmoxBackend extends ProvisionerBackend {
       return shellSingleQuote(`${key}=${value}`);
     });
     const guestCommand = envArgs.length ? `env ${envArgs.join(" ")} ${shellCommand}` : shellCommand;
-    const command = `${this.sudoPrefix}${this.pctCommand} exec ${vmid} -- ${guestCommand}`;
+    const command = this._hostCommand(this.pctCommand, [
+      "exec",
+      vmid,
+      "--",
+      "/bin/sh",
+      "-lc",
+      guestCommand,
+    ]);
     const session = this._openSshStream(command, {
       interactive: !opts.cmd,
       tty: opts.tty !== false,

@@ -25,6 +25,8 @@ const PROXMOX_RESOURCE_ID_RE = /^[A-Za-z0-9_.-]+$/;
 // Linux interface names, including Proxmox bridges, are limited to 15 bytes.
 // Restricting the character set also prevents net0 option-delimiter injection.
 const PROXMOX_BRIDGE_RE = /^[A-Za-z0-9_.-]{1,15}$/;
+const PROXMOX_SAFE_HOST_EXECUTABLE_RE = /^(?:\/[A-Za-z0-9_./-]+|[A-Za-z0-9_.-]+)$/;
+const PROXMOX_SAFE_HOST_HELPER_RE = /^\/[A-Za-z0-9_./-]+$/;
 
 const OPENCLAW_OPERATOR_CONTRACT = Object.freeze([
   "deploy/redeploy",
@@ -188,13 +190,19 @@ function normalizeRuntimeFamilyName(value) {
 }
 
 function normalizeDeployTargetName(value) {
-  const normalized = String(value || "docker")
+  const normalized = String(value ?? "")
     .trim()
     .toLowerCase();
+  if (!normalized) return "docker";
   if (normalized.startsWith("k8s:")) return "k8s";
   if (normalized.startsWith("remote:")) return "remote-docker";
   if (normalized === EXTERNAL_DEPLOY_TARGET) return EXTERNAL_DEPLOY_TARGET;
-  return KNOWN_DEPLOY_TARGETS.includes(normalized) ? normalized : "docker";
+  if (KNOWN_DEPLOY_TARGETS.includes(normalized)) return normalized;
+
+  const error = new Error(`Unknown deploy target: ${normalized}`);
+  error.code = "UNKNOWN_DEPLOY_TARGET";
+  error.statusCode = 400;
+  throw error;
 }
 
 function normalizeBackendName(value) {
@@ -265,6 +273,71 @@ function isKnownSandboxProfile(value) {
     .trim()
     .toLowerCase();
   return KNOWN_SANDBOX_PROFILES.includes(normalized);
+}
+
+function hasRuntimeSelectionValue(value) {
+  return value != null && String(value).trim() !== "";
+}
+
+function firstRuntimeSelectionValue(selection, keys) {
+  for (const key of keys) {
+    if (hasRuntimeSelectionValue(selection[key])) return selection[key];
+  }
+  return null;
+}
+
+function unknownRuntimeSelectionError(label, code, value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  const error = new Error(`Unknown ${label}: ${normalized}`);
+  error.code = code;
+  error.statusCode = 400;
+  return error;
+}
+
+function assertKnownRuntimeSelectionInputs(selection = {}) {
+  const runtimeFamily = firstRuntimeSelectionValue(selection, ["runtimeFamily", "runtime_family"]);
+  if (runtimeFamily != null && !isKnownRuntimeFamily(runtimeFamily)) {
+    throw unknownRuntimeSelectionError("runtime family", "UNKNOWN_RUNTIME_FAMILY", runtimeFamily);
+  }
+
+  const deployTarget = firstRuntimeSelectionValue(selection, [
+    "deployTarget",
+    "deploy_target",
+    "backend",
+    "backend_type",
+  ]);
+  if (deployTarget != null && !isKnownDeployTarget(deployTarget)) {
+    // Preserve the canonical deploy-target error contract.
+    normalizeDeployTargetName(deployTarget);
+  }
+
+  const executionTargetId = firstRuntimeSelectionValue(selection, [
+    "executionTargetId",
+    "execution_target_id",
+  ]);
+  if (executionTargetId != null && normalizeExecutionTargetId(executionTargetId) == null) {
+    throw unknownRuntimeSelectionError(
+      "execution target",
+      "UNKNOWN_EXECUTION_TARGET",
+      executionTargetId,
+    );
+  }
+
+  const sandboxProfile = firstRuntimeSelectionValue(selection, [
+    "sandboxProfile",
+    "sandbox_profile",
+    "sandbox",
+    "sandbox_type",
+  ]);
+  if (sandboxProfile != null && !isKnownSandboxProfile(sandboxProfile)) {
+    throw unknownRuntimeSelectionError(
+      "sandbox profile",
+      "UNKNOWN_SANDBOX_PROFILE",
+      sandboxProfile,
+    );
+  }
 }
 
 function getRuntimeFamilyMetadata(runtimeFamily) {
@@ -576,6 +649,73 @@ function getProxmoxTemplateIssue(value, envName) {
   return null;
 }
 
+function normalizeProxmoxHostExecutable(value, envName, fallback) {
+  const executable = String(value || fallback || "").trim();
+  const basename = executable.replace(/\/+$/, "").split("/").pop();
+  if (
+    !PROXMOX_SAFE_HOST_EXECUTABLE_RE.test(executable) ||
+    executable.startsWith("-") ||
+    basename === "." ||
+    basename === ".."
+  ) {
+    const error = new Error(
+      `${envName} must be a single command name or absolute executable path without arguments`,
+    );
+    error.code = `${envName}_INVALID`;
+    throw error;
+  }
+  return executable;
+}
+
+function normalizeProxmoxSudoCommand(value, sshUser) {
+  const configured = String(value || "").trim();
+  if (!configured) return sshUser === "root" ? [] : ["sudo", "-n"];
+
+  const match = configured.match(/^([^ ]+) -n$/);
+  if (!match) {
+    const error = new Error(
+      "PROXMOX_SUDO must be exactly 'sudo -n' or an absolute sudo path followed by '-n'",
+    );
+    error.code = "PROXMOX_SUDO_INVALID";
+    throw error;
+  }
+  const executable = normalizeProxmoxHostExecutable(match[1], "PROXMOX_SUDO", "sudo");
+  if (executable.replace(/\/+$/, "").split("/").pop() !== "sudo") {
+    const error = new Error(
+      "PROXMOX_SUDO must invoke the sudo executable with only the non-interactive -n option",
+    );
+    error.code = "PROXMOX_SUDO_INVALID";
+    throw error;
+  }
+  return [executable, "-n"];
+}
+
+function normalizeProxmoxOfflineStageCommand(value, { required = false } = {}) {
+  const configured = String(value || "").trim();
+  if (!configured) {
+    if (!required) return "";
+    const error = new Error(
+      "Non-root Proxmox SSH requires PROXMOX_OFFLINE_STAGE_COMMAND as one absolute operator-installed helper path",
+    );
+    error.code = "PROXMOX_OFFLINE_STAGE_COMMAND_REQUIRED";
+    throw error;
+  }
+
+  const pathSegments = configured.split("/");
+  if (
+    !PROXMOX_SAFE_HOST_HELPER_RE.test(configured) ||
+    configured.endsWith("/") ||
+    pathSegments.some((segment) => segment === "." || segment === "..")
+  ) {
+    const error = new Error(
+      "PROXMOX_OFFLINE_STAGE_COMMAND must be one absolute executable path without arguments, traversal, or shell syntax",
+    );
+    error.code = "PROXMOX_OFFLINE_STAGE_COMMAND_INVALID";
+    throw error;
+  }
+  return configured;
+}
+
 function getProxmoxConfigIssue(env = process.env, options = {}) {
   const rawApiUrl = String(env.PROXMOX_API_URL || "").trim();
   if (!rawApiUrl) return "Proxmox requires PROXMOX_API_URL.";
@@ -616,8 +756,18 @@ function getProxmoxConfigIssue(env = process.env, options = {}) {
   if (!String(env.PROXMOX_SSH_HOST || "").trim()) {
     return "Proxmox requires PROXMOX_SSH_HOST.";
   }
-  if (!String(env.PROXMOX_SSH_USER || "").trim()) {
+  const sshUser = String(env.PROXMOX_SSH_USER || "").trim();
+  if (!sshUser) {
     return "Proxmox requires PROXMOX_SSH_USER.";
+  }
+  try {
+    normalizeProxmoxHostExecutable(env.PROXMOX_PCT_COMMAND, "PROXMOX_PCT_COMMAND", "pct");
+    normalizeProxmoxSudoCommand(env.PROXMOX_SUDO, sshUser);
+    normalizeProxmoxOfflineStageCommand(env.PROXMOX_OFFLINE_STAGE_COMMAND, {
+      required: sshUser !== "root",
+    });
+  } catch (error) {
+    return error.message;
   }
 
   const node = String(env.PROXMOX_NODE || "pve").trim();
@@ -710,6 +860,15 @@ function runtimeSelectionIssue(selection = {}, env = process.env) {
   const normalizedRuntimeFamily = normalizeRuntimeFamilyName(runtimeFamily);
   const normalizedDeployTarget = normalizeDeployTargetName(deployTarget);
   const normalizedSandboxProfile = normalizeSandboxProfileName(sandboxProfile);
+  const normalizedExecutionTargetId =
+    normalizeExecutionTargetId(
+      selection.executionTargetId || selection.execution_target_id || normalizedDeployTarget,
+    ) || normalizedDeployTarget;
+  const executionDeployTarget = deployTargetFromExecutionTargetId(normalizedExecutionTargetId);
+
+  if (executionDeployTarget !== normalizedDeployTarget) {
+    return `Execution target ${normalizedExecutionTargetId} belongs to deploy target ${executionDeployTarget}, not ${normalizedDeployTarget}.`;
+  }
 
   if (!executionTargetsForRuntimeFamily(normalizedRuntimeFamily).includes(normalizedDeployTarget)) {
     return `${getRuntimeFamilyMetadata(normalizedRuntimeFamily).label} does not support the ${getExecutionTargetMetadata(normalizedDeployTarget, env).label} execution target.`;
@@ -754,6 +913,7 @@ function backendConfigIssue(backend, env = process.env) {
 }
 
 function getRuntimeSelectionStatus(selection = {}, env = process.env) {
+  assertKnownRuntimeSelectionInputs(selection);
   const runtimeFamily = normalizeRuntimeFamilyName(
     selection.runtimeFamily || selection.runtime_family,
   );
@@ -1339,6 +1499,9 @@ module.exports = {
   normalizeBackendName,
   normalizeDeployTargetName,
   normalizeExecutionTargetId,
+  normalizeProxmoxHostExecutable,
+  normalizeProxmoxOfflineStageCommand,
+  normalizeProxmoxSudoCommand,
   normalizeRuntimeFamilyName,
   normalizeSandboxProfileName,
   runtimeFamilyForBackend,

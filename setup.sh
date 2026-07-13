@@ -49,6 +49,34 @@ warn()  { printf "${YELLOW}[warn]${NC}  %s\n" "$1"; }
 error() { printf "${RED}[error]${NC} %s\n" "$1"; }
 header(){ printf "\n${BOLD}${CYAN}── %s ──${NC}\n\n" "$1"; }
 
+bootstrap_admin_email_is_valid() {
+  local value="$1" lowered
+  [[ "$value" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] || return 1
+  case "$value" in
+    *'<'*|*'>'*|*'{{'*) return 1 ;;
+  esac
+  lowered="$(printf '%s' "$value" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  case "$lowered" in
+    your_*|replace_with*|replace-with*|placeholder*) return 1 ;;
+  esac
+  return 0
+}
+
+bootstrap_admin_password_is_forbidden() {
+  local value="$1" lowered comparable
+  lowered="$(printf '%s' "$value" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  case "$lowered" in
+    your_*|example*|sample*|placeholder*|changeme*|replace-me*|test-*|demo-*|*'<'*|*'{{'*)
+      return 0
+      ;;
+  esac
+  comparable="$(printf '%s' "$lowered" | LC_ALL=C tr -cd 'a-z0-9')"
+  case "$comparable" in
+    admin123*|administrator*|password*|changeme*|letmein*|welcome1*|qwerty123*) return 0 ;;
+  esac
+  return 1
+}
+
 usage() {
   cat <<'EOF'
 Usage: bash setup.sh [--install | --update | --clean-reinstall]
@@ -625,15 +653,79 @@ read_env_value() {
   value="${line#*=}"
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
-  if [ "${#value}" -ge 2 ]; then
-    first="${value:0:1}"
-    last="${value: -1}"
-    if { [ "$first" = '"' ] && [ "$last" = '"' ]; } || { [ "$first" = "'" ] && [ "$last" = "'" ]; }; then
-      value="${value:1:${#value}-2}"
-    fi
-  fi
+  value="$(decode_compose_env_literal "$value")"
 
   printf "%s\n" "$value"
+}
+
+compose_env_literal() {
+  local value="$1" escaped
+  case "$value" in
+    *$'\n'* | *$'\r'*)
+      error "Compose environment values cannot contain newlines."
+      return 1
+      ;;
+  esac
+
+  if [ -n "$value" ] && { [ "${value: -1}" = "\\" ] || [[ "$value" == *"\\'"* ]]; }; then
+    escaped="${value//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    escaped="${escaped//\$/\$\$}"
+    printf '"%s"\n' "$escaped"
+    return 0
+  fi
+
+  escaped="${value//\'/\\\'}"
+  printf "'%s'\n" "$escaped"
+}
+
+decode_compose_env_literal() {
+  local value="$1" first last body output="" current next i=0 length quote_mode
+  if [ "${#value}" -lt 2 ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  first="${value:0:1}"
+  last="${value: -1}"
+  if [ "$first" = '"' ] && [ "$last" = '"' ]; then
+    quote_mode="double"
+  elif [ "$first" = "'" ] && [ "$last" = "'" ]; then
+    quote_mode="single"
+  else
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  body="${value:1:${#value}-2}"
+  length="${#body}"
+  while [ "$i" -lt "$length" ]; do
+    current="${body:$i:1}"
+    if [ "$quote_mode" = "single" ] && [ "$current" = "\\" ] && [ $((i + 1)) -lt "$length" ]; then
+      next="${body:$((i + 1)):1}"
+      if [ "$next" = "'" ]; then
+        output="${output}${next}"
+        i=$((i + 2))
+        continue
+      fi
+    fi
+    if [ "$quote_mode" = "double" ] && [ $((i + 1)) -lt "$length" ]; then
+      next="${body:$((i + 1)):1}"
+      if [ "$current" = "\\" ] && { [ "$next" = "\\" ] || [ "$next" = '"' ]; }; then
+        output="${output}${next}"
+        i=$((i + 2))
+        continue
+      fi
+      if [ "$current" = '$' ] && [ "$next" = '$' ]; then
+        output="${output}${current}"
+        i=$((i + 2))
+        continue
+      fi
+    fi
+    output="${output}${current}"
+    i=$((i + 1))
+  done
+  printf '%s\n' "$output"
 }
 
 read_env_value_with_alias() {
@@ -1512,6 +1604,7 @@ PROXMOX_SSH_HOST_FINGERPRINT="$(read_env_value "$ENV_FILE" "PROXMOX_SSH_HOST_FIN
 PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY="$(read_env_value "$ENV_FILE" "PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY" "false")"
 PROXMOX_PCT_COMMAND="$(read_env_value "$ENV_FILE" "PROXMOX_PCT_COMMAND" "pct")"
 PROXMOX_SUDO="$(read_env_value "$ENV_FILE" "PROXMOX_SUDO" "")"
+PROXMOX_OFFLINE_STAGE_COMMAND="$(read_env_value "$ENV_FILE" "PROXMOX_OFFLINE_STAGE_COMMAND" "")"
 PROXMOX_NODE_MAJOR="$(read_env_value "$ENV_FILE" "PROXMOX_NODE_MAJOR" "24")"
 PROXMOX_OPENCLAW_PACKAGE="$(read_env_value "$ENV_FILE" "PROXMOX_OPENCLAW_PACKAGE" "openclaw@2026.6.11")"
 if [ "$PROXMOX_OPENCLAW_PACKAGE" = "openclaw@latest" ]; then
@@ -1680,12 +1773,16 @@ if [ "$BACKEND_API_PORT" != "4100" ]; then
   warn "Port 4100 was busy — Nora backend API will run at 127.0.0.1:${BACKEND_API_PORT}."
 fi
 
-# ── Bootstrap Admin Account (Optional) ───────────────────────
+# ── Bootstrap Admin Account ──────────────────────────────────
 
-header "Bootstrap Admin Account (Optional)"
-
-printf "  Leave both fields blank to skip bootstrap admin creation.\n"
-printf "  If set, the password must be at least 12 characters.\n\n"
+if [ "$PLATFORM_MODE" = "paas" ]; then
+  header "Bootstrap Admin Account (Required for PaaS)"
+  printf "  Hosted PaaS requires an explicit bootstrap administrator.\n"
+else
+  header "Bootstrap Admin Account (Optional)"
+  printf "  Leave both fields blank to claim the first admin after boot.\n"
+fi
+printf "  If set, use a valid email and a non-default password of at least 12 characters.\n\n"
 
 while true; do
   printf "  Admin email [leave blank to skip]: "
@@ -1696,9 +1793,13 @@ while true; do
   printf "\n"
 
   if [ -z "$admin_email_input" ] && [ -z "$admin_pass_input" ]; then
+    if [ "$PLATFORM_MODE" = "paas" ]; then
+      warn "Hosted PaaS cannot expose first-account admin claim. Configure the bootstrap administrator."
+      continue
+    fi
     DEFAULT_ADMIN_EMAIL=""
     DEFAULT_ADMIN_PASSWORD=""
-    info "Skipping bootstrap admin seed — create your operator account after first boot."
+    info "Skipping bootstrap admin seed — claim your self-hosted operator account after first boot."
     break
   fi
 
@@ -1707,8 +1808,18 @@ while true; do
     continue
   fi
 
+  if ! bootstrap_admin_email_is_valid "$admin_email_input"; then
+    warn "Bootstrap admin email must be a valid non-placeholder address."
+    continue
+  fi
+
   if [ ${#admin_pass_input} -lt 12 ]; then
     warn "Bootstrap admin password must be at least 12 characters."
+    continue
+  fi
+
+  if bootstrap_admin_password_is_forbidden "$admin_pass_input"; then
+    warn "Bootstrap admin password cannot be a shipped placeholder or derived from a common default."
     continue
   fi
 
@@ -1820,6 +1931,8 @@ SIGNUP_TURNSTILE_SITE_KEY="$(read_env_value_with_alias "$ENV_FILE" "SIGNUP_TURNS
 SIGNUP_TURNSTILE_SECRET="$(read_env_value "$ENV_FILE" "SIGNUP_TURNSTILE_SECRET" "")"
 SIGNUP_RECAPTCHA_SITE_KEY="$(read_env_value_with_alias "$ENV_FILE" "SIGNUP_RECAPTCHA_SITE_KEY" "NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY" "")"
 SIGNUP_RECAPTCHA_SECRET="$(read_env_value "$ENV_FILE" "SIGNUP_RECAPTCHA_SECRET" "")"
+DEFAULT_ADMIN_EMAIL_ENV="$(compose_env_literal "$DEFAULT_ADMIN_EMAIL")"
+DEFAULT_ADMIN_PASSWORD_ENV="$(compose_env_literal "$DEFAULT_ADMIN_PASSWORD")"
 if [ -n "$NORA_CURRENT_COMMIT" ]; then
   ok "Release tracking: ${NORA_CURRENT_VERSION:-source checkout} @ ${NORA_CURRENT_COMMIT:0:12}"
 else
@@ -1841,8 +1954,8 @@ NORA_AGENT_HUB_API_KEY_HASH_SECRET=${NORA_AGENT_HUB_API_KEY_HASH_SECRET}
 NORA_API_KEY_HASH_SECRET=${NORA_API_KEY_HASH_SECRET}
 
 # ── Bootstrap Admin Account (optional; seeded only when both are set securely) ──
-DEFAULT_ADMIN_EMAIL=${DEFAULT_ADMIN_EMAIL}
-DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD}
+DEFAULT_ADMIN_EMAIL=${DEFAULT_ADMIN_EMAIL_ENV}
+DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD_ENV}
 
 # ── Database (defaults work with Docker Compose) ─────────────
 DB_HOST=postgres
@@ -2026,6 +2139,7 @@ PROXMOX_SSH_HOST_FINGERPRINT=${PROXMOX_SSH_HOST_FINGERPRINT}
 PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY=${PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY}
 PROXMOX_PCT_COMMAND=${PROXMOX_PCT_COMMAND}
 PROXMOX_SUDO=${PROXMOX_SUDO}
+PROXMOX_OFFLINE_STAGE_COMMAND=${PROXMOX_OFFLINE_STAGE_COMMAND}
 PROXMOX_NODE_MAJOR=${PROXMOX_NODE_MAJOR}
 PROXMOX_OPENCLAW_PACKAGE=${PROXMOX_OPENCLAW_PACKAGE}
 PROXMOX_HERMES_BIN=${PROXMOX_HERMES_BIN}

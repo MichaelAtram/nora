@@ -1140,15 +1140,33 @@ class DockerBackend extends ProvisionerBackend {
     }
 
     if (agentId) {
+      const volumeCleanupFailures = [];
       for (const volume of [`nora_agent_state_${agentId}`, `nora_agent_home_${agentId}`]) {
         try {
           await this.docker.getVolume(volume).remove({ force: true });
           console.log(`[docker] Volume ${volume} removed`);
-        } catch (e) {
+        } catch (error) {
+          if (isDockerNotFound(error)) {
+            console.log(`[docker] Volume ${volume} already absent`);
+            continue;
+          }
           console.warn(
-            `[docker] Could not remove volume ${volume} for agent ${agentId}: ${e.message}`,
+            `[docker] Could not remove volume ${volume} for agent ${agentId}: ${error.message}`,
           );
+          volumeCleanupFailures.push({ volume, error });
         }
+      }
+      if (volumeCleanupFailures.length > 0) {
+        const failedVolumes = volumeCleanupFailures.map(({ volume }) => volume);
+        const error = new Error(
+          `Failed to remove Nora-managed Docker ${failedVolumes.length === 1 ? "volume" : "volumes"} ` +
+            `${failedVolumes.join(", ")} for agent ${agentId}. The container is absent, but durable ` +
+            "state may remain; retry deletion after correcting Docker volume access.",
+        );
+        error.code = "DOCKER_VOLUME_CLEANUP_FAILED";
+        error.volumeNames = failedVolumes;
+        error.cause = volumeCleanupFailures[0].error;
+        throw error;
       }
     }
   }

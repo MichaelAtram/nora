@@ -74,6 +74,97 @@ function Write-Warn  { param($msg) Write-Host "[warn]  $msg" -ForegroundColor Ye
 function Write-Err   { param($msg) Write-Host "[error] $msg" -ForegroundColor Red }
 function Write-Header { param($msg) Write-Host "`n── $msg ──`n" -ForegroundColor Cyan }
 
+function Test-BootstrapAdminEmail {
+    param([string]$Value)
+    if (-not $Value -or $Value -notmatch '^[^\s@]+@[^\s@]+$') { return $false }
+    if ($Value.Contains('<') -or $Value.Contains('>') -or $Value.Contains('{{')) { return $false }
+    return $Value -notmatch '^(?i:your_|replace[-_]with|placeholder)'
+}
+
+function Test-BootstrapAdminPasswordForbidden {
+    param([string]$Value)
+    $lowered = ([string]$Value).ToLowerInvariant()
+    if ($lowered -match '^(your_|example|sample|placeholder|changeme|replace-me|test-|demo-)' -or
+        $lowered.Contains('<') -or $lowered.Contains('{{')) {
+        return $true
+    }
+    $comparable = [regex]::Replace($lowered, '[^a-z0-9]', '')
+    foreach ($prefix in @('admin123', 'administrator', 'password', 'changeme', 'letmein', 'welcome1', 'qwerty123')) {
+        if ($comparable.StartsWith($prefix, [System.StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
+function Read-SecretText {
+    param([string]$Prompt)
+    $secureValue = Read-Host $Prompt -AsSecureString
+    $credential = [System.Net.NetworkCredential]::new('', $secureValue)
+    return $credential.Password
+}
+
+function ConvertTo-ComposeEnvLiteral {
+    param([AllowEmptyString()][string]$Value)
+    if ($null -eq $Value) { $Value = "" }
+    if ($Value.Contains("`r") -or $Value.Contains("`n")) {
+        throw "Compose environment values cannot contain newlines."
+    }
+    $slash = [char]92
+    if (
+        $Value.EndsWith([string]$slash, [System.StringComparison]::Ordinal) -or
+        $Value.Contains([string]::Concat($slash, [char]39))
+    ) {
+        $escaped = $Value.Replace([string]$slash, [string]::Concat($slash, $slash))
+        $escaped = $escaped.Replace([string][char]34, [string]::Concat($slash, [char]34))
+        $escaped = $escaped.Replace('$', '$$')
+        return [string][char]34 + $escaped + [string][char]34
+    }
+    $escaped = $Value.Replace("'", [string]::Concat($slash, "'"))
+    return "'" + $escaped + "'"
+}
+
+function ConvertFrom-ComposeEnvLiteral {
+    param([AllowEmptyString()][string]$Value)
+    if ($null -eq $Value) { return "" }
+    $trimmed = $Value.Trim()
+    if ($trimmed.Length -lt 2) { return $trimmed }
+
+    $first = $trimmed.Substring(0, 1)
+    $last = $trimmed.Substring($trimmed.Length - 1, 1)
+    if ($first -eq '"' -and $last -eq '"') { $quoteMode = "double" }
+    elseif ($first -eq "'" -and $last -eq "'") { $quoteMode = "single" }
+    else { return $trimmed }
+
+    $body = $trimmed.Substring(1, $trimmed.Length - 2)
+    $slash = [char]92
+    $builder = [System.Text.StringBuilder]::new()
+    for ($index = 0; $index -lt $body.Length; $index += 1) {
+        $current = $body[$index]
+        if ($quoteMode -eq "single" -and $current -eq $slash -and ($index + 1) -lt $body.Length) {
+            $next = $body[$index + 1]
+            if ($next -eq [char]39) {
+                [void]$builder.Append($next)
+                $index += 1
+                continue
+            }
+        }
+        if ($quoteMode -eq "double" -and ($index + 1) -lt $body.Length) {
+            $next = $body[$index + 1]
+            if ($current -eq $slash -and ($next -eq $slash -or $next -eq [char]34)) {
+                [void]$builder.Append($next)
+                $index += 1
+                continue
+            }
+            if ($current -eq [char]36 -and $next -eq [char]36) {
+                [void]$builder.Append($current)
+                $index += 1
+                continue
+            }
+        }
+        [void]$builder.Append($current)
+    }
+    return $builder.ToString()
+}
+
 function Write-PublicNginxConfig {
     param([string]$TemplatePath, [string]$Domain)
     $content = Get-Content $TemplatePath -Raw
@@ -398,16 +489,14 @@ function Update-ReleaseTrackingEnv {
 function Get-EnvAssignmentValue {
     param([string]$Line)
 
-    $value = $Line -replace '^[^=]*=', ''
-    $value = $value -replace '\s+#.*$', ''
-    $value = $value.Trim()
-    if (
+    $value = ($Line -replace '^[^=]*=', '').Trim()
+    $quoted =
         ($value.Length -ge 2) -and
         (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))
-    ) {
-        $value = $value.Substring(1, $value.Length - 2).Trim()
+    if (-not $quoted) {
+        $value = ($value -replace '\s+#.*$', '').Trim()
     }
-    return $value
+    return ConvertFrom-ComposeEnvLiteral -Value $value
 }
 
 function Test-AgentHubHashSecretPresent {
@@ -900,14 +989,7 @@ function Read-EnvValue {
     foreach ($line in Get-Content -LiteralPath $EnvPath) {
         if ($line -match $pattern) {
             $value = $matches[1].Trim()
-            if ($value.Length -ge 2) {
-                $first = $value.Substring(0, 1)
-                $last = $value.Substring($value.Length - 1, 1)
-                if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
-                    $value = $value.Substring(1, $value.Length - 2)
-                }
-            }
-            return $value
+            return ConvertFrom-ComposeEnvLiteral -Value $value
         }
     }
 
@@ -1607,6 +1689,7 @@ $PROXMOX_SSH_HOST_FINGERPRINT = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_
 $PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY" -Default "false"
 $PROXMOX_PCT_COMMAND = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_PCT_COMMAND" -Default "pct"
 $PROXMOX_SUDO = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_SUDO" -Default ""
+$PROXMOX_OFFLINE_STAGE_COMMAND = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_OFFLINE_STAGE_COMMAND" -Default ""
 $PROXMOX_NODE_MAJOR = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_NODE_MAJOR" -Default "24"
 $PROXMOX_OPENCLAW_PACKAGE = Read-EnvValue -EnvPath $ENV_FILE -Name "PROXMOX_OPENCLAW_PACKAGE" -Default "openclaw@2026.6.11"
 if ($PROXMOX_OPENCLAW_PACKAGE -eq "openclaw@latest") {
@@ -1775,21 +1858,29 @@ if ("$BACKEND_API_PORT" -ne "4100") {
     Write-Warn "Port 4100 was busy — Nora backend API will run at 127.0.0.1:$BACKEND_API_PORT."
 }
 
-# ── Bootstrap Admin Account (Optional) ───────────────────────
+# ── Bootstrap Admin Account ──────────────────────────────────
 
-Write-Header "Bootstrap Admin Account (Optional)"
-
-Write-Host "  Leave both fields blank to skip bootstrap admin creation."
-Write-Host "  If set, the password must be at least 12 characters.`n"
+if ($PLATFORM_MODE -eq "paas") {
+    Write-Header "Bootstrap Admin Account (Required for PaaS)"
+    Write-Host "  Hosted PaaS requires an explicit bootstrap administrator."
+} else {
+    Write-Header "Bootstrap Admin Account (Optional)"
+    Write-Host "  Leave both fields blank to claim the first admin after boot."
+}
+Write-Host "  If set, use a valid email and a non-default password of at least 12 characters.`n"
 
 while ($true) {
     $adminEmailInput = Read-Host "  Admin email [leave blank to skip]"
-    $adminPassInput = Read-Host "  Admin password (min 12 chars, leave blank to skip)"
+    $adminPassInput = Read-SecretText "  Admin password (min 12 chars, leave blank to skip)"
 
     if (-not $adminEmailInput -and -not $adminPassInput) {
+        if ($PLATFORM_MODE -eq "paas") {
+            Write-Warn "Hosted PaaS cannot expose first-account admin claim. Configure the bootstrap administrator."
+            continue
+        }
         $DEFAULT_ADMIN_EMAIL = ""
         $DEFAULT_ADMIN_PASSWORD = ""
-        Write-Info "Skipping bootstrap admin seed — create your operator account after first boot."
+        Write-Info "Skipping bootstrap admin seed — claim your self-hosted operator account after first boot."
         break
     }
 
@@ -1798,8 +1889,18 @@ while ($true) {
         continue
     }
 
+    if (-not (Test-BootstrapAdminEmail -Value $adminEmailInput)) {
+        Write-Warn "Bootstrap admin email must be a valid non-placeholder address."
+        continue
+    }
+
     if ($adminPassInput.Length -lt 12) {
         Write-Warn "Bootstrap admin password must be at least 12 characters."
+        continue
+    }
+
+    if (Test-BootstrapAdminPasswordForbidden -Value $adminPassInput) {
+        Write-Warn "Bootstrap admin password cannot be a shipped placeholder or derived from a common default."
         continue
     }
 
@@ -1902,6 +2003,8 @@ $SIGNUP_TURNSTILE_SITE_KEY = Read-EnvValueWithAlias -EnvPath $ENV_FILE -Name "SI
 $SIGNUP_TURNSTILE_SECRET = Read-EnvValue -EnvPath $ENV_FILE -Name "SIGNUP_TURNSTILE_SECRET" -Default ""
 $SIGNUP_RECAPTCHA_SITE_KEY = Read-EnvValueWithAlias -EnvPath $ENV_FILE -Name "SIGNUP_RECAPTCHA_SITE_KEY" -AliasName "NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY" -Default ""
 $SIGNUP_RECAPTCHA_SECRET = Read-EnvValue -EnvPath $ENV_FILE -Name "SIGNUP_RECAPTCHA_SECRET" -Default ""
+$DEFAULT_ADMIN_EMAIL_ENV = ConvertTo-ComposeEnvLiteral -Value $DEFAULT_ADMIN_EMAIL
+$DEFAULT_ADMIN_PASSWORD_ENV = ConvertTo-ComposeEnvLiteral -Value $DEFAULT_ADMIN_PASSWORD
 if ($NORA_CURRENT_COMMIT) {
     $label = if ($NORA_CURRENT_VERSION) { $NORA_CURRENT_VERSION } else { "source checkout" }
     Write-Ok "Release tracking: $label @ $($NORA_CURRENT_COMMIT.Substring(0, [Math]::Min(12, $NORA_CURRENT_COMMIT.Length)))"
@@ -1924,8 +2027,8 @@ NORA_AGENT_HUB_API_KEY_HASH_SECRET=$NORA_AGENT_HUB_API_KEY_HASH_SECRET
 NORA_API_KEY_HASH_SECRET=$NORA_API_KEY_HASH_SECRET
 
 # ── Bootstrap Admin Account (optional; seeded only when both are set securely) ──
-DEFAULT_ADMIN_EMAIL=$DEFAULT_ADMIN_EMAIL
-DEFAULT_ADMIN_PASSWORD=$DEFAULT_ADMIN_PASSWORD
+DEFAULT_ADMIN_EMAIL=$DEFAULT_ADMIN_EMAIL_ENV
+DEFAULT_ADMIN_PASSWORD=$DEFAULT_ADMIN_PASSWORD_ENV
 
 # ── Database (defaults work with Docker Compose) ─────────────
 DB_HOST=postgres
@@ -2109,6 +2212,7 @@ PROXMOX_SSH_HOST_FINGERPRINT=$PROXMOX_SSH_HOST_FINGERPRINT
 PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY=$PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY
 PROXMOX_PCT_COMMAND=$PROXMOX_PCT_COMMAND
 PROXMOX_SUDO=$PROXMOX_SUDO
+PROXMOX_OFFLINE_STAGE_COMMAND=$PROXMOX_OFFLINE_STAGE_COMMAND
 PROXMOX_NODE_MAJOR=$PROXMOX_NODE_MAJOR
 PROXMOX_OPENCLAW_PACKAGE=$PROXMOX_OPENCLAW_PACKAGE
 PROXMOX_HERMES_BIN=$PROXMOX_HERMES_BIN

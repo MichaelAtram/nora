@@ -225,7 +225,37 @@ async function removeAgent(workspaceId, agentId) {
   return result.rows[0] || null;
 }
 
-async function listAccessibleAgents(userId, { scope = "accessible" } = {}) {
+async function listAccessibleAgents(userId, { scope = "accessible", workspaceId = null } = {}) {
+  if (workspaceId) {
+    const ownedOnly = scope === "owned" ? "AND a.user_id = $1" : "";
+    const result = await db.query(
+      `SELECT a.*,
+              (a.user_id = $1) AS is_direct_owner,
+              CASE
+                WHEN a.user_id = $1 THEN 'owner'
+                ELSE COALESCE(wm.role, CASE WHEN w.user_id = $1 THEN 'owner' ELSE NULL END)
+              END AS effective_role,
+              jsonb_build_array(
+                jsonb_build_object(
+                  'id', w.id,
+                  'name', w.name,
+                  'role', COALESCE(wm.role, CASE WHEN w.user_id = $1 THEN 'owner' ELSE NULL END)
+                )
+              ) AS workspaces
+         FROM workspace_agents wa
+         JOIN agents a ON a.id = wa.agent_id
+         JOIN workspaces w ON w.id = wa.workspace_id
+         LEFT JOIN workspace_members wm
+           ON wm.workspace_id = w.id AND wm.user_id = $1
+        WHERE wa.workspace_id = $2
+          AND (a.user_id = $1 OR wm.user_id = $1 OR w.user_id = $1)
+          ${ownedOnly}
+        ORDER BY a.created_at DESC`,
+      [userId, workspaceId],
+    );
+    return result.rows.map(serializeAccessibleAgent);
+  }
+
   if (scope === "owned") {
     const result = await db.query(
       `SELECT a.*,

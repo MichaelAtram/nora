@@ -39,9 +39,10 @@ try {
 }
 const { listKubernetesExecutionTargets } = require("./kubernetesClusters");
 const { STARTER_TEMPLATES } = require("./starterTemplates");
-const { getBootstrapAdminSeedConfig } = require("./bootstrapAdmin");
+const { allowsFirstAdminSignupClaim, getBootstrapAdminSeedConfig } = require("./bootstrapAdmin");
 const { ensureFirstRegisteredUserIsAdmin } = require("./ensureAdminUser");
 const { authenticateToken } = require("./middleware/auth");
+const { requireApiKeyAgentPathScope } = require("./middleware/ownership");
 const { correlationId, errorHandler } = require("./middleware/errorHandler");
 const {
   createGatewayRouter,
@@ -1151,6 +1152,11 @@ app.use("/agent-hub", require("./routes/agentHubPublic"));
 // ─── Auth Wall ────────────────────────────────────────────────────
 app.use(authenticateToken);
 
+// Agent-id paths enforce the API key's exact workspace assignment before any
+// router can touch runtime state. Each router then applies its own public scope
+// contract (agents, integrations, monitoring, or session-only).
+app.use("/agents", requireApiKeyAgentPathScope());
+
 // ─── Gateway Proxy ────────────────────────────────────────────────
 app.use(createGatewayRouter());
 
@@ -2212,6 +2218,47 @@ async function seedStarterAgentHub() {
   console.log(`Agent Hub seeded with ${STARTER_TEMPLATES.length} built-in starter templates`);
 }
 
+async function seedBootstrapAdminAccount() {
+  const { rows } = await db.query("SELECT id FROM users LIMIT 1");
+  if (rows.length > 0) return;
+
+  const adminEmail = process.env.DEFAULT_ADMIN_EMAIL;
+  const adminPassword = process.env.DEFAULT_ADMIN_PASSWORD;
+  const bootstrapAdmin = getBootstrapAdminSeedConfig({ adminEmail, adminPassword });
+
+  if (!bootstrapAdmin.shouldSeed) {
+    const emailConfigured = typeof adminEmail === "string" && adminEmail.trim() !== "";
+    const passwordConfigured = typeof adminPassword === "string" && adminPassword !== "";
+    if (!emailConfigured && !passwordConfigured) {
+      if (!allowsFirstAdminSignupClaim()) {
+        const error = new Error(
+          "Hosted PaaS requires explicit DEFAULT_ADMIN_EMAIL and DEFAULT_ADMIN_PASSWORD before the API can start with an empty user database.",
+        );
+        error.code = "PAAS_BOOTSTRAP_ADMIN_REQUIRED";
+        throw error;
+      }
+      console.warn(
+        "Skipping bootstrap admin seed: set explicit DEFAULT_ADMIN_EMAIL and a non-default DEFAULT_ADMIN_PASSWORD with at least 12 characters, or claim the first account through signup.",
+      );
+      return;
+    }
+
+    const error = new Error(
+      `Invalid bootstrap admin configuration (${bootstrapAdmin.reason}). Refusing to start with an empty user database because the configured account would not be created.`,
+    );
+    error.code = "BOOTSTRAP_ADMIN_CONFIGURATION_INVALID";
+    throw error;
+  }
+
+  const bcrypt = require("bcryptjs");
+  const hash = await bcrypt.hash(bootstrapAdmin.password, 10);
+  await db.query(
+    "INSERT INTO users(email, password_hash, role, name) VALUES($1, $2, 'admin', 'Admin') ON CONFLICT DO NOTHING",
+    [bootstrapAdmin.email, hash],
+  );
+  console.log(`Bootstrap admin account created: ${bootstrapAdmin.email}`);
+}
+
 // ─── Startup ──────────────────────────────────────────────────────
 if (require.main === module) {
   const { attachLogStream } = require("./logStream");
@@ -2224,6 +2271,10 @@ if (require.main === module) {
     // a transaction, advisory lock, append-only ledger, and checksums; Nora
     // must never serve traffic against a partially migrated database.
     await migrateDB();
+    // Bootstrap credentials are an activation and security gate. Validate and
+    // seed them before binding the HTTP listener so a copied placeholder or a
+    // password rejected by policy cannot silently leave first-run signup open.
+    await seedBootstrapAdminAccount();
 
     const server = app.listen(PORT, async () => {
       console.log(`api running on ${PORT}`);
@@ -2252,33 +2303,6 @@ if (require.main === module) {
         } catch (e) {
           console.warn("Could not persist/restore dev JWT secret:", e.message);
         }
-      }
-
-      // Seed bootstrap admin account on first boot only when explicit secure credentials are provided.
-      try {
-        const { rows } = await db.query("SELECT id FROM users LIMIT 1");
-        if (rows.length === 0) {
-          const bootstrapAdmin = getBootstrapAdminSeedConfig({
-            adminEmail: process.env.DEFAULT_ADMIN_EMAIL,
-            adminPassword: process.env.DEFAULT_ADMIN_PASSWORD,
-          });
-
-          if (!bootstrapAdmin.shouldSeed) {
-            console.warn(
-              "Skipping bootstrap admin seed: set explicit DEFAULT_ADMIN_EMAIL and a non-default DEFAULT_ADMIN_PASSWORD with at least 12 characters.",
-            );
-          } else {
-            const bcrypt = require("bcryptjs");
-            const hash = await bcrypt.hash(bootstrapAdmin.password, 10);
-            await db.query(
-              "INSERT INTO users(email, password_hash, role, name) VALUES($1, $2, 'admin', 'Admin') ON CONFLICT DO NOTHING",
-              [bootstrapAdmin.email, hash],
-            );
-            console.log(`Bootstrap admin account created: ${bootstrapAdmin.email}`);
-          }
-        }
-      } catch (e) {
-        console.error("Failed to seed admin account:", e.message);
       }
 
       try {
@@ -2390,4 +2414,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
-module.exports.__test = Object.freeze({ migrateDB });
+module.exports.__test = Object.freeze({ migrateDB, seedBootstrapAdminAccount });

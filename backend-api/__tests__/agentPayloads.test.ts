@@ -14,7 +14,12 @@ jest.mock("../remoteHosts", () => ({
     mockToPublicRemoteHostAuthorizationError(...args),
 }));
 
-const { buildTemplatePayloadFromAgent, serializeAgent } = require("../agentPayloads");
+const {
+  buildTemplatePayloadFromAgent,
+  extractTemplateDefaultsFromSnapshot,
+  serializeAgent,
+} = require("../agentPayloads");
+const { buildAgentHubTemplateUpdate } = require("../agentHubTemplateEdits");
 
 beforeEach(() => {
   mockRuntimeAuthHeaders.mockReset().mockResolvedValue({ Authorization: "Bearer token" });
@@ -65,6 +70,104 @@ describe("serializeAgent", () => {
     });
 
     expect(serialized.networkPolicyStatus).toBeNull();
+  });
+});
+
+describe("Agent Hub template deploy targets", () => {
+  it("rejects unknown canonical template targets instead of defaulting installs to Docker", () => {
+    expect(() =>
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            deploy_target: "moon",
+          },
+        },
+      }),
+    ).toThrow(expect.objectContaining({ code: "UNKNOWN_DEPLOY_TARGET" }));
+  });
+
+  it("rejects unknown template execution targets instead of defaulting installs to Docker", () => {
+    expect(() =>
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            execution_target_id: "moon",
+          },
+        },
+      }),
+    ).toThrow(expect.objectContaining({ code: "UNKNOWN_DEPLOY_TARGET" }));
+  });
+
+  it("keeps legacy NemoClaw backend metadata on the Docker compatibility path", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            backend: "nemoclaw",
+            sandbox: "nemoclaw",
+          },
+        },
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        backend: null,
+        executionTargetId: null,
+        sandbox: "nemoclaw",
+      }),
+    );
+  });
+
+  it.each(["sandbox_profile", "sandboxProfile", "sandbox"])(
+    "rejects unknown template %s values instead of downgrading to the standard sandbox",
+    (field) => {
+      expect(() =>
+        extractTemplateDefaultsFromSnapshot({
+          config: {
+            defaults: {
+              [field]: "nemoclaw-typo",
+            },
+          },
+        }),
+      ).toThrow(expect.objectContaining({ code: "UNKNOWN_SANDBOX_PROFILE", statusCode: 400 }));
+    },
+  );
+
+  it("rejects unknown backend edits instead of retaining a deployable fallback", () => {
+    expect(() =>
+      buildAgentHubTemplateUpdate(
+        {
+          name: "Template",
+          kind: "community-template",
+          config: {
+            defaults: {
+              backend: "docker",
+              sandbox: "standard",
+            },
+          },
+        },
+        { name: "Template", source_type: "community" },
+        { backend: "moon" },
+      ),
+    ).toThrow(expect.objectContaining({ code: "UNKNOWN_DEPLOY_TARGET" }));
+  });
+
+  it("rejects unknown sandbox edits instead of retaining a deployable fallback", () => {
+    expect(() =>
+      buildAgentHubTemplateUpdate(
+        {
+          name: "Template",
+          kind: "community-template",
+          config: {
+            defaults: {
+              backend: "docker",
+              sandbox: "standard",
+            },
+          },
+        },
+        { name: "Template", source_type: "community" },
+        { sandbox: "nemoclaw-typo" },
+      ),
+    ).toThrow(expect.objectContaining({ code: "UNKNOWN_SANDBOX_PROFILE", statusCode: 400 }));
   });
 });
 
@@ -122,6 +225,10 @@ describe("buildTemplatePayloadFromAgent capture authorization", () => {
         execution_target_id: "docker",
         runtime_host: null,
         template_payload: {
+          metadata: {
+            source: "demo-activation",
+            activation: "local-docker-demo-v1",
+          },
           files: [
             {
               path: "CUSTOM.md",
@@ -136,6 +243,7 @@ describe("buildTemplatePayloadFromAgent capture authorization", () => {
     expect(payload.files).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "CUSTOM.md" })]),
     );
+    expect(payload.metadata).toEqual({ source: "demo-activation" });
     expect(mockRuntimeAuthHeaders).not.toHaveBeenCalled();
     expect(mockAssertRemoteHostAgentUse).not.toHaveBeenCalled();
   });

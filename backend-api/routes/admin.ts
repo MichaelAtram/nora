@@ -570,6 +570,35 @@ async function destroyUserAgents(userId) {
   return result.rows;
 }
 
+async function ensureOwnedRemoteHostsAreUnused(userId) {
+  const result = await db.query(
+    `SELECT rh.id,
+            rh.label,
+            COUNT(a.id)::int AS "agentCount"
+       FROM remote_hosts rh
+       JOIN agents a
+         ON a.execution_target_id = 'remote:' || rh.id
+      WHERE rh.owner_user_id = $1
+        AND a.status IS DISTINCT FROM 'deleted'
+      GROUP BY rh.id, rh.label
+      ORDER BY rh.label, rh.id
+      LIMIT 1`,
+    [userId],
+  );
+  const referencedHost = result.rows[0];
+  if (!referencedHost) return;
+
+  const agentCount = Number(referencedHost.agentCount) || 1;
+  const error = new Error(
+    `Cannot delete user while Remote Docker host "${referencedHost.label || referencedHost.id}" ` +
+      `is still referenced by ${agentCount} agent${agentCount === 1 ? "" : "s"}. ` +
+      "Drain or delete every agent on hosts owned by this user first.",
+  );
+  error.statusCode = 409;
+  error.code = "REMOTE_HOSTS_IN_USE";
+  throw error;
+}
+
 function buildSubscriptionLookup(row = {}) {
   if (!row?.subscriptionPlan) return null;
   return {
@@ -1450,6 +1479,7 @@ router.delete(
     res.locals.auditContext = buildUserContext(user);
 
     await ensureNotLastAdmin(user);
+    await ensureOwnedRemoteHostsAreUnused(user.id);
     const deletedAgents = await destroyUserAgents(user.id);
     await db.query("DELETE FROM users WHERE id = $1", [user.id]);
     await monitoring.logEvent(

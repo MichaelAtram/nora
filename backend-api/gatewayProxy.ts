@@ -12,6 +12,8 @@ const db = require("./db");
 const { decrypt } = require("./crypto");
 const integrations = require("./integrations");
 const { resolveAgentRuntimeFamily } = require("./agentRuntimeFields");
+const { scopeByMethod } = require("./middleware/auth");
+const { findAgentForRequest, requireApiKeyAgentScope } = require("./middleware/ownership");
 const remoteHosts = require("./remoteHosts");
 const { PRIVATE_IP_RE } = require("./networkSafety");
 const { normalizeDeployTargetName } = require("../agent-runtime/lib/backendCatalog");
@@ -1434,6 +1436,15 @@ function createGatewayRouter(options = {}) {
     return null;
   }
 
+  // The gateway router is mounted before routes/agents in server.ts. Keep its
+  // scope and workspace boundary local as well as at the server mount so it
+  // remains safe if reused independently in tests or another entrypoint.
+  router.use(
+    "/agents/:agentId/gateway",
+    scopeByMethod("agents:read", "agents:write"),
+    requireApiKeyAgentScope("agentId"),
+  );
+
   // Middleware: resolve agent + verify ownership
   // Allow both 'running' and 'warning' statuses — 'warning' means the post-deploy
   // health check was inconclusive (e.g. npm install was slow), but the gateway may
@@ -1441,7 +1452,7 @@ function createGatewayRouter(options = {}) {
   // gateway eventually starts successfully.
   router.use("/agents/:agentId/gateway", async (req, res, next) => {
     try {
-      const agent = await resolveAgent(req.params.agentId, req.user.id);
+      const agent = await findAgentForRequest(req, req.params.agentId);
       if (!agent) return res.status(404).json({ error: "Agent not found" });
       if (resolveAgentRuntimeFamily(agent) !== "openclaw") {
         return res.status(409).json({
@@ -1457,7 +1468,10 @@ function createGatewayRouter(options = {}) {
       req.agent = agent;
       next();
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      res.status(err?.statusCode || 500).json({
+        error: err?.message || "Unexpected error",
+        ...(err?.code ? { code: err.code } : {}),
+      });
     }
   });
 

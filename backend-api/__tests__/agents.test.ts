@@ -76,6 +76,8 @@ const mockGetDeploymentDefaults = jest.fn().mockResolvedValue({
 });
 const mockGetAgentHubSourceApiKey = jest.fn().mockResolvedValue("nora_hub_test_key");
 const mockAssertKubernetesExecutionTargetAvailable = jest.fn().mockResolvedValue();
+const mockAssertRemoteHostExecutionTargetAvailable = jest.fn().mockResolvedValue();
+const mockVerifyApiKey = jest.fn();
 const mockGetAgentVersion = jest.fn();
 const mockRecordAgentVersion = jest.fn();
 const mockRecordAgentVersionBestEffort = jest.fn();
@@ -84,6 +86,10 @@ const mockAcquireAgentProvisionLock = jest.fn().mockResolvedValue({
   release: mockAgentProvisionLockRelease,
 });
 jest.mock("../db", () => mockDb);
+jest.mock("../apiKeys", () => ({
+  ...jest.requireActual("../apiKeys"),
+  verifyApiKey: mockVerifyApiKey,
+}));
 jest.mock("pg", () => ({
   ...jest.requireActual("pg"),
   Client: mockPgClient,
@@ -117,6 +123,10 @@ jest.mock("../agentProvisionLock", () => ({
 jest.mock("../kubernetesClusters", () => ({
   assertKubernetesExecutionTargetAvailable: mockAssertKubernetesExecutionTargetAvailable,
   listKubernetesExecutionTargets: jest.fn().mockResolvedValue([]),
+}));
+jest.mock("../remoteHosts", () => ({
+  ...jest.requireActual("../remoteHosts"),
+  assertRemoteHostExecutionTargetAvailable: mockAssertRemoteHostExecutionTargetAvailable,
 }));
 jest.mock("../scheduler", () => ({
   selectNode: jest.fn().mockResolvedValue({ name: "worker-01" }),
@@ -358,7 +368,31 @@ const editorToken = jwt.sign(
   { expiresIn: "1h" },
 );
 const editorAuth = (req) => req.set("Authorization", `Bearer ${editorToken}`);
+const workspaceApiKeyAuth = (req) =>
+  req.set("Authorization", "Bearer nora_workspace_agents_write_test");
 const hubKeyAuth = (req) => req.set("Authorization", "Bearer nora_hub_test_key");
+
+function authorizeWorkspaceApiKey({
+  workspaceId = "workspace-a",
+  userId = "user-1",
+  scopes = ["agents:write"],
+} = {}) {
+  mockVerifyApiKey.mockResolvedValueOnce({
+    key: {
+      id: "workspace-key-1",
+      workspaceId,
+      scopes,
+      status: "active",
+    },
+    workspace: { id: workspaceId, name: "Workspace A" },
+    user: {
+      id: userId,
+      email: `${userId}@nora.test`,
+      name: "Workspace API User",
+      role: "user",
+    },
+  });
+}
 
 function mockValidHubApiKey() {
   mockDb.query
@@ -498,6 +532,8 @@ beforeEach(() => {
     disk_gb: 10,
   });
   mockGetAgentVersion.mockReset();
+  mockVerifyApiKey.mockReset().mockResolvedValue(null);
+  mockAssertRemoteHostExecutionTargetAvailable.mockReset().mockResolvedValue();
   mockRecordAgentVersion.mockReset().mockResolvedValue({
     id: "version-restored",
     versionNumber: 3,
@@ -559,6 +595,33 @@ describe("GET /agents", () => {
     const res = await auth(request(app).get("/agents?scope=owned"));
     expect(res.status).toBe(200);
     expect(workspaces.listAccessibleAgents).toHaveBeenCalledWith("user-1", { scope: "owned" });
+  });
+
+  it.each([
+    ["accessible", "/agents"],
+    ["owned", "/agents?scope=owned"],
+  ])("binds workspace API-key %s listings to the key workspace", async (scope, path) => {
+    authorizeWorkspaceApiKey({ scopes: ["agents:read"] });
+    const workspaces = require("../workspaces");
+    workspaces.listAccessibleAgents.mockResolvedValueOnce([]);
+
+    const res = await workspaceApiKeyAuth(request(app).get(path));
+
+    expect(res.status).toBe(200);
+    expect(workspaces.listAccessibleAgents).toHaveBeenCalledWith("user-1", {
+      scope,
+      workspaceId: "workspace-a",
+    });
+  });
+
+  it("fails closed when an API-key agent listing has no workspace binding", async () => {
+    authorizeWorkspaceApiKey({ workspaceId: null, scopes: ["agents:read"] });
+
+    const res = await workspaceApiKeyAuth(request(app).get("/agents"));
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("wrong_workspace");
+    expect(require("../workspaces").listAccessibleAgents).not.toHaveBeenCalled();
   });
 });
 
@@ -1592,6 +1655,47 @@ describe("Hermes WebUI routes", () => {
 });
 
 describe("Hermes integration sync routes", () => {
+  it("fails closed when a Hermes integration manifest cannot be built", async () => {
+    const integrationsModule = require("../integrations");
+    integrationsModule.connectIntegration.mockResolvedValueOnce({
+      id: "int-hermes-missing-strategy",
+      provider: "stale-provider",
+    });
+    integrationsModule.getIntegrationsForSync.mockRejectedValueOnce(
+      new Error('No integration strategy is registered for provider "stale-provider"'),
+    );
+
+    const agent = {
+      id: "a-hermes-missing-strategy",
+      user_id: "user-1",
+      name: "Hermes Missing Strategy",
+      status: "running",
+      runtime_family: "hermes",
+      backend_type: "docker",
+      container_id: "hermes-container",
+    };
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [agent] })
+      .mockResolvedValueOnce({ rows: [agent] })
+      .mockResolvedValueOnce({ rows: [agent] });
+
+    const res = await auth(
+      request(app).post("/agents/a-hermes-missing-strategy/integrations").send({
+        provider: "stale-provider",
+        token: "stored-token",
+      }),
+    );
+
+    expect(res.status).toBe(502);
+    expect(res.body).toMatchObject({
+      error: "Integration saved, but runtime reconciliation could not be confirmed",
+      committed: true,
+    });
+    expect(integrationsModule.getIntegrationsForSync).toHaveBeenCalledTimes(1);
+    expect(mockRunContainerCommand).not.toHaveBeenCalled();
+    expect(mockSyncAuthToUserAgents).not.toHaveBeenCalled();
+  });
+
   it("syncs Hermes env after connecting an integration", async () => {
     const integrationsModule = require("../integrations");
     integrationsModule.connectIntegration.mockResolvedValueOnce({
@@ -2606,6 +2710,40 @@ describe("GET /agents/:id/stats/history", () => {
 });
 
 describe("POST /agents/adopt (external runtime)", () => {
+  it("atomically assigns an API-key adoption to the bound workspace", async () => {
+    authorizeWorkspaceApiKey();
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-ext-api-key",
+          name: "Workspace External",
+          status: "running",
+          user_id: "user-1",
+          runtime_family: "openclaw",
+          deploy_target: "external",
+          execution_target_id: "external",
+          gateway_host: "203.0.113.5",
+          gateway_port: 18789,
+        },
+      ],
+    });
+
+    const res = await workspaceApiKeyAuth(
+      request(app).post("/agents/adopt").send({
+        name: "Workspace External",
+        runtime_family: "openclaw",
+        url: "https://203.0.113.5:18789",
+        gateway_token: "secret-token",
+      }),
+    );
+
+    expect(res.status).toBe(201);
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(mockDb.query.mock.calls[0][0]).toMatch(/WITH created_agent AS[\s\S]*workspace_agents/i);
+    expect(mockDb.query.mock.calls[0][1].at(-1)).toBe("workspace-a");
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
   it("adopts a reachable OpenClaw runtime without provisioning", async () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
@@ -2711,6 +2849,18 @@ describe("POST /agents/adopt (external runtime)", () => {
 });
 
 describe("POST /agents/activate-demo", () => {
+  it("keeps demo activation session-only", async () => {
+    authorizeWorkspaceApiKey();
+
+    const response = await workspaceApiKeyAuth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({ code: "session_required" });
+    expect(mockPgClient).not.toHaveBeenCalled();
+    expect(mockDb.query).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
   it("serializes concurrent activation requests and returns one demo agent", async () => {
     let locked = false;
     const waiters = [];
@@ -2806,6 +2956,14 @@ describe("POST /agents/activate-demo", () => {
         metadata: expect.objectContaining({ activation: "local-docker-demo-v1" }),
       }),
     );
+    const lookupSql = clients
+      .flatMap((client) => client.query.mock.calls)
+      .map(([sql]) => sql)
+      .find((sql) => sql.includes("FROM agents") && sql.includes("template_payload @>"));
+    expect(lookupSql).toEqual(expect.stringContaining("runtime_family = 'openclaw'"));
+    expect(lookupSql).toEqual(expect.stringContaining("deploy_target = 'docker'"));
+    expect(lookupSql).toEqual(expect.stringContaining("execution_target_id = 'docker'"));
+    expect(lookupSql).toEqual(expect.stringContaining("sandbox_profile = 'standard'"));
     expect(clients).toHaveLength(2);
     expect(clients.every((client) => client.connect.mock.calls.length === 1)).toBe(true);
     expect(clients.every((client) => client.end.mock.calls.length === 1)).toBe(true);
@@ -2866,6 +3024,62 @@ describe("POST /agents/activate-demo", () => {
       "user-1",
     ]);
     expect(client.end).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reuse a marker-bearing agent outside the exact local Docker tuple", async () => {
+    const copiedRemoteAgent = {
+      id: "copied-demo-remote",
+      user_id: "user-1",
+      name: "Demo Agent Copy",
+      status: "error",
+      runtime_family: "openclaw",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:build-host",
+      sandbox_profile: "standard",
+      backend_type: "remote-docker",
+      container_id: "remote-container",
+    };
+    const newDemoAgent = {
+      id: "agent-demo-local-new",
+      user_id: "user-1",
+      name: "Demo Agent",
+      status: "queued",
+      runtime_family: "openclaw",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      backend_type: "docker",
+      sandbox_type: "standard",
+    };
+    const client = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      end: jest.fn().mockResolvedValue(undefined),
+      query: jest.fn(async (sql) => {
+        if (sql.includes("FROM agents") && sql.includes("template_payload @>")) {
+          const exactTupleGuard = [
+            "runtime_family = 'openclaw'",
+            "deploy_target = 'docker'",
+            "execution_target_id = 'docker'",
+            "sandbox_profile = 'standard'",
+          ].every((clause) => sql.includes(clause));
+          return { rows: exactTupleGuard ? [] : [copiedRemoteAgent] };
+        }
+        if (sql.includes("INSERT INTO agents")) return { rows: [newDemoAgent] };
+        return { rows: [] };
+      }),
+    };
+    mockPgClient.mockImplementation(() => client);
+    mockAddDeploymentJob.mockResolvedValue(undefined);
+
+    const response = await auth(request(app).post("/agents/activate-demo").send({}));
+
+    expect(response.status).toBe(200);
+    expect(response.body.id).toBe(newDemoAgent.id);
+    expect(require("../containerManager").destroy).not.toHaveBeenCalledWith(copiedRemoteAgent);
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: newDemoAgent.id, backend: "docker" }),
+      { jobId: `demo-activation-${newDemoAgent.id}` },
+    );
   });
 
   it("resets and requeues the same demo agent after a terminal deployment failure", async () => {
@@ -3183,6 +3397,138 @@ describe("POST /agents/deploy", () => {
     expect(res.status).toBe(401);
   });
 
+  it("keeps migration-draft deployment session-only", async () => {
+    authorizeWorkspaceApiKey();
+
+    const res = await workspaceApiKeyAuth(
+      request(app).post("/agents/deploy").send({
+        name: "Blocked Migration Deploy",
+        migration_draft_id: "draft-1",
+      }),
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "session_required" });
+    expect(mockDb.query).not.toHaveBeenCalled();
+    expect(require("../billing").enforceLimits).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a personal host", "remote:personal-build-host"],
+    ["a host shared through another workspace", "remote:other-workspace-host"],
+  ])(
+    "rejects a workspace API key before looking up or queueing Remote Docker placement on %s",
+    async (_label, executionTargetId) => {
+      authorizeWorkspaceApiKey();
+
+      const res = await workspaceApiKeyAuth(
+        request(app).post("/agents/deploy").send({
+          name: "Blocked Remote Agent",
+          runtime_family: "openclaw",
+          deploy_target: "remote-docker",
+          execution_target_id: executionTargetId,
+          sandbox_profile: "standard",
+        }),
+      );
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual(
+        expect.objectContaining({
+          error: expect.stringMatching(/session authentication/i),
+          code: "session_required",
+        }),
+      );
+      expect(require("../billing").enforceLimits).not.toHaveBeenCalled();
+      expect(mockAssertRemoteHostExecutionTargetAvailable).not.toHaveBeenCalled();
+      expect(mockDb.query).not.toHaveBeenCalled();
+      expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves workspace API-key deployment for non-Remote targets", async () => {
+    authorizeWorkspaceApiKey();
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-api-key-docker",
+            name: "API Key Docker Agent",
+            status: "queued",
+            user_id: "user-1",
+            runtime_family: "openclaw",
+            backend_type: "docker",
+            deploy_target: "docker",
+            execution_target_id: "docker",
+            sandbox_profile: "standard",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await workspaceApiKeyAuth(
+      request(app).post("/agents/deploy").send({
+        name: "API Key Docker Agent",
+        deploy_target: "docker",
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockAssertRemoteHostExecutionTargetAvailable).toHaveBeenCalledWith(
+      expect.objectContaining({ deploy_target: "docker" }),
+      { ownerUserId: "user-1" },
+    );
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "a-api-key-docker", backend: "docker" }),
+    );
+    expect(mockDb.query.mock.calls[0][0]).toMatch(/WITH created_agent AS[\s\S]*workspace_agents/i);
+    expect(mockDb.query.mock.calls[0][1].at(-1)).toBe("workspace-a");
+  });
+
+  it("allows a session-authenticated Remote Docker deployment", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-session-remote",
+            name: "Session Remote Agent",
+            status: "queued",
+            user_id: "user-1",
+            runtime_family: "openclaw",
+            backend_type: "remote-docker",
+            deploy_target: "remote-docker",
+            execution_target_id: "remote:session-host",
+            sandbox_profile: "standard",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(
+      request(app).post("/agents/deploy").send({
+        name: "Session Remote Agent",
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:session-host",
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockAssertRemoteHostExecutionTargetAvailable).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:session-host",
+      }),
+      { ownerUserId: "user-1" },
+    );
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "a-session-remote",
+        backend: "remote-docker",
+        execution_target_id: "remote:session-host",
+      }),
+    );
+  });
+
   it("rejects agent name over 100 chars", async () => {
     const longName = "A".repeat(101);
     const res = await auth(request(app).post("/agents/deploy").send({ name: longName }));
@@ -3225,7 +3571,10 @@ describe("POST /agents/deploy", () => {
           files: [{ path: "README.md", contentBase64: "" }],
           memoryFiles: [],
           wiring: { channels: [], integrations: [] },
-          metadata: { source: "migration-test" },
+          metadata: {
+            source: "migration-test",
+            activation: "local-docker-demo-v1",
+          },
         },
         managed: {
           llmProviders: [{ provider: "openai", apiKey: "secret" }],
@@ -3270,7 +3619,8 @@ describe("POST /agents/deploy", () => {
     expect(mockAttachDraftToAgent).toHaveBeenCalledWith("draft-openclaw-1", "a-migrated");
     expect(JSON.parse(mockDb.query.mock.calls[0][1][10])).toEqual(
       expect.objectContaining({
-        files: [{ path: "README.md", contentBase64: "" }],
+        files: [expect.objectContaining({ path: "README.md", contentBase64: "" })],
+        metadata: { source: "migration-test" },
       }),
     );
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
@@ -3543,6 +3893,25 @@ describe("POST /agents/deploy", () => {
     expect(mockDb.query).not.toHaveBeenCalled();
     expect(mockAddDeploymentJob).not.toHaveBeenCalled();
   });
+
+  it.each(["deploy_target", "execution_target_id"])(
+    "rejects unknown %s values before queueing a deployment",
+    async (field) => {
+      const res = await auth(
+        request(app)
+          .post("/agents/deploy")
+          .send({
+            name: "BadTarget",
+            [field]: "moon",
+          }),
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/unknown deploy target: moon/i);
+      expect(mockDb.query).not.toHaveBeenCalled();
+      expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    },
+  );
 
   it("sanitizes deploy input and clamps self-hosted resource requests", async () => {
     mockDb.query
@@ -3916,9 +4285,76 @@ describe("Agent file and export routes", () => {
     expect(mockPackMigrationBundle).toHaveBeenCalledWith(manifest);
     expect(Buffer.from(res.body)).toEqual(Buffer.from("bundle-data"));
   });
+
+  it("keeps secret-bearing migration exports session-only for workspace API keys", async () => {
+    authorizeWorkspaceApiKey({ scopes: ["agents:read"] });
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-files-1",
+          backend_type: "docker",
+          deploy_target: "docker",
+          execution_target_id: "docker",
+        },
+      ],
+    });
+
+    const res = await workspaceApiKeyAuth(request(app).get("/agents/agent-files-1/export"));
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "session_required" });
+    expect(mockBuildMigrationManifestFromAgent).not.toHaveBeenCalled();
+    expect(mockPackMigrationBundle).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "/agents/agent-files-1/files/roots",
+    "/agents/agent-files-1/files/content?root=workspace&path=AGENTS.md",
+    "/agents/agent-files-1/files/download?root=workspace&path=AGENTS.md",
+  ])("keeps secret-bearing runtime file reads session-only at %s", async (path) => {
+    authorizeWorkspaceApiKey({ scopes: ["agents:read"] });
+
+    const res = await workspaceApiKeyAuth(request(app).get(path));
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ code: "session_required" });
+    expect(mockDb.query).not.toHaveBeenCalled();
+    expect(mockReadFile).not.toHaveBeenCalled();
+    expect(mockDownloadPath).not.toHaveBeenCalled();
+    expect(mockRootsForAgent).not.toHaveBeenCalled();
+  });
 });
 
 describe("PATCH /agents/:id", () => {
+  it("preserves non-Remote API-key mutation inside the bound workspace", async () => {
+    authorizeWorkspaceApiKey();
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-key-rename",
+            backend_type: "docker",
+            deploy_target: "docker",
+            execution_target_id: "docker",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [{ id: "a-key-rename", name: "Old Name", user_id: "user-1" }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{ id: "a-key-rename", name: "New Name", user_id: "user-1" }],
+      });
+
+    const res = await workspaceApiKeyAuth(
+      request(app).patch("/agents/a-key-rename").send({ name: "New Name" }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("name", "New Name");
+    expect(mockDb.query).toHaveBeenCalledTimes(3);
+  });
+
   it("renames an existing agent", async () => {
     mockDb.query
       .mockResolvedValueOnce({
@@ -3941,6 +4377,121 @@ describe("PATCH /agents/:id", () => {
 });
 
 describe("POST /agents/:id/duplicate", () => {
+  it.each([
+    [
+      "a Remote Docker source onto a local target",
+      {
+        backend_type: "remote-docker",
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:source-host",
+      },
+      { deploy_target: "docker", execution_target_id: "docker" },
+    ],
+    [
+      "a local source onto a Remote Docker target",
+      {
+        backend_type: "docker",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+      },
+      {
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:destination-host",
+      },
+    ],
+  ])(
+    "rejects workspace API-key duplication involving %s",
+    async (_label, sourcePlacement, body) => {
+      authorizeWorkspaceApiKey();
+      const sourceAgent = {
+        id: "a-api-key-duplicate-source",
+        name: "API Key Duplicate Source",
+        user_id: "user-1",
+        status: "stopped",
+        runtime_family: "openclaw",
+        sandbox_profile: "standard",
+        sandbox_type: "standard",
+        ...sourcePlacement,
+      };
+      mockDb.query
+        .mockResolvedValueOnce({ rows: [sourceAgent] })
+        .mockResolvedValueOnce({ rows: [sourceAgent] });
+
+      const res = await workspaceApiKeyAuth(
+        request(app)
+          .post("/agents/a-api-key-duplicate-source/duplicate")
+          .send({
+            name: "Blocked Duplicate",
+            ...body,
+          }),
+      );
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual(
+        expect.objectContaining({
+          error: expect.stringMatching(/session authentication/i),
+          code: "session_required",
+        }),
+      );
+      expect(require("../billing").enforceLimits).not.toHaveBeenCalled();
+      expect(mockAssertRemoteHostExecutionTargetAvailable).not.toHaveBeenCalled();
+      expect(mockDb.query).toHaveBeenCalledTimes(
+        sourcePlacement.deploy_target === "remote-docker" ? 1 : 2,
+      );
+      expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+    },
+  );
+
+  it("atomically assigns a non-Remote API-key duplicate to the bound workspace", async () => {
+    authorizeWorkspaceApiKey();
+    const sourceAgent = {
+      id: "a-api-key-local-source",
+      name: "Workspace Source",
+      user_id: "user-1",
+      status: "stopped",
+      runtime_family: "openclaw",
+      backend_type: "docker",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      sandbox_type: "standard",
+      template_payload: { files: [{ path: "AGENT.md", content: "hello" }] },
+    };
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [sourceAgent] })
+      .mockResolvedValueOnce({ rows: [sourceAgent] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-api-key-local-copy",
+            name: "Workspace Copy",
+            user_id: "user-1",
+            status: "queued",
+            runtime_family: "openclaw",
+            backend_type: "docker",
+            deploy_target: "docker",
+            execution_target_id: "docker",
+            sandbox_profile: "standard",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await workspaceApiKeyAuth(
+      request(app).post("/agents/a-api-key-local-source/duplicate").send({
+        name: "Workspace Copy",
+        clone_mode: "files_only",
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockDb.query.mock.calls[2][0]).toMatch(/WITH created_agent AS[\s\S]*workspace_agents/i);
+    expect(mockDb.query.mock.calls[2][1].at(-1)).toBe("workspace-a");
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "a-api-key-local-copy", backend: "docker" }),
+    );
+  });
+
   it("duplicates an agent using stored payload fallback and full clone wiring", async () => {
     mockDb.query
       .mockResolvedValueOnce({
@@ -4200,7 +4751,10 @@ describe("POST /agent-hub/install", () => {
           files: [{ path: "AGENT.md", content: "starter" }],
           memoryFiles: [],
           wiring: { channels: [], integrations: [] },
-          metadata: { starterType: "operations" },
+          metadata: {
+            starterType: "operations",
+            activation: "local-docker-demo-v1",
+          },
         },
       },
     });
@@ -4252,6 +4806,7 @@ describe("POST /agent-hub/install", () => {
         "BOOTSTRAP.md",
       ]),
     );
+    expect(JSON.parse(insertParams[10]).metadata).toEqual({ starterType: "operations" });
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "a-market",
@@ -4431,6 +4986,85 @@ describe("POST /agent-hub/install", () => {
     expect(mockDb.query).not.toHaveBeenCalled();
     expect(mockAddDeploymentJob).not.toHaveBeenCalled();
   });
+
+  it("strips internal activation metadata from remote Agent Hub installs", async () => {
+    const agentHubRemote = require("../agentHubRemote");
+    agentHubRemote.fetchListing.mockResolvedValueOnce({
+      id: "hub:remote-demo",
+      remote_id: "remote-demo",
+      name: "Remote Demo Copy",
+      defaults: { backend: "docker", sandbox: "standard" },
+      templatePayload: {
+        metadata: {
+          source: "demo-activation",
+          activation: "local-docker-demo-v1",
+        },
+        files: [{ path: "AGENTS.md", content: "remote" }],
+      },
+    });
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-remote-template",
+            name: "Remote Demo Copy",
+            status: "queued",
+            user_id: "user-1",
+            backend_type: "docker",
+            sandbox_type: "standard",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(
+      request(app).post("/agent-hub/install").send({
+        listingId: "hub:remote-demo",
+        name: "Remote Demo Copy",
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(mockDb.query.mock.calls[0][1][10]).metadata).toEqual({
+      source: "demo-activation",
+    });
+  });
+
+  it("rejects unknown stored template targets before queueing an Agent Hub install", async () => {
+    const agentHubStoreModule = require("../agentHubStore");
+    const snapshotsModule = require("../snapshots");
+
+    agentHubStoreModule.getListing.mockResolvedValueOnce({
+      id: "listing-1",
+      snapshot_id: "snap-1",
+      name: "Broken Template",
+      status: "published",
+      source_type: "platform",
+    });
+    snapshotsModule.getSnapshot.mockResolvedValueOnce({
+      id: "snap-1",
+      name: "Broken Template",
+      config: {
+        defaults: {
+          deploy_target: "moon",
+          sandbox: "standard",
+        },
+      },
+    });
+
+    const res = await auth(
+      request(app).post("/agent-hub/install").send({
+        listingId: "listing-1",
+        name: "Broken Agent",
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/unknown deploy target: moon/i);
+    expect(mockDb.query).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
 });
 
 describe("Agent Hub browse, share, download, and report", () => {
@@ -4519,6 +5153,10 @@ describe("Agent Hub browse, share, download, and report", () => {
             files: [{ path: "AGENTS.md", content: "hello" }],
             memoryFiles: [],
             wiring: { channels: [], integrations: [] },
+            metadata: {
+              source: "demo-activation",
+              activation: "local-docker-demo-v1",
+            },
           },
         }),
     );
@@ -4538,6 +5176,9 @@ describe("Agent Hub browse, share, download, and report", () => {
         shareTarget: "community",
       }),
     );
+    expect(snapshotsModule.createSnapshot.mock.calls[0][3].templatePayload.metadata).toEqual({
+      source: "demo-activation",
+    });
   });
 
   it("lists published Agent Hub entries for authenticated users", async () => {
@@ -5049,6 +5690,29 @@ describe("Agent Hub browse, share, download, and report", () => {
     );
   });
 
+  it("does not forward internal activation metadata in remote Agent Hub downloads", async () => {
+    const agentHubRemote = require("../agentHubRemote");
+    agentHubRemote.fetchListing.mockResolvedValueOnce({
+      id: "hub:remote-download",
+      remote_id: "remote-download",
+      slug: "remote-download",
+      name: "Remote Download",
+      defaults: {},
+      templatePayload: {
+        metadata: {
+          source: "demo-activation",
+          activation: "local-docker-demo-v1",
+        },
+        files: [{ path: "AGENTS.md", content: "remote" }],
+      },
+    });
+
+    const res = await auth(request(app).get("/agent-hub/hub:remote-download/download"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.templatePayload.metadata).toEqual({ source: "demo-activation" });
+  });
+
   it("reports a published community listing", async () => {
     const agentHubStoreModule = require("../agentHubStore");
     const monitoringModule = require("../monitoring");
@@ -5101,6 +5765,47 @@ describe("Agent Hub browse, share, download, and report", () => {
 });
 
 describe("POST /agents/:id/stop", () => {
+  it("rejects when an API-key agent becomes Remote Docker during the lifecycle lock", async () => {
+    authorizeWorkspaceApiKey({ scopes: ["agents:write"] });
+    const localAgent = {
+      id: "a-key-placement-race",
+      status: "running",
+      user_id: "user-1",
+      runtime_family: "openclaw",
+      backend_type: "docker",
+      deploy_target: "docker",
+      execution_target_id: "docker",
+      sandbox_profile: "standard",
+      container_id: "local-container",
+    };
+    const remoteAgent = {
+      ...localAgent,
+      backend_type: "remote-docker",
+      deploy_target: "remote-docker",
+      execution_target_id: "remote:race-host",
+      container_id: "remote-container",
+    };
+    mockDb.query
+      // Global exact-workspace guard.
+      .mockResolvedValueOnce({ rows: [localAgent] })
+      // Pre-lock visibility remains local.
+      .mockResolvedValueOnce({ rows: [localAgent] })
+      // The authoritative row after acquiring the provision lock is remote.
+      .mockResolvedValueOnce({ rows: [remoteAgent] });
+
+    const res = await workspaceApiKeyAuth(request(app).post("/agents/a-key-placement-race/stop"));
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(
+      expect.objectContaining({
+        error: expect.stringMatching(/session authentication/i),
+        code: "session_required",
+      }),
+    );
+    expect(require("../containerManager").stop).not.toHaveBeenCalled();
+    expect(mockDb.query).toHaveBeenCalledTimes(3);
+  });
+
   it("stops a running agent", async () => {
     // db.query calls: initial visibility, locked revalidation, UPDATE status
     mockDb.query
@@ -5275,6 +5980,63 @@ describe("POST /agents/:id/stop", () => {
 });
 
 describe("POST /agents/:id/redeploy", () => {
+  it.each([
+    [
+      "moving an existing Remote Docker runtime to Docker",
+      {
+        backend_type: "remote-docker",
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:current-host",
+      },
+      { deploy_target: "docker", execution_target_id: "docker" },
+    ],
+    [
+      "moving a Docker runtime onto Remote Docker",
+      {
+        backend_type: "docker",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+      },
+      {
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:next-host",
+      },
+    ],
+  ])("rejects workspace API-key redeploy when %s", async (_label, currentPlacement, body) => {
+    authorizeWorkspaceApiKey();
+    const agent = {
+      id: "a-api-key-redeploy",
+      name: "API Key Redeploy",
+      status: "stopped",
+      user_id: "user-1",
+      runtime_family: "openclaw",
+      sandbox_profile: "standard",
+      sandbox_type: "standard",
+      container_id: "existing-runtime",
+      container_name: "existing-runtime",
+      ...currentPlacement,
+    };
+    mockDb.query.mockResolvedValueOnce({ rows: [agent] }).mockResolvedValueOnce({ rows: [agent] });
+
+    const res = await workspaceApiKeyAuth(
+      request(app).post("/agents/a-api-key-redeploy/redeploy").send(body),
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(
+      expect.objectContaining({
+        error: expect.stringMatching(/session authentication/i),
+        code: "session_required",
+      }),
+    );
+    expect(mockAssertRemoteHostExecutionTargetAvailable).not.toHaveBeenCalled();
+    expect(mockDb.query).toHaveBeenCalledTimes(
+      currentPlacement.deploy_target === "remote-docker" ? 1 : 2,
+    );
+    expect(mockAcquireAgentProvisionLock).not.toHaveBeenCalled();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
   it("allows redeploy when an agent is in warning state", async () => {
     mockDb.query
       .mockResolvedValueOnce({
@@ -5815,7 +6577,65 @@ describe("POST /agents/:id/redeploy", () => {
   });
 });
 
+describe("GET /agents/:id/schedules/:scheduleId/runs", () => {
+  it("binds schedule-run history to both the authorized agent and schedule", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "agent-a", user_id: "user-1", name: "Agent A" }],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(request(app).get("/agents/agent-a/schedules/schedule-b/runs"));
+
+    expect(res.status).toBe(200);
+    expect(mockDb.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("metadata #>> '{result,agentId}' = $2"),
+      ["schedule-b", "agent-a", 25],
+    );
+  });
+});
+
 describe("POST /agents/:id/rollback/:versionId", () => {
+  it("rejects workspace API-key rollback of a Remote Docker agent before version or lock work", async () => {
+    authorizeWorkspaceApiKey();
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-api-key-remote-rollback",
+          name: "API Key Remote Rollback",
+          status: "stopped",
+          user_id: "user-1",
+          runtime_family: "openclaw",
+          backend_type: "remote-docker",
+          deploy_target: "remote-docker",
+          execution_target_id: "remote:rollback-host",
+          sandbox_profile: "standard",
+          sandbox_type: "standard",
+          container_id: "remote-runtime",
+          container_name: "remote-runtime",
+        },
+      ],
+    });
+
+    const res = await workspaceApiKeyAuth(
+      request(app).post("/agents/a-api-key-remote-rollback/rollback/version-1"),
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(
+      expect.objectContaining({
+        error: expect.stringMatching(/session authentication/i),
+        code: "session_required",
+      }),
+    );
+    expect(mockGetAgentVersion).not.toHaveBeenCalled();
+    expect(mockAcquireAgentProvisionLock).not.toHaveBeenCalled();
+    expect(mockAssertRemoteHostExecutionTargetAvailable).not.toHaveBeenCalled();
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
   it("queues rollback from the locked row when a runtime appears while waiting for the lock", async () => {
     const targetConfig = { files: [], memoryFiles: [], wiring: { channels: [], integrations: [] } };
     const initialAgent = {
@@ -6028,63 +6848,196 @@ describe("POST /agents/:id/rollback/:versionId", () => {
   });
 });
 
-describe("POST /agents/:id/delete", () => {
-  it("deletes an agent", async () => {
-    // db.query calls: SELECT agent, DELETE
-    mockDb.query
-      .mockResolvedValueOnce({ rows: [{ id: "a1", container_id: null, user_id: "user-1" }] })
-      .mockResolvedValueOnce({ rows: [] });
+describe("agent deletion routes", () => {
+  function deleteRequest(method, agentId) {
+    return method === "post"
+      ? request(app).post(`/agents/${agentId}/delete`)
+      : request(app).delete(`/agents/${agentId}`);
+  }
 
-    const res = await auth(request(app).post("/agents/a1/delete"));
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty("success", true);
-    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledWith("a1");
-  });
+  it.each([
+    ["POST /agents/:id/delete", "post"],
+    ["DELETE /agents/:id", "delete"],
+  ])(
+    "%s rejects a visible non-owner before acquiring the provision lock",
+    async (_route, method) => {
+      const agentId = `a-visible-non-owner-${method}`;
+      mockDb.query
+        .mockResolvedValueOnce({
+          rows: [{ id: agentId, container_id: null, user_id: "owner-2" }],
+        })
+        .mockResolvedValueOnce({ rows: [{ role: "viewer" }] });
+
+      const res = await auth(deleteRequest(method, agentId));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/direct agent owner/i);
+      expect(mockAcquireAgentProvisionLock).not.toHaveBeenCalled();
+      expect(mockCancelDeploymentJobsForAgent).not.toHaveBeenCalled();
+      expect(mockAgentProvisionLockRelease).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["POST /agents/:id/delete", "post"],
+    ["DELETE /agents/:id", "delete"],
+  ])(
+    "%s destroys the authoritative placement while holding the provision lock",
+    async (_route, method) => {
+      const agentId = `a-delete-race-${method}`;
+      const staleLocalAgent = {
+        id: agentId,
+        name: "Delete Race",
+        user_id: "user-1",
+        runtime_family: "openclaw",
+        backend_type: "docker",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+        sandbox_profile: "standard",
+        container_id: "stale-local-runtime",
+        container_name: "nora-oclaw-stale-local-runtime",
+      };
+      const authoritativeRemoteAgent = {
+        ...staleLocalAgent,
+        backend_type: "remote-docker",
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:build-host",
+        container_id: "authoritative-remote-runtime",
+        container_name: "nora-oclaw-authoritative-remote-runtime",
+      };
+      mockDb.query
+        .mockResolvedValueOnce({ rows: [staleLocalAgent] })
+        .mockResolvedValueOnce({ rows: [authoritativeRemoteAgent] })
+        .mockResolvedValueOnce({ rows: [] });
+
+      const res = await auth(deleteRequest(method, agentId));
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("success", true);
+      expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith(agentId, {
+        applicationName: "nora-backend-agent-delete",
+      });
+      expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledWith(agentId);
+      expect(require("../containerManager").destroy).toHaveBeenCalledWith(
+        expect.objectContaining(authoritativeRemoteAgent),
+      );
+      expect(mockAcquireAgentProvisionLock.mock.invocationCallOrder[0]).toBeLessThan(
+        mockDb.query.mock.invocationCallOrder[1],
+      );
+      expect(require("../containerManager").destroy.mock.invocationCallOrder[0]).toBeLessThan(
+        mockDb.query.mock.invocationCallOrder[2],
+      );
+      expect(mockDb.query.mock.invocationCallOrder[2]).toBeLessThan(
+        mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+      );
+      expect(mockDb.query).toHaveBeenLastCalledWith("DELETE FROM agents WHERE id = $1", [agentId]);
+    },
+  );
+
+  it.each([
+    ["POST /agents/:id/delete", "post"],
+    ["DELETE /agents/:id", "delete"],
+  ])(
+    "%s rejects an API key when the in-lock placement became Remote Docker",
+    async (_route, method) => {
+      authorizeWorkspaceApiKey();
+      const agentId = `a-api-key-delete-race-${method}`;
+      const staleLocalAgent = {
+        id: agentId,
+        name: "API Key Delete Race",
+        user_id: "user-1",
+        runtime_family: "openclaw",
+        backend_type: "docker",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+        sandbox_profile: "standard",
+        container_id: "stale-local-runtime",
+      };
+      const authoritativeRemoteAgent = {
+        ...staleLocalAgent,
+        backend_type: "remote-docker",
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:session-only-host",
+        container_id: "remote-runtime",
+      };
+      mockDb.query
+        // Global API-key path guard.
+        .mockResolvedValueOnce({ rows: [staleLocalAgent] })
+        // Pre-lock visibility check.
+        .mockResolvedValueOnce({ rows: [staleLocalAgent] })
+        // Authoritative reload after waiting for the provision lock.
+        .mockResolvedValueOnce({ rows: [authoritativeRemoteAgent] });
+
+      const res = await workspaceApiKeyAuth(deleteRequest(method, agentId));
+
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ code: "session_required" });
+      expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith(agentId, {
+        applicationName: "nora-backend-agent-delete",
+      });
+      expect(mockCancelDeploymentJobsForAgent).not.toHaveBeenCalled();
+      expect(require("../containerManager").destroy).not.toHaveBeenCalled();
+      expect(mockDb.query).toHaveBeenCalledTimes(3);
+      expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("keeps the agent record when its pending deployment jobs cannot be cancelled", async () => {
     mockCancelDeploymentJobsForAgent.mockRejectedValueOnce(new Error("Redis unavailable"));
-    mockDb.query.mockResolvedValueOnce({
-      rows: [{ id: "a-queued", container_id: null, user_id: "user-1", status: "queued" }],
-    });
+    const agent = {
+      id: "a-queued",
+      container_id: null,
+      user_id: "user-1",
+      status: "queued",
+    };
+    mockDb.query.mockResolvedValueOnce({ rows: [agent] }).mockResolvedValueOnce({ rows: [agent] });
 
     const res = await auth(request(app).delete("/agents/a-queued"));
 
     expect(res.status).toBe(500);
     expect(res.body.error).toBe("Internal server error");
-    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects deleting a workspace-shared agent when caller is not the direct owner", async () => {
+  it("rechecks direct ownership after acquiring the provision lock", async () => {
     mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "a-shared", container_id: null, user_id: "user-1" }],
+      })
       .mockResolvedValueOnce({
         rows: [{ id: "a-shared", container_id: null, user_id: "owner-2" }],
       })
       .mockResolvedValueOnce({ rows: [{ role: "admin" }] });
 
     const res = await auth(request(app).post("/agents/a-shared/delete"));
+
     expect(res.status).toBe(403);
     expect(res.body.error).toMatch(/direct agent owner/i);
+    expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith("a-shared", {
+      applicationName: "nora-backend-agent-delete",
+    });
+    expect(mockCancelDeploymentJobsForAgent).not.toHaveBeenCalled();
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
   it("destroys Kubernetes resources by container_name before deleting a stale local record", async () => {
     const containerManager = require("../containerManager");
+    const agent = {
+      id: "a-k8s-stale",
+      name: "Stale K8s Agent",
+      user_id: "user-1",
+      runtime_family: "openclaw",
+      backend_type: "k8s",
+      deploy_target: "k8s",
+      execution_target_id: "k8s:test-cluster",
+      sandbox_profile: "standard",
+      container_id: null,
+      container_name: "nora-oclaw-stale-k8s-agent-abc123",
+    };
     mockDb.query
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            id: "a-k8s-stale",
-            name: "Stale K8s Agent",
-            user_id: "user-1",
-            runtime_family: "openclaw",
-            backend_type: "k8s",
-            deploy_target: "k8s",
-            execution_target_id: "k8s:test-cluster",
-            sandbox_profile: "standard",
-            container_id: null,
-            container_name: "nora-oclaw-stale-k8s-agent-abc123",
-          },
-        ],
-      })
+      .mockResolvedValueOnce({ rows: [agent] })
+      .mockResolvedValueOnce({ rows: [agent] })
       .mockResolvedValueOnce({ rows: [] });
 
     const res = await auth(request(app).delete("/agents/a-k8s-stale"));
@@ -6104,54 +7057,50 @@ describe("POST /agents/:id/delete", () => {
   it("keeps the Kubernetes agent record when runtime cleanup fails", async () => {
     const containerManager = require("../containerManager");
     containerManager.destroy.mockRejectedValueOnce(new Error("Kubernetes API unreachable"));
-    mockDb.query.mockResolvedValueOnce({
-      rows: [
-        {
-          id: "a-k8s-delete-fail",
-          name: "K8s Delete Fail",
-          user_id: "user-1",
-          runtime_family: "openclaw",
-          backend_type: "k8s",
-          deploy_target: "k8s",
-          execution_target_id: "k8s:test-cluster",
-          sandbox_profile: "standard",
-          container_id: null,
-          container_name: "nora-oclaw-delete-fail",
-        },
-      ],
-    });
+    const agent = {
+      id: "a-k8s-delete-fail",
+      name: "K8s Delete Fail",
+      user_id: "user-1",
+      runtime_family: "openclaw",
+      backend_type: "k8s",
+      deploy_target: "k8s",
+      execution_target_id: "k8s:test-cluster",
+      sandbox_profile: "standard",
+      container_id: null,
+      container_name: "nora-oclaw-delete-fail",
+    };
+    mockDb.query.mockResolvedValueOnce({ rows: [agent] }).mockResolvedValueOnce({ rows: [agent] });
 
     const res = await auth(request(app).delete("/agents/a-k8s-delete-fail"));
 
     expect(res.status).toBe(500);
     expect(res.body.error).toMatch(/Kubernetes API unreachable/i);
-    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a Proxmox agent record when runtime cleanup fails", async () => {
     const containerManager = require("../containerManager");
     containerManager.destroy.mockRejectedValueOnce(new Error("Proxmox destroy task failed"));
-    mockDb.query.mockResolvedValueOnce({
-      rows: [
-        {
-          id: "a-proxmox-delete-fail",
-          name: "Proxmox Delete Fail",
-          user_id: "user-1",
-          runtime_family: "openclaw",
-          backend_type: "proxmox",
-          deploy_target: "proxmox",
-          execution_target_id: "proxmox",
-          sandbox_profile: "standard",
-          container_id: "302",
-        },
-      ],
-    });
+    const agent = {
+      id: "a-proxmox-delete-fail",
+      name: "Proxmox Delete Fail",
+      user_id: "user-1",
+      runtime_family: "openclaw",
+      backend_type: "proxmox",
+      deploy_target: "proxmox",
+      execution_target_id: "proxmox",
+      sandbox_profile: "standard",
+      container_id: "302",
+    };
+    mockDb.query.mockResolvedValueOnce({ rows: [agent] }).mockResolvedValueOnce({ rows: [agent] });
 
     const res = await auth(request(app).delete("/agents/a-proxmox-delete-fail"));
 
     expect(res.status).toBe(500);
     expect(res.body.error).toMatch(/Proxmox destroy task failed/i);
-    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
   it("returns 404 for non-existent agent", async () => {
@@ -6159,5 +7108,6 @@ describe("POST /agents/:id/delete", () => {
 
     const res = await auth(request(app).post("/agents/missing/delete"));
     expect(res.status).toBe(404);
+    expect(mockAcquireAgentProvisionLock).not.toHaveBeenCalled();
   });
 });

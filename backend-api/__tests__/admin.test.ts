@@ -2538,6 +2538,7 @@ describe("admin routes", () => {
       .mockResolvedValueOnce({
         rows: [{ id: "user-7", email: "user@example.com", role: "user" }],
       })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({
         rows: [
           {
@@ -2567,6 +2568,7 @@ describe("admin routes", () => {
       .mockResolvedValueOnce({
         rows: [{ id: "user-proxmox-fail", email: "proxmox@example.com", role: "user" }],
       })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({
         rows: [
           {
@@ -2582,9 +2584,33 @@ describe("admin routes", () => {
     const res = await withToken(request(app).delete("/admin/users/user-proxmox-fail"), adminToken);
 
     expect(res.status).toBe(500);
-    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockDb.query).toHaveBeenCalledTimes(3);
     expect(mockDb.query).not.toHaveBeenCalledWith("DELETE FROM users WHERE id = $1", [
       "user-proxmox-fail",
+    ]);
+  });
+
+  it("blocks user deletion before cleanup when an owned Remote Docker host is referenced", async () => {
+    const containerManager = require("../containerManager");
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "host-owner", email: "owner@example.com", role: "user" }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{ id: "shared-build-host", label: "Shared build host", agentCount: 2 }],
+      });
+
+    const res = await withToken(request(app).delete("/admin/users/host-owner"), adminToken);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/Shared build host.*2 agents/i);
+    expect(res.body.code).toBe("REMOTE_HOSTS_IN_USE");
+    expect(containerManager.destroy).not.toHaveBeenCalled();
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockDb.query.mock.calls[1][0]).toMatch(/a\.execution_target_id = 'remote:' \|\| rh\.id/);
+    expect(mockDb.query.mock.calls[1][0]).not.toMatch(/a\.user_id/);
+    expect(mockDb.query).not.toHaveBeenCalledWith("DELETE FROM users WHERE id = $1", [
+      "host-owner",
     ]);
   });
 

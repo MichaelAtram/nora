@@ -5,7 +5,8 @@ import {
   apiJson,
   assertJsonRecord,
   ensureUserSession,
-  isJsonRecord,
+  extractIdFromUrl,
+  uniqueEmail,
 } from "./support/app";
 import { deleteAgent, listProviders, waitForAgentStatus } from "./support/agents";
 
@@ -15,127 +16,101 @@ type AgentRecord = Record<string, unknown> & {
   status?: string;
 };
 
-function messageText(payload: Record<string, unknown>) {
-  const message = isJsonRecord(payload.message) ? payload.message : null;
-  const content = message?.content;
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-
-  return content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      return isJsonRecord(part) && typeof part.text === "string" ? part.text : "";
-    })
-    .join("");
-}
-
-function finalAssistantText(rawSse: string) {
-  let latest = "";
-
-  for (const line of rawSse.split("\n")) {
-    if (!line.startsWith("data: ")) continue;
-    const data = line.slice(6).trim();
-    if (!data || data === "[DONE]") continue;
-
-    let payload: unknown;
-    try {
-      payload = JSON.parse(data);
-    } catch {
-      continue;
-    }
-    if (!isJsonRecord(payload)) continue;
-
-    const message = isJsonRecord(payload.message) ? payload.message : null;
-    if (message?.role === "user" || message?.role === "human") continue;
-    if (payload.state !== "delta" && payload.state !== "final") continue;
-
-    const text = messageText(payload);
-    if (text) latest = text;
-  }
-
-  return latest;
-}
-
 test.describe("Built-in demo activation", () => {
-  test("a retry reuses one provider and one worker-backed agent that can chat", async ({
-    request,
+  test("signup launches one reusable worker-backed demo and completes first chat", async ({
+    page,
+    context,
   }) => {
     test.setTimeout(15 * 60 * 1000);
 
-    const operator = await ensureUserSession(request, {
+    const browserRequest = context.request;
+    await ensureUserSession(browserRequest, {
       email: DEMO_ADMIN_EMAIL,
       password: DEFAULT_PASSWORD,
     });
+    const operatorEmail = uniqueEmail(`nora-demo-browser-r${test.info().retry}`);
     let agentId = "";
 
     try {
-      const activate = async () => {
-        const { body } = await apiJson<AgentRecord>(request, "/api/agents/activate-demo", {
-          method: "POST",
-          token: operator.token,
-          data: {},
-        });
-        const agent = assertJsonRecord<AgentRecord>(body, "/api/agents/activate-demo");
-        expect(agent.id).toBeTruthy();
-        return agent;
-      };
+      // Keep the chat send as the first request that reaches the runtime
+      // gateway. The agent page and chat panel probe sessions/status as they
+      // render; abort those browser-side so they cannot hide a worker that
+      // reports `running` before its post-deploy restart has settled.
+      await page.route(/\/api\/agents\/[^/]+\/gateway\/(?!chat(?:[/?#]|$))/, async (route) =>
+        route.abort(),
+      );
 
-      const first = await activate();
-      agentId = first.id;
-      const retry = await activate();
+      await page.goto("/signup?intent=demo");
+      await page.getByLabel(/email address/i).fill(operatorEmail);
+      await page.getByLabel(/^password$/i).fill(DEFAULT_PASSWORD);
+      await page.getByRole("button", { name: /create account/i }).click();
 
-      expect(retry.id).toBe(first.id);
+      await page.waitForURL(/\/app\/(?:[a-z]{2}\/)?getting-started$/, { timeout: 30_000 });
+      const authCookie = (await context.cookies()).find((cookie) => cookie.name === "nora_auth");
+      expect(authCookie).toMatchObject({ httpOnly: true, sameSite: "Lax" });
+      expect(await page.evaluate(() => localStorage.getItem("token"))).toBeNull();
 
-      const { body: ownedBody } = await apiJson<AgentRecord[]>(request, "/api/agents?scope=owned", {
-        token: operator.token,
+      const launchDemo = page.getByRole("button", {
+        name: "Launch local Docker demo — no API key",
       });
+      await expect(launchDemo).toBeEnabled();
+      await launchDemo.click();
+      await page.waitForURL(/\/app\/(?:[a-z]{2}\/)?agents\/[^/?#]+$/, { timeout: 60_000 });
+      agentId = extractIdFromUrl(page.url(), "/agents/");
+
+      const { body: retryBody } = await apiJson<AgentRecord>(
+        browserRequest,
+        "/api/agents/activate-demo",
+        { method: "POST", data: {} },
+      );
+      const retry = assertJsonRecord<AgentRecord>(retryBody, "/api/agents/activate-demo retry");
+      expect(retry.id).toBe(agentId);
+
+      const { body: ownedBody } = await apiJson<AgentRecord[]>(
+        browserRequest,
+        "/api/agents?scope=owned",
+      );
       const ownedAgents = Array.isArray(ownedBody) ? ownedBody : [];
       expect(ownedAgents.filter((agent) => agent.name === "Demo Agent")).toEqual([
-        expect.objectContaining({ id: first.id }),
+        expect.objectContaining({ id: agentId }),
       ]);
 
-      const providers = await listProviders(request, operator.token);
+      const providers = await listProviders(browserRequest, "");
       expect(providers.filter((provider) => provider?.provider === "demo")).toHaveLength(1);
 
-      const runningAgent = await waitForAgentStatus(request, operator.token, agentId, "running", {
+      const runningAgent = await waitForAgentStatus(browserRequest, "", agentId, "running", {
         timeoutMs: 10 * 60 * 1000,
         intervalMs: 1000,
       });
       expect(runningAgent.status).toBe("running");
 
-      // This must be the first gateway request after the control plane publishes
-      // final readiness. Do not warm the connection with /gateway/status or retry
-      // chat here: either would mask a worker that marks the agent running before
-      // its post-deploy auth reconciliation restart has settled.
-      const prompt = `demo activation e2e ${Date.now()}`;
-      const { response: chatResponse, body: chatBody } = await apiJson<unknown>(
-        request,
-        `/api/agents/${agentId}/gateway/chat`,
-        {
-          method: "POST",
-          token: operator.token,
-          data: { message: prompt, stream: true },
-          failOnStatus: false,
-        },
-      );
-      const rawChatBody =
-        typeof chatBody === "string" ? chatBody : JSON.stringify(chatBody ?? null);
-      expect(chatResponse.status(), `First chat response:\n${rawChatBody}`).toBe(200);
-      expect(typeof chatBody).toBe("string");
-      const reply = finalAssistantText(rawChatBody);
-      expect(reply, `Raw gateway SSE:\n${rawChatBody}`).toContain(
-        "Hi! I'm Nora's demo agent, running on a built-in stub model — no API key required.",
-      );
-      // OpenClaw prepends sender metadata and a timestamp before the user text;
-      // assert the unique prompt survives that protocol envelope instead of
-      // coupling this worker-backed smoke to OpenClaw's presentation wrapper.
-      expect(reply).toContain(prompt);
-      expect(reply).toContain(
-        "This response is generated locally by your Nora control plane (deterministic, zero cost).",
-      );
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await expect(page.getByRole("heading", { name: "Demo Agent" })).toBeVisible();
+      await expect(page.getByText("running", { exact: true }).first()).toBeVisible();
+
+      await page.getByRole("button", { name: "OpenClaw", exact: true }).last().click();
+      await page.getByRole("button", { name: "Chat", exact: true }).click();
+      const chatInput = page.getByPlaceholder("Type a message...");
+      await expect(chatInput).toBeVisible();
+
+      const prompt = `demo activation browser e2e ${Date.now()}`;
+      await chatInput.fill(prompt);
+      await chatInput.press("Enter");
+
+      await expect(page.getByText(prompt, { exact: true })).toBeVisible();
+      await expect(
+        page.getByText(
+          /Hi! I'm Nora's demo agent, running on a built-in stub model — no API key required\./,
+        ),
+      ).toBeVisible({ timeout: 120_000 });
+      await expect(
+        page.getByText(
+          /This response is generated locally by your Nora control plane \(deterministic, zero cost\)\./,
+        ),
+      ).toBeVisible();
     } finally {
       if (agentId) {
-        await deleteAgent(request, operator.token, agentId);
+        await deleteAgent(browserRequest, "", agentId);
       }
     }
   });

@@ -2042,6 +2042,51 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
     expect(removeVolume).toHaveBeenCalledTimes(2);
   });
 
+  it("treats already-absent agent volumes as idempotent destroy success", async () => {
+    const backend = mockDockerBackend();
+    const notFound = Object.assign(new Error("No such volume"), { statusCode: 404 });
+    backend.docker.getContainer.mockReturnValue({
+      inspect: jest
+        .fn()
+        .mockRejectedValue(
+          Object.assign(new Error("No such container: missing-agent"), { statusCode: 404 }),
+        ),
+      stop: jest.fn(),
+      remove: jest.fn(),
+    });
+    backend.docker.getVolume.mockImplementation(() => ({
+      remove: jest.fn().mockRejectedValue(notFound),
+    }));
+
+    await expect(backend.destroy("missing-agent", { agentId: "agent-1" })).resolves.toBeUndefined();
+    expect(backend.docker.getVolume).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces volume cleanup failure after attempting every Nora-managed volume", async () => {
+    const backend = mockDockerBackend();
+    const removeState = jest.fn().mockRejectedValue(new Error("volume is busy"));
+    const removeHome = jest.fn().mockResolvedValue({});
+    backend.docker.getContainer.mockReturnValue({
+      inspect: jest
+        .fn()
+        .mockRejectedValue(
+          Object.assign(new Error("No such container: missing-agent"), { statusCode: 404 }),
+        ),
+      stop: jest.fn(),
+      remove: jest.fn(),
+    });
+    backend.docker.getVolume.mockImplementation((volume) => ({
+      remove: volume === "nora_agent_state_agent-1" ? removeState : removeHome,
+    }));
+
+    await expect(backend.destroy("missing-agent", { agentId: "agent-1" })).rejects.toMatchObject({
+      code: "DOCKER_VOLUME_CLEANUP_FAILED",
+      volumeNames: ["nora_agent_state_agent-1"],
+    });
+    expect(removeState).toHaveBeenCalledTimes(1);
+    expect(removeHome).toHaveBeenCalledTimes(1);
+  });
+
   it("preserves durable volumes when a bind conflict will be retried", async () => {
     const backend = mockDockerBackend();
     backend._testCreatedContainer.start.mockRejectedValueOnce(

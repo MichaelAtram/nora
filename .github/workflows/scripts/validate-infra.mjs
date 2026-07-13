@@ -205,6 +205,14 @@ function validateDeployVersionMetadata() {
     assert.equal(automaticProductVersion.result.status, 0, automaticProductVersion.result.stderr);
     assert.match(automaticProductVersion.output, /^version=v1\.16\.0$/m);
 
+    const exactManualProductVersion = runMetadata("v1.16.0");
+    assert.equal(
+      exactManualProductVersion.result.status,
+      0,
+      exactManualProductVersion.result.stderr,
+    );
+    assert.match(exactManualProductVersion.output, /^version=v1\.16\.0$/m);
+
     fs.writeFileSync(path.join(fixtureRepo, "post-release.txt"), "post-release source checkout\n");
     runGit(["add", "post-release.txt"]);
     runGit([
@@ -222,8 +230,11 @@ function validateDeployVersionMetadata() {
     assert.match(sourceCheckout.output, /^version=$/m);
 
     const manualProductVersion = runMetadata("v1.16.0");
-    assert.equal(manualProductVersion.result.status, 0, manualProductVersion.result.stderr);
-    assert.match(manualProductVersion.output, /^version=v1\.16\.0$/m);
+    assert.notEqual(manualProductVersion.result.status, 0);
+    assert.match(
+      `${manualProductVersion.result.stderr}${manualProductVersion.result.stdout}`,
+      /does not point at target commit/,
+    );
 
     const componentOverride = runMetadata("nora-copilot-plugin-v0.1.3");
     assert.notEqual(componentOverride.result.status, 0);
@@ -255,7 +266,7 @@ function validateDeployVersionMetadata() {
     assert.notEqual(unrelatedOverride.result.status, 0);
     assert.match(
       `${unrelatedOverride.result.stderr}${unrelatedOverride.result.stdout}`,
-      /is not reachable from target commit/,
+      /does not point at target commit/,
     );
   } finally {
     fs.rmSync(fixtureRepo, { recursive: true, force: true });

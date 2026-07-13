@@ -5,9 +5,12 @@ on:
   pull_request:
     paths: &quality_paths
       - ".github/workflows/ci-quality.yml"
+      - ".github/workflows/community-response.yml"
       - ".github/workflows/deploy-production.yml"
       - ".github/workflows/release-docker.yml"
       - ".github/workflows/release-helm.yml"
+      - ".github/workflows/release-mcp-registry.yml"
+      - ".github/workflows/release-npm.yml"
       - ".github/workflows/scripts/**"
       - ".prettierignore"
       - ".prettierrc.json"
@@ -15,6 +18,8 @@ on:
       - "package.json"
       - "package-lock.json"
       - "scripts/**"
+      - "docs/docs.json"
+      - "docs/guides/integrations/**"
       - "tsconfig.base.json"
       - "admin-dashboard/**"
       - "frontend-dashboard/**"
@@ -167,3 +172,36 @@ jobs:
       - run: npm ci
       - run: npm run test:scaffolds
       - run: npm run validate:extensions
+
+  community-response-contracts:
+    name: Community response contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+      - run: node --test .github/workflows/scripts/community-response.test.mjs
+
+  release-target-contracts:
+    name: Release target contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: node --test .github/workflows/scripts/verify-release-target.test.mjs
+      - run: >-
+          npx prettier --check
+          .github/workflows/release-npm.yml
+          .github/workflows/release-mcp-registry.yml
+          .github/workflows/scripts/verify-release-target.mjs
+          .github/workflows/scripts/verify-release-target.test.mjs

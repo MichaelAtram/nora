@@ -269,13 +269,39 @@ test("backend scaffolder creates a fail-closed adapter and contract test", async
   );
   assert.match(adapter, /class AcmeCloudBackend extends ProvisionerBackend/);
   assert.match(adapter, /"Acme Cloud backend"/);
-  assert.match(adapter, /this\._notImplemented\("create"\)/);
+  for (const method of [
+    "create",
+    "destroy",
+    "status",
+    "stats",
+    "stop",
+    "start",
+    "restart",
+    "logs",
+    "exec",
+  ]) {
+    assert.match(adapter, new RegExp(`this\\._notImplemented\\("${method}"\\)`));
+  }
   assert.doesNotMatch(adapter, /containerManager/);
   const Backend = require(path.join(root, "workers/provisioner/backends/acme-cloud.ts"));
-  await assert.rejects(
-    new Backend({}).create({ id: "agent-1", name: "test" }),
-    /Acme Cloud backend create is not implemented/,
-  );
+  const backend = new Backend({});
+  const calls = [
+    ["create", [{ id: "agent-1", name: "test" }]],
+    ["destroy", ["runtime-1", { agentId: "agent-1" }]],
+    ["status", ["runtime-1"]],
+    ["stats", ["runtime-1", { id: "agent-1" }]],
+    ["stop", ["runtime-1"]],
+    ["start", ["runtime-1"]],
+    ["restart", ["runtime-1"]],
+    ["logs", ["runtime-1", { follow: false }]],
+    ["exec", ["runtime-1", { cmd: ["true"] }]],
+  ];
+  for (const [method, args] of calls) {
+    await assert.rejects(
+      backend[method](...args),
+      new RegExp(`Acme Cloud backend ${method} is not implemented`),
+    );
+  }
   for (const file of [
     "workers/provisioner/backends/acme-cloud.ts",
     "backend-api/__tests__/acme-cloudBackend.test.ts",

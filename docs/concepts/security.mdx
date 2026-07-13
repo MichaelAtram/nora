@@ -11,19 +11,25 @@ Nora is built to be trustworthy in real operator environments: you run it on you
 - **Bootstrap artifacts are secret-free.** Docker and NemoClaw immutable container metadata and startup scripts do not carry provider, integration, gateway, pairing, or MCP credentials. Kubernetes stores mutable credentials in per-agent Secrets rather than ConfigMaps or pod-spec literals. Runtime startup derives pairing state from the owner-only gateway token and rebuilds mutable auth/config from restricted managed state.
 - **Setup generates strong secrets.** The installer creates `JWT_SECRET` and `ENCRYPTION_KEY` with OpenSSL and preserves existing secrets on re-runs.
 - **Production refuses weak secrets by default.** The backend will not boot when `JWT_SECRET` is missing, too short, or a placeholder, or when `ENCRYPTION_KEY` is missing or malformed. The only encryption-key bypass is the explicit `NORA_ALLOW_PLAINTEXT_SECRETS=true` override, which logs a security warning and transfers responsibility to the operator.
-- **First-run claim flow.** Until the first user registers, the signup page runs in "claim this server" mode; the first account becomes the platform admin. `GET /api/auth/bootstrap-status` exposes that boolean plus safe runtime OAuth visibility, platform mode, and signup-challenge metadata, never provider verification secrets.
+- **Self-hosted first-run claim flow.** A self-hosted instance may leave both bootstrap-admin fields blank; until the first user registers, signup runs in "claim this server" mode and that account becomes platform admin. Hosted PaaS never exposes public admin claim: an empty PaaS database requires explicit secure bootstrap credentials before the API listener starts. `GET /api/auth/bootstrap-status` exposes the safe claim state plus runtime OAuth visibility, platform mode, and signup-challenge metadata, never provider verification secrets.
 
 ## Authentication and authorization
 
 - **JWT-based sessions** authenticate dashboard and API requests; OAuth sign-in flows hand off to backend-issued HttpOnly session cookies.
 - **Role-based access control** separates operators from platform admins — admin routes are guarded by explicit role checks, and the admin dashboard is a separate application surface.
+- **Workspace API keys are tenant-bound capabilities.** Agent scopes are checked before gateway,
+  file, NemoClaw, Hermes, lifecycle, integration, monitoring, and ClawHub agent handlers, and the
+  requested agent must be assigned to the key's exact workspace. Agent list responses are filtered
+  to that workspace, while deploy, adopt, and duplicate atomically create the assignment before any
+  queue or runtime side effect. Demo activation, migration-draft deployment, and all Remote Docker
+  agent operations remain session-only.
 - **Migration inspection is a privileged boundary.** Migration drafts and uploads require a browser
   session. Reading a live Docker container is available only to a platform admin on a self-hosted
   control plane because it crosses the backend Docker-socket boundary; hosted users and workspace
   API keys cannot invoke it. Live SSH pull is disabled until independently verified host-key pinning
   is available, so cross-host migration uses an exported bundle instead.
 - **Scoped Agent Hub API keys** can be issued, rotated, and revoked per tenant, with dedicated middleware guarding the public `/api/agent-hub/*` surface.
-- **Signup abuse controls**: signup-specific burst and daily rate limits, duplicate-email short-circuiting, and optional Cloudflare Turnstile or Google reCAPTCHA with server-side challenge verification.
+- **Signup abuse controls**: signup-specific burst and daily rate limits, duplicate-email short-circuiting, and Cloudflare Turnstile or Google reCAPTCHA with server-side challenge verification. A self-hosted operator may opt out; hosted PaaS signup fails closed until a provider is configured.
 
 ## API and edge hardening
 

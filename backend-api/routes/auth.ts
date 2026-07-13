@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const db = require("../db");
+const { allowsFirstAdminSignupClaim } = require("../bootstrapAdmin");
 const { authenticateToken, requireSession } = require("../middleware/auth");
 const { setAuthCookie, clearAuthCookie } = require("../authCookie");
 const { normalizeEmail, normalizeProvider, verifyOAuthIdentity } = require("../oauthProviders");
@@ -98,6 +99,22 @@ function getSignupBotProtectionSiteKey(provider) {
     : readFirstSignupEnv("SIGNUP_RECAPTCHA_SITE_KEY", "NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY");
 }
 
+function getNoSignupBotProtectionConfig() {
+  if (getPublicPlatformMode() === "paas") {
+    return {
+      enabled: true,
+      provider: "none",
+      configured: false,
+      siteKey: "",
+      error:
+        "Public PaaS signup requires SIGNUP_BOT_PROTECTION_PROVIDER=turnstile or recaptcha with matching site and secret keys",
+      publicError:
+        "Signup verification is required for this hosted service, but no challenge provider is configured. Contact the administrator.",
+    };
+  }
+  return { enabled: false, provider: "none", configured: true, siteKey: "" };
+}
+
 function getSignupBotProtectionConfig() {
   const explicitProvider = normalizeSignupBotProtectionProvider(
     readFirstSignupEnv(
@@ -107,7 +124,7 @@ function getSignupBotProtectionConfig() {
   );
 
   if (explicitProvider === "none") {
-    return { enabled: false, provider: "none", configured: true, siteKey: "" };
+    return getNoSignupBotProtectionConfig();
   }
   if (explicitProvider === "invalid") {
     return {
@@ -147,7 +164,7 @@ function getSignupBotProtectionConfig() {
   }
 
   if (!provider) {
-    return { enabled: false, provider: "none", configured: true, siteKey: "" };
+    return getNoSignupBotProtectionConfig();
   }
 
   const secret = provider === "turnstile" ? turnstileSecret : recaptchaSecret;
@@ -185,7 +202,7 @@ function getPublicSignupBotProtectionConfig() {
   const config = getSignupBotProtectionConfig();
   const provider = ["turnstile", "recaptcha"].includes(config.provider)
     ? config.provider
-    : config.provider === "none"
+    : config.provider === "none" && config.enabled !== true
       ? "none"
       : null;
 
@@ -309,7 +326,16 @@ async function withUserCreationLock(work) {
 
 async function nextRegisteredUserRole(client) {
   const result = await client.query("SELECT EXISTS(SELECT 1 FROM users) AS has_users");
-  return result.rows[0]?.has_users ? "user" : "admin";
+  if (result.rows[0]?.has_users) return "user";
+  if (!allowsFirstAdminSignupClaim()) {
+    const error = createHttpError(
+      "Hosted PaaS requires an operator-provisioned bootstrap administrator before public signup can create accounts",
+      503,
+    );
+    error.code = "PAAS_BOOTSTRAP_ADMIN_REQUIRED";
+    throw error;
+  }
+  return "admin";
 }
 
 async function findExistingUserByEmail(email) {
@@ -335,8 +361,9 @@ function isDuplicateUserError(error) {
 router.get("/bootstrap-status", async (req, res) => {
   try {
     const { rows } = await db.query("SELECT 1 FROM users LIMIT 1");
+    const firstAdminClaimAllowed = allowsFirstAdminSignupClaim();
     res.json({
-      needsFirstAdmin: rows.length === 0,
+      needsFirstAdmin: rows.length === 0 && firstAdminClaimAllowed,
       oauthLoginEnabled: isOAuthLoginEnabled(),
       platformMode: getPublicPlatformMode(),
       signupBotProtection: getPublicSignupBotProtectionConfig(),
@@ -373,6 +400,9 @@ router.post("/signup", signupBurstLimiter, signupDailyLimiter, async (req, res) 
       return res.status(409).json({ error: DUPLICATE_SIGNUP_MESSAGE });
     }
     const statusCode = e.statusCode || 500;
+    if (e.code === "PAAS_BOOTSTRAP_ADMIN_REQUIRED") {
+      return res.status(statusCode).json({ error: e.message, code: e.code });
+    }
     if (statusCode >= 500) {
       console.error("Signup failed:", e.message);
       return res.status(500).json({ error: "Could not create account" });

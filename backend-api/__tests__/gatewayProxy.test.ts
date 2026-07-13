@@ -313,11 +313,12 @@ describe("gateway proxy control-plane routes", () => {
   let app;
   const originalFetch = global.fetch;
 
-  function buildApp(routerOptions = {}) {
+  function buildApp(routerOptions = {}, authContext = {}) {
     const nextApp = express();
     nextApp.use(express.json());
     nextApp.use((req, res, next) => {
       req.user = { id: "user-1" };
+      Object.assign(req, authContext);
       next();
     });
     nextApp.use(createGatewayRouter(routerOptions));
@@ -417,6 +418,134 @@ describe("gateway proxy control-plane routes", () => {
     evictConnection("10.0.0.20");
     evictConnection("10.0.0.30");
     global.fetch = originalFetch;
+  });
+
+  it("requires the agents read scope before API-key gateway access", async () => {
+    app = buildApp(
+      {},
+      {
+        apiKey: { id: "key-1", workspaceId: "ws-A", scopes: ["workspaces:read"] },
+        apiKeyWorkspace: { id: "ws-A" },
+      },
+    );
+
+    const res = await request(app).get("/agents/agent-1/gateway/status");
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("missing_scope");
+    expect(mockDb.query).not.toHaveBeenCalled();
+  });
+
+  it("rejects an API-key gateway request when the agent is outside the bound workspace", async () => {
+    app = buildApp(
+      {},
+      {
+        apiKey: { id: "key-1", workspaceId: "ws-A", scopes: ["agents:read"] },
+        apiKeyWorkspace: { id: "ws-A" },
+      },
+    );
+    mockDb.query.mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app).get("/agents/agent-1/gateway/status");
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("wrong_workspace");
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Remote Docker gateway access session-only for API keys", async () => {
+    app = buildApp(
+      {},
+      {
+        apiKey: { id: "key-1", workspaceId: "ws-A", scopes: ["agents:read"] },
+        apiKeyWorkspace: { id: "ws-A" },
+      },
+    );
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-1",
+          backend_type: "remote-docker",
+          deploy_target: "remote-docker",
+          execution_target_id: "remote:host-a",
+        },
+      ],
+    });
+
+    const res = await request(app).get("/agents/agent-1/gateway/status");
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("session_required");
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves session_required when an agent becomes Remote Docker on the authoritative load", async () => {
+    app = buildApp(
+      {},
+      {
+        apiKey: { id: "key-1", workspaceId: "ws-A", scopes: ["agents:read"] },
+        apiKeyWorkspace: { id: "ws-A" },
+      },
+    );
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "agent-1", backend_type: "docker", deploy_target: "docker" }],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-1",
+            backend_type: "remote-docker",
+            deploy_target: "remote-docker",
+            execution_target_id: "remote:host-a",
+          },
+        ],
+      });
+
+    const res = await request(app).get("/agents/agent-1/gateway/status");
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({
+      error: "Remote Docker agent operations require session authentication",
+      code: "session_required",
+    });
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockFakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("allows an API key to reach a teammate-owned agent assigned to its workspace", async () => {
+    app = buildApp(
+      {},
+      {
+        apiKey: { id: "key-1", workspaceId: "ws-A", scopes: ["agents:read"] },
+        apiKeyWorkspace: { id: "ws-A" },
+      },
+    );
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "agent-1", backend_type: "docker", deploy_target: "docker" }],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-1",
+            user_id: "teammate-1",
+            status: "running",
+            host: "10.0.0.10",
+            gateway_token: "gateway-token",
+            gateway_host_port: null,
+            backend_type: "docker",
+            runtime_family: "openclaw",
+            deploy_target: "docker",
+          },
+        ],
+      });
+
+    const res = await request(app).get("/agents/agent-1/gateway/status");
+
+    expect(res.status).toBe(200);
+    expect(mockDb.query.mock.calls[1][0]).toMatch(/FROM workspace_agents wa/);
+    expect(mockDb.query.mock.calls[1][1]).toEqual(["ws-A", "agent-1"]);
   });
 
   it("sends non-streaming chat through the gateway and records usage metrics", async () => {

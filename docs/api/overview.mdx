@@ -68,8 +68,26 @@ API keys carry **scopes** that are enforced per endpoint, drawn from the recogni
 
 Session-authenticated requests skip scope checks (role-based guards apply instead). A request whose API key lacks the required scope is rejected with `403` and `{ "code": "missing_scope" }`.
 
+Explicit `Authorization`, `X-Api-Key`, and `X-Nora-Api-Key` credentials take precedence over the
+ambient session cookie. Nora rejects conflicting explicit credentials with `400` and `{ "code":
+"conflicting_auth" }` instead of silently selecting the more privileged identity.
+
+Agent scopes are also workspace-bound: an API key can list or address only agents assigned to the
+workspace where the key was issued, even when its issuing user owns or can access agents elsewhere.
+Non-Remote agents created through deploy, adopt, or duplicate are atomically assigned to that
+workspace before queue or runtime work begins.
+
+The issuing user must remain an active user and a member or owner of the bound workspace. Removing
+that issuer makes the key unusable; issue a replacement from another workspace admin instead of
+allowing a retained credential to impersonate a deleted or removed account.
+
 <Note>
-  Some mutating or destructive operations are **session-only** and reject API keys even with a valid scope — for example monitoring writes, workspace writes, and API-key issuance. These return `403` with `{ "code": "session_required" }`.
+  Some operations are **session-only** and reject API keys even with a valid scope — including demo
+  activation, migration-draft deployment, Remote Docker placement and existing-agent operations,
+  user-global LLM-provider credentials, platform-wide performance monitoring, workspace writes, and
+  API-key issuance. These return `403` with `{ "code": "session_required" }`. Workspace monitoring
+  and cost reads remain available with their documented scopes, but are restricted to the key's
+  exact bound workspace.
 </Note>
 
 ## Rate limiting

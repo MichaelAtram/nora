@@ -19,22 +19,22 @@ const { createSecretEncryption } = require("../crypto/secretEncryption");
 const { buildIntegrationToolCatalogEntries } = require("./toolCatalogBuilder");
 const { createProviderRegistry } = require("../providers/base/registry");
 
-// Stub provider returned by the registry when a catalog id has no
-// strategy registered. Stores the credential without verifying connectivity
-// and emits no env vars — agents using the provider get told the feature
-// isn't wired up yet rather than getting a hard crash.
+// Fail-closed provider returned by the registry when a catalog id has no
+// strategy registered. A stale database catalog row or mismatched deployment
+// must never report successful verification or silently omit runtime env vars.
 function createStubProvider(providerId) {
+  const unsupportedMessage = `No integration strategy is registered for provider "${providerId}"`;
   return {
     id: providerId,
     authType: "custom",
     async test() {
       return {
-        success: true,
-        message: "Credentials stored — no strategy registered for this provider yet",
+        success: false,
+        error: unsupportedMessage,
       };
     },
     mapToEnv() {
-      return { primary: null, config: {} };
+      throw new Error(unsupportedMessage);
     },
   };
 }

@@ -72,7 +72,7 @@ The installer script is the fastest path to a running Nora instance. It handles 
     http://localhost:8080
     ```
 
-    If setup selected a different port, use the printed URL instead. If you skipped the bootstrap admin account, go to `/signup` on that origin. On a fresh instance the signup page runs in "claim this server" mode and the first account you create becomes the platform admin (see [Security architecture](/concepts/security)).
+    If setup selected a different port, use the printed URL instead. If you skipped the bootstrap admin account, go to `/signup` on that origin. On a fresh self-hosted instance the signup page runs in "claim this server" mode and the first account you create becomes the platform admin (see [Security architecture](/concepts/security)). Hosted PaaS cannot skip bootstrap-admin creation.
 
   </Step>
 </Steps>
@@ -141,13 +141,17 @@ Use manual setup when you want full control over every configuration value befor
     receives an explicit allowlist of only its runtime/OAuth values, not the complete deploy env.
 
     <Warning>
-      Do not start the stack with placeholder values for `JWT_SECRET` or `ENCRYPTION_KEY`. Generate each with `openssl rand -hex 32` before running the update command.
+      Do not start the stack with placeholder values for `JWT_SECRET` or `ENCRYPTION_KEY`. Generate
+      each with `openssl rand -hex 32` before running the update command. Also replace both
+      `DEFAULT_ADMIN_EMAIL` and `DEFAULT_ADMIN_PASSWORD` placeholders with a secure bootstrap
+      account. A self-hosted install may blank both values to use first-account claim through
+      `/signup`; hosted PaaS requires both values before startup.
     </Warning>
 
   </Step>
 
   <Step title="Open the dashboard">
-    Once the stack is up, open your browser to `http://localhost:8080`. Open `/signup` to create your operator account if you did not pre-seed a bootstrap admin. On a fresh database this runs as first-run claim, and the first account created becomes the platform admin.
+    Once the stack is up, open your browser to `http://localhost:8080`. On self-hosted Nora, open `/signup` to create your operator account if you did not pre-seed a bootstrap admin. On a fresh database this runs as first-run claim, and the first account created becomes the platform admin. Hosted PaaS requires a pre-seeded administrator.
   </Step>
 </Steps>
 
@@ -157,7 +161,7 @@ Run Nora itself on a Kubernetes cluster with the public OCI chart at `oci://ghcr
 
 ```bash
 helm install nora oci://ghcr.io/solomon2773/nora \
-  --version 0.7.4 \
+  --version 0.7.5 \
   --namespace nora --create-namespace \
   --set secrets.jwtSecret="$(openssl rand -hex 32)" \
   --set secrets.encryptionKey="$(openssl rand -hex 32)" \
@@ -217,6 +221,10 @@ Once you can reach the dashboard, the next steps are:
 ![Settings — LLM provider keys section with masked entries](/images/operator/settings-provider-setup.png)
 
 See the [quick start](/quickstart) for a full walkthrough of the first 15 minutes with Nora.
+
+To keep the Nora control plane on this installation while running agents on another private Docker
+server or VM, follow [Connect a Remote Docker host](/guides/remote-docker). The walkthrough covers
+SSH registration, host-key pinning, firewall boundaries, deployment validation, and safe retirement.
 
 ## Useful Docker Compose commands
 

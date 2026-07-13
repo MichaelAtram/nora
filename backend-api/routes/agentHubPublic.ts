@@ -7,6 +7,7 @@ const { scanTemplatePayloadForSecrets } = require("../agentHubSafety");
 const {
   extractTemplateDefaultsFromSnapshot,
   extractTemplatePayloadFromSnapshot,
+  stripInternalTemplateMetadata,
   summarizeTemplatePayload,
 } = require("../agentPayloads");
 
@@ -161,7 +162,9 @@ router.post("/submissions", requireAgentHubApiKey, async (req, res, next) => {
   try {
     const payload = req.body || {};
     const listingPayload = payload.listing || payload;
-    const templatePayload = payload.templatePayload || payload.template_payload || {};
+    const templatePayload = stripInternalTemplateMetadata(
+      payload.templatePayload || payload.template_payload || {},
+    );
     const issues = scanTemplatePayloadForSecrets(templatePayload);
     if (issues.length > 0) {
       return res.status(400).json({

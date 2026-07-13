@@ -24,6 +24,14 @@ for deployment until the operator fixes the reported preflight issue.
 
 Hermes defaults to `/opt/hermes/.venv/bin/hermes`. Override `PROXMOX_HERMES_BIN` when your prepared image installs the executable elsewhere. Its dashboard binds to loopback by default; the lifecycle and runtime API remain available to Nora without exposing the dashboard on the LXC network.
 
+<Warning>
+  Hermes workspace capture for Nora-managed agent backups and live migration is not implemented on
+  Proxmox. Those operations fail explicitly with `MIGRATION_CAPTURE_UNSUPPORTED` instead of writing
+  an incomplete archive. Export important Hermes workspace state through a runtime-native process
+  before destructive maintenance. This limitation does not change the Experimental lifecycle,
+  readiness, logs, terminal, or provider-sync paths described on this page.
+</Warning>
+
 ## Secure configuration
 
 Enable Proxmox alongside Docker while you validate it:
@@ -83,7 +91,44 @@ You may provide `PROXMOX_CA_CERT` and `PROXMOX_SSH_PRIVATE_KEY` inline instead o
 
 The API token must be authorized on the selected node, storage, and bridge to create, inspect, start, stop, restart, configure, and delete LXCs. The SSH account must be allowed to run `pct` non-interactively.
 
-Root SSH is the supported direct path for stopped-LXC reconciliation. A non-root SSH account needs a separately installed, narrowly scoped helper configured through `PROXMOX_OFFLINE_STAGE_COMMAND`. The value must be one absolute executable path; Nora rejects generic `sudo sh -c`, arguments, and arbitrary shell prefixes. `PROXMOX_SUDO` still applies to ordinary fixed `pct` lifecycle commands, but it is not sufficient for mounting and safely editing a stopped root filesystem. If neither root SSH nor the strict helper is available, start and restart fail closed before the LXC can run stale credentials.
+Root SSH is the supported direct path for stopped-LXC reconciliation. A non-root SSH account needs a separately installed, narrowly scoped helper configured through `PROXMOX_OFFLINE_STAGE_COMMAND`. The value must be one absolute executable path; Nora rejects missing helpers, generic `sudo sh -c`, arguments, traversal, and arbitrary shell prefixes during catalog preflight. `PROXMOX_SUDO` still applies to fixed `pct` lifecycle commands and to invoking the strict helper, but generic sudo access is not sufficient for safely editing a stopped root filesystem. If neither root SSH nor the strict helper is available, the target remains unavailable and start or restart cannot run stale credentials.
+
+`PROXMOX_PCT_COMMAND` accepts only one command name or absolute executable path, without arguments.
+For a non-root SSH account, leave `PROXMOX_SUDO` unset to use `sudo -n`, or set it to exactly
+`sudo -n` or an absolute `sudo` path followed by `-n`. Nora rejects extra options, whitespace-delimited
+commands, and shell metacharacters before opening SSH.
+
+### Non-root offline staging helper contract
+
+Nora does not install this privileged helper. The operator must audit and install it on the Proxmox
+host as a root-owned executable that the SSH account cannot modify. Grant non-interactive sudo access
+to that one executable path only; do not grant a general shell or unrestricted `pct mount` access.
+
+Nora invokes the helper through the validated `PROXMOX_SUDO` prefix with exactly three arguments:
+
+```text theme={null}
+<helper> <numeric-vmid> <openclaw|hermes> <0|1>
+```
+
+The final argument is `1` when Nora is applying an authoritative managed-state replacement and `0`
+for a scoped merge. Standard input is a tar archive containing only regular files:
+
+- `env.patch`: desired `NAME=BASE64_VALUE` entries, one per line;
+- `env.keys`: the exact environment names to remove before applying `env.patch`;
+- `env.scope`: Nora-managed names that must remain in the managed-name registry;
+- OpenClaw: `build-auth.js`, `prestart.sh`, `prestart-reconcile.js`,
+  `provider-bootstrap.sh`, `mcp-wrapper`, and `dropin.conf`;
+- Hermes: `prestart.sh` and `dropin.conf`.
+
+The helper must reject extra arguments, unknown runtime families, nonnumeric VMIDs, archive paths, links,
+devices, and unexpected files. Before writing, it must confirm the LXC is stopped, acquire the
+Proxmox LXC config lock, mount the exact VMID, confine every destination beneath that mounted root,
+refuse symlink destinations, and preserve the ownership of the existing managed environment file.
+It must merge through same-directory temporary files, apply the required `0600`, `0700`, `0755`, or
+`0644` modes, unmount successfully, release the lock, remove all staging data, and return nonzero on
+any ambiguity. It must never print archive contents or decoded credentials. Nora rechecks ownership,
+lock state, and stopped status after the helper exits; a missing or nonzero confirmed exit blocks the
+subsequent start.
 
 Created containers are unprivileged and use DHCP on `PROXMOX_BRIDGE`. Ensure the bridge can provide an address and that the LXC can reach the package registries and providers required by the selected runtime.
 
@@ -105,6 +150,30 @@ The template must include:
 - network access required by the configured model and integrations.
 
 Nora creates the runtime directories, writes managed environment state with restricted permissions, and runs the service as `hermes`. Setting `PROXMOX_HERMES_ENABLE_INSECURE_DASHBOARD=true` changes the dashboard bind from `127.0.0.1` to `0.0.0.0`; leave it false unless you have a separate authenticated network boundary.
+
+Before publishing the template, instantiate a disposable LXC from it and validate the exact binary
+path plus the unprivileged runtime account. Replace `9000` and the provider hostname with your test
+VMID and provider:
+
+```bash theme={null}
+VMID=9000
+PROVIDER_HOST=api.openai.com
+
+pct start "$VMID"
+pct exec "$VMID" -- /bin/sh -lc \
+  'set -eu; command -v systemctl; command -v base64; id hermes; test -x /opt/hermes/.venv/bin/hermes || command -v hermes'
+pct exec "$VMID" -- /bin/sh -lc \
+  'su -s /bin/sh hermes -c "/opt/hermes/.venv/bin/hermes --help >/dev/null"'
+pct exec "$VMID" -- getent hosts "$PROVIDER_HOST"
+pct exec "$VMID" -- systemctl --version
+pct shutdown "$VMID" --timeout 30
+```
+
+If `PROXMOX_HERMES_BIN` differs, substitute that exact path in both checks. Also perform one
+credential-free TCP/TLS reachability check for every provider or integration host required by the
+deployment. Do not publish the template until the LXC stops cleanly and all checks pass as the
+`hermes` user where applicable. The protected smoke remains mandatory after uploading the resulting
+archive to the configured `vztmpl` storage.
 
 ## Credential staging and restart safety
 
@@ -146,8 +215,40 @@ Configure these GitHub Environment secrets:
 Configure these non-secret GitHub Environment variables for the exact hardware target:
 
 - `PROXMOX_NODE`, `PROXMOX_TEMPLATE`, `PROXMOX_ROOTFS_STORAGE`, and `PROXMOX_BRIDGE`;
-- a pinned `PROXMOX_OPENCLAW_PACKAGE` value;
+- an exact `PROXMOX_OPENCLAW_PACKAGE` registry spec, such as `openclaw@2026.6.11`;
 - `PROXMOX_HERMES_TEMPLATE` when dispatching the `openclaw,hermes` matrix;
+- `PROXMOX_OFFLINE_STAGE_COMMAND` when `PROXMOX_SSH_USER` is not `root`;
 - optional SSH port, sudo/pct command, Node major, and Hermes binary overrides.
 
-The workflow hard-codes verified TLS and pinned SSH transport, validates that the required external values exist without printing them, starts an isolated Nora control-plane project, and then calls the same destructive smoke script. A passing run is evidence for that exact commit, templates, node, storage, bridge, and network. It does not automatically promote Proxmox beyond **Experimental**, and no release should claim this gate passed unless the corresponding workflow run is green.
+The OpenClaw package spec must be a package name plus one exact semantic version. Scoped package
+names and prerelease/build versions are accepted, but `latest`, other dist-tags, ranges such as `^`
+or `~`, aliases, URLs, and Git references are rejected. The workflow forwards and records the exact
+string; it does not resolve or rewrite it before the smoke. This keeps a later rerun from silently
+qualifying different package contents under a floating selector.
+
+The hardware runner's SSH identity must also be able to resolve each selected template with
+`pvesm path` and read it with `sha256sum`. Root SSH satisfies that requirement directly. For a
+non-root identity, provide direct read access or narrowly scoped, non-interactive sudo rules for
+those two read-only commands in addition to the lifecycle and offline-staging permissions described
+above. Do not grant a general shell.
+
+The workflow hard-codes verified TLS and pinned SSH transport, validates that the required external
+values exist without printing secrets, starts an isolated Nora control-plane project, and then calls
+the same destructive smoke script. It hashes every selected template before and after the smoke and
+fails qualification if a reference changed contents during the run.
+
+Every run emits a `proxmox-qualification-<run-id>-<attempt>` artifact containing a nonsecret JSON
+record with:
+
+- the candidate commit, workflow URL, run ID, and attempt;
+- the PVE version when the API or host CLI exposes it;
+- the node, root-filesystem storage, bridge, template references, and template SHA256 values;
+- selected runtime families, the exact runtime package specs, SSH authentication/privilege mode, and
+  `keep_on_failure` value;
+- each smoke cell's result and LXC cleanup evidence, plus the isolated Compose teardown result.
+
+Raw smoke output is not uploaded with this artifact and its temporary file is removed before upload.
+A passing record is evidence only for that exact commit, package specs, templates, node, storage,
+bridge, and network. It does not automatically promote Proxmox beyond **Experimental**, and no
+release should claim this gate passed unless both the workflow run and its qualification record are
+green.

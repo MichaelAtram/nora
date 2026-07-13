@@ -9,13 +9,14 @@ const remoteHosts = require("./remoteHosts");
 const { NORA_INTEGRATIONS_CONTEXT_FILE } = require("../agent-runtime/lib/runtimeBootstrap");
 const { NORA_INTEGRATIONS_SKILL_FILE } = require("../agent-runtime/lib/integrationTools");
 const {
-  isKnownBackend,
   normalizeBackendName,
   normalizeExecutionTargetId,
 } = require("../agent-runtime/lib/backendCatalog");
-const { buildAgentRuntimeFields } = require("./agentRuntimeFields");
+const { buildAgentRuntimeFields, parseSandboxProfile } = require("./agentRuntimeFields");
 
 const CLONE_MODES = new Set(["files_only", "files_plus_memory", "full_clone"]);
+const LEGACY_BACKEND_TYPE_ALIASES = new Set(["hermes", "nemoclaw"]);
+const INTERNAL_TEMPLATE_METADATA_KEYS = new Set(["activation"]);
 
 const OPENCLAW_CORE_FILE_SPECS = Object.freeze([
   { path: "AGENTS.md", label: "Agents", required: true },
@@ -128,6 +129,18 @@ function normalizeTemplatePayload(rawPayload = {}) {
     wiring: normalizeWiringBlueprint(payload.wiring),
     metadata: payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {},
   };
+}
+
+// Metadata that identifies a control-plane-owned agent must never cross a
+// duplicate, migration, backup, or Agent Hub boundary. Otherwise a copied
+// payload could be mistaken for the original durable control-plane record.
+function stripInternalTemplateMetadata(rawPayload = {}) {
+  const payload = normalizeTemplatePayload(rawPayload);
+  const metadata = { ...payload.metadata };
+  for (const key of INTERNAL_TEMPLATE_METADATA_KEYS) {
+    delete metadata[key];
+  }
+  return { ...payload, metadata };
 }
 
 function decodeContentBase64(value) {
@@ -359,7 +372,7 @@ function createEmptyTemplatePayload(metadata = {}) {
 }
 
 function cloneTemplatePayloadForMode(rawPayload, cloneMode = "files_only") {
-  const payload = normalizeTemplatePayload(rawPayload);
+  const payload = stripInternalTemplateMetadata(rawPayload);
   const normalizedMode = CLONE_MODES.has(cloneMode) ? cloneMode : "files_only";
 
   return {
@@ -820,7 +833,7 @@ async function materializeTemplateWiring(agentId, rawPayload = {}) {
 function extractTemplatePayloadFromSnapshot(snapshot, options = {}) {
   const config = decodeMaybeString(snapshot?.config);
   const builtIn = config?.builtIn === true || snapshot?.built_in === true;
-  return ensureCoreTemplateFiles(config.templatePayload || {}, {
+  return ensureCoreTemplateFiles(stripInternalTemplateMetadata(config.templatePayload || {}), {
     name: snapshot?.name || "OpenClaw Agent",
     description: snapshot?.description || "",
     templateKey: snapshot?.template_key || config?.templateKey || null,
@@ -835,18 +848,28 @@ function extractTemplatePayloadFromSnapshot(snapshot, options = {}) {
 function extractTemplateDefaultsFromSnapshot(snapshot) {
   const config = decodeMaybeString(snapshot?.config);
   const defaults = config.defaults && typeof config.defaults === "object" ? config.defaults : {};
-  const requestedBackend = defaults.deploy_target || defaults.deployTarget || defaults.backend;
-  const backend = isKnownBackend(requestedBackend) ? normalizeBackendName(requestedBackend) : null;
+  const canonicalBackend = defaults.deploy_target ?? defaults.deployTarget;
+  const legacyBackend = defaults.backend;
+  const hasCanonicalBackend = String(canonicalBackend ?? "").trim() !== "";
+  const hasLegacyBackend = String(legacyBackend ?? "").trim() !== "";
+  const normalizedLegacyBackend = String(legacyBackend ?? "")
+    .trim()
+    .toLowerCase();
+  const requestedBackend = hasCanonicalBackend ? canonicalBackend : legacyBackend;
+  const backend = hasCanonicalBackend
+    ? normalizeBackendName(canonicalBackend)
+    : hasLegacyBackend && !LEGACY_BACKEND_TYPE_ALIASES.has(normalizedLegacyBackend)
+      ? normalizeBackendName(legacyBackend)
+      : null;
+  const requestedExecutionTargetId = defaults.execution_target_id ?? defaults.executionTargetId;
+  const normalizedExecutionTargetId = normalizeExecutionTargetId(requestedExecutionTargetId);
+  if (String(requestedExecutionTargetId ?? "").trim() !== "" && !normalizedExecutionTargetId) {
+    normalizeBackendName(requestedExecutionTargetId);
+  }
   const executionTargetId =
-    normalizeExecutionTargetId(defaults.execution_target_id || defaults.executionTargetId) ||
-    normalizeExecutionTargetId(requestedBackend) ||
-    backend;
-  const sandbox =
-    String(defaults.sandbox_profile || defaults.sandboxProfile || defaults.sandbox || "")
-      .trim()
-      .toLowerCase() === "nemoclaw"
-      ? "nemoclaw"
-      : "standard";
+    normalizedExecutionTargetId || normalizeExecutionTargetId(requestedBackend) || backend;
+  const requestedSandbox = defaults.sandbox_profile ?? defaults.sandboxProfile ?? defaults.sandbox;
+  const sandbox = parseSandboxProfile(requestedSandbox) || "standard";
 
   return {
     backend,
@@ -880,5 +903,6 @@ module.exports = {
   resolveContainerName,
   sanitizeAgentName,
   serializeAgent,
+  stripInternalTemplateMetadata,
   summarizeTemplatePayload,
 };

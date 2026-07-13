@@ -4,6 +4,106 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.16.5](https://github.com/solomon2773/nora/releases/tag/v1.16.5) — 2026-07-13
+
+Activation, extension safety, and operator-readiness patch: the first-run path is browser-proven,
+configured bootstrap credentials fail closed, deployment targets cannot silently fall back to local
+Docker, and release/deploy automation preserves exact commit provenance.
+
+### Added
+
+- Browser E2E coverage now proves signup, HttpOnly cookie handoff, Getting Started demo activation,
+  worker-backed deployment, running state, and the first rendered OpenClaw chat response in one
+  operator journey.
+- External Issues, ready-for-review pull requests, and Discussions receive a least-privilege queue
+  acknowledgement; drafts enter the queue only when marked ready, and a scheduled audit reminds the
+  maintainer at day twelve and fails visibly when an open thread exceeds the fourteen-day
+  human-response target.
+- A task-oriented Remote Docker guide now provides the shortest path from private-network and SSH
+  prerequisites through registration, host-key pinning, deployment, lifecycle validation, and
+  troubleshooting, while linking to the complete backend security and recovery reference.
+
+### Changed
+
+- Bootstrap-admin validation is aligned across the backend, Bash installer, and PowerShell
+  installer. Password input is hidden, malformed/placeholder email and placeholder/default-derived
+  passwords are rejected, Compose-sensitive password characters round-trip literally, and an
+  invalid configured account on an empty database stops startup before the API listener binds.
+  Hosted PaaS now also requires explicit bootstrap credentials and cannot expose public first-admin
+  claim; self-hosted operators may still leave both values blank for the local claim flow.
+- Hosted PaaS signup now fails closed unless Turnstile or reCAPTCHA is fully configured; self-hosted
+  operators retain the explicit `none` option alongside burst and daily signup limits.
+- Production deploys now skip automatic publication for untagged commits, require version overrides
+  to point at the exact target commit, revalidate release/default-branch provenance after environment
+  approval and on the remote host, check out the immutable CI-validated commit rather than a branch
+  that can advance during approval, and base64-transport remote configuration instead of embedding
+  repository/environment values in a shell command.
+- PaaS production deploys now refuse to rebuild the stack unless the selected Turnstile or reCAPTCHA
+  provider has both its public site key and server secret. The public homepage keeps strict browser
+  revalidation while publishing a separate five-minute, homepage-only Cloudflare edge-cache policy;
+  authenticated, signup, dashboard, and API routes remain dynamic.
+- Docker image publication now runs the CI gate from the immutable workflow commit, builds only the
+  resolved target SHA, and derives the `sha-*` image tag plus OCI revision label from that same
+  commit instead of a moving ref or workflow-event SHA. `latest` moves only in a non-cancelable,
+  globally serialized promotion job that rechecks the current default-branch head after immutable
+  publication completes. Registry write permission is limited to the publish/promotion jobs and the
+  target must remain on protected default-branch history.
+- npm, Helm, and MCP Registry publication now resolve one stable published product tag, require its
+  immutable commit on protected default-branch history, wait for exact-SHA CI, and revalidate after
+  protected-environment approval. Privileged jobs consume validated artifacts instead of executing
+  release-target code; downloaded kubeconform and MCP publisher assets are verified against pinned
+  checksum manifests before execution.
+- The protected Proxmox hardware gate now requires an exact OpenClaw package version, verifies
+  template SHA256 values before and after the lifecycle smoke, and emits a nonsecret qualification
+  artifact containing the candidate, PVE/target tuple, cell results, and cleanup evidence.
+- Backend adapter scaffolds fail explicitly for lifecycle, telemetry, logs, and exec operations;
+  extension validation and CI now cover provider strategy registration, tests, docs navigation, and
+  the complete nine-method adapter contract.
+- Worker images cache bounded backend dependency installs before source copies, Cloudflare launch
+  guidance now documents the exact cache/security rollout checks, and Mintlify metadata, exclusions,
+  and SEO configuration are aligned with the current public docs surface.
+- The quickstart reflects the current runtime/target/sandbox and optional OpenClaw skills flow.
+- Release metadata advances the Gemini extension manifest to `1.16.5` and the Helm chart to `0.7.5`
+  with application version `1.16.5`.
+
+### Fixed
+
+- Nonempty unknown runtime families, deploy targets, execution-target ids, and sandbox profiles now
+  fail with a stable client error across shared runtime fields, deploy/redeploy paths, Agent Hub
+  templates, and the provisioner instead of being normalized to OpenClaw, local Docker, or the
+  standard sandbox. Contradictory target/id tuples and unsupported runtime/sandbox combinations are
+  terminal worker errors; legacy Hermes and NemoClaw metadata remains on its explicit compatibility
+  path.
+- Workspace API keys now remain inside their exact workspace across agent lists and mutations,
+  gateway, NemoClaw, ClawHub, monitoring, event, and cost surfaces. New non-Remote agents are
+  atomically assigned to the key workspace; agent export/live-filesystem access, Remote Docker
+  operations, migration drafts, demo activation, user-global LLM-provider credentials, and platform
+  performance records are session-only. Explicit API credentials take precedence over ambient
+  cookies, and conflicting explicit headers fail before authentication instead of inheriting a
+  broader session. Keys also fail authentication once their issuer is deleted or no longer belongs
+  to the bound workspace.
+- Demo activation now reuses only a durably marked agent on the exact OpenClaw/local-Docker/standard
+  tuple. Duplicate, migration, backup, and Agent Hub portability paths strip the internal activation
+  marker so a copied agent cannot be destroyed or requeued as the user's built-in demo.
+- Unregistered integration strategies no longer report successful credential verification or
+  silently omit runtime environment variables; stale catalog/deployment mismatches fail closed.
+- Proxmox host commands now validate executable and sudo tokens and quote every SSH argument, closing
+  command-injection paths through `PROXMOX_PCT_COMMAND` and `PROXMOX_SUDO`. Proxmox remains
+  experimental until the protected real-hardware lifecycle gate passes with trusted TLS/SSH and a
+  verified template.
+- Non-root Proxmox targets now remain unavailable unless an absolute operator-installed offline
+  staging helper is configured. Both installers preserve that setting, the protected hardware gate
+  forwards and validates it, and the public reference documents the helper input contract, prepared
+  Hermes template checks, and the explicit lack of Proxmox Hermes backup/live-migration capture.
+- Community response audits ignore closed Discussions and draft pull requests, start a pull
+  request's response clock at its latest ready-for-review event, and paginate top-level comments,
+  nested replies, issue comments, and pull-request reviews before deciding that a maintainer has not
+  responded.
+- Admin account deletion now stops before cascading a Remote Docker registration that still has
+  referenced agents, including workloads owned by workspace members. Docker and Remote Docker
+  deletion also treats missing managed volumes as idempotent but retains the agent record and reports
+  `DOCKER_VOLUME_CLEANUP_FAILED` when durable state cannot actually be removed.
+
 ## [v1.16.4](https://github.com/solomon2773/nora/releases/tag/v1.16.4) — 2026-07-13
 
 Remote Docker security and lifecycle patch: a current workspace grant now remains authoritative

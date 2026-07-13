@@ -4,6 +4,18 @@
 
 The Agents API is the core of Nora. You use it to deploy new agent containers, control their lifecycle (start, stop, restart, redeploy, delete), poll live resource stats, and retrieve the gateway UI URL for direct browser access. Read endpoints include agents you own directly and agents shared with you through workspaces. Destructive deletion remains limited to the direct agent owner.
 
+<Warning>
+  A workspace API key is confined to agents assigned to its exact workspace. The same issuing user
+  may belong to other workspaces, but the key cannot list, read, mutate, proxy, export, or execute
+  against those agents. Existing Remote Docker agent operations are session-only because they can
+  reach host credentials and privileged cleanup paths.
+</Warning>
+
+Agent export and live-filesystem routes are session-only for every backend. Their allowed runtime
+roots can contain provider credentials, gateway secrets, paired-device state, and conversation
+sessions, so workspace API keys cannot call `/agents/:id/export` or `/agents/:id/files/*` even when
+the agent is assigned to the key's workspace.
+
 <Note>
   An agent moves through the following statuses: `queued` → `deploying` → `running`. From `running`
   it can transition to `warning`, `error`, or `stopped`. Use `POST /agents/:id/redeploy` to recover
@@ -15,6 +27,9 @@ The Agents API is the core of Nora. You use it to deploy new agent containers, c
 ## List agents
 
 Returns all agents accessible to the authenticated user, ordered by creation time (newest first). Use `scope=owned` when a UI or integration needs only directly owned agents, such as assignment candidates or quota counters.
+
+For workspace API keys, both `accessible` and `owned` are evaluated inside the key's exact bound
+workspace, and the response does not include assignments from another workspace.
 
 ```
 GET /agents
@@ -117,6 +132,11 @@ POST /agents/deploy
   enforce it as a container storage quota.
 </ParamField>
 
+<ParamField body="migration_draft_id" type="string">
+  Optional migration draft UUID. Migration drafts can contain complete managed state, so this field
+  is session-only and returns `403 session_required` when supplied with a workspace API key.
+</ParamField>
+
 <Warning>
   On PaaS deployments the operator-managed platform defaults determine `vcpu`, `ram_mb`, and
   `disk_gb`; plan tiers currently control deployment count, not per-agent resource size.
@@ -125,6 +145,10 @@ POST /agents/deploy
 ### Response
 
 Returns the newly created agent record.
+
+When a workspace API key creates a non-Remote agent, Nora creates the agent and its assignment to the
+key's workspace in one database statement before publishing any deployment job. Adoption and
+duplication follow the same workspace-binding rule.
 
 <ResponseField name="id" type="string">
   UUID of the new agent.
@@ -241,17 +265,21 @@ The session user must own the host or have an `editor`, `admin`, or `owner` role
 the host is shared. The created agent belongs to the deploying user and is not automatically assigned
 to that workspace.
 
-`POST /agents/deploy` also accepts a workspace API key with `agents:write`, but a remote-host access
-check uses the key's issuing user and the new agent is not automatically attached to the key's bound
-workspace. Use a session JWT for the initial advanced deployment, then assign the agent explicitly if
-workspace-scoped API access is required. See the [Remote Docker guide](/configuration/provisioner-backends/remote-docker)
-for test scope, networking, capacity, sharing, and revocation limits.
+Remote Docker placement and every existing-agent Remote Docker operation are session-only. A
+workspace API key receives `403 session_required` before host lookup, persistence, queue publication,
+gateway/file access, or lifecycle cleanup when the source, destination, or persisted agent uses
+Remote Docker. API-key deploys to non-Remote targets continue to use the normal `agents:write` scope
+and are automatically assigned to the key's workspace. After a session Remote Docker deployment,
+assign the agent explicitly if workspace access is required. Follow [Connect a Remote Docker
+host](/guides/remote-docker) for setup, then use the [backend
+reference](/configuration/provisioner-backends/remote-docker) for the full test, networking,
+capacity, sharing, and revocation contract.
 
-| Status | Condition                                                                                        |
-| ------ | ------------------------------------------------------------------------------------------------ |
-| `400`  | Invalid or unavailable runtime selection, unknown/inaccessible concrete target, or name too long |
-| `402`  | Billing limit reached                                                                            |
-| `403`  | API key lacks `agents:write`                                                                     |
+| Status | Condition                                                                                          |
+| ------ | -------------------------------------------------------------------------------------------------- |
+| `400`  | Invalid or unavailable runtime selection, unknown/inaccessible concrete target, or name too long   |
+| `402`  | Billing limit reached                                                                              |
+| `403`  | API key lacks `agents:write`, uses a migration draft, or targets a session-only Remote Docker path |
 
 ---
 

@@ -129,7 +129,7 @@ iwr -useb https://raw.githubusercontent.com/solomon2773/nora/master/setup.ps1 | 
 **Kubernetes (Helm):**
 
 ```bash
-helm show chart oci://ghcr.io/solomon2773/nora --version 0.7.4
+helm show chart oci://ghcr.io/solomon2773/nora --version 0.7.5
 ```
 
 The public OCI chart installs the full Nora control plane. See the [Helm instructions](https://noradocs.solomontsao.com/self-hosting#kubernetes-helm) for the required secrets and Ingress options.
@@ -143,7 +143,7 @@ For manual setup, environment variables, public-domain mode, TLS, Remote Docker,
 - [Self-hosting guide](https://noradocs.solomontsao.com/self-hosting)
 - [Environment variables reference](https://noradocs.solomontsao.com/configuration/environment-variables)
 - [Provisioner backends](https://noradocs.solomontsao.com/configuration/provisioner-backends) (Docker and k3s/Kubernetes are GA; Remote Docker, NemoClaw, and Proxmox LXC are experimental)
-- [Remote Docker BYOC setup](https://noradocs.solomontsao.com/configuration/provisioner-backends/remote-docker) — SSH registration, private networking, validation, sharing, and recovery
+- [Remote Docker BYOC setup](https://noradocs.solomontsao.com/guides/remote-docker) — SSH registration, private networking, validation, sharing, and recovery
 - [TLS and public domains](https://noradocs.solomontsao.com/configuration/tls-domains)
 - [Fronting a launch with Cloudflare](infra/cloudflare-launch.md) — edge caching, rate limiting, and spike absorption for the single-host deploy
 
@@ -231,7 +231,7 @@ See the [MCP guide](https://noradocs.solomontsao.com/guides/mcp-server) for Gemi
 ## Roadmap
 
 - **NemoClaw hardening** _(high priority)_ — mature the experimental secure-sandbox profile end to end: enablement, policy controls, approvals, telemetry, and validation.
-- **Proxmox release gate** — validate the experimental LXC adapter on real hardware, publish prepared-Hermes image guidance, and harden recovery before considering a beta label.
+- **Proxmox hardware qualification** — run the protected OpenClaw and prepared-Hermes lifecycle matrix on the exact node, storage, bridge, templates, and network before considering any beta label; until then the target remains Experimental.
 - **Hermes/OpenClaw parity** — close runtime gaps across validation, logs, terminal access, monitoring, and failure reporting.
 - **First-run operator UX** — a tighter path from install to the first deployed, validated agent.
 - **Account-scoped monitoring** — account-level health roll-ups across workspaces, agents, cost, and alerts, with drill-downs.

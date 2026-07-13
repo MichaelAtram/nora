@@ -40,7 +40,7 @@ const oauthCallback = (provider) => ({
   tags: ["Integrations"],
   summary: `Complete ${provider} OAuth and redirect to the operator UI`,
   description:
-    "Browser callback for a previously initiated, user-bound OAuth state. The response is a redirect, not JSON.",
+    "Session-only browser callback for a previously initiated, user-bound OAuth state. Workspace API keys are rejected. The response is a redirect, not JSON.",
   parameters: [
     { name: "state", in: "query", required: true, schema: { type: "string" } },
     { name: "code", in: "query", schema: { type: "string" } },

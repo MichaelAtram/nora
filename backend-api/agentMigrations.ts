@@ -15,6 +15,7 @@ const {
   buildTemplatePayloadFromAgent,
   ensureCoreTemplateFiles,
   normalizeTemplatePayload,
+  stripInternalTemplateMetadata,
 } = require("./agentPayloads");
 const {
   getAgentSecretEnvVars,
@@ -330,7 +331,7 @@ function normalizeMigrationManifest(rawManifest = {}) {
       .toLowerCase() || "openclaw";
   const templatePayload =
     runtimeFamily === "openclaw"
-      ? ensureCoreTemplateFiles(rawManifest.templatePayload || {}, {
+      ? ensureCoreTemplateFiles(stripInternalTemplateMetadata(rawManifest.templatePayload || {}), {
           name: rawManifest.name || "Imported OpenClaw Agent",
           sourceType: "community",
         })

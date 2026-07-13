@@ -102,9 +102,12 @@ not (http.cookie contains "nora_auth=")
 - Edge TTL: **Use cache-control header if present, bypass cache if not**.
 - Browser TTL: **Respect origin**.
 
-Nora already returns `s-maxage=300` for `/`, so the origin supplies the initial five-minute edge
-TTL. Keep this rule limited to the exact homepage. Cloudflare's normal static-asset behavior still
-handles `/_next/static/*`, `/og-image.png`, favicons, and `/robots.txt` without a broad HTML rule.
+Nora returns browser-revalidation-oriented `Cache-Control` plus a homepage-only
+`Cloudflare-CDN-Cache-Control: public, max-age=300, stale-while-revalidate=60` directive, so the
+origin supplies the initial five-minute edge TTL without making login, signup, dashboards, or APIs
+cacheable. Keep this rule limited to the exact homepage. Cloudflare's normal static-asset behavior
+still handles `/_next/static/*`, `/og-image.png`, favicons, and `/robots.txt` without a broad HTML
+rule.
 
 **Rule 2 — "Nora dynamic and authenticated bypass" (place last):**
 

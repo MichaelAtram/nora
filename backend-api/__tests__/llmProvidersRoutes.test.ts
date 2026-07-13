@@ -23,6 +23,20 @@ const app = express();
 app.use(express.json());
 app.use((req, _res, next) => {
   req.user = { id: "user-1" };
+  if (req.get("x-test-api-key")) {
+    req.apiKey = {
+      workspaceId: "workspace-1",
+      scopes: [
+        "agents:read",
+        "agents:write",
+        "workspaces:read",
+        "monitoring:read",
+        "integrations:read",
+        "integrations:write",
+        "admin:read",
+      ],
+    };
+  }
   next();
 });
 app.use("/llm-providers", router);
@@ -54,6 +68,46 @@ beforeEach(() => {
     await args[2]?.afterCommit?.(result);
     return result;
   });
+});
+
+describe("workspace API-key isolation", () => {
+  const apiKeyRequest = (method, path) =>
+    request(app)[method](path).set("x-test-api-key", "present");
+
+  it.each([
+    ["post", "/llm-providers", { provider: "openai", apiKey: "sk-live" }],
+    ["put", "/llm-providers/provider-openai", { is_default: true }],
+    ["delete", "/llm-providers/provider-openai", undefined],
+    ["post", "/llm-providers/sync", { agentId: "remote-docker-agent" }],
+  ])(
+    "rejects API-key %s %s before provider or reconciliation side effects",
+    async (method, path, body) => {
+      let pending = apiKeyRequest(method, path);
+      if (body) pending = pending.send(body);
+
+      const response = await pending;
+
+      expect(response.status).toBe(403);
+      expect(response.body).toEqual({
+        error: "This endpoint requires session authentication",
+        code: "session_required",
+      });
+      expect(mockAddProvider).not.toHaveBeenCalled();
+      expect(mockUpdateProvider).not.toHaveBeenCalled();
+      expect(mockDeleteProvider).not.toHaveBeenCalled();
+      expect(mockSyncAuthToUserAgents).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([["/llm-providers/available"], ["/llm-providers"]])(
+    "rejects API-key reads on the user-global provider surface: %s",
+    async (path) => {
+      const response = await apiKeyRequest("get", path);
+
+      expect(response.status).toBe(403);
+      expect(response.body.code).toBe("session_required");
+    },
+  );
 });
 
 describe("PUT/DELETE /llm-providers/:id", () => {

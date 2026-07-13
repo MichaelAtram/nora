@@ -118,7 +118,7 @@ module.exports = {
       tags: ["Agents"],
       summary: "List agents accessible to the caller",
       description:
-        "Direct ownership plus workspace-shared agents. API keys see the agents of their bound workspace.",
+        "Direct ownership plus workspace-shared agents. API keys see only agents assigned to their exact bound workspace; scope=owned applies inside that same boundary.",
       "x-required-scopes": ["agents:read"],
       parameters: [
         {
@@ -136,7 +136,7 @@ module.exports = {
       tags: ["Agents"],
       summary: "Provision and deploy a new agent",
       description:
-        "Queues the deployment and returns the created agent; poll GET /agents/{id} until status is 'running'.",
+        "Queues the deployment and returns the created agent; poll GET /agents/{id} until status is 'running'. A workspace API-key deployment is atomically assigned to the key's bound workspace. API keys may deploy non-Remote targets with agents:write, but migration drafts and Remote Docker placement require a session JWT.",
       "x-required-scopes": ["agents:write"],
       requestBody: {
         required: true,
@@ -154,12 +154,23 @@ module.exports = {
                 vcpu: { type: "integer", minimum: 1 },
                 ram_mb: { type: "integer", minimum: 512 },
                 disk_gb: { type: "integer", minimum: 1 },
+                migration_draft_id: {
+                  type: "string",
+                  format: "uuid",
+                  description: "Session-only migration draft to materialize into the new agent.",
+                },
               },
             },
           },
         },
       },
-      responses: ok("The created agent (status 'queued')", agentSummary),
+      responses: {
+        ...ok("The created agent (status 'queued')", agentSummary),
+        403: {
+          description:
+            "Missing agents:write scope, or a workspace API key attempted session-only migration-draft or Remote Docker deployment.",
+        },
+      },
     },
   },
   "/agents/activate-demo": {
@@ -167,10 +178,11 @@ module.exports = {
       tags: ["Agents"],
       summary: "Activate or reuse the zero-key local Docker demo",
       description:
-        "Serializes activation per user, ensures the built-in demo provider, repairs a missing durable queue handoff, and returns the same durably marked OpenClaw agent on retries. New activation requires a reachable local Docker daemon.",
-      "x-required-scopes": ["agents:write"],
+        "Session-only. Serializes activation per user, ensures the built-in demo provider, repairs a missing durable queue handoff, and returns the same durably marked OpenClaw agent on retries. New activation requires a reachable local Docker daemon.",
+      "x-session-required": true,
       responses: {
         ...ok("The new or existing demo agent", agentSummary),
+        403: { description: "A workspace API key attempted this session-only activation." },
         402: { description: "Agent quota or subscription does not allow activation" },
         503: { description: "The local Docker daemon is unavailable" },
       },
@@ -181,7 +193,7 @@ module.exports = {
       tags: ["Agents"],
       summary: "Adopt an already-running external runtime",
       description:
-        "Registers an existing OpenClaw or Hermes runtime that Nora did not provision, by its reachable URL + gateway token. Creates an agent with deploy_target='external' and status='running' (no provisioning). Nora monitors and proxies it; lifecycle actions are unavailable and delete is a deregister.",
+        "Registers an existing OpenClaw or Hermes runtime that Nora did not provision, by its reachable URL + gateway token. Creates an agent with deploy_target='external' and status='running' (no provisioning). API-key adoptions are atomically assigned to the key's bound workspace. Nora monitors and proxies the runtime; lifecycle actions are unavailable and delete is a deregister.",
       "x-required-scopes": ["agents:write"],
       requestBody: {
         required: true,
@@ -224,6 +236,8 @@ module.exports = {
     get: {
       tags: ["Agents"],
       summary: "Get one agent with live-reconciled status",
+      description:
+        "Workspace API keys are restricted to agents assigned to their exact bound workspace. Existing Remote Docker agent operations require a session JWT.",
       "x-required-scopes": ["agents:read"],
       parameters: [agentParam],
       responses: ok("Agent detail", agentSummary),
@@ -259,18 +273,26 @@ const tail = {
     post: summarize("Agents", "Restart a running agent in place", [agentParam], ["agents:write"]),
   },
   "/agents/{id}/redeploy": {
-    post: summarize(
-      "Agents",
-      "Tear down and re-provision the runtime (agent must be stopped/warning/error)",
-      [agentParam],
-      ["agents:write"],
-    ),
+    post: {
+      ...summarize(
+        "Agents",
+        "Tear down and re-provision the runtime (agent must be stopped/warning/error)",
+        [agentParam],
+        ["agents:write"],
+      ),
+      description:
+        "Workspace API keys may redeploy only when neither the current nor requested placement is Remote Docker. Any Remote Docker replacement requires a session JWT.",
+    },
   },
   "/agents/{id}/delete": {
     post: summarize("Agents", "Delete an agent (legacy POST form)", [agentParam], ["agents:write"]),
   },
   "/agents/{id}/duplicate": {
-    post: summarize("Agents", "Duplicate an agent's configuration", [agentParam], ["agents:write"]),
+    post: {
+      ...summarize("Agents", "Duplicate an agent's configuration", [agentParam], ["agents:write"]),
+      description:
+        "Workspace API keys may duplicate only when neither the source nor destination uses Remote Docker. Remote Docker source capture or placement requires a session JWT.",
+    },
   },
   "/agents/{id}/budget": {
     get: {
@@ -456,7 +478,7 @@ const tail = {
       tags: ["Agents"],
       summary: "Roll back to a configuration version and redeploy when needed",
       description:
-        "Snapshots the current config first, restores the selected version, re-materializes template wiring, and queues a redeploy when the agent has a runtime.",
+        "Snapshots the current config first, restores the selected version, re-materializes template wiring, and queues a redeploy when the agent has a runtime. Rollback of a Remote Docker agent requires a session JWT.",
       parameters: [agentParam, versionParam],
       "x-required-scopes": ["agents:write"],
       "x-required-agent-role": "editor",

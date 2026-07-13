@@ -119,7 +119,14 @@ Public contributor-facing docs currently live at the repo root. Keep them aligne
 
 ## Review Standards
 
-Nora is currently maintainer-led, so review capacity can vary. Maintainers aim to acknowledge a complete issue or pull request within fourteen days; this is a response target, not a guaranteed SLA. If there has been no response after fourteen days, one polite ping on the original thread is welcome. Please do not open duplicate issues or PRs to get attention.
+Nora is currently maintainer-led, so review capacity can vary. External Issues, ready-for-review pull
+requests, and Discussions receive an automated queue acknowledgement. Draft pull requests enter the
+response queue and start their clock only when marked ready. A scheduled check reminds the maintainer
+at twelve days without a human response and escalates when the fourteen-day target is exceeded.
+Maintainers aim to acknowledge a complete thread within fourteen days; this is a response target,
+not a guaranteed SLA, and the automated queue receipt is not a human review. If there has been no
+human response after fourteen days, one polite ping on the original thread is welcome. Please do not
+open duplicates to get attention.
 
 PRs move fastest when they are small, linked to an issue for substantial changes, include proof, and pass the targeted contributor check. Draft PRs are welcome for early architectural feedback; mark them ready only when the description and validation notes are complete.
 

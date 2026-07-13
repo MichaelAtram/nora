@@ -10,7 +10,7 @@ error() {
 }
 
 read_env_value() {
-  local env_path="$1" name="$2" default_value="$3" line value first last
+  local env_path="$1" name="$2" default_value="$3" line value
 
   if [ ! -f "$env_path" ]; then
     printf '%s\n' "$default_value"
@@ -26,15 +26,58 @@ read_env_value() {
   value="${line#*=}"
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
-  if [ "${#value}" -ge 2 ]; then
-    first="${value:0:1}"
-    last="${value: -1}"
-    if { [ "$first" = '"' ] && [ "$last" = '"' ]; } || { [ "$first" = "'" ] && [ "$last" = "'" ]; }; then
-      value="${value:1:${#value}-2}"
-    fi
-  fi
+  value="$(decode_compose_env_literal "$value")"
 
   printf '%s\n' "$value"
+}
+
+decode_compose_env_literal() {
+  local value="$1" first last body output="" current next i=0 length quote_mode
+  if [ "${#value}" -lt 2 ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  first="${value:0:1}"
+  last="${value: -1}"
+  if [ "$first" = '"' ] && [ "$last" = '"' ]; then
+    quote_mode="double"
+  elif [ "$first" = "'" ] && [ "$last" = "'" ]; then
+    quote_mode="single"
+  else
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  body="${value:1:${#value}-2}"
+  length="${#body}"
+  while [ "$i" -lt "$length" ]; do
+    current="${body:$i:1}"
+    if [ "$quote_mode" = "single" ] && [ "$current" = "\\" ] && [ $((i + 1)) -lt "$length" ]; then
+      next="${body:$((i + 1)):1}"
+      if [ "$next" = "'" ]; then
+        output="${output}${next}"
+        i=$((i + 2))
+        continue
+      fi
+    fi
+    if [ "$quote_mode" = "double" ] && [ $((i + 1)) -lt "$length" ]; then
+      next="${body:$((i + 1)):1}"
+      if [ "$current" = "\\" ] && { [ "$next" = "\\" ] || [ "$next" = '"' ]; }; then
+        output="${output}${next}"
+        i=$((i + 2))
+        continue
+      fi
+      if [ "$current" = '$' ] && [ "$next" = '$' ]; then
+        output="${output}${current}"
+        i=$((i + 2))
+        continue
+      fi
+    fi
+    output="${output}${current}"
+    i=$((i + 1))
+  done
+  printf '%s\n' "$output"
 }
 
 file_mode() {

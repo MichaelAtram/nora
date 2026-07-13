@@ -139,6 +139,22 @@ it("normalizes Hermes seed paths and strips special mode bits", () => {
   ]);
 });
 
+it("strips control-plane-only activation metadata from portable OpenClaw manifests", () => {
+  const normalized = normalizeMigrationManifest({
+    name: "Copied demo",
+    runtimeFamily: "openclaw",
+    templatePayload: {
+      metadata: {
+        source: "demo-activation",
+        activation: "local-docker-demo-v1",
+      },
+      files: [],
+    },
+  });
+
+  expect(normalized.templatePayload.metadata).toEqual({ source: "demo-activation" });
+});
+
 it("defensively rejects traversal when building a Hermes seed archive", async () => {
   await expect(
     buildHermesSeedArchive({

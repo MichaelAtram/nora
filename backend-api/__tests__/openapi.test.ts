@@ -152,6 +152,10 @@ describe("OpenAPI document", () => {
   it("marks sensitive cross-boundary surfaces as session-only", () => {
     expect(doc.paths["/agent-hub/install"].post["x-session-required"]).toBe(true);
     expect(doc.paths["/agents/{id}/backups"].get["x-session-required"]).toBe(true);
+    expect(doc.paths["/llm-providers"].post["x-session-required"]).toBe(true);
+    expect(doc.paths["/llm-providers/{id}"].put["x-session-required"]).toBe(true);
+    expect(doc.paths["/llm-providers/{id}"].delete["x-session-required"]).toBe(true);
+    expect(doc.paths["/llm-providers/sync"].post["x-session-required"]).toBe(true);
     expect(doc.paths["/remote-hosts"].get["x-session-required"]).toBe(true);
   });
 

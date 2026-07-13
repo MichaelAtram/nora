@@ -4,7 +4,8 @@ const {
   extractTemplateDefaultsFromSnapshot,
   extractTemplatePayloadFromSnapshot,
 } = require("./agentPayloads");
-const { isKnownBackend, normalizeBackendName } = require("../agent-runtime/lib/backendCatalog");
+const { normalizeBackendName } = require("../agent-runtime/lib/backendCatalog");
+const { parseSandboxProfile } = require("./agentRuntimeFields");
 
 function decodeMaybeString(value) {
   if (typeof value === "string") {
@@ -68,20 +69,13 @@ function normalizePositiveInt(value, fallback, { min = 1, max = 99999 } = {}) {
 }
 
 function normalizeSandbox(value, fallback = "standard") {
-  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-  if (normalized === "nemoclaw") return "nemoclaw";
-  if (normalized === "standard") return "standard";
-  return fallback === "nemoclaw" ? "nemoclaw" : "standard";
+  return parseSandboxProfile(value) || parseSandboxProfile(fallback) || "standard";
 }
 
 function normalizeBackend(value, fallback = null) {
-  if (isKnownBackend(value)) {
-    return normalizeBackendName(value);
-  }
-  if (isKnownBackend(fallback)) {
-    return normalizeBackendName(fallback);
-  }
-  return null;
+  const candidate = String(value ?? "").trim() !== "" ? value : fallback;
+  if (String(candidate ?? "").trim() === "") return null;
+  return normalizeBackendName(candidate);
 }
 
 function normalizeImage(value, fallback = null) {

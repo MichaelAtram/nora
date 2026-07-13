@@ -25,6 +25,39 @@ const PLATFORM_AGENT_NAME_PREFIXES = [
   "Duplicate Agent ",
   "Community Install ",
 ];
+const PLATFORM_AGENT_DELETE_ATTEMPTS = 3;
+const PLATFORM_AGENT_DELETE_RETRY_MS = 1000;
+
+function isProvisionLockTimeout(response, body) {
+  return (
+    response.status() === 409 &&
+    typeof body === "object" &&
+    body !== null &&
+    !Array.isArray(body) &&
+    body.code === "AGENT_PROVISION_LOCK_TIMEOUT"
+  );
+}
+
+async function deletePlatformAgent(request, token, agentId) {
+  for (let attempt = 1; attempt <= PLATFORM_AGENT_DELETE_ATTEMPTS; attempt += 1) {
+    const { response, body } = await apiJson(request, `/api/agents/${agentId}`, {
+      method: "DELETE",
+      token,
+      failOnStatus: false,
+      // The backend may spend 30 seconds waiting for the provision lock. Keep
+      // the client alive long enough to receive the retryable 409 response.
+      timeout: 45000,
+    });
+    if (response.ok() || response.status() === 404) return;
+    if (attempt < PLATFORM_AGENT_DELETE_ATTEMPTS && isProvisionLockTimeout(response, body)) {
+      await new Promise((resolve) => setTimeout(resolve, PLATFORM_AGENT_DELETE_RETRY_MS));
+      continue;
+    }
+    throw new Error(
+      `DELETE /api/agents/${agentId} failed with ${response.status()}: ${JSON.stringify(body)}`,
+    );
+  }
+}
 
 async function cleanupPlatformAgents(request, token) {
   const { body } = await apiJson(request, "/api/agents?scope=owned", { token });
@@ -39,16 +72,7 @@ async function cleanupPlatformAgents(request, token) {
       continue;
     }
 
-    const { response, body: deleteBody } = await apiJson(request, `/api/agents/${agent.id}`, {
-      method: "DELETE",
-      token,
-      failOnStatus: false,
-    });
-    if (!response.ok() && response.status() !== 404) {
-      throw new Error(
-        `DELETE /api/agents/${agent.id} failed with ${response.status()}: ${JSON.stringify(deleteBody)}`,
-      );
-    }
+    await deletePlatformAgent(request, token, agent.id);
   }
 }
 
@@ -71,7 +95,12 @@ test.describe("Complete platform journey", () => {
   let workspaceName = "";
   const authCookieName = "nora_auth";
 
-  test.afterAll(async ({ request }) => {
+  test.afterAll(async ({ request }, testInfo) => {
+    // Agent deletion now waits for the shared provision lock so cleanup cannot
+    // race an in-flight deployment and orphan its runtime. The hook can clean
+    // several scoped agents sequentially, so give teardown its own bounded
+    // budget instead of relying on Playwright's 30-second hook default.
+    testInfo.setTimeout(360000);
     if (admin?.token) {
       await apiJson(request, "/api/admin/settings/language", {
         method: "PUT",

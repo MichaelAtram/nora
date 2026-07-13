@@ -5,8 +5,12 @@ const monitoring = require("../monitoring");
 const fleetStatus = require("../fleetStatus");
 const metricsModule = require("../metrics");
 const { asyncHandler } = require("../middleware/errorHandler");
-const { findAccessibleAgent, requireAccessibleAgent } = require("../middleware/ownership");
-const { requireAdmin, scopeByMethod } = require("../middleware/auth");
+const {
+  apiKeyWorkspaceId,
+  findAccessibleAgent,
+  requireAccessibleAgent,
+} = require("../middleware/ownership");
+const { requireAdmin, requireSession, scopeByMethod } = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -17,6 +21,7 @@ router.get("/agents/:id/cost", requireAccessibleMonitoringAgent);
 // Monitoring is read-only via API keys. We scope-gate the specific path
 // prefixes the router handles — applying scopeByMethod at the router root
 // would block unrelated requests because this router is mounted at "/".
+router.use("/monitoring/performance", requireSession);
 router.use("/monitoring", scopeByMethod("monitoring:read", null));
 router.use("/agents/:id/metrics", scopeByMethod("monitoring:read", null));
 router.use("/agents/:id/cost", scopeByMethod("monitoring:read", null));
@@ -84,19 +89,43 @@ function wantsPaginatedEvents(query = {}) {
   return ["page", "search", "type", "from", "to"].some((key) => query[key] !== undefined);
 }
 
+function getApiKeyWorkspaceOrReject(req, res) {
+  if (!req.apiKey) return null;
+  const workspaceId = apiKeyWorkspaceId(req);
+  if (!workspaceId) {
+    res.status(403).json({ error: "API key has no workspace binding", code: "wrong_workspace" });
+    return false;
+  }
+  return workspaceId;
+}
+
 // ─── Platform monitoring ──────────────────────────────────────────
 
 router.get(
   "/monitoring/metrics",
   asyncHandler(async (req, res) => {
-    res.json(await monitoring.getMetrics({ userId: req.user.id }));
+    const workspaceId = getApiKeyWorkspaceOrReject(req, res);
+    if (workspaceId === false) return;
+    res.json(
+      await monitoring.getMetrics({
+        userId: req.user.id,
+        ...(workspaceId ? { workspaceId } : {}),
+      }),
+    );
   }),
 );
 
 router.get(
   "/monitoring/fleet-status",
   asyncHandler(async (req, res) => {
-    res.json(await fleetStatus.getFleetAttention({ userId: req.user.id }));
+    const workspaceId = getApiKeyWorkspaceOrReject(req, res);
+    if (workspaceId === false) return;
+    res.json(
+      await fleetStatus.getFleetAttention({
+        userId: req.user.id,
+        ...(workspaceId ? { workspaceId } : {}),
+      }),
+    );
   }),
 );
 
@@ -106,11 +135,28 @@ router.get(
     const { agentId, limit } = req.query;
     const filters = buildEventFilters(req.query);
     const scopedAgentId = typeof agentId === "string" && agentId.trim() ? agentId.trim() : null;
+    const workspaceId = getApiKeyWorkspaceOrReject(req, res);
+    if (workspaceId === false) return;
     let scopedAgent = null;
 
     if (scopedAgentId) {
-      scopedAgent = await findAccessibleAgent(scopedAgentId, req.user.id, "viewer");
-      if (!scopedAgent) return res.status(404).json({ error: "Agent not found" });
+      if (workspaceId) {
+        const assignment = await db.query(
+          `SELECT 1 FROM workspace_agents
+            WHERE workspace_id = $1 AND agent_id = $2
+            LIMIT 1`,
+          [workspaceId, scopedAgentId],
+        );
+        if (!assignment.rows[0]) {
+          return res.status(403).json({
+            error: "API key is not scoped to this agent's workspace",
+            code: "wrong_workspace",
+          });
+        }
+      } else {
+        scopedAgent = await findAccessibleAgent(scopedAgentId, req.user.id, "viewer");
+        if (!scopedAgent) return res.status(404).json({ error: "Agent not found" });
+      }
     }
 
     if (wantsPaginatedEvents(req.query)) {
@@ -124,6 +170,7 @@ router.get(
         await monitoring.getUserEventsPage(req.user.id, {
           ...filters,
           agentId: scopedAgentId,
+          ...(workspaceId ? { workspaceId } : {}),
           page,
           limit: pageLimit,
         }),
@@ -135,6 +182,7 @@ router.get(
       return res.json(
         await monitoring.getUserRecentEvents(req.user.id, {
           agentId: scopedAgentId,
+          ...(workspaceId ? { workspaceId } : {}),
           limit: parsedLimit,
         }),
       );
@@ -142,6 +190,7 @@ router.get(
 
     res.json(
       await monitoring.getUserRecentEvents(req.user.id, {
+        ...(workspaceId ? { workspaceId } : {}),
         limit: parsedLimit,
       }),
     );

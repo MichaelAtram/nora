@@ -19,6 +19,8 @@ const {
   getEnabledBackends,
   isKnownBackend,
   normalizeBackendName,
+  normalizeExecutionTargetId,
+  runtimeSelectionIssue,
 } = require("../../agent-runtime/lib/backendCatalog");
 const { buildAgentRuntimeFields } = require("../../agent-runtime/lib/agentRuntimeFields");
 const { getAgentSecretEnvVars } = require("../../backend-api/agentSecretOverrides");
@@ -259,6 +261,78 @@ function isFinalDeploymentAttempt(job) {
 
 function isUnrecoverableDeploymentError(error) {
   return error?.name === "UnrecoverableError";
+}
+
+const LEGACY_BACKEND_TYPE_ALIASES = new Set(["hermes", "nemoclaw"]);
+
+function normalizeProvisionerDeployTarget(
+  value,
+  { field = "deploy target", allowLegacyBackendAlias = false } = {},
+) {
+  const rawValue = String(value ?? "").trim();
+  if (!rawValue) return null;
+
+  const normalizedValue = rawValue.toLowerCase();
+  if (allowLegacyBackendAlias && LEGACY_BACKEND_TYPE_ALIASES.has(normalizedValue)) {
+    return null;
+  }
+  if (!isKnownBackend(rawValue)) {
+    const error = new UnrecoverableError(`Unknown ${field}: ${rawValue}`);
+    error.code = "UNKNOWN_DEPLOY_TARGET";
+    throw error;
+  }
+  return normalizeBackendName(rawValue);
+}
+
+function normalizeProvisionerExecutionTargetId(value, { field = "execution target" } = {}) {
+  const rawValue = String(value ?? "").trim();
+  if (!rawValue) return null;
+
+  const normalizedValue = normalizeExecutionTargetId(rawValue);
+  if (!normalizedValue) {
+    const error = new UnrecoverableError(`Unknown ${field}: ${rawValue}`);
+    error.code = "UNKNOWN_DEPLOY_TARGET";
+    throw error;
+  }
+  return normalizedValue;
+}
+
+function toUnrecoverableRuntimeSelectionError(error) {
+  if (isUnrecoverableDeploymentError(error)) return error;
+  if (
+    ![
+      "UNKNOWN_DEPLOY_TARGET",
+      "UNKNOWN_RUNTIME_FAMILY",
+      "UNKNOWN_SANDBOX_PROFILE",
+      "RUNTIME_SELECTION_TARGET_MISMATCH",
+    ].includes(error?.code)
+  ) {
+    return error;
+  }
+
+  const unrecoverable = new UnrecoverableError(error.message);
+  unrecoverable.code = error.code;
+  if (error.statusCode != null) unrecoverable.statusCode = error.statusCode;
+  unrecoverable.cause = error;
+  return unrecoverable;
+}
+
+function assertProvisionerRuntimeSelection(runtimeFields, env = process.env) {
+  const issue = runtimeSelectionIssue(
+    {
+      runtimeFamily: runtimeFields.runtime_family,
+      deployTarget: runtimeFields.deploy_target,
+      executionTargetId: runtimeFields.execution_target_id,
+      sandboxProfile: runtimeFields.sandbox_profile,
+    },
+    env,
+  );
+  if (!issue) return runtimeFields;
+
+  const error = new UnrecoverableError(`Invalid runtime selection: ${issue}`);
+  error.code = "INVALID_RUNTIME_SELECTION";
+  error.statusCode = 400;
+  throw error;
 }
 
 function resolveCanonicalDeploymentOwnerUserId(jobData = {}, agentRow = {}) {
@@ -2336,9 +2410,10 @@ function sleep(ms) {
 const backendInstances = new Map();
 
 function backendInstanceKey(runtimeFields = {}) {
-  const backend = normalizeBackendName(
-    runtimeFields.backend_type || runtimeFields.deploy_target || "docker",
-  );
+  const backend =
+    normalizeProvisionerDeployTarget(runtimeFields.deploy_target || runtimeFields.backend_type, {
+      field: "runtime deploy target",
+    }) || "docker";
   if (backend === "docker") {
     if (runtimeFields.runtime_family === "hermes") return "docker:hermes";
     if (runtimeFields.sandbox_profile === "nemoclaw") return "docker:nemoclaw";
@@ -2566,9 +2641,11 @@ async function loadBackend(runtimeFields = {}, { ownerUserId = null } = {}) {
           "Remote Docker provisioning requires a registered host target such as remote:my-laptop.",
         );
       }
-      console.warn(`Unknown backend "${key}", falling back to docker`);
-      instance = new (require("./backends/docker"))();
-      break;
+      {
+        const error = new UnrecoverableError(`Unsupported provisioner deploy target: ${key}`);
+        error.code = "UNSUPPORTED_DEPLOY_TARGET";
+        throw error;
+      }
   }
 
   backendInstances.set(key, instance);
@@ -3499,6 +3576,23 @@ const worker = new Worker(
         });
         throw error;
       }
+      // A retained runtime identity is the highest-priority provisioning
+      // safety barrier after owner validation. Refuse the job before parsing
+      // a possibly stale desired target so malformed selection metadata cannot
+      // mask the live/orphaned runtime that an operator must reconcile first.
+      if (agentRow.container_id && job.data.replace_existing_runtime !== true) {
+        console.error(
+          `[provisioner] Refusing to create a replacement runtime for agent ${id}; unresolved runtime ${agentRow.container_id} is still persisted`,
+        );
+        return await failDeploymentForUnresolvedRuntime({
+          queryable: db,
+          job,
+          agentId: id,
+          name,
+          containerId: agentRow.container_id,
+          error: new Error("A previous provisioning attempt left runtime identity in place"),
+        });
+      }
       // gateway_token is encrypted at rest. Decrypt the stored value in place so
       // the reuse path (k8s/Hermes pass it back into the container as the runtime
       // password) gets plaintext. A rotated/corrupted key → treat as no reusable
@@ -3514,38 +3608,76 @@ const worker = new Worker(
           agentRow.gateway_token = null;
         }
       }
-      const storedRuntimeFields = buildAgentRuntimeFields(agentRow);
-      const resolvedRuntimeFields = buildAgentRuntimeFields({
-        runtime_family: job.data.runtime_family || storedRuntimeFields.runtime_family,
-        deploy_target: isKnownBackend(backend)
-          ? normalizeBackendName(backend)
-          : storedRuntimeFields.deploy_target,
-        execution_target_id:
-          job.data.execution_target_id || storedRuntimeFields.execution_target_id,
-        backend_type: isKnownBackend(backend)
-          ? normalizeBackendName(backend)
-          : storedRuntimeFields.backend_type,
-        sandbox_profile: sandbox || storedRuntimeFields.sandbox_profile,
-      });
-      const resolvedBackend = resolvedRuntimeFields.backend_type;
-      const resolvedSandbox = resolvedRuntimeFields.sandbox_profile;
+      let storedRuntimeFields;
+      let resolvedRuntimeFields;
+      let resolvedBackend;
+      let resolvedSandbox;
       let provisioner;
       try {
+        normalizeProvisionerDeployTarget(agentRow.deploy_target, {
+          field: "persisted deploy target",
+        });
+        normalizeProvisionerExecutionTargetId(agentRow.execution_target_id, {
+          field: "persisted execution target",
+        });
+        if (!String(agentRow.deploy_target ?? "").trim()) {
+          normalizeProvisionerDeployTarget(agentRow.backend_type, {
+            field: "persisted backend type",
+            allowLegacyBackendAlias: true,
+          });
+        }
+
+        const queuedDeployTarget =
+          normalizeProvisionerDeployTarget(job.data.deploy_target, {
+            field: "deployment job deploy target",
+          }) ||
+          normalizeProvisionerDeployTarget(backend, {
+            field: "deployment job backend",
+            allowLegacyBackendAlias: true,
+          });
+        const queuedTargetValue = String(job.data.deploy_target || backend || "")
+          .trim()
+          .toLowerCase();
+        const queuedExecutionTargetId =
+          normalizeProvisionerExecutionTargetId(job.data.execution_target_id, {
+            field: "deployment job execution target",
+          }) ||
+          (/^(?:k8s|remote):/.test(queuedTargetValue)
+            ? normalizeProvisionerExecutionTargetId(queuedTargetValue, {
+                field: "deployment job execution target",
+              })
+            : null);
+
+        storedRuntimeFields = buildAgentRuntimeFields(agentRow);
+        resolvedRuntimeFields = buildAgentRuntimeFields({
+          runtime_family: job.data.runtime_family || storedRuntimeFields.runtime_family,
+          deploy_target: queuedDeployTarget || storedRuntimeFields.deploy_target,
+          execution_target_id: queuedExecutionTargetId || storedRuntimeFields.execution_target_id,
+          backend_type: queuedDeployTarget || storedRuntimeFields.backend_type,
+          sandbox_profile: sandbox || storedRuntimeFields.sandbox_profile,
+        });
+        assertProvisionerRuntimeSelection(resolvedRuntimeFields);
+        resolvedBackend = resolvedRuntimeFields.backend_type;
+        resolvedSandbox = resolvedRuntimeFields.sandbox_profile;
         provisioner = await loadBackend(resolvedRuntimeFields, {
           ownerUserId,
         });
       } catch (error) {
-        if (isRemoteHostAccessRevokedError(error) || isUnrecoverableDeploymentError(error)) {
+        const terminalError = toUnrecoverableRuntimeSelectionError(error);
+        if (
+          isRemoteHostAccessRevokedError(error) ||
+          isUnrecoverableDeploymentError(terminalError)
+        ) {
           await persistProvisioningFailure({
             queryable: db,
             job,
             agentId: id,
             name,
-            error,
+            error: terminalError,
             forceTerminal: true,
           });
         }
-        throw error;
+        throw terminalError;
       }
       const resolvedImage =
         image ||
@@ -3556,19 +3688,6 @@ const worker = new Worker(
           sandbox_profile: resolvedSandbox,
           backend: resolvedBackend,
         });
-      if (agentRow.container_id && job.data.replace_existing_runtime !== true) {
-        console.error(
-          `[provisioner] Refusing to create a replacement runtime for agent ${id}; unresolved runtime ${agentRow.container_id} is still persisted`,
-        );
-        return await failDeploymentForUnresolvedRuntime({
-          queryable: db,
-          job,
-          agentId: id,
-          name,
-          containerId: agentRow.container_id,
-          error: new Error("A previous provisioning attempt left runtime identity in place"),
-        });
-      }
       let templatePayload = agentRow.template_payload || {};
       if (typeof templatePayload === "string") {
         try {
@@ -4539,6 +4658,7 @@ healthServer.listen(HEALTH_PORT, () => {
 
 module.exports = {
   allocateAvailableLocalDockerGatewayPort,
+  assertProvisionerRuntimeSelection,
   buildProvisionerExecCleanupCommand,
   buildTrackedProvisionerCommand,
   buildUnresolvedRuntimeError,
@@ -4550,6 +4670,9 @@ module.exports = {
   guardRemoteProvisioner,
   isRemoteAuthorizationFailure,
   isFinalDeploymentAttempt,
+  loadBackend,
+  normalizeProvisionerDeployTarget,
+  normalizeProvisionerExecutionTargetId,
   persistProvisionedRuntimeIdentity,
   persistProvisioningFailure,
   prepareReplacementRuntime,
@@ -4559,4 +4682,5 @@ module.exports = {
   runRuntimeCommand,
   runProvisionerExecCommand,
   seedHermesArchiveForDeployment,
+  toUnrecoverableRuntimeSelectionError,
 };

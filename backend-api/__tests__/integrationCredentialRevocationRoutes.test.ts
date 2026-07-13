@@ -53,6 +53,7 @@ jest.mock("../middleware/ownership", () => ({
   requireAccessibleAgent: jest.fn(() => (_req, _res, next) => next()),
 }));
 jest.mock("../middleware/auth", () => ({
+  requireSession: jest.fn((_req, _res, next) => next()),
   scopeByMethod: jest.fn(() => (_req, _res, next) => next()),
 }));
 jest.mock("../../agent-runtime/lib/agentEndpoints", () => ({

@@ -96,7 +96,15 @@ To reduce back-and-forth, include:
 
 ## Response expectations
 
-Maintainers aim to acknowledge complete bug reports and pull requests within fourteen days. This is a best-effort target, not a support SLA. If a thread has had no response after fourteen days, add one polite follow-up to that thread rather than opening a duplicate.
+New external Issues, ready-for-review pull requests, and Discussions receive an automated
+acknowledgement so the thread is visibly in Nora's response queue. Draft pull requests enter the queue
+and start their clock only when marked ready. A scheduled audit posts a maintainer reminder after
+twelve days without a human response and escalates after the fourteen-day target is exceeded.
+
+Maintainers aim to acknowledge complete bug reports, pull requests, and Discussions within fourteen
+days. This is a best-effort target, not a support SLA. The automated comment is a queue receipt, not
+a human review. If a thread still has no human response after fourteen days, add one polite follow-up
+to that thread rather than opening a duplicate.
 
 Reports missing reproduction steps, version details, or sanitized logs may take longer to diagnose. Security reports follow the private process in [SECURITY.md](SECURITY.md) and should never be chased in a public issue.
 

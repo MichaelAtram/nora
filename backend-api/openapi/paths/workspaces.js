@@ -69,6 +69,8 @@ module.exports = {
     get: {
       tags: ["Workspaces"],
       summary: "Get cost across all workspaces accessible to the caller",
+      description:
+        "Session users receive their accessible workspace groups plus unassigned owned agents. A workspace API key receives only its exact bound workspace and no unassigned agents.",
       "x-required-scopes": ["workspaces:read"],
       parameters: [
         { name: "period_days", in: "query", schema: { type: "integer", minimum: 1 } },

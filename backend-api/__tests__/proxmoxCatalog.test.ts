@@ -30,6 +30,7 @@ const ENV_KEYS = [
   "PROXMOX_SSH_PRIVATE_KEY_PATH",
   "PROXMOX_SSH_HOST_FINGERPRINT",
   "PROXMOX_SSH_INSECURE_ACCEPT_HOST_KEY",
+  "PROXMOX_OFFLINE_STAGE_COMMAND",
   "PROXMOX_HERMES_TEMPLATE",
   "PROXMOX_NEMOCLAW_TEMPLATE",
 ];
@@ -53,6 +54,7 @@ function configureProxmox() {
   process.env.PROXMOX_SSH_USER = "nora-bootstrap";
   process.env.PROXMOX_SSH_PASSWORD = "secret";
   process.env.PROXMOX_SSH_HOST_FINGERPRINT = `SHA256:${"A".repeat(43)}`;
+  process.env.PROXMOX_OFFLINE_STAGE_COMMAND = "/usr/local/libexec/nora-proxmox-stage";
 }
 
 describe("proxmox runtime selection", () => {
@@ -119,6 +121,23 @@ describe("proxmox runtime selection", () => {
 
     process.env.PROXMOX_SSH_PORT = "22suffix";
     expect(getBackendStatus("proxmox").issue).toMatch(/between 1 and 65535/i);
+  });
+
+  it("requires the strict offline staging helper only for non-root SSH", () => {
+    delete process.env.PROXMOX_OFFLINE_STAGE_COMMAND;
+    expect(getBackendStatus("proxmox")).toEqual(
+      expect.objectContaining({
+        configured: false,
+        available: false,
+        availableForOnboarding: false,
+      }),
+    );
+    expect(getBackendStatus("proxmox").issue).toMatch(/OFFLINE_STAGE_COMMAND/i);
+
+    process.env.PROXMOX_SSH_USER = "root";
+    expect(getBackendStatus("proxmox")).toEqual(
+      expect.objectContaining({ configured: true, available: true, issue: null }),
+    );
   });
 
   it("allows transport escape hatches only outside production", () => {
