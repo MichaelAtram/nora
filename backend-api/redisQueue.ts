@@ -33,6 +33,8 @@ const connection = new IORedis({
   maxRetriesPerRequest: null,
 });
 
+// ── Queue definitions and retry policy ──────────────────────────
+
 const deployQueue = new Queue("deployments", {
   connection,
   defaultJobOptions: {
@@ -107,15 +109,31 @@ const agentScheduleQueue = new Queue("agent-schedules", {
   },
 });
 
+// ── Enqueue operations ──────────────────────────────────────────
+
 async function addDeploymentJob(agent) {
   await deployQueue.add("deploy-agent", agent);
 }
 
+/**
+ * Enqueue one schedule execution, using runId as payload and BullMQ job identity.
+ * Repeated attempts deduplicate only while the corresponding job is retained.
+ *
+ * @param {Object} payload - Claimed schedule-run payload.
+ * @returns {Promise<Object>} BullMQ job.
+ */
 async function addScheduleRunJob(payload) {
   const jobId = payload?.runId || randomUUID();
   return agentScheduleQueue.add("run-schedule", { ...payload, runId: jobId }, { jobId });
 }
 
+/**
+ * Enqueue one webhook channel delivery under a stable delivery ID so sibling
+ * channels retry independently.
+ *
+ * @param {Object} payload - Rule, channel, and event delivery context.
+ * @returns {Promise<Object>} BullMQ job.
+ */
 async function addAlertDeliveryJob(payload) {
   const deliveryId = payload?.deliveryId || randomUUID();
   return alertDeliveryQueue.add(
@@ -125,6 +143,13 @@ async function addAlertDeliveryJob(payload) {
   );
 }
 
+/**
+ * Enqueue a ClawHub operation with a caller-provided or generated job ID.
+ * Repeated IDs deduplicate only while the corresponding job is retained.
+ *
+ * @param {Object} payload - Agent, skill, and operation details.
+ * @returns {Promise<Object>} BullMQ job.
+ */
 async function addClawhubJob(payload) {
   const jobId = payload?.jobId || randomUUID();
   const operation = String(payload?.operation || "").trim() || "install";
@@ -136,6 +161,14 @@ async function addBackupJob(payload) {
   return backupsQueue.add("run-backup", { ...payload, jobId }, { jobId });
 }
 
+/**
+ * Coalesce Kubernetes policy reconciliation per cluster. Waiting jobs are
+ * updated in place, active jobs receive a follow-up, and terminal jobs are
+ * replaced.
+ *
+ * @param {Object} payload - Cluster ID and desired policy hash.
+ * @returns {Promise<Object>} Existing, updated, or newly enqueued BullMQ job.
+ */
 async function addKubernetesPolicyReconcileJob(payload) {
   const clusterId = String(payload?.clusterId || payload?.cluster_id || "").trim();
   if (!clusterId) {
@@ -169,6 +202,16 @@ async function addKubernetesPolicyReconcileJob(payload) {
   );
 }
 
+// ── ClawHub job inspection and compatibility helpers ────────────
+
+/**
+ * Find an in-flight ClawHub job for the same agent, skill, and optional operation.
+ *
+ * @param {string} agentId - Agent receiving the operation.
+ * @param {string} slug - ClawHub skill slug.
+ * @param {string} operation - Optional operation filter.
+ * @returns {Promise<Object|null>} Matching BullMQ job, if any.
+ */
 async function findInFlightClawhubJob(agentId, slug, operation) {
   if (!agentId || !slug) return null;
 
@@ -258,6 +301,8 @@ async function getClawhubInstallJobStatus(jobId) {
   const status = await getClawhubJobStatus(jobId);
   return status && status.operation === "install" ? status : null;
 }
+
+// ── Deployment dead-letter operations ──────────────────────────
 
 /** Retrieve failed jobs (dead letter queue) for inspection. */
 async function getDLQJobs(start = 0, end = 50) {

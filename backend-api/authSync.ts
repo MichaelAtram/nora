@@ -1,9 +1,8 @@
 // @ts-nocheck
-// Syncs OpenClaw auth to running agents via the runtime sidecar.
-// Writes the legacy auth-profiles.json file, imports API-key profiles into
-// OpenClaw's per-agent SQLite auth store, then restarts the backend so the
-// gateway process re-reads auth on startup (it does not hot-reload from disk).
-// Called whenever LLM provider keys or LLM-relevant integrations change.
+// Synchronizes provider, integration, and model auth into live OpenClaw and
+// Hermes agents. OpenClaw profiles are written through the runtime sidecar
+// when possible; Hermes receives a managed environment and model config.
+// Backends restart afterward because runtime auth is not hot-reloaded.
 
 const db = require("./db");
 const containerManager = require("./containerManager");
@@ -78,6 +77,8 @@ const HERMES_CUSTOM_PROVIDER_BASE_URLS = Object.freeze({
 
 const CONTAINER_EXEC_AUTH_FALLBACK_BACKENDS = new Set(["docker", "proxmox"]);
 
+// Provider and model normalization
+
 function normalizeProviderConfig(config) {
   if (!config) return {};
   if (typeof config === "string") {
@@ -151,6 +152,14 @@ function resolveHermesProviderBaseUrl(defaultProvider = null) {
   return savedBaseUrl || catalogBaseUrl || HERMES_CUSTOM_PROVIDER_BASE_URLS[providerId] || "";
 }
 
+/**
+ * Translate a saved default provider into Hermes' native or custom model configuration.
+ *
+ * @param {Object|null} [defaultProvider=null] - Saved provider, model, and endpoint settings.
+ * @param {Object} [envVars={}] - Managed environment values that may contain its API key.
+ * @returns {Object|null} Hermes model configuration, or `null` when no default is configured.
+ * @throws {Error} When the provider lacks a required id, model, or custom base URL.
+ */
 function buildHermesModelConfig(defaultProvider = null, envVars = {}) {
   if (!defaultProvider) return null;
 
@@ -202,6 +211,8 @@ function hasMeaningfulHermesModelConfig(modelConfig = {}) {
   );
 }
 
+// Managed auth and environment material
+
 async function getIntegrationLlmEnvVars(agentId) {
   try {
     const { getIntegrationEnvVars } = require("./integrations");
@@ -219,10 +230,12 @@ async function getIntegrationLlmEnvVars(agentId) {
 }
 
 /**
- * Build auth-profiles.json content for a specific agent.
- * Merges per-user LLM provider keys with per-agent integration tokens
- * that overlap with LLM auth env vars (e.g., HF_TOKEN, OPENAI_API_KEY).
- * Explicit LLM provider keys always take precedence over integration tokens.
+ * Build OpenClaw auth profiles by merging user provider keys with matching
+ * per-agent integration tokens; explicit provider keys take precedence.
+ *
+ * @param {string} userId - User whose saved provider credentials should be loaded.
+ * @param {string} agentId - Agent whose integration credentials should be considered.
+ * @returns {Promise<Object>} OpenClaw auth-profile document.
  */
 async function buildAuthProfilesForAgent(userId, agentId) {
   const llmKeys = await llmProviders.getProviderKeys(userId);
@@ -241,14 +254,13 @@ async function buildAuthProfilesForAgent(userId, agentId) {
 }
 
 /**
- * Env vars the OpenClaw boot script needs to rebuild auth from scratch.
- * On Kubernetes a restart is a rollout: the replacement pod gets a fresh
- * filesystem and re-seeds auth-profiles.json + the SQLite auth store from
- * the pod env alone, so exec-written files never survive it. Keys saved
- * after provisioning must therefore be patched onto the Deployment env.
- * Carries ALL integration env vars (not just LLM-overlapping ones) — a
- * GITHUB_TOKEN/SLACK_TOKEN connected after provisioning otherwise lives
- * only in the pod's openclaw.json and dies with the pod.
+ * Build a best-effort OpenClaw managed environment from currently available
+ * provider, endpoint, integration, and model sources for pod recreation.
+ *
+ * @param {string} userId - User whose provider credentials should be loaded.
+ * @param {string} agentId - Agent whose integration environment should be included.
+ * @param {Object|null} [defaultProvider=null] - Saved default provider and model.
+ * @returns {Promise<Object>} Filtered managed environment values.
  */
 async function buildOpenClawManagedEnvForAgent(userId, agentId, defaultProvider = null) {
   const llmKeys = await llmProviders.getProviderKeys(userId);
@@ -294,6 +306,15 @@ async function buildOpenClawManagedEnvForAgent(userId, agentId, defaultProvider 
   );
 }
 
+/**
+ * Build a best-effort Hermes managed environment from currently available
+ * provider, endpoint, persisted-channel, and integration sources. Explicit
+ * provider settings win when sources overlap.
+ *
+ * @param {string} userId - User whose provider credentials should be loaded.
+ * @param {string} agentId - Agent whose channel and integration values should be included.
+ * @returns {Promise<Object>} Filtered managed environment values.
+ */
 async function buildHermesManagedEnvForAgent(userId, agentId) {
   const llmKeys = await llmProviders.getProviderKeys(userId);
   const overrides =
@@ -344,6 +365,8 @@ async function buildHermesManagedEnvForAgent(userId, agentId) {
   }
 }
 
+// Runtime write command construction
+
 function buildAuthProfilesWriteCommand(authProfiles) {
   return buildOpenClawAuthProfilesWriteCommand(authProfiles);
 }
@@ -385,6 +408,13 @@ function escapeDotenvValue(value) {
     .replace(/"/g, '\\"')}"`;
 }
 
+/**
+ * Build a shell command that replaces Nora's managed Hermes environment block
+ * while preserving unrelated `.env` content and enforcing private file modes.
+ *
+ * @param {Object} [envVars={}] - Environment values to write into the managed block.
+ * @returns {string} Shell command for rewriting `/opt/data/.env`.
+ */
 function buildHermesEnvWriteCommand(envVars = {}) {
   const managedBlock = Object.entries(envVars)
     .sort(([left], [right]) => left.localeCompare(right))
@@ -415,6 +445,17 @@ function buildHermesEnvWriteCommand(envVars = {}) {
   ].join("\n");
 }
 
+// Runtime command execution and writes
+
+/**
+ * Execute an authenticated command through the runtime sidecar, rejecting HTTP
+ * failures and non-zero command exits.
+ *
+ * @param {Object} agent - Agent whose runtime sidecar should execute the command.
+ * @param {string} command - Shell command sent to the sidecar.
+ * @param {Object} [options={}] - Runtime command timeout options.
+ * @returns {Promise<Object>} Runtime execution response payload.
+ */
 async function runRuntimeCommand(agent, command, { timeout = 30000 } = {}) {
   const runtimeUrl = runtimeUrlForAgent(agent, "/exec");
   if (!runtimeUrl) {
@@ -450,6 +491,15 @@ async function runRuntimeCommand(agent, command, { timeout = 30000 } = {}) {
   return payload;
 }
 
+/**
+ * Execute a shell command through the agent's backend, collecting output and
+ * preserving exit-code metadata on failures.
+ *
+ * @param {Object} agent - Agent whose container should execute the command.
+ * @param {string} command - Shell command to run.
+ * @param {Object} [options={}] - Stream collection timeout options.
+ * @returns {Promise<Object>} Successful exit code and combined command output.
+ */
 async function runContainerCommand(agent, command, { timeout = 30000 } = {}) {
   const execResult = await containerManager.exec(agent, {
     cmd: ["/bin/sh", "-lc", command],
@@ -506,6 +556,14 @@ async function runContainerCommand(agent, command, { timeout = 30000 } = {}) {
   return { exitCode, output };
 }
 
+/**
+ * Write OpenClaw auth through the runtime sidecar, falling back to direct exec
+ * only for Docker and Proxmox-backed agents.
+ *
+ * @param {Object} agent - Agent receiving the auth profiles.
+ * @param {Object} authProfiles - OpenClaw auth-profile document to persist.
+ * @returns {Promise<Object>} Runtime or container execution result.
+ */
 async function writeAuthToContainer(agent, authProfiles) {
   const command = buildAuthProfilesWriteCommand(authProfiles);
   try {
@@ -521,6 +579,14 @@ async function writeAuthToContainer(agent, authProfiles) {
   }
 }
 
+/**
+ * Persist the Hermes managed environment through deployment env on Kubernetes
+ * or a protected `.env` rewrite on other backends.
+ *
+ * @param {Object} agent - Hermes agent receiving the environment.
+ * @param {Object} envVars - Complete managed environment values.
+ * @returns {Promise} Backend-dependent update or command result.
+ */
 async function writeHermesEnvToContainer(agent, envVars) {
   if (
     typeof containerManager.isKubernetesAgent === "function" &&
@@ -533,6 +599,8 @@ async function writeHermesEnvToContainer(agent, envVars) {
   }
   return runContainerCommand(agent, buildHermesEnvWriteCommand(envVars));
 }
+
+// Runtime restart and address reconciliation
 
 function pickDockerComposeNetworkAddress(info = {}) {
   const networks = info?.NetworkSettings?.Networks || {};
@@ -549,6 +617,13 @@ function pickDockerComposeNetworkAddress(info = {}) {
   return info?.NetworkSettings?.IPAddress || "";
 }
 
+/**
+ * Best-effort refresh of a Docker agent's in-memory and persisted runtime host
+ * after a restart changes its Compose network address.
+ *
+ * @param {Object} agent - Restarted Docker agent to refresh.
+ * @returns {Promise<string|null>} Updated address, or `null` when unavailable.
+ */
 async function refreshDockerRuntimeAddress(agent) {
   const backendType = String(agent?.backend_type || "")
     .trim()
@@ -584,12 +659,17 @@ async function restartAgentAndRefreshAddress(agent) {
   return result;
 }
 
+// Auth synchronization orchestration
+
 /**
- * Sync OpenClaw auth to all running agents of a user.
- * If agentId is provided, syncs only that agent.
+ * Rebuild runtime auth for a user's running or warning container-backed agents,
+ * restart each backend, and isolate failures to per-agent result entries.
  *
- * Returns an array of { agentId, status, error? } results.
- * Non-blocking safe: failures per-agent are logged but do not throw.
+ * @param {string} userId - Owner whose provider credentials and agents should be synced.
+ * @param {string|null} [agentId=null] - Optional owner-scoped agent to sync exclusively.
+ * @param {Object} [options={}] - `onlyIfAuthPresent` is a best-effort empty-auth skip;
+ * OpenClaw's structural profile envelope may appear nonempty without credentials.
+ * @returns {Promise<Array>} Per-agent `synced`, `skipped`, or `failed` results.
  */
 async function syncAuthToUserAgents(userId, agentId = null, options = {}) {
   const onlyIfAuthPresent = Boolean(options?.onlyIfAuthPresent);

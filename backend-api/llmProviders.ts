@@ -161,6 +161,13 @@ function maskKey(key) {
 
 // ── CRUD ─────────────────────────────────────────────────
 
+/**
+ * List a user's providers with masked credentials, never returning raw keys;
+ * unreadable encrypted values are surfaced as a display warning.
+ *
+ * @param {string} userId - User whose providers should be listed.
+ * @returns {Promise<Array>} Provider rows safe for API responses.
+ */
 async function listProviders(userId) {
   const result = await db.query(
     "SELECT id, user_id, provider, api_key, model, config, is_default, created_at FROM llm_providers WHERE user_id = $1 ORDER BY created_at",
@@ -184,6 +191,17 @@ async function listProviders(userId) {
   });
 }
 
+/**
+ * Add an encrypted provider credential, making the first provider the default.
+ * The built-in demo provider derives its token and endpoint without user secrets.
+ *
+ * @param {string} userId - User who owns the provider.
+ * @param {string} provider - Approved provider identifier.
+ * @param {string} apiKey - Provider credential; optional only for the demo provider.
+ * @param {string} model - Optional default model or deployment name.
+ * @param {Object} [config={}] - Provider-specific endpoint configuration.
+ * @returns {Promise<Object>} Persisted provider summary.
+ */
 async function addProvider(userId, provider, apiKey, model, config = {}) {
   if (!PROVIDERS.find((p) => p.id === provider)) {
     throw new Error(`Unknown LLM provider: ${provider}`);
@@ -216,6 +234,15 @@ async function addProvider(userId, provider, apiKey, model, config = {}) {
   return result.rows[0];
 }
 
+/**
+ * Update an owner-scoped provider, encrypting replacement credentials and
+ * clearing other defaults before promoting this provider.
+ *
+ * @param {string} id - Provider row to update.
+ * @param {string} userId - User expected to own the provider.
+ * @param {Object} updates - Credential, model, config, or default-state changes.
+ * @returns {Promise<Object>} Updated provider summary.
+ */
 async function updateProvider(id, userId, updates) {
   const sets = [];
   const params = [];
@@ -266,6 +293,9 @@ async function deleteProvider(id, userId) {
 /**
  * Get decrypted keys for all providers of a user — internal use only.
  * Returns a map of { envVarName: decryptedKey } for container injection.
+ *
+ * @param {string} userId - User whose runtime credentials should be loaded.
+ * @returns {Promise<Object>} Decrypted keys indexed by runtime environment variable.
  */
 async function getProviderKeys(userId) {
   const result = await db.query("SELECT provider, api_key FROM llm_providers WHERE user_id = $1", [
@@ -328,6 +358,9 @@ function pickConfigDeployment(config, model) {
  * Return per-user provider config overrides keyed by env var and provider id.
  * Used to inject {PROVIDER}_BASE_URL / {PROVIDER}_API_VERSION into containers
  * and to write `endpoint` / `api_version` fields into OpenClaw's auth-profiles.json.
+ *
+ * @param {string} userId - User whose provider overrides should be loaded.
+ * @returns {Promise<Object>} Endpoint, API-version, and deployment maps.
  */
 async function getProviderEndpoints(userId) {
   const result = await db.query(
@@ -425,6 +458,11 @@ function buildDeploymentEnvVars(deploymentsByEnvVar = {}) {
 /**
  * Build the auth-profiles.json content that openclaw expects.
  * Maps provider keys to the persisted OpenClaw auth profile store format.
+ *
+ * @param {Object} providerKeys - Decrypted keys indexed by environment variable.
+ * @param {Object} [endpointOverridesByProvider={}] - Saved provider endpoints.
+ * @param {Object} [apiVersionOverridesByProvider={}] - Saved API versions.
+ * @returns {Object} OpenClaw auth profile document.
  */
 function buildAuthProfiles(
   providerKeys,

@@ -7,9 +7,8 @@
 // the same way a Kubernetes cluster surfaces as `k8s:<id>`. SSH credentials are
 // encrypted at rest with the shared AES-256-GCM helper.
 //
-// This module is intentionally self-contained (db + crypto only): it does not
-// touch the shared backendCatalog selection logic. Wiring `remote-docker` into
-// the deploy path and the gateway allowlist lands in later Phase A PRs.
+// This module stays self-contained (db + crypto only). Deployment adapters and
+// the gateway allowlist consume its secret-bearing and masked profile APIs.
 
 const db = require("./db");
 const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
@@ -27,6 +26,8 @@ function getSshClientCtor() {
   }
   return sshClientCtor;
 }
+
+// Input normalization and profile serialization
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -106,6 +107,14 @@ function sshTargetLabel(profile) {
   return `${user}${profile.sshHost}${port}`;
 }
 
+/**
+ * Convert a remote-host row into its provisioning profile and derived availability state.
+ * Secrets remain masked unless explicitly requested by a trusted internal caller.
+ *
+ * @param {Object} row - Remote-host database row.
+ * @param {Object} [options={}] - Profile serialization options.
+ * @returns {Object|null} Normalized remote-host profile.
+ */
 function rowToProfile(row, { includeSecret = false } = {}) {
   if (!row) return null;
   const id = normalizeHostId(row.id || row.host_id || row.label || "host");
@@ -187,6 +196,13 @@ function maskHost(row) {
   };
 }
 
+/**
+ * Normalize create or update input, encrypting new SSH credentials and honoring explicit clears.
+ *
+ * @param {Object} [input={}] - Requested remote-host fields.
+ * @param {Object|null} [existing=null] - Existing row whose omitted values should be preserved.
+ * @returns {Object} Database-facing host fields with encrypted credential material.
+ */
 function normalizeHostInput(input = {}, existing = null) {
   const label = normalizeText(input.label ?? existing?.label);
   const id = existing
@@ -256,6 +272,15 @@ function connectionInputChanged(existing, host) {
   );
 }
 
+// Registry persistence
+
+/**
+ * List remote hosts with optional owner scoping and secret inclusion.
+ * A missing registry table is treated as an empty installation during migrations.
+ *
+ * @param {Object} [options={}] - Disabled-row, owner, and secret visibility options.
+ * @returns {Promise<Array>} Normalized host profiles.
+ */
 async function listRemoteHosts(options = {}) {
   const includeDisabled = options.includeDisabled !== false;
   const includeSecret = options.includeSecret === true;
@@ -297,6 +322,13 @@ async function getHostRow(hostId) {
   return result.rows[0] || null;
 }
 
+/**
+ * Load a secret-bearing remote-host profile for trusted provisioning callers.
+ * This lookup does not perform user authorization or availability checks.
+ *
+ * @param {string} executionTargetId - Target in `remote:<id>` form.
+ * @returns {Promise<Object|null>} Decrypted provisioning profile or `null`.
+ */
 async function getRemoteHostProfile(executionTargetId) {
   const normalized = normalizeRemoteExecutionTargetId(executionTargetId);
   if (!normalized) return null;
@@ -311,8 +343,12 @@ async function getRemoteHost(hostId) {
   return row ? maskHost(row) : null;
 }
 
-// Masked lookup by execution target ("remote:<id>"), no secret decryption —
-// used by the gateway proxy to learn a remote host's advertised address.
+/**
+ * Load a masked host by execution target for address allowlisting without decrypting credentials.
+ *
+ * @param {string} executionTargetId - Target in `remote:<id>` form.
+ * @returns {Promise<Object|null>} Masked host profile or `null`.
+ */
 async function getRemoteHostByExecutionTarget(executionTargetId) {
   const normalized = normalizeRemoteExecutionTargetId(executionTargetId);
   if (!normalized) return null;
@@ -329,6 +365,13 @@ async function clearOtherDefaults(hostId, ownerUserId) {
   );
 }
 
+/**
+ * Register a remote host with encrypted SSH credentials and owner-scoped default selection.
+ * Caller authorization and owner assignment are enforced by the route layer.
+ *
+ * @param {Object} [input={}] - Remote-host registration fields.
+ * @returns {Promise<Object>} Persisted masked host profile.
+ */
 async function createRemoteHost(input = {}) {
   const host = normalizeHostInput(input);
   const result = await db.query(
@@ -365,6 +408,14 @@ async function createRemoteHost(input = {}) {
   return maskHost(result.rows[0]);
 }
 
+/**
+ * Update a remote host, invalidating its test result and host-key pin when connection inputs change.
+ * Caller authorization and owner pinning are enforced by the route layer.
+ *
+ * @param {string} hostId - Remote host to update.
+ * @param {Object} [input={}] - Replacement and credential-clear fields.
+ * @returns {Promise<Object>} Updated masked host profile.
+ */
 async function updateRemoteHost(hostId, input = {}) {
   const existing = await getHostRow(hostId);
   if (!existing) {
@@ -422,6 +473,12 @@ async function updateRemoteHost(hostId, input = {}) {
   return maskHost(result.rows[0]);
 }
 
+/**
+ * Delete a remote host only when no non-deleted agent still references its execution target.
+ *
+ * @param {string} hostId - Remote host to delete.
+ * @returns {Promise<Object>} Deleted masked host profile.
+ */
 async function deleteRemoteHost(hostId) {
   const id = normalizeHostId(hostId);
   const executionTargetId = `remote:${id}`;
@@ -442,6 +499,8 @@ async function deleteRemoteHost(hostId) {
   }
   return maskHost(result.rows[0]);
 }
+
+// SSH connectivity verification
 
 function buildSshConnectConfig(profile, timeoutMs, { onHostKey } = {}) {
   const config = {
@@ -474,8 +533,14 @@ function buildSshConnectConfig(profile, timeoutMs, { onHostKey } = {}) {
   return config;
 }
 
-// Connect over SSH and confirm the Docker daemon is reachable. Resolves to
-// { ok, message } and never rejects so callers can persist the result.
+/**
+ * Probe Docker over SSH while enforcing any pinned host key and capturing a first-use key.
+ * Expected connection and command failures resolve as structured results for persistence.
+ *
+ * @param {Object} profile - Secret-bearing remote-host profile.
+ * @param {Object} [options={}] - Probe timeout options.
+ * @returns {Promise<Object>} Probe status, message, and optional presented host key.
+ */
 function runRemoteDockerProbe(profile, { timeoutMs = DEFAULT_TEST_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     const Client = getSshClientCtor();
@@ -557,6 +622,13 @@ function runRemoteDockerProbe(profile, { timeoutMs = DEFAULT_TEST_TIMEOUT_MS } =
   });
 }
 
+/**
+ * Test a registered host, persist its latest result, and pin its SSH host key on first success.
+ *
+ * @param {string} hostId - Remote host to test.
+ * @param {Object} [options={}] - SSH probe options.
+ * @returns {Promise<Object>} Updated masked host profile, including the stored test result.
+ */
 async function testRemoteHost(hostId, options = {}) {
   const profile = await getRemoteHostProfile(`remote:${hostId}`);
   if (!profile) {
@@ -595,18 +667,22 @@ async function testRemoteHost(hostId, options = {}) {
   return maskHost(result.rows[0]);
 }
 
-// Deploy-path gate, mirroring assertKubernetesExecutionTargetAvailable. Wiring
-// this into the deploy queue happens in a later Phase A PR; it lives here now so
-// the contract is defined alongside the registry.
+// Workspace grants and deployment eligibility
+
 // Workspace roles (editor and above) that may USE a shared remote host — deploy
 // agents to it and reach them through the gateway. Mirrors WORKSPACE_ROLE_RANK in
 // middleware/ownership.ts (viewer:0, editor:1, admin:2, owner:3). Viewer can see a
 // shared host (visibility) but not deploy to it. Host config stays owner-only.
 const HOST_USE_ROLES = Object.freeze(["editor", "admin", "owner"]);
 
-// True if the user owns the host OR it's shared into a workspace where they hold an
-// editor+ role. Positive grant check — used to widen the owner-only deploy/reach
-// gates to shared hosts without ever broadening cross-tenant SSRF.
+/**
+ * Check whether a user owns a host or has an editor-or-higher workspace grant to use it.
+ * Missing grant tables fail closed.
+ *
+ * @param {string} userId - User requesting deployment or gateway reachability.
+ * @param {string} hostId - Remote host being used.
+ * @returns {Promise<boolean>} Whether an explicit qualifying grant exists.
+ */
 async function userCanUseRemoteHost(userId, hostId) {
   if (!userId || !hostId) return false;
   const owned = await db.query(
@@ -632,9 +708,13 @@ async function userCanUseRemoteHost(userId, hostId) {
   }
 }
 
-// Hosts a user can see: owned (full management) + shared into any workspace they
-// belong to (read-only). Each entry is masked (no secrets) and annotated with the
-// access kind + whether the user may deploy (editor+).
+/**
+ * List masked hosts a user owns or can see through workspace sharing.
+ * Shared entries include whether the user's highest workspace role permits deployment.
+ *
+ * @param {string} userId - User whose accessible hosts should be listed.
+ * @returns {Promise<Array>} Owned and shared profiles annotated with access rights.
+ */
 async function listAccessibleRemoteHosts(userId) {
   const owned = (await listRemoteHosts({ ownerUserId: userId, includeDisabled: true })).map(
     (host) => ({
@@ -669,8 +749,14 @@ async function listAccessibleRemoteHosts(userId) {
   return [...owned, ...shared];
 }
 
-// Share a host into a workspace (idempotent). Ownership + workspace-membership are
-// enforced by the caller (route layer).
+/**
+ * Idempotently share a host into a workspace; assumes the caller completed authorization checks.
+ *
+ * @param {string} hostId - Remote host to share.
+ * @param {string} workspaceId - Workspace receiving visibility and role-based use.
+ * @param {string} byUserId - User recorded as creating the share.
+ * @returns {Promise<void>}
+ */
 async function shareRemoteHost(hostId, workspaceId, byUserId) {
   await db.query(
     `INSERT INTO workspace_remote_hosts (workspace_id, remote_host_id, created_by)
@@ -704,6 +790,14 @@ async function listRemoteHostShares(hostId) {
   }
 }
 
+/**
+ * Validate a remote-docker target before deployment and return its secret-bearing profile.
+ * When an owner id is supplied, unowned and ungranted hosts are reported as unknown.
+ *
+ * @param {Object} [runtimeFields={}] - Runtime selection containing the remote execution target.
+ * @param {Object} [options={}] - Optional owner scope for cross-tenant authorization.
+ * @returns {Promise<Object|null>} Available provisioning profile, or `null` for other targets.
+ */
 async function assertRemoteHostExecutionTargetAvailable(runtimeFields = {}, options = {}) {
   if (!isRemoteDockerTarget(runtimeFields.deploy_target ?? runtimeFields.deployTarget)) {
     return null;

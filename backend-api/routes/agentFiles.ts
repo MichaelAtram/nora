@@ -21,6 +21,14 @@ const { createMutationFailureAuditMiddleware } = require("../auditLog");
 const router = express.Router();
 router.use(createMutationFailureAuditMiddleware("agent_files"));
 
+/**
+ * Load an agent only for its direct owner, responding with 404 when ownership
+ * does not match so file routes never expose cross-workspace runtime contents.
+ *
+ * @param {Object} req - Express request containing agent and user identifiers.
+ * @param {Object} res - Express response used for the not-found result.
+ * @returns {Promise<Object|null>} Owned agent row, or `null` after responding.
+ */
 async function loadOwnedAgent(req, res) {
   const result = await db.query(
     `SELECT *
@@ -42,6 +50,8 @@ function filenameFromHeader(req) {
     .filter(Boolean)
     .pop();
 }
+
+// Agent export and filesystem reads
 
 router.get(
   "/:id/export",
@@ -122,6 +132,8 @@ router.get(
     res.send(Buffer.from(payload.contentBase64, "base64"));
   }),
 );
+
+// Filesystem mutations
 
 router.put(
   "/:id/files/content",

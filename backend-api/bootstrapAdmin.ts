@@ -13,6 +13,13 @@ const FORBIDDEN_BOOTSTRAP_PASSWORDS = [
   "qwerty123",
 ];
 
+/**
+ * Validate optional bootstrap-admin credentials without mutating persistence,
+ * declining to seed missing, short, or commonly defaulted passwords.
+ *
+ * @param {Object} input - Bootstrap email and password from configuration.
+ * @returns {Object} Seed decision, normalized email, and reason.
+ */
 function getBootstrapAdminSeedConfig({ adminEmail, adminPassword }) {
   const normalizedEmail = typeof adminEmail === "string" ? adminEmail.trim() : "";
   const password = typeof adminPassword === "string" ? adminPassword : "";

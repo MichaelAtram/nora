@@ -52,6 +52,8 @@ const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 const { shellSingleQuote } = require("../agent-runtime/lib/containerCommand");
 
+// Manifest storage and presentation
+
 function decodeStoredManifest(rawValue = "") {
   const decrypted = decrypt(String(rawValue || ""));
   if (!decrypted) return null;
@@ -118,6 +120,12 @@ function summarizeManifest(manifest = {}) {
   };
 }
 
+/**
+ * Build a migration preview that omits managed credential values from API responses.
+ *
+ * @param {Object} [manifest={}] - Normalized migration manifest.
+ * @returns {Object} Counts, resource identifiers, source metadata, and Hermes model settings.
+ */
 function buildDraftPreview(manifest = {}) {
   const templatePayload = normalizeTemplatePayload(manifest.templatePayload || {});
   const warnings = normalizeManifestWarnings(manifest.warnings);
@@ -167,6 +175,14 @@ function buildDraftPreview(manifest = {}) {
   };
 }
 
+// Bundle parsing and compatibility
+
+/**
+ * Package a migration manifest as Nora's gzipped tar bundle format.
+ *
+ * @param {Object} [manifest={}] - Manifest to store as `manifest.json`.
+ * @returns {Promise<Buffer>} Compressed migration bundle.
+ */
 async function packMigrationBundle(manifest = {}) {
   const bundle = tar.pack();
   const archiveChunks = [];
@@ -223,6 +239,12 @@ async function unpackMigrationBundle(buffer) {
   return JSON.parse(manifestText);
 }
 
+/**
+ * Canonicalize uploaded, live, or agent-derived state into the current manifest shape.
+ *
+ * @param {Object} [rawManifest={}] - Manifest-like input from a supported source.
+ * @returns {Object} Versioned manifest with normalized runtime and managed state.
+ */
 function normalizeMigrationManifest(rawManifest = {}) {
   const runtimeFamily =
     String(rawManifest.runtimeFamily || rawManifest.runtime_family || "")
@@ -309,6 +331,15 @@ function legacyTemplateToManifest(payload = {}, filename = "") {
   });
 }
 
+/**
+ * Parse a current-format JSON manifest, legacy template JSON, or gzipped
+ * migration bundle within the configured size limit.
+ *
+ * @param {Buffer} buffer - Raw upload body.
+ * @param {string} [filename=""] - Filename used to recognize legacy template packages.
+ * @param {Object} [options={}] - Parsing limits; set `maxBytes` to `null` for trusted archives.
+ * @returns {Promise<Object>} Normalized migration manifest.
+ */
 async function parseUploadedMigrationBuffer(buffer, filename = "", options = {}) {
   if (!Buffer.isBuffer(buffer)) {
     throw new Error("Upload body is empty");
@@ -343,6 +374,15 @@ async function parseUploadedMigrationBuffer(buffer, filename = "", options = {})
   return normalizeMigrationManifest(parsed);
 }
 
+// Live-source collection
+
+/**
+ * Decode regular files from a tar archive while rejecting paths that escape its base.
+ *
+ * @param {Buffer} buffer - Tar archive bytes.
+ * @param {Object} [options={}] - Optional archive root name to strip.
+ * @returns {Promise<Object[]>} Sorted files with Base64 content and modes.
+ */
 async function readTarBufferFiles(buffer, { stripBaseName = "" } = {}) {
   const extract = tar.extract();
   const files = [];
@@ -797,6 +837,13 @@ function manifestFromHermesSource({ name, workspaceFiles = [], snapshot = {}, so
   });
 }
 
+/**
+ * Inspect a Docker or SSH source and convert its runtime files and managed credentials to a
+ * manifest.
+ *
+ * @param {Object} [input={}] - Runtime family, transport, and source connection details.
+ * @returns {Promise<Object>} Normalized secret-bearing migration manifest.
+ */
 async function buildLiveMigrationManifest(input = {}) {
   const runtimeFamily =
     String(input.runtime_family || input.runtimeFamily || "")
@@ -935,6 +982,8 @@ async function buildLiveMigrationManifest(input = {}) {
   });
 }
 
+// Nora agent export and draft persistence
+
 async function listUserRawLlmProviders(userId) {
   const result = await db.query(
     `SELECT provider, api_key, model, config, is_default
@@ -988,6 +1037,13 @@ async function listAgentChannelSecrets(agentId) {
   }));
 }
 
+/**
+ * Capture an agent's portable runtime state, including decrypted managed credentials.
+ *
+ * @param {Object} agent - Agent row to export.
+ * @param {Object} options - Export context containing the owning user ID.
+ * @returns {Promise<Object>} Normalized secret-bearing migration manifest.
+ */
 async function buildMigrationManifestFromAgent(agent, { userId }) {
   const runtimeFamily =
     String(agent?.runtime_family || "")
@@ -1077,6 +1133,12 @@ async function buildMigrationManifestFromAgent(agent, { userId }) {
   });
 }
 
+/**
+ * Encrypt and persist a user-owned migration draft that expires after 24 hours.
+ *
+ * @param {Object} input - Owner, manifest, and source metadata.
+ * @returns {Promise<Object>} Stored draft with its normalized manifest and safe preview.
+ */
 async function createMigrationDraft({
   userId,
   manifest,
@@ -1125,6 +1187,14 @@ async function createMigrationDraft({
   };
 }
 
+/**
+ * Load and decrypt a migration draft only when it belongs to the requested user.
+ *
+ * @param {string} draftId - Draft identifier.
+ * @param {string} userId - Expected owner identifier.
+ * @returns {Promise<Object|null>} Draft, or `null` when absent or its plaintext is invalid JSON.
+ * @throws {Error} Authenticated decryption failure for corrupted or mismatched-key data.
+ */
 async function getOwnedMigrationDraft(draftId, userId) {
   const result = await db.query(
     `SELECT id, user_id, name, runtime_family, source_kind, source_transport, status,
@@ -1149,6 +1219,13 @@ async function getOwnedMigrationDraft(draftId, userId) {
   };
 }
 
+/**
+ * Load the latest migration manifest attached to a deployed agent for provisioning.
+ *
+ * @param {string} agentId - Deployed agent identifier.
+ * @returns {Promise<Object|null>} Decrypted manifest when one is attached and valid JSON.
+ * @throws {Error} Authenticated decryption failure for corrupted or mismatched-key data.
+ */
 async function getMigrationManifestForAgent(agentId) {
   const result = await db.query(
     `SELECT encrypted_manifest
@@ -1170,6 +1247,13 @@ async function deleteOwnedMigrationDraft(draftId, userId) {
   return Boolean(result.rows[0]);
 }
 
+/**
+ * Attach a draft to its deployed agent and remove its automatic expiration.
+ *
+ * @param {string} draftId - Migration draft identifier.
+ * @param {string} agentId - Deployed agent identifier.
+ * @returns {Promise<void>}
+ */
 async function attachDraftToAgent(draftId, agentId) {
   await db.query(
     `UPDATE agent_migrations
@@ -1179,6 +1263,8 @@ async function attachDraftToAgent(draftId, agentId) {
     [draftId, agentId],
   );
 }
+
+// Imported state materialization and Hermes seeding
 
 async function seedImportedLlmProviders(userId, providerEntries = []) {
   if (!Array.isArray(providerEntries) || providerEntries.length === 0) return;
@@ -1206,6 +1292,17 @@ async function seedImportedLlmProviders(userId, providerEntries = []) {
   }
 }
 
+/**
+ * Apply imported providers, integrations, channels, overrides, and Hermes state to an agent.
+ *
+ * Existing LLM providers are preserved. Writes are not transactional, so a later failure may
+ * leave earlier managed resources materialized.
+ *
+ * @param {string} userId - Owner receiving any missing LLM providers.
+ * @param {string} agentId - Agent receiving imported managed state.
+ * @param {Object} [manifest={}] - Normalized migration manifest.
+ * @returns {Promise<void>}
+ */
 async function materializeManagedMigrationState(userId, agentId, manifest = {}) {
   const managed = manifest.managed || {};
   await seedImportedLlmProviders(userId, managed.llmProviders || []);
@@ -1269,6 +1366,12 @@ function buildHermesSeedArchiveEntries(manifest = {}) {
     .filter(Boolean);
 }
 
+/**
+ * Build a container-rooted tar archive for imported Hermes workspace files.
+ *
+ * @param {Object} [manifest={}] - Manifest containing Hermes seed files.
+ * @returns {Promise<Buffer|null>} Tar archive, or `null` when there are no files.
+ */
 async function buildHermesSeedArchive(manifest = {}) {
   const entries = buildHermesSeedArchiveEntries(manifest);
   if (entries.length === 0) return null;

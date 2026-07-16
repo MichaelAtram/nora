@@ -39,6 +39,12 @@ function escapeImapString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+/**
+ * Authenticate directly to IMAP with a 10-second socket-inactivity timeout and explicit LOGIN.
+ *
+ * @param {Object} config - Canonical Email configuration.
+ * @returns {Promise<Object>} Successful IMAP endpoint summary.
+ */
 async function connectImap(config: EmailConfig): Promise<{ ok: true; message: string }> {
   const imap = config.imap || {};
   const auth = config.auth || {};
@@ -100,6 +106,12 @@ async function connectImap(config: EmailConfig): Promise<{ ok: true; message: st
   return { ok: true, message: `IMAP authenticated to ${host}:${port}` };
 }
 
+/**
+ * Verify SMTP authentication through Nodemailer with certificate validation disabled.
+ *
+ * @param {Object} config - Canonical Email configuration.
+ * @returns {Promise<Object>} Successful SMTP endpoint summary.
+ */
 async function verifySmtp(config: EmailConfig): Promise<{ ok: true; message: string }> {
   const smtp = config.smtp || {};
   const auth = config.auth || {};
@@ -123,6 +135,12 @@ async function verifySmtp(config: EmailConfig): Promise<{ ok: true; message: str
   return { ok: true, message: `SMTP verified for ${host}:${port}` };
 }
 
+/**
+ * Probe IMAP and SMTP independently and return both results even when either side fails.
+ *
+ * @param {Object} config - Canonical Email configuration with plaintext credentials.
+ * @returns {Promise<Object>} Combined connectivity status and protocol-specific details.
+ */
 export async function testEmailConnection(config: EmailConfig) {
   let imap: any;
   let smtp: any;

@@ -178,6 +178,14 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
   return status;
 }
 
+/**
+ * Validate a template's runtime selection and verify any Kubernetes or remote
+ * execution target is available to the future owning user.
+ *
+ * @param {Object} runtimeFields - Requested runtime and target selection.
+ * @param {string} ownerUserId - User who will own the instantiated agent.
+ * @returns {Promise<Object>} Validated runtime-selection status.
+ */
 async function assertRuntimeTargetAvailable(runtimeFields, ownerUserId) {
   const status = assertRuntimeSelectionAvailable(runtimeFields);
   await assertKubernetesExecutionTargetAvailable(runtimeFields);
@@ -211,6 +219,14 @@ async function getOwnedAgent(agentId, userId) {
   return result.rows[0] || null;
 }
 
+/**
+ * Allow published platform/internal listings to all signed-in users while
+ * retaining owner access to listings that are not generally visible.
+ *
+ * @param {Object} listing - Listing being requested.
+ * @param {string} userId - Requesting user.
+ * @returns {boolean} Whether the listing may be accessed.
+ */
 function canAccessPublishedListing(listing, userId) {
   if (!listing) return false;
   if (
@@ -255,6 +271,14 @@ async function getAgentHubRemoteSettings() {
   };
 }
 
+/**
+ * Combine a local listing with its snapshot, deployment defaults, and either a
+ * compact template summary or full file content.
+ *
+ * @param {Object} listing - Local Agent Hub listing.
+ * @param {Object} [options={}] - Whether decoded template content is included.
+ * @returns {Promise<Object>} Listing detail for API responses.
+ */
 async function buildListingTemplateDetail(listing, options = {}) {
   const snapshot = listing?.snapshot_id ? await snapshots.getSnapshot(listing.snapshot_id) : null;
   const templatePayload = snapshot
@@ -370,6 +394,15 @@ function buildCentralSubmissionPayload(listing, snapshot, templatePayload) {
   };
 }
 
+/**
+ * Submit a local listing to the central hub and convert remote failure into a
+ * persistable share-status result instead of rejecting the local workflow.
+ *
+ * @param {Object} listing - Local listing metadata.
+ * @param {Object} snapshot - Snapshot referenced by the listing.
+ * @param {Object} templatePayload - Template content being shared.
+ * @returns {Promise<Object>} Submitted or failed central-share state.
+ */
 async function submitToCentralHub(listing, snapshot, templatePayload) {
   const settings = await getAgentHubRemoteSettings();
   try {
@@ -390,6 +423,8 @@ async function submitToCentralHub(listing, snapshot, templatePayload) {
     };
   }
 }
+
+// Catalog, settings, and API-key management
 
 router.get(
   "/",
@@ -470,6 +505,8 @@ router.delete(
     res.json(key);
   }),
 );
+
+// Publishing and installation
 
 router.post(
   "/share",

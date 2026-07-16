@@ -69,6 +69,13 @@ function normalizeInstalledSkillsLockfile(parsed) {
     .filter((entry) => entry.slug && entry.version);
 }
 
+/**
+ * Require an OpenClaw agent with recorded running/warning status and a container
+ * ID; this check does not probe the runtime.
+ *
+ * @param {Object|null} agent - Agent selected for a ClawHub operation.
+ * @returns {void}
+ */
 function validateClawhubMutableAgent(agent) {
   if (!agent) {
     const error = new Error("agent_not_found");
@@ -131,6 +138,13 @@ function sendClawhubMutationError(res, error) {
   });
 }
 
+/**
+ * Load the minimal agent state needed for skill management only for its direct owner.
+ *
+ * @param {string} agentId - Agent to load.
+ * @param {string} userId - User expected to own the agent.
+ * @returns {Promise<Object|null>} Owned agent row, or `null`.
+ */
 async function loadOwnedAgent(agentId, userId) {
   const result = await db.query(
     `SELECT id, user_id, name, status, host, container_id, backend_type, runtime_family,
@@ -142,6 +156,8 @@ async function loadOwnedAgent(agentId, userId) {
   );
   return result.rows[0] || null;
 }
+
+// Public registry queries
 
 router.get("/skills", async (req, res) => {
   try {
@@ -188,6 +204,8 @@ router.get("/skills/:slug", async (req, res) => {
     sendClawhubError(res, error);
   }
 });
+
+// Owned-agent skill state and mutations
 
 router.get("/agents/:agentId/skills", async (req, res) => {
   try {
@@ -342,6 +360,8 @@ router.post("/agents/:agentId/skills/:slug/delete", async (req, res) => {
     return sendClawhubMutationError(res, error);
   }
 });
+
+// Owner-scoped asynchronous job status
 
 router.get("/jobs/:jobId", async (req, res) => {
   const jobId = typeof req.params.jobId === "string" ? req.params.jobId.trim() : "";

@@ -7,6 +7,8 @@ const { runtimeAuthHeaders } = require("../runtimeAuth");
 
 const router = express.Router();
 
+// ─── Runtime status ───────────────────────────────────────────────
+
 router.get("/:id/nemoclaw/status", async (req, res, next) => {
   try {
     const agentResult = await db.query("SELECT * FROM agents WHERE id = $1 AND user_id = $2", [
@@ -28,6 +30,8 @@ router.get("/:id/nemoclaw/status", async (req, res, next) => {
     next(e);
   }
 });
+
+// ─── Policy ──────────────────────────────────────────────────────
 
 router.get("/:id/nemoclaw/policy", async (req, res, next) => {
   try {
@@ -76,6 +80,8 @@ router.post("/:id/nemoclaw/policy", async (req, res, next) => {
     next(e);
   }
 });
+
+// ─── Approval workflow ───────────────────────────────────────────
 
 router.get("/:id/nemoclaw/approvals", async (req, res, next) => {
   try {

@@ -16,8 +16,12 @@ const { findWorkspaceMembership } = require("../middleware/ownership");
 const router = express.Router();
 router.use(requireSession);
 
-// Load a host and confirm it belongs to the caller. Returns 404 (not 403) when
-// it exists but is owned by someone else, so we never leak its existence.
+/**
+ * Load a caller-owned host, returning not-found semantics for foreign hosts.
+ *
+ * @param {Object} req - Authenticated request containing the remote-host id.
+ * @returns {Promise<Object>} Masked host owned by the caller.
+ */
 async function loadOwnedHost(req) {
   const host = await remoteHosts.getRemoteHost(req.params.id);
   if (!host || host.ownerUserId !== req.user.id) {

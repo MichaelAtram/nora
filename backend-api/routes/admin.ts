@@ -77,16 +77,7 @@ const router = express.Router();
 router.use(requireAdmin);
 router.use(createMutationFailureAuditMiddleware("admin"));
 
-// Control-plane self-check (DB, queue, Kubernetes targets, secret posture,
-// fleet health, gateway exposure). Backs `nora doctor` and the admin Health
-// panel. Cached briefly; pass ?fresh=1 to force a recompute.
-router.get(
-  "/admin/doctor",
-  asyncHandler(async (req, res) => {
-    const fresh = req.query.fresh === "1" || req.query.fresh === "true";
-    res.json(await doctor.getDoctorReport({ fresh }));
-  }),
-);
+// Shared parsing and admin orchestration helpers
 
 function parseInterval(pg) {
   const match = String(pg || "").match(/(\d+)\s*(day|minute|hour|second)/);
@@ -134,6 +125,13 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
   return status;
 }
 
+/**
+ * Validate an admin-selected runtime path and confirm its Kubernetes or remote
+ * execution target is currently available without owner scoping.
+ *
+ * @param {Object} runtimeFields - Requested runtime and execution-target fields.
+ * @returns {Promise<Object>} Runtime selection status.
+ */
 async function assertRuntimeTargetAvailable(runtimeFields) {
   const status = assertRuntimeSelectionAvailable(runtimeFields);
   await kubernetesClusters.assertKubernetesExecutionTargetAvailable(runtimeFields);
@@ -415,6 +413,12 @@ function adminReportAuditMetadata(req, report, extra = {}) {
   return buildAuditMetadata(req, buildReportContext(report, extra));
 }
 
+/**
+ * Best-effort reconcile an admin-visible agent's stored status with its live runtime.
+ *
+ * @param {Object} agent - Mutable agent row being returned to the admin.
+ * @returns {Promise<Object>} Agent with reconciled status when the runtime was reachable.
+ */
 async function reconcileAdminAgent(agent) {
   if (!agent?.container_id || !["running", "warning", "error", "stopped"].includes(agent.status)) {
     return agent;
@@ -490,6 +494,13 @@ async function buildAdminListingDetail(listing, reports = [], options = {}) {
   };
 }
 
+/**
+ * Reject demotion or deletion when the user is currently observed as the
+ * installation's final platform administrator.
+ *
+ * @param {Object} user - User whose admin role may be removed.
+ * @returns {Promise<void>}
+ */
 async function ensureNotLastAdmin(user) {
   if (user?.role !== "admin") return;
   const adminCount = await countAdminUsers();
@@ -500,6 +511,13 @@ async function ensureNotLastAdmin(user) {
   }
 }
 
+/**
+ * Destroy an agent runtime before deleting its row, tolerating cleanup errors
+ * for non-Kubernetes backends but preserving Kubernetes failures for retry.
+ *
+ * @param {Object} agent - Agent and runtime being deleted.
+ * @returns {Promise<void>}
+ */
 async function destroyAgent(agent) {
   if (containerManager.canDestroy(agent)) {
     try {
@@ -533,6 +551,13 @@ function buildSubscriptionLookup(row = {}) {
   };
 }
 
+/**
+ * Enrich an admin user row with effective agent and backup entitlements.
+ *
+ * @param {Object} row - User, usage, override, and subscription fields.
+ * @param {Object} [options={}] - Optional preloaded platform and subscription data.
+ * @returns {Promise<Object>} Admin-facing user and effective entitlement payload.
+ */
 async function buildAdminUserResponse(
   row,
   { deploymentDefaults = null, backupPlanLimits = null, subscriptionRow } = {},
@@ -617,6 +642,19 @@ async function getAdminUserRow(userId) {
 
   return result.rows[0] || null;
 }
+
+// Control-plane self-check (DB, queue, Kubernetes targets, secret posture,
+// fleet health, gateway exposure). Backs `nora doctor` and the admin Health
+// panel. Cached briefly; pass ?fresh=1 to force a recompute.
+router.get(
+  "/admin/doctor",
+  asyncHandler(async (req, res) => {
+    const fresh = req.query.fresh === "1" || req.query.fresh === "true";
+    res.json(await doctor.getDoctorReport({ fresh }));
+  }),
+);
+
+// Platform operations and settings
 
 router.get(
   "/stats",
@@ -1110,6 +1148,8 @@ router.post(
   }),
 );
 
+// User and entitlement administration
+
 router.get(
   "/users",
   asyncHandler(async (_req, res) => {
@@ -1421,6 +1461,8 @@ router.delete(
   }),
 );
 
+// Backup administration
+
 router.get(
   "/backups",
   asyncHandler(async (_req, res) => {
@@ -1500,6 +1542,8 @@ router.post(
     res.json(restored);
   }),
 );
+
+// Fleet agent administration
 
 router.get(
   "/agents",
@@ -1816,6 +1860,8 @@ router.delete(
   }),
 );
 
+// Agent Hub moderation
+
 router.delete(
   "/agent-hub/:id",
   asyncHandler(async (req, res) => {
@@ -2053,6 +2099,8 @@ router.get(
     res.json(await buildAdminListingDetail(listing, reports, { includeContent: true }));
   }),
 );
+
+// Audit and queue recovery
 
 router.get(
   "/audit/export",

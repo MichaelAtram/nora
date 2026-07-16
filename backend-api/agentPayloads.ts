@@ -38,8 +38,18 @@ const OPENCLAW_CORE_FILE_ALIASES = Object.freeze({
 const OPENCLAW_WORKSPACE_ROOT = "/root/.openclaw/workspace";
 const OPENCLAW_LEGACY_AGENT_TEMPLATE_ROOT = "/root/.openclaw/agents/main/agent";
 
+// Payload encoding and normalization
+
 function encodeContentBase64(value) {
   return Buffer.from(String(value || ""), "utf8").toString("base64");
+}
+
+function decodeContentBase64(value) {
+  try {
+    return Buffer.from(String(value || ""), "base64").toString("utf8");
+  } catch {
+    return "";
+  }
 }
 
 function decodeMaybeString(value) {
@@ -132,13 +142,11 @@ function normalizeTemplatePayload(rawPayload = {}) {
   };
 }
 
-function decodeContentBase64(value) {
-  try {
-    return Buffer.from(String(value || ""), "base64").toString("utf8");
-  } catch {
-    return "";
-  }
+function createEmptyTemplatePayload(metadata = {}) {
+  return normalizeTemplatePayload({ metadata });
 }
+
+// Core template files
 
 function buildCoreFileDefaultContent(filePath, context = {}) {
   const name = String(context.name || "OpenClaw Agent").trim() || "OpenClaw Agent";
@@ -276,6 +284,8 @@ function ensureCoreTemplateFiles(rawPayload = {}, context = {}) {
   });
 }
 
+// Payload summaries, edits, and clone modes
+
 /**
  * Build a UI-friendly summary of a template payload, including core-file
  * presence, previews, and file counts.
@@ -372,15 +382,12 @@ function applyTemplateFileEdits(rawPayload = {}, nextFiles = null, context = {})
   );
 }
 
-function createEmptyTemplatePayload(metadata = {}) {
-  return normalizeTemplatePayload({ metadata });
-}
-
 /**
  * Trim a template payload down to the data allowed for the requested clone mode.
  *
  * @param {Object} rawPayload - Template payload being prepared for cloning or export.
- * @param {string} [cloneMode="files_only"] - Clone depth to preserve (`files_only`, `files_plus_memory`, or `full_clone`).
+ * @param {string} [cloneMode="files_only"] - `files_only` keeps files,
+ *   `files_plus_memory` adds memory, and `full_clone` also includes wiring.
  * @returns {Object} Payload filtered to the files, memory, and wiring allowed by that mode.
  */
 function cloneTemplatePayloadForMode(rawPayload, cloneMode = "files_only") {
@@ -393,6 +400,8 @@ function cloneTemplatePayloadForMode(rawPayload, cloneMode = "files_only") {
     wiring: normalizedMode === "full_clone" ? payload.wiring : { channels: [], integrations: [] },
   };
 }
+
+// Agent and container naming
 
 function stripAsciiControlCharacters(value) {
   return Array.from(value)
@@ -486,6 +495,8 @@ function serializeAgent(agent) {
     ...buildAgentRuntimeFields(rest),
   };
 }
+
+// Runtime template export
 
 async function fetchTemplateExportViaRuntime(agent, includeMemory) {
   const runtimeUrl = runtimeUrlForAgent(agent, "/template/export");
@@ -626,7 +637,8 @@ process.stdout.write(JSON.stringify(result));
  * stored agent payload when runtime export paths are unavailable.
  *
  * @param {Object} agent - Agent row whose template content should be exported.
- * @param {string} [cloneMode="files_only"] - Clone depth to preserve in the exported payload.
+ * @param {string} [cloneMode="files_only"] - `files_only` keeps files,
+ *   `files_plus_memory` adds memory, and `full_clone` also includes wiring.
  * @returns {Promise<Object>} Exported payload normalized to the requested clone mode.
  */
 async function exportTemplatePayloadFromAgent(agent, cloneMode = "files_only") {
@@ -651,6 +663,8 @@ async function exportTemplatePayloadFromAgent(agent, cloneMode = "files_only") {
     }
   }
 }
+
+// Template wiring
 
 /**
  * Read the integrations and channels that should travel with a full template
@@ -682,7 +696,8 @@ async function buildAgentWiringBlueprint(agentId) {
  * optionally attaching runtime memory and cloneable wiring.
  *
  * @param {Object} agent - Agent row to export as a reusable template.
- * @param {string} [cloneMode="files_only"] - Clone depth to preserve in the resulting payload.
+ * @param {string} [cloneMode="files_only"] - `files_only` keeps files,
+ *   `files_plus_memory` adds memory, and `full_clone` also includes wiring.
  * @returns {Promise<Object>} Normalized template payload ready for duplication or publishing.
  */
 async function buildTemplatePayloadFromAgent(agent, cloneMode = "files_only") {
@@ -741,6 +756,8 @@ async function materializeTemplateWiring(agentId, rawPayload = {}) {
     );
   }
 }
+
+// Stored template snapshots
 
 /**
  * Extract a normalized template payload from a saved template snapshot, filling
