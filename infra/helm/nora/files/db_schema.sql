@@ -89,9 +89,38 @@ CREATE TABLE IF NOT EXISTS kubernetes_clusters (
 CREATE INDEX IF NOT EXISTS idx_kubernetes_clusters_enabled
   ON kubernetes_clusters(enabled, is_default, label);
 
+CREATE TABLE IF NOT EXISTS user_groups (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL CHECK (CHAR_LENGTH(BTRIM(name)) BETWEEN 1 AND 120),
+  members_version BIGINT NOT NULL DEFAULT 1,
+  created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_groups_name_unique
+  ON user_groups(LOWER(name));
+
+CREATE TABLE IF NOT EXISTS user_group_members (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id UUID NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(group_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_group_members_user
+  ON user_group_members(user_id, group_id);
+
 CREATE TABLE IF NOT EXISTS remote_hosts (
   id TEXT PRIMARY KEY,
-  owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  management_scope TEXT NOT NULL DEFAULT 'user'
+    CHECK (management_scope IN ('user', 'platform')),
+  owner_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  available_to_all BOOLEAN NOT NULL DEFAULT false,
+  access_version BIGINT NOT NULL DEFAULT 1,
   label TEXT NOT NULL,
   enabled BOOLEAN NOT NULL DEFAULT true,
   is_default BOOLEAN NOT NULL DEFAULT false,
@@ -111,11 +140,90 @@ CREATE TABLE IF NOT EXISTS remote_hosts (
   last_test_message TEXT,
   last_tested_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT remote_hosts_scope_owner_check CHECK (
+    (management_scope = 'user' AND owner_user_id IS NOT NULL AND available_to_all = false)
+    OR (management_scope = 'platform' AND owner_user_id IS NULL)
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_remote_hosts_owner
   ON remote_hosts(owner_user_id, enabled, is_default, label);
+
+CREATE INDEX IF NOT EXISTS idx_remote_hosts_platform
+  ON remote_hosts(management_scope, available_to_all, enabled, is_default, label);
+
+CREATE TABLE IF NOT EXISTS remote_host_id_tombstones (
+  remote_host_id TEXT PRIMARY KEY,
+  management_scope TEXT NOT NULL CHECK (management_scope IN ('user', 'platform')),
+  deleted_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE OR REPLACE FUNCTION enforce_remote_host_agent_target()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  target_host_id TEXT;
+BEGIN
+  IF LOWER(NEW.execution_target_id) LIKE 'remote:%'
+     AND NEW.status IS DISTINCT FROM 'deleted' THEN
+    target_host_id := LEFT(
+      TRIM(BOTH '-' FROM REGEXP_REPLACE(
+        REGEXP_REPLACE(LOWER(SUBSTRING(NEW.execution_target_id FROM 8)), '[^a-z0-9-]+', '-', 'g'),
+        '-+',
+        '-',
+        'g'
+      )),
+      64
+    );
+    PERFORM pg_advisory_xact_lock(
+      hashtextextended('nora:remote-host-mutation:' || target_host_id, 0)
+    );
+    IF target_host_id = ''
+       OR EXISTS (
+         SELECT 1 FROM remote_host_id_tombstones WHERE remote_host_id = target_host_id
+       )
+       OR NOT EXISTS (
+         SELECT 1 FROM remote_hosts WHERE id = target_host_id
+       ) THEN
+      RAISE EXCEPTION 'Remote host execution target % does not exist', NEW.execution_target_id
+        USING ERRCODE = '23503';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_agents_remote_host_target ON agents;
+CREATE TRIGGER trg_agents_remote_host_target
+BEFORE INSERT OR UPDATE OF execution_target_id, status ON agents
+FOR EACH ROW EXECUTE FUNCTION enforce_remote_host_agent_target();
+
+CREATE TABLE IF NOT EXISTS remote_host_user_grants (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  remote_host_id TEXT NOT NULL REFERENCES remote_hosts(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(remote_host_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_remote_host_user_grants_user
+  ON remote_host_user_grants(user_id, remote_host_id);
+
+CREATE TABLE IF NOT EXISTS remote_host_group_grants (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  remote_host_id TEXT NOT NULL REFERENCES remote_hosts(id) ON DELETE CASCADE,
+  group_id UUID NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+  created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(remote_host_id, group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_remote_host_group_grants_group
+  ON remote_host_group_grants(group_id, remote_host_id);
 
 CREATE TABLE IF NOT EXISTS gateway_port_allocations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

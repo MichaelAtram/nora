@@ -2141,6 +2141,145 @@ async function migrateDB(database = db, env = process.env) {
     `DO $$ BEGIN ALTER TABLE platform_settings ADD COLUMN smtp_password_encrypted TEXT; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
     `DO $$ BEGIN ALTER TABLE platform_settings ADD COLUMN smtp_from_address TEXT NOT NULL DEFAULT ''; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
     `DO $$ BEGIN ALTER TABLE platform_settings ADD COLUMN smtp_from_name TEXT NOT NULL DEFAULT 'Nora'; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+    // ─── Platform-managed Remote Hosts + direct/group grants ───────────
+    // Append-only: existing remote hosts are explicitly retained as personal
+    // owner-scoped rows while platform rows may outlive their creating admin.
+    `DO $$ BEGIN
+       ALTER TABLE remote_hosts ADD COLUMN management_scope TEXT NOT NULL DEFAULT 'user';
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
+    `DO $$ BEGIN
+       ALTER TABLE remote_hosts ADD COLUMN created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
+    `DO $$ BEGIN
+       ALTER TABLE remote_hosts ADD COLUMN available_to_all BOOLEAN NOT NULL DEFAULT false;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
+    `ALTER TABLE remote_hosts ALTER COLUMN owner_user_id DROP NOT NULL`,
+    `UPDATE remote_hosts
+        SET management_scope = 'user',
+            created_by_user_id = COALESCE(created_by_user_id, owner_user_id),
+            available_to_all = false
+      WHERE management_scope IS NULL OR management_scope = 'user'`,
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM pg_constraint
+          WHERE conname = 'remote_hosts_management_scope_check'
+            AND conrelid = 'remote_hosts'::regclass
+       ) THEN
+         ALTER TABLE remote_hosts
+           ADD CONSTRAINT remote_hosts_management_scope_check
+           CHECK (management_scope IN ('user', 'platform'));
+       END IF;
+     END $$`,
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM pg_constraint
+          WHERE conname = 'remote_hosts_scope_owner_check'
+            AND conrelid = 'remote_hosts'::regclass
+       ) THEN
+         ALTER TABLE remote_hosts
+           ADD CONSTRAINT remote_hosts_scope_owner_check CHECK (
+             (management_scope = 'user' AND owner_user_id IS NOT NULL AND available_to_all = false)
+             OR (management_scope = 'platform' AND owner_user_id IS NULL)
+           );
+       END IF;
+     END $$`,
+    `CREATE INDEX IF NOT EXISTS idx_remote_hosts_platform
+       ON remote_hosts(management_scope, available_to_all, enabled, is_default, label)`,
+    `CREATE TABLE IF NOT EXISTS user_groups (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       name TEXT NOT NULL CHECK (CHAR_LENGTH(BTRIM(name)) BETWEEN 1 AND 120),
+       created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       updated_at TIMESTAMPTZ DEFAULT NOW()
+     )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_user_groups_name_unique
+       ON user_groups(LOWER(name))`,
+    `CREATE TABLE IF NOT EXISTS user_group_members (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       group_id UUID NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       UNIQUE(group_id, user_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_user_group_members_user
+       ON user_group_members(user_id, group_id)`,
+    `CREATE TABLE IF NOT EXISTS remote_host_user_grants (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       remote_host_id TEXT NOT NULL REFERENCES remote_hosts(id) ON DELETE CASCADE,
+       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+       created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       UNIQUE(remote_host_id, user_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_remote_host_user_grants_user
+       ON remote_host_user_grants(user_id, remote_host_id)`,
+    `CREATE TABLE IF NOT EXISTS remote_host_group_grants (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       remote_host_id TEXT NOT NULL REFERENCES remote_hosts(id) ON DELETE CASCADE,
+       group_id UUID NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+       created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+       created_at TIMESTAMPTZ DEFAULT NOW(),
+       UNIQUE(remote_host_id, group_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_remote_host_group_grants_group
+       ON remote_host_group_grants(group_id, remote_host_id)`,
+    `DO $$ BEGIN
+       ALTER TABLE remote_hosts ADD COLUMN access_version BIGINT NOT NULL DEFAULT 1;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
+    `DO $$ BEGIN
+       ALTER TABLE user_groups ADD COLUMN members_version BIGINT NOT NULL DEFAULT 1;
+     EXCEPTION WHEN duplicate_column THEN NULL;
+     END $$`,
+    `CREATE TABLE IF NOT EXISTS remote_host_id_tombstones (
+       remote_host_id TEXT PRIMARY KEY,
+       management_scope TEXT NOT NULL CHECK (management_scope IN ('user', 'platform')),
+       deleted_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+       deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE OR REPLACE FUNCTION enforce_remote_host_agent_target()
+     RETURNS TRIGGER
+     LANGUAGE plpgsql
+     AS $$
+     DECLARE
+       target_host_id TEXT;
+     BEGIN
+       IF LOWER(NEW.execution_target_id) LIKE 'remote:%'
+          AND NEW.status IS DISTINCT FROM 'deleted' THEN
+         target_host_id := LEFT(
+           TRIM(BOTH '-' FROM REGEXP_REPLACE(
+             REGEXP_REPLACE(LOWER(SUBSTRING(NEW.execution_target_id FROM 8)), '[^a-z0-9-]+', '-', 'g'),
+             '-+',
+             '-',
+             'g'
+           )),
+           64
+         );
+         PERFORM pg_advisory_xact_lock(
+           hashtextextended('nora:remote-host-mutation:' || target_host_id, 0)
+         );
+         IF target_host_id = ''
+            OR EXISTS (
+              SELECT 1 FROM remote_host_id_tombstones WHERE remote_host_id = target_host_id
+            )
+            OR NOT EXISTS (
+              SELECT 1 FROM remote_hosts WHERE id = target_host_id
+            ) THEN
+           RAISE EXCEPTION 'Remote host execution target % does not exist', NEW.execution_target_id
+             USING ERRCODE = '23503';
+         END IF;
+       END IF;
+       RETURN NEW;
+     END;
+     $$`,
+    `DROP TRIGGER IF EXISTS trg_agents_remote_host_target ON agents`,
+    `CREATE TRIGGER trg_agents_remote_host_target
+     BEFORE INSERT OR UPDATE OF execution_target_id, status ON agents
+     FOR EACH ROW EXECUTE FUNCTION enforce_remote_host_agent_target()`,
   ];
 
   return runVersionedMigrations(database, migrations, {

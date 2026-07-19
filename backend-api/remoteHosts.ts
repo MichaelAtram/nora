@@ -1,16 +1,14 @@
 // @ts-nocheck
-// Remote-host registry — Phase A of the Bring-Your-Own-Compute epic.
+// Remote-host registry for Nora's Bring-Your-Own-Compute path.
 //
-// Mirrors kubernetesClusters.ts: a registry of operator-owned remote machines
-// (normally a Linux Docker server, VPS, or cloud VM) that Nora can reach over
-// SSH to run the Docker adapter. A registered host surfaces as the execution
-// target `remote:<id>`,
-// the same way a Kubernetes cluster surfaces as `k8s:<id>`. SSH credentials are
-// encrypted at rest with the shared AES-256-GCM helper.
+// Mirrors kubernetesClusters.ts: personal and platform-owned remote machines
+// (normally Linux Docker servers, VPSes, or cloud VMs) surface as concrete
+// `remote:<id>` execution targets. SSH credentials are encrypted at rest with
+// the shared AES-256-GCM helper.
 //
-// This module is intentionally self-contained (db + crypto only): it does not
-// touch the shared backendCatalog selection logic. Wiring `remote-docker` into
-// the deploy path and the gateway allowlist lands in later Phase A PRs.
+// The module owns registration, access, trust-on-first-use testing, and
+// credential loading; deploy, gateway, lifecycle, and backup callers consume
+// these checks through its exported authorization helpers.
 
 const db = require("./db");
 const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
@@ -21,12 +19,14 @@ const net = require("node:net");
 const { PRIVATE_IP_RE } = require("./networkSafety");
 
 const AUTH_MODES = new Set(["key", "password"]);
+const MANAGEMENT_SCOPES = new Set(["user", "platform"]);
 const DEFAULT_SSH_PORT = 22;
 const DEFAULT_TEST_TIMEOUT_MS = 10000;
 const DEFAULT_MUTATION_LOCK_TIMEOUT_MS = 15000;
 const MUTATION_LOCK_POLL_MS = 50;
 const DOCKER_VERSION_PROBE = "docker version --format '{{.Server.Version}}'";
 const REMOTE_HOSTNAME_RE = /^[A-Za-z0-9._-]+$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const REMOTE_HOST_MUTATION_LOCK_PREFIX = "nora:remote-host-mutation:";
 
 let sshClientCtor = null;
@@ -169,6 +169,26 @@ function requireRemoteHostOwnerUserId(value) {
   error.statusCode = 400;
   error.code = "REMOTE_HOST_OWNER_REQUIRED";
   throw error;
+}
+
+function normalizeManagementScope(value, fallback = "user") {
+  const normalized = normalizeText(value).toLowerCase();
+  return MANAGEMENT_SCOPES.has(normalized) ? normalized : fallback;
+}
+
+function createPlatformRemoteHostNotFoundError() {
+  const error = createRemoteHostNotFoundError();
+  error.code = "PLATFORM_REMOTE_HOST_NOT_FOUND";
+  return error;
+}
+
+function createRemoteHostIdRetiredError(hostId) {
+  const error = new Error(
+    `Remote host id "${normalizeHostId(hostId)}" was permanently retired after deletion; choose a new id`,
+  );
+  error.statusCode = 409;
+  error.code = "REMOTE_HOST_ID_RETIRED";
+  return error;
 }
 
 function createRemoteHostNotFoundError() {
@@ -411,7 +431,15 @@ function rowToProfile(row, { includeSecret = false } = {}) {
     executionTargetId,
     adapter: "remote-docker",
     deployTarget: "remote-docker",
+    managementScope: normalizeManagementScope(row.management_scope),
     ownerUserId: row.owner_user_id || null,
+    ownerEmail: row.owner_email || row.ownerEmail || null,
+    ownerName: row.owner_name || row.ownerName || null,
+    createdByUserId: row.created_by_user_id || null,
+    createdByEmail: row.created_by_email || row.createdByEmail || null,
+    createdByName: row.created_by_name || row.createdByName || null,
+    availableToAll: row.available_to_all === true,
+    accessVersion: Number(row.access_version || 1),
     label,
     shortLabel: label,
     enabled: row.enabled !== false,
@@ -448,6 +476,40 @@ function maskHost(row) {
     sshPrivateKey: undefined,
     sshPassword: undefined,
     sshPassphrase: undefined,
+  };
+}
+
+function maskAdminHost(row) {
+  const host = maskHost(row);
+  if (host.managementScope === "platform") return host;
+  // Platform admins may inventory personal hosts and their owning account, but
+  // personal network identity, credentials, pins, and probe diagnostics remain
+  // private to the operator who registered the host.
+  return {
+    id: host.id,
+    executionTargetId: host.executionTargetId,
+    adapter: host.adapter,
+    deployTarget: host.deployTarget,
+    managementScope: host.managementScope,
+    ownerUserId: host.ownerUserId,
+    ownerEmail: host.ownerEmail,
+    ownerName: host.ownerName,
+    createdByUserId: host.createdByUserId,
+    createdByEmail: host.createdByEmail,
+    createdByName: host.createdByName,
+    availableToAll: false,
+    label: host.label,
+    shortLabel: host.shortLabel,
+    enabled: host.enabled,
+    isDefault: host.isDefault,
+    configured: host.configured,
+    connected: host.connected,
+    available: host.available,
+    lastTestStatus: host.lastTestStatus,
+    lastTestedAt: host.lastTestedAt,
+    createdAt: host.createdAt,
+    updatedAt: host.updatedAt,
+    operationalMetadataRedacted: true,
   };
 }
 
@@ -567,6 +629,10 @@ async function listRemoteHosts(options = {}) {
 
 async function listRemoteHostExecutionTargets(options = {}) {
   if (isPaaSMode()) return [];
+  if (options.ownerUserId) {
+    const hosts = await listAccessibleRemoteHosts(options.ownerUserId);
+    return hosts.filter((host) => host.available && host.canDeploy !== false);
+  }
   const hosts = await listRemoteHosts({ ...options, includeDisabled: false });
   return hosts.filter((host) => host.available);
 }
@@ -577,6 +643,53 @@ async function getHostRow(hostId) {
   return result.rows[0] || null;
 }
 
+async function getPlatformHostRow(hostId, queryable = db, { forUpdate = false } = {}) {
+  const id = normalizeHostId(hostId);
+  const result = await queryable.query(
+    `SELECT *
+       FROM remote_hosts
+      WHERE id = $1
+        AND management_scope = 'platform'${forUpdate ? " FOR UPDATE" : ""}`,
+    [id],
+  );
+  return result.rows[0] || null;
+}
+
+async function listAdminRemoteHosts() {
+  const result = await db.query(
+    `SELECT rh.*,
+            owner.email AS owner_email,
+            owner.name AS owner_name,
+            creator.email AS created_by_email,
+            creator.name AS created_by_name
+       FROM remote_hosts rh
+       LEFT JOIN users owner ON owner.id = rh.owner_user_id
+       LEFT JOIN users creator ON creator.id = rh.created_by_user_id
+      ORDER BY CASE WHEN rh.management_scope = 'platform' THEN 0 ELSE 1 END,
+               rh.is_default DESC,
+               LOWER(rh.label),
+               rh.id`,
+  );
+  return result.rows.map(maskAdminHost);
+}
+
+async function getAdminRemoteHost(hostId) {
+  const id = normalizeHostId(hostId);
+  const result = await db.query(
+    `SELECT rh.*,
+            owner.email AS owner_email,
+            owner.name AS owner_name,
+            creator.email AS created_by_email,
+            creator.name AS created_by_name
+       FROM remote_hosts rh
+       LEFT JOIN users owner ON owner.id = rh.owner_user_id
+       LEFT JOIN users creator ON creator.id = rh.created_by_user_id
+      WHERE rh.id = $1`,
+    [id],
+  );
+  return result.rows[0] ? maskAdminHost(result.rows[0]) : null;
+}
+
 async function getOwnedHostRow(hostId, expectedOwnerUserId) {
   const id = normalizeHostId(hostId);
   const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
@@ -584,7 +697,10 @@ async function getOwnedHostRow(hostId, expectedOwnerUserId) {
     id,
     ownerUserId,
   ]);
-  return result.rows[0] || null;
+  const row = result.rows[0] || null;
+  // Platform rows are deliberately never manageable through owner/operator
+  // helpers, even if corrupt legacy data happens to carry an owner id.
+  return row && normalizeManagementScope(row.management_scope) === "user" ? row : null;
 }
 
 async function getRemoteHostProfile(executionTargetId) {
@@ -694,12 +810,14 @@ async function createRemoteHostLocked(host) {
        ssh_host, ssh_port, ssh_user, ssh_auth_mode,
        ssh_private_key_encrypted, ssh_password_encrypted, ssh_passphrase_encrypted,
        gateway_host, docker_host
-     ) VALUES(
-       $1, $2, $3, $4, $5,
-       $6, $7, $8, $9,
-       $10, $11, $12,
-       $13, $14
      )
+     SELECT $1, $2, $3, $4, $5,
+            $6, $7, $8, $9,
+            $10, $11, $12,
+            $13, $14
+      WHERE NOT EXISTS (
+        SELECT 1 FROM remote_host_id_tombstones WHERE remote_host_id = $1
+      )
      RETURNING *`,
     [
       host.id,
@@ -718,6 +836,7 @@ async function createRemoteHostLocked(host) {
       host.dockerHost,
     ],
   );
+  if (!result.rows[0]) throw createRemoteHostIdRetiredError(host.id);
   if (host.isDefault) await clearOtherDefaults(host.id, host.ownerUserId);
   return maskHost(result.rows[0]);
 }
@@ -731,6 +850,63 @@ async function createRemoteHost(input = {}) {
     gatewayHost: host.gatewayHost || host.sshHost,
   });
   return withRemoteHostMutationLock(host.id, () => createRemoteHostLocked(host));
+}
+
+async function createPlatformRemoteHost(input = {}, createdByUserId = null) {
+  assertRemoteHostsSupported();
+  const host = normalizeHostInput(input);
+  host.ownerUserId = null;
+  await resolveRemoteHostRuntimeProfile({
+    sshHost: host.sshHost,
+    gatewayHost: host.gatewayHost || host.sshHost,
+  });
+  return withRemoteHostMutationLock(host.id, async () => {
+    const result = await db.query(
+      `INSERT INTO remote_hosts(
+         id, management_scope, owner_user_id, created_by_user_id, available_to_all,
+         label, enabled, is_default,
+         ssh_host, ssh_port, ssh_user, ssh_auth_mode,
+         ssh_private_key_encrypted, ssh_password_encrypted, ssh_passphrase_encrypted,
+         gateway_host, docker_host
+       )
+       SELECT $1, 'platform', NULL, $2, false,
+              $3, $4, $5,
+              $6, $7, $8, $9,
+              $10, $11, $12,
+              $13, $14
+        WHERE NOT EXISTS (
+          SELECT 1 FROM remote_host_id_tombstones WHERE remote_host_id = $1
+        )
+       RETURNING *`,
+      [
+        host.id,
+        createdByUserId || null,
+        host.label,
+        host.enabled,
+        host.isDefault,
+        host.sshHost,
+        host.sshPort,
+        host.sshUser,
+        host.sshAuthMode,
+        host.sshPrivateKeyEncrypted,
+        host.sshPasswordEncrypted,
+        host.sshPassphraseEncrypted,
+        host.gatewayHost,
+        host.dockerHost,
+      ],
+    );
+    if (!result.rows[0]) throw createRemoteHostIdRetiredError(host.id);
+    if (host.isDefault) {
+      await db.query(
+        `UPDATE remote_hosts
+            SET is_default = false
+          WHERE id <> $1
+            AND management_scope = 'platform'`,
+        [host.id],
+      );
+    }
+    return maskHost(result.rows[0]);
+  });
 }
 
 async function updateRemoteHostLocked(hostId, input = {}, expectedOwnerUserId) {
@@ -807,6 +983,76 @@ async function updateRemoteHost(hostId, input = {}, options = {}) {
   );
 }
 
+async function updatePlatformRemoteHostLocked(hostId, input = {}) {
+  assertRemoteHostsSupported();
+  const existing = await getPlatformHostRow(hostId);
+  if (!existing) throw createPlatformRemoteHostNotFoundError();
+  const host = normalizeHostInput(input, existing);
+  host.ownerUserId = null;
+  const resetTest = connectionInputChanged(existing, host);
+  const resetHostKey = sshHostIdentityChanged(existing, host);
+  await resolveRemoteHostRuntimeProfile({
+    sshHost: host.sshHost,
+    gatewayHost: host.gatewayHost || host.sshHost,
+  });
+  const result = await db.query(
+    `UPDATE remote_hosts
+        SET label = $2,
+            enabled = $3,
+            is_default = $4,
+            ssh_host = $5,
+            ssh_port = $6,
+            ssh_user = $7,
+            ssh_auth_mode = $8,
+            ssh_private_key_encrypted = $9,
+            ssh_password_encrypted = $10,
+            ssh_passphrase_encrypted = $11,
+            gateway_host = $12,
+            docker_host = $13,
+            last_test_status = CASE WHEN $14 THEN NULL ELSE last_test_status END,
+            last_test_message = CASE WHEN $14 THEN NULL ELSE last_test_message END,
+            last_tested_at = CASE WHEN $14 THEN NULL ELSE last_tested_at END,
+            ssh_host_key = CASE WHEN $15 THEN NULL ELSE ssh_host_key END,
+            updated_at = NOW()
+      WHERE id = $1
+        AND management_scope = 'platform'
+      RETURNING *`,
+    [
+      existing.id,
+      host.label,
+      host.enabled,
+      host.isDefault,
+      host.sshHost,
+      host.sshPort,
+      host.sshUser,
+      host.sshAuthMode,
+      host.sshPrivateKeyEncrypted,
+      host.sshPasswordEncrypted,
+      host.sshPassphraseEncrypted,
+      host.gatewayHost,
+      host.dockerHost,
+      resetTest,
+      resetHostKey,
+    ],
+  );
+  if (!result.rows[0]) throw createPlatformRemoteHostNotFoundError();
+  if (host.isDefault) {
+    await db.query(
+      `UPDATE remote_hosts
+          SET is_default = false
+        WHERE id <> $1
+          AND management_scope = 'platform'`,
+      [existing.id],
+    );
+  }
+  return maskHost(result.rows[0]);
+}
+
+async function updatePlatformRemoteHost(hostId, input = {}) {
+  assertRemoteHostsSupported();
+  return withRemoteHostMutationLock(hostId, () => updatePlatformRemoteHostLocked(hostId, input));
+}
+
 function assertHostKeyPinResetConfirmation(existing, confirmation) {
   const provided = normalizeText(confirmation);
   const label = normalizeText(existing?.label);
@@ -855,6 +1101,29 @@ async function resetRemoteHostHostKeyPin(hostId, confirmation, options = {}) {
   );
 }
 
+async function resetPlatformRemoteHostHostKeyPin(hostId, confirmation) {
+  assertRemoteHostsSupported();
+  return withRemoteHostMutationLock(hostId, async () => {
+    const existing = await getPlatformHostRow(hostId);
+    if (!existing) throw createPlatformRemoteHostNotFoundError();
+    assertHostKeyPinResetConfirmation(existing, confirmation);
+    const result = await db.query(
+      `UPDATE remote_hosts
+          SET ssh_host_key = NULL,
+              last_test_status = NULL,
+              last_test_message = NULL,
+              last_tested_at = NULL,
+              updated_at = NOW()
+        WHERE id = $1
+          AND management_scope = 'platform'
+        RETURNING *`,
+      [existing.id],
+    );
+    if (!result.rows[0]) throw createPlatformRemoteHostNotFoundError();
+    return maskHost(result.rows[0]);
+  });
+}
+
 async function deleteRemoteHostLocked(hostId, expectedOwnerUserId) {
   const id = normalizeHostId(hostId);
   const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
@@ -862,7 +1131,7 @@ async function deleteRemoteHostLocked(hostId, expectedOwnerUserId) {
   if (!existing) throw createRemoteHostNotFoundError();
   const executionTargetId = `remote:${id}`;
   const usage = await db.query(
-    "SELECT COUNT(*)::int AS count FROM agents WHERE execution_target_id = $1 AND status <> 'deleted'",
+    "SELECT COUNT(*)::int AS count FROM agents WHERE execution_target_id = $1 AND status IS DISTINCT FROM 'deleted'",
     [executionTargetId],
   );
   if ((usage.rows[0]?.count || 0) > 0) {
@@ -871,7 +1140,17 @@ async function deleteRemoteHostLocked(hostId, expectedOwnerUserId) {
     throw error;
   }
   const result = await db.query(
-    "DELETE FROM remote_hosts WHERE id = $1 AND owner_user_id = $2 RETURNING *",
+    `WITH retired AS (
+       INSERT INTO remote_host_id_tombstones(remote_host_id, management_scope, deleted_by_user_id)
+       VALUES($1, 'user', $2)
+       ON CONFLICT (remote_host_id) DO NOTHING
+       RETURNING remote_host_id
+     )
+     DELETE FROM remote_hosts
+      WHERE id = $1
+        AND owner_user_id = $2
+        AND EXISTS (SELECT 1 FROM retired)
+      RETURNING *`,
     [id, ownerUserId],
   );
   if (!result.rows[0]) throw createRemoteHostNotFoundError();
@@ -883,6 +1162,41 @@ async function deleteRemoteHost(hostId, options = {}) {
   return withRemoteHostMutationLock(hostId, () =>
     deleteRemoteHostLocked(hostId, expectedOwnerUserId),
   );
+}
+
+async function deletePlatformRemoteHost(hostId, options = {}) {
+  assertRemoteHostsSupported();
+  return withRemoteHostMutationLock(hostId, async () => {
+    const id = normalizeHostId(hostId);
+    const existing = await getPlatformHostRow(id);
+    if (!existing) throw createPlatformRemoteHostNotFoundError();
+    const usage = await db.query(
+      "SELECT COUNT(*)::int AS count FROM agents WHERE execution_target_id = $1 AND status IS DISTINCT FROM 'deleted'",
+      [`remote:${id}`],
+    );
+    if ((usage.rows[0]?.count || 0) > 0) {
+      const error = new Error("Cannot delete a remote host while agents still reference it");
+      error.statusCode = 409;
+      error.code = "REMOTE_HOST_IN_USE";
+      throw error;
+    }
+    const result = await db.query(
+      `WITH retired AS (
+         INSERT INTO remote_host_id_tombstones(remote_host_id, management_scope, deleted_by_user_id)
+         VALUES($1, 'platform', $2)
+         ON CONFLICT (remote_host_id) DO NOTHING
+         RETURNING remote_host_id
+       )
+       DELETE FROM remote_hosts
+        WHERE id = $1
+          AND management_scope = 'platform'
+          AND EXISTS (SELECT 1 FROM retired)
+        RETURNING *`,
+      [id, options.deletedByUserId || null],
+    );
+    if (!result.rows[0]) throw createPlatformRemoteHostNotFoundError();
+    return maskHost(result.rows[0]);
+  });
 }
 
 function buildSshConnectConfig(profile, timeoutMs, { onHostKey } = {}) {
@@ -1060,9 +1374,48 @@ async function testRemoteHost(hostId, options = {}) {
   );
 }
 
-// Deploy-path gate, mirroring assertKubernetesExecutionTargetAvailable. Wiring
-// this into the deploy queue happens in a later Phase A PR; it lives here now so
-// the contract is defined alongside the registry.
+async function testPlatformRemoteHost(hostId, options = {}) {
+  assertRemoteHostsSupported();
+  return withRemoteHostMutationLock(hostId, async () => {
+    const row = await getPlatformHostRow(hostId);
+    if (!row) throw createPlatformRemoteHostNotFoundError();
+    const profile = await resolveRemoteHostRuntimeProfile(
+      rowToProfile(row, { includeSecret: true }),
+    );
+    let status = "ok";
+    let message = "Docker is reachable over SSH.";
+    let pinHostKey = null;
+    if (!profile.configured) {
+      status = "failed";
+      message = profile.issue || "Remote host is not configured.";
+    } else {
+      const probe = await runRemoteDockerProbe(profile, options);
+      const presentedHostKey = normalizeText(probe.hostKey);
+      status = probe.ok && presentedHostKey ? "ok" : "failed";
+      message =
+        probe.ok && !presentedHostKey
+          ? "SSH connected, but Nora could not verify and pin the presented host key; the host remains unavailable."
+          : probe.message;
+      if (status === "ok" && !normalizeText(profile.sshHostKey)) pinHostKey = presentedHostKey;
+    }
+    const result = await db.query(
+      `UPDATE remote_hosts
+          SET last_test_status = $2,
+              last_test_message = $3,
+              ssh_host_key = COALESCE(ssh_host_key, $4),
+              last_tested_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $1
+          AND management_scope = 'platform'
+        RETURNING *`,
+      [profile.id, status, message, pinHostKey],
+    );
+    if (!result.rows[0]) throw createPlatformRemoteHostNotFoundError();
+    return maskHost(result.rows[0]);
+  });
+}
+
+// Deploy-path gate mirroring assertKubernetesExecutionTargetAvailable.
 // Workspace roles (editor and above) that may USE a shared remote host — deploy
 // agents to it and reach them through the gateway. Mirrors WORKSPACE_ROLE_RANK in
 // middleware/ownership.ts (viewer:0, editor:1, admin:2, owner:3). Viewer can see a
@@ -1080,14 +1433,51 @@ async function getAuthorizedRemoteHostRow(userId, hostId) {
          FROM remote_hosts rh
         WHERE rh.id = $1
           AND (
-            rh.owner_user_id = $2
-            OR EXISTS (
-              SELECT 1
-                FROM workspace_remote_hosts wrh
-                JOIN workspace_members wm ON wm.workspace_id = wrh.workspace_id
-               WHERE wrh.remote_host_id = rh.id
-                 AND wm.user_id = $2
-                 AND wm.role = ANY($3)
+            (
+              rh.management_scope = 'user'
+              AND (
+                rh.owner_user_id = $2
+                OR EXISTS (
+                  SELECT 1
+                    FROM workspace_remote_hosts wrh
+                    JOIN workspace_members wm ON wm.workspace_id = wrh.workspace_id
+                   WHERE wrh.remote_host_id = rh.id
+                     AND wm.user_id = $2
+                     AND wm.role = ANY($3)
+                )
+              )
+            )
+            OR (
+              rh.management_scope = 'platform'
+              AND (
+                rh.available_to_all = true
+                OR EXISTS (
+                  SELECT 1 FROM users actor
+                   WHERE actor.id = $2
+                     AND actor.role = 'admin'
+                )
+                OR EXISTS (
+                  SELECT 1
+                    FROM remote_host_user_grants uhg
+                   WHERE uhg.remote_host_id = rh.id
+                     AND uhg.user_id = $2
+                )
+                OR EXISTS (
+                  SELECT 1
+                    FROM remote_host_group_grants ghg
+                    JOIN user_group_members ugm ON ugm.group_id = ghg.group_id
+                   WHERE ghg.remote_host_id = rh.id
+                     AND ugm.user_id = $2
+                )
+                OR EXISTS (
+                  SELECT 1
+                    FROM workspace_remote_hosts wrh
+                    JOIN workspace_members wm ON wm.workspace_id = wrh.workspace_id
+                   WHERE wrh.remote_host_id = rh.id
+                     AND wm.user_id = $2
+                     AND wm.role = ANY($3)
+                )
+              )
             )
           )
         LIMIT 1`,
@@ -1095,14 +1485,38 @@ async function getAuthorizedRemoteHostRow(userId, hostId) {
     );
     return result.rows[0] || null;
   } catch (error) {
-    if (error?.code !== "42P01") throw error;
-    // During a rolling migration, fail closed for shared access while keeping
-    // direct owners operational from one owner-bound row lookup.
-    const owned = await db.query(
-      "SELECT * FROM remote_hosts WHERE id = $1 AND owner_user_id = $2",
-      [hostId, userId],
-    );
-    return owned.rows[0] || null;
+    if (!["42P01", "42703"].includes(error?.code)) throw error;
+    // During a rolling migration, platform grants do not exist yet. Keep only
+    // the pre-migration user-owner/workspace semantics, still from one row
+    // snapshot, and fail closed for every new grant kind.
+    try {
+      const legacy = await db.query(
+        `SELECT rh.*
+           FROM remote_hosts rh
+          WHERE rh.id = $1
+            AND (
+              rh.owner_user_id = $2
+              OR EXISTS (
+                SELECT 1
+                  FROM workspace_remote_hosts wrh
+                  JOIN workspace_members wm ON wm.workspace_id = wrh.workspace_id
+                 WHERE wrh.remote_host_id = rh.id
+                   AND wm.user_id = $2
+                   AND wm.role = ANY($3)
+              )
+            )
+          LIMIT 1`,
+        [hostId, userId, HOST_USE_ROLES],
+      );
+      return legacy.rows[0] || null;
+    } catch (legacyError) {
+      if (legacyError?.code !== "42P01") throw legacyError;
+      const owned = await db.query(
+        "SELECT * FROM remote_hosts WHERE id = $1 AND owner_user_id = $2",
+        [hostId, userId],
+      );
+      return owned.rows[0] || null;
+    }
   }
 }
 
@@ -1111,27 +1525,7 @@ async function getAuthorizedRemoteHostRow(userId, hostId) {
 // gates to shared hosts without ever broadening cross-tenant SSRF.
 async function userCanUseRemoteHost(userId, hostId) {
   if (!userId || !hostId) return false;
-  const owned = await db.query(
-    "SELECT 1 FROM remote_hosts WHERE id = $1 AND owner_user_id = $2 LIMIT 1",
-    [hostId, userId],
-  );
-  if (owned.rows[0]) return true;
-  try {
-    const shared = await db.query(
-      `SELECT 1
-         FROM workspace_remote_hosts wrh
-         JOIN workspace_members wm ON wm.workspace_id = wrh.workspace_id
-        WHERE wrh.remote_host_id = $1
-          AND wm.user_id = $2
-          AND wm.role = ANY($3)
-        LIMIT 1`,
-      [hostId, userId, HOST_USE_ROLES],
-    );
-    return Boolean(shared.rows[0]);
-  } catch (error) {
-    if (error?.code === "42P01") return false; // grants table not migrated yet
-    throw error;
-  }
+  return Boolean(await getAuthorizedRemoteHostRow(userId, hostId));
 }
 
 // Active Remote Docker operations must re-check the CURRENT positive grant.
@@ -1176,12 +1570,83 @@ function isRemoteHostAccessRevokedError(error) {
 // access kind + whether the user may deploy (editor+).
 async function listAccessibleRemoteHosts(userId) {
   if (isPaaSMode()) return [];
+  if (!userId) return [];
+  try {
+    const result = await db.query(
+      `WITH actor AS (
+         SELECT EXISTS (
+           SELECT 1 FROM users WHERE id = $1 AND role = 'admin'
+         ) AS is_admin
+       ), workspace_access AS (
+         SELECT wrh.remote_host_id,
+                BOOL_OR(wm.role = ANY($2)) AS can_deploy
+           FROM workspace_remote_hosts wrh
+           JOIN workspace_members wm ON wm.workspace_id = wrh.workspace_id
+          WHERE wm.user_id = $1
+          GROUP BY wrh.remote_host_id
+       ), direct_access AS (
+         SELECT remote_host_id
+           FROM remote_host_user_grants
+          WHERE user_id = $1
+       ), group_access AS (
+         SELECT DISTINCT ghg.remote_host_id
+           FROM remote_host_group_grants ghg
+           JOIN user_group_members ugm ON ugm.group_id = ghg.group_id
+          WHERE ugm.user_id = $1
+       )
+       SELECT rh.*,
+              CASE
+                WHEN rh.management_scope = 'user' AND rh.owner_user_id = $1 THEN 'owned'
+                WHEN rh.management_scope = 'platform' AND actor.is_admin THEN 'platform_admin'
+                WHEN rh.management_scope = 'platform' AND rh.available_to_all THEN 'global'
+                WHEN rh.management_scope = 'platform' AND direct_access.remote_host_id IS NOT NULL THEN 'direct'
+                WHEN rh.management_scope = 'platform' AND group_access.remote_host_id IS NOT NULL THEN 'group'
+                ELSE 'shared'
+              END AS __access,
+              CASE
+                WHEN rh.management_scope = 'user' AND rh.owner_user_id = $1 THEN true
+                WHEN rh.management_scope = 'platform' AND (
+                  actor.is_admin
+                  OR rh.available_to_all
+                  OR direct_access.remote_host_id IS NOT NULL
+                  OR group_access.remote_host_id IS NOT NULL
+                ) THEN true
+                ELSE COALESCE(workspace_access.can_deploy, false)
+              END AS __can_deploy
+         FROM remote_hosts rh
+         CROSS JOIN actor
+         LEFT JOIN workspace_access ON workspace_access.remote_host_id = rh.id
+         LEFT JOIN direct_access ON direct_access.remote_host_id = rh.id
+         LEFT JOIN group_access ON group_access.remote_host_id = rh.id
+        WHERE (
+          rh.management_scope = 'user'
+          AND (rh.owner_user_id = $1 OR workspace_access.remote_host_id IS NOT NULL)
+        ) OR (
+          rh.management_scope = 'platform'
+          AND (
+            actor.is_admin
+            OR rh.available_to_all
+            OR direct_access.remote_host_id IS NOT NULL
+            OR group_access.remote_host_id IS NOT NULL
+            OR workspace_access.remote_host_id IS NOT NULL
+          )
+        )
+        ORDER BY rh.is_default DESC, LOWER(rh.label), rh.id`,
+      [userId, HOST_USE_ROLES],
+    );
+    return result.rows.map((row) => ({
+      ...maskHost(row),
+      access: row.__access,
+      canDeploy: row.__can_deploy === true,
+    }));
+  } catch (error) {
+    if (!["42P01", "42703"].includes(error?.code)) throw error;
+  }
+
+  // Rolling-upgrade fallback: only the established user-owner/workspace model
+  // is visible until every platform grant table and scope column exists.
   const owned = (await listRemoteHosts({ ownerUserId: userId, includeDisabled: true })).map(
-    (host) => ({
-      ...host,
-      access: "owned",
-      canDeploy: true,
-    }),
+    (host) => ({ ...host, access: "owned", canDeploy: true }),
   );
   const ownedIds = new Set(owned.map((host) => host.id));
   const shared = [];
@@ -1200,11 +1665,11 @@ async function listAccessibleRemoteHosts(userId) {
     for (const row of rows.rows) {
       if (ownedIds.has(row.host_id)) continue;
       const host = await getRemoteHost(row.host_id);
-      if (!host) continue;
+      if (!host || host.managementScope !== "user") continue;
       shared.push({ ...host, access: "shared", canDeploy: Number(row.rank) >= 1 });
     }
   } catch (error) {
-    if (error?.code !== "42P01") throw error; // grants table not migrated yet
+    if (error?.code !== "42P01") throw error;
   }
   return [...owned, ...shared];
 }
@@ -1302,6 +1767,213 @@ async function listRemoteHostShares(hostId, options = {}) {
   }
 }
 
+function normalizeGrantIds(value, fieldName, keys) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    const error = new Error(`${fieldName} must be an array`);
+    error.statusCode = 400;
+    throw error;
+  }
+  const ids = value.map((entry) => {
+    let raw = entry;
+    if (entry && typeof entry === "object") {
+      raw = keys.map((key) => entry[key]).find((candidate) => candidate != null);
+    }
+    const id = normalizeText(raw).toLowerCase();
+    if (!UUID_RE.test(id)) {
+      const error = new Error(`${fieldName} must contain valid ids`);
+      error.statusCode = 400;
+      throw error;
+    }
+    return id;
+  });
+  return [...new Set(ids)];
+}
+
+async function readPlatformRemoteHostAccess(queryable, host) {
+  const id = normalizeHostId(host.id);
+  const users = await queryable.query(
+    `SELECT u.id AS "userId", u.email, u.name
+         FROM remote_host_user_grants grant_row
+         JOIN users u ON u.id = grant_row.user_id
+        WHERE grant_row.remote_host_id = $1
+        ORDER BY LOWER(u.email), u.id`,
+    [id],
+  );
+  const groups = await queryable.query(
+    `SELECT ug.id AS "groupId", ug.name
+         FROM remote_host_group_grants grant_row
+         JOIN user_groups ug ON ug.id = grant_row.group_id
+        WHERE grant_row.remote_host_id = $1
+        ORDER BY LOWER(ug.name), ug.id`,
+    [id],
+  );
+  const workspaces = await queryable.query(
+    `SELECT w.id AS "workspaceId", w.name
+         FROM workspace_remote_hosts grant_row
+         JOIN workspaces w ON w.id = grant_row.workspace_id
+        WHERE grant_row.remote_host_id = $1
+        ORDER BY LOWER(w.name), w.id`,
+    [id],
+  );
+  return {
+    version: Number(host.access_version || 1),
+    availableToAll: host.available_to_all === true,
+    users: users.rows.map((row) => ({
+      userId: row.userId ?? row.user_id,
+      email: row.email || "",
+      name: row.name || null,
+    })),
+    groups: groups.rows.map((row) => ({
+      groupId: row.groupId ?? row.group_id,
+      name: row.name,
+    })),
+    workspaces: workspaces.rows.map((row) => ({
+      workspaceId: row.workspaceId ?? row.workspace_id,
+      name: row.name,
+    })),
+  };
+}
+
+async function listPlatformRemoteHostAccess(hostId) {
+  const id = normalizeHostId(hostId);
+  const client = await db.connect();
+  let transactionOpen = false;
+  try {
+    await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    transactionOpen = true;
+    const host = await getPlatformHostRow(id, client);
+    if (!host) throw createPlatformRemoteHostNotFoundError();
+    const access = await readPlatformRemoteHostAccess(client, host);
+    await client.query("COMMIT");
+    transactionOpen = false;
+    return access;
+  } catch (error) {
+    if (transactionOpen) await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function normalizeExpectedVersion(value, label) {
+  const version = Number(value);
+  if (!Number.isSafeInteger(version) || version < 1) {
+    const error = new Error(`${label} expectedVersion is required`);
+    error.statusCode = 400;
+    error.code = "EXPECTED_VERSION_REQUIRED";
+    throw error;
+  }
+  return version;
+}
+
+async function validateGrantIds(client, table, ids, fieldName) {
+  if (ids.length === 0) return;
+  const result = await client.query(`SELECT id FROM ${table} WHERE id = ANY($1::uuid[])`, [ids]);
+  const found = new Set(result.rows.map((row) => String(row.id).toLowerCase()));
+  const missing = ids.find((id) => !found.has(id));
+  if (!missing) return;
+  const error = new Error(`Unknown ${fieldName} id: ${missing}`);
+  error.statusCode = 400;
+  error.code = "REMOTE_HOST_ACCESS_PRINCIPAL_NOT_FOUND";
+  throw error;
+}
+
+async function replacePlatformRemoteHostAccess(hostId, input = {}, createdByUserId = null) {
+  assertRemoteHostsSupported();
+  const id = normalizeHostId(hostId);
+  const expectedVersion = normalizeExpectedVersion(input.expectedVersion, "Remote host access");
+  const userIds = normalizeGrantIds(input.users, "users", ["userId", "user_id", "id"]);
+  const groupIds = normalizeGrantIds(input.groups, "groups", ["groupId", "group_id", "id"]);
+  const workspaceIds = normalizeGrantIds(input.workspaces, "workspaces", [
+    "workspaceId",
+    "workspace_id",
+    "id",
+  ]);
+  const availableToAll = normalizeBool(input.availableToAll ?? input.available_to_all, false);
+
+  return withRemoteHostMutationLock(id, async () => {
+    const client = await db.connect();
+    let transactionOpen = false;
+    let access = null;
+    try {
+      await client.query("BEGIN");
+      transactionOpen = true;
+      const host = await getPlatformHostRow(id, client, { forUpdate: true });
+      if (!host) throw createPlatformRemoteHostNotFoundError();
+      if (Number(host.access_version || 1) !== expectedVersion) {
+        const error = new Error(
+          "Remote host access changed since it was loaded; refresh and try again",
+        );
+        error.statusCode = 409;
+        error.code = "REMOTE_HOST_ACCESS_VERSION_CONFLICT";
+        throw error;
+      }
+
+      await validateGrantIds(client, "users", userIds, "user");
+      await validateGrantIds(client, "user_groups", groupIds, "group");
+      await validateGrantIds(client, "workspaces", workspaceIds, "workspace");
+
+      const updated = await client.query(
+        `UPDATE remote_hosts
+            SET available_to_all = $2,
+                access_version = access_version + 1,
+                updated_at = NOW()
+          WHERE id = $1
+            AND management_scope = 'platform'
+            AND access_version = $3
+        RETURNING *`,
+        [id, availableToAll, expectedVersion],
+      );
+      if (!updated.rows[0]) {
+        const error = new Error(
+          "Remote host access changed since it was loaded; refresh and try again",
+        );
+        error.statusCode = 409;
+        error.code = "REMOTE_HOST_ACCESS_VERSION_CONFLICT";
+        throw error;
+      }
+      await client.query("DELETE FROM remote_host_user_grants WHERE remote_host_id = $1", [id]);
+      await client.query("DELETE FROM remote_host_group_grants WHERE remote_host_id = $1", [id]);
+      await client.query("DELETE FROM workspace_remote_hosts WHERE remote_host_id = $1", [id]);
+
+      if (userIds.length > 0) {
+        await client.query(
+          `INSERT INTO remote_host_user_grants(remote_host_id, user_id, created_by_user_id)
+           SELECT $1, ids.grant_id, $3
+             FROM UNNEST($2::uuid[]) AS ids(grant_id)`,
+          [id, userIds, createdByUserId || null],
+        );
+      }
+      if (groupIds.length > 0) {
+        await client.query(
+          `INSERT INTO remote_host_group_grants(remote_host_id, group_id, created_by_user_id)
+           SELECT $1, ids.grant_id, $3
+             FROM UNNEST($2::uuid[]) AS ids(grant_id)`,
+          [id, groupIds, createdByUserId || null],
+        );
+      }
+      if (workspaceIds.length > 0) {
+        await client.query(
+          `INSERT INTO workspace_remote_hosts(workspace_id, remote_host_id, created_by)
+           SELECT ids.grant_id, $1, $3
+             FROM UNNEST($2::uuid[]) AS ids(grant_id)`,
+          [id, workspaceIds, createdByUserId || null],
+        );
+      }
+      access = await readPlatformRemoteHostAccess(client, updated.rows[0]);
+      await client.query("COMMIT");
+      transactionOpen = false;
+    } catch (error) {
+      if (transactionOpen) await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+    return access;
+  });
+}
+
 async function assertRemoteHostExecutionTargetAvailable(runtimeFields = {}, options = {}) {
   if (!isRemoteDockerTarget(runtimeFields.deploy_target ?? runtimeFields.deployTarget)) {
     return null;
@@ -1354,8 +2026,11 @@ module.exports = {
   assertRemoteHostAgentUse,
   assertRemoteHostExecutionTargetAvailable,
   assertRemoteHostsSupported,
+  createPlatformRemoteHost,
   createRemoteHost,
+  deletePlatformRemoteHost,
   deleteRemoteHost,
+  getAdminRemoteHost,
   getRemoteHost,
   getRemoteHostByExecutionTarget,
   getRemoteHostCleanupProfile,
@@ -1363,16 +2038,22 @@ module.exports = {
   isRemoteDockerTarget,
   isRemoteDockerAgent,
   isRemoteHostAccessRevokedError,
+  listAdminRemoteHosts,
   listRemoteHosts,
   listAccessibleRemoteHosts,
+  listPlatformRemoteHostAccess,
   listRemoteHostExecutionTargets,
   normalizeRemoteExecutionTargetId,
   resolveRemoteAddressForRuntime,
   resolveRemoteHostRuntimeProfile,
+  replacePlatformRemoteHostAccess,
+  resetPlatformRemoteHostHostKeyPin,
   resetRemoteHostHostKeyPin,
   rowToProfile,
+  testPlatformRemoteHost,
   testRemoteHost,
   toPublicRemoteHostAuthorizationError,
+  updatePlatformRemoteHost,
   updateRemoteHost,
   userCanUseRemoteHost,
   shareRemoteHost,

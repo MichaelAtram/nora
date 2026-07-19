@@ -226,7 +226,10 @@ function installMutableRemoteHostRow(initialRow) {
       operations.push("delete-usage");
       return { rows: [{ count: 0 }] };
     }
-    if (text === "DELETE FROM remote_hosts WHERE id = $1 AND owner_user_id = $2 RETURNING *") {
+    if (
+      text.includes("INSERT INTO remote_host_id_tombstones") &&
+      text.includes("DELETE FROM remote_hosts")
+    ) {
       operations.push("delete");
       if (!row || row.owner_user_id !== params[1]) return { rows: [] };
       const deleted = row;
@@ -541,10 +544,11 @@ describe("remote host mutation lock", () => {
     expect(busyClient.end).toHaveBeenCalledTimes(1);
   });
 
-  it("serializes delete/recreate and rejects stale mutations from the former owner", async () => {
+  it("serializes deletion and permanently rejects recreation of the retired host id", async () => {
     const allowDelete = deferred();
     const lock = installTwoOperationLock();
     let row = remoteHostRow({ is_default: false, owner_user_id: "user-1" });
+    let retired = false;
     const operations = [];
     mockDb.query.mockImplementation(async (sql, params = []) => {
       const text = String(sql);
@@ -557,14 +561,19 @@ describe("remote host mutation lock", () => {
         await allowDelete.promise;
         return { rows: [{ count: 0 }] };
       }
-      if (text === "DELETE FROM remote_hosts WHERE id = $1 AND owner_user_id = $2 RETURNING *") {
+      if (
+        text.includes("INSERT INTO remote_host_id_tombstones") &&
+        text.includes("DELETE FROM remote_hosts")
+      ) {
         operations.push(`delete:${params[1]}`);
         const deleted = row;
         row = null;
+        retired = true;
         return { rows: deleted ? [{ ...deleted }] : [] };
       }
       if (text.includes("INSERT INTO remote_hosts")) {
         operations.push(`create:${params[1]}`);
+        if (retired) return { rows: [] };
         row = remoteHostRow({
           id: params[0],
           owner_user_id: params[1],
@@ -604,7 +613,10 @@ describe("remote host mutation lock", () => {
 
     allowDelete.resolve();
     await expect(deletion).resolves.toMatchObject({ ownerUserId: "user-1" });
-    await expect(recreation).resolves.toMatchObject({ ownerUserId: "user-2" });
+    await expect(recreation).rejects.toMatchObject({
+      statusCode: 409,
+      code: "REMOTE_HOST_ID_RETIRED",
+    });
 
     await expect(
       remoteHosts.updateRemoteHost("my-laptop", { label: "Stale owner edit" }, EXPECTED_OWNER),
@@ -613,7 +625,7 @@ describe("remote host mutation lock", () => {
       remoteHosts.shareRemoteHost("my-laptop", "workspace-1", "user-1"),
     ).rejects.toMatchObject({ statusCode: 404 });
 
-    expect(row).toMatchObject({ owner_user_id: "user-2", label: "Replacement host" });
+    expect(row).toBeNull();
     expect(operations).toEqual([
       "select:user-1",
       "delete-usage",
@@ -1104,18 +1116,24 @@ describe("assertRemoteHostExecutionTargetAvailable", () => {
 });
 
 describe("listRemoteHostExecutionTargets", () => {
-  it("returns only available hosts and scopes the query by owner", async () => {
+  it("returns only deployable accessible hosts for the requesting user", async () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
-        remoteHostRow({ id: "ready-host" }),
-        remoteHostRow({ id: "broken-host", last_test_status: "failed" }),
+        remoteHostRow({ id: "ready-host", __access: "owned", __can_deploy: true }),
+        remoteHostRow({
+          id: "broken-host",
+          last_test_status: "failed",
+          __access: "owned",
+          __can_deploy: true,
+        }),
       ],
     });
     const targets = await remoteHosts.listRemoteHostExecutionTargets({ ownerUserId: "user-1" });
     expect(targets.map((t) => t.id)).toEqual(["ready-host"]);
     const select = mockDb.query.mock.calls[0];
-    expect(select[0]).toMatch(/WHERE enabled = true AND owner_user_id = \$1/);
-    expect(select[1]).toEqual(["user-1"]);
+    expect(select[0]).toMatch(/remote_host_user_grants/);
+    expect(select[0]).toMatch(/user_group_members/);
+    expect(select[1]).toEqual(["user-1", ["editor", "admin", "owner"]]);
   });
 
   it("returns an empty list when the table has not been migrated yet", async () => {

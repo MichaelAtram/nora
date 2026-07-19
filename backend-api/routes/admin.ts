@@ -11,6 +11,7 @@ const containerManager = require("../containerManager");
 const releaseUpgrade = require("../releaseUpgrade");
 const kubernetesClusters = require("../kubernetesClusters");
 const remoteHosts = require("../remoteHosts");
+const userGroups = require("../userGroups");
 const doctor = require("../doctor");
 const { repairHermesAgentConfig } = require("../hermesUi");
 const {
@@ -141,12 +142,12 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
   return status;
 }
 
-async function assertRuntimeTargetAvailable(runtimeFields) {
+async function assertRuntimeTargetAvailable(runtimeFields, { ownerUserId = null } = {}) {
   const status = assertRuntimeSelectionAvailable(runtimeFields);
   await kubernetesClusters.assertKubernetesExecutionTargetAvailable(runtimeFields);
-  // Admin re-deploys an existing agent, so this validates host availability
-  // (enabled/configured/connected) without owner-scoping the trusted admin.
-  await remoteHosts.assertRemoteHostExecutionTargetAvailable(runtimeFields);
+  // The persisted agent owner remains the durable credential/host principal
+  // even when a platform admin initiates the replacement.
+  await remoteHosts.assertRemoteHostExecutionTargetAvailable(runtimeFields, { ownerUserId });
   return status;
 }
 
@@ -835,13 +836,239 @@ router.delete(
   }),
 );
 
-// Fleet-wide read-only view of every operator's registered remote hosts (BYOC).
-// Hosts are owned per-user; this is the admin oversight surface. Secrets are
-// masked by the registry's list path.
+// Fleet-wide masked inventory. Personal hosts remain read-only here; only
+// management_scope=platform rows can be mutated through admin routes.
 router.get(
   "/remote-hosts",
   asyncHandler(async (_req, res) => {
-    res.json(await remoteHosts.listRemoteHosts({ includeDisabled: true }));
+    res.json(await remoteHosts.listAdminRemoteHosts());
+  }),
+);
+
+router.post(
+  "/remote-hosts",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = {
+      settings: { kind: "platform_remote_host", id: req.body?.id || null },
+    };
+    const host = await remoteHosts.createPlatformRemoteHost(req.body || {}, req.user.id);
+    await monitoring.logEvent(
+      "admin_remote_host_registered",
+      `Admin registered platform remote host "${host.label}"`,
+      adminAuditMetadata(req, {
+        settings: { kind: "platform_remote_host", remoteHost: { id: host.id, label: host.label } },
+      }),
+    );
+    res.status(201).json(host);
+  }),
+);
+
+router.get(
+  "/remote-hosts/:id",
+  asyncHandler(async (req, res) => {
+    const host = await remoteHosts.getAdminRemoteHost(req.params.id);
+    if (!host) return res.status(404).json({ error: "Remote host not found" });
+    res.json(host);
+  }),
+);
+
+router.put(
+  "/remote-hosts/:id",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = {
+      settings: { kind: "platform_remote_host", id: req.params.id },
+    };
+    const host = await remoteHosts.updatePlatformRemoteHost(req.params.id, req.body || {});
+    await monitoring.logEvent(
+      "admin_remote_host_updated",
+      `Admin updated platform remote host "${host.label}"`,
+      adminAuditMetadata(req, {
+        settings: { kind: "platform_remote_host", remoteHost: { id: host.id, label: host.label } },
+      }),
+    );
+    res.json(host);
+  }),
+);
+
+router.post(
+  "/remote-hosts/:id/test",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = {
+      settings: { kind: "platform_remote_host", id: req.params.id },
+    };
+    const host = await remoteHosts.testPlatformRemoteHost(req.params.id);
+    await monitoring.logEvent(
+      "admin_remote_host_tested",
+      `Admin tested platform remote host "${host.label}" (${host.lastTestStatus})`,
+      adminAuditMetadata(req, {
+        settings: {
+          kind: "platform_remote_host",
+          remoteHost: { id: host.id, label: host.label, status: host.lastTestStatus },
+        },
+      }),
+    );
+    res.json(host);
+  }),
+);
+
+router.post(
+  "/remote-hosts/:id/reset-host-key",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = {
+      settings: { kind: "platform_remote_host", id: req.params.id },
+    };
+    const host = await remoteHosts.resetPlatformRemoteHostHostKeyPin(
+      req.params.id,
+      req.body?.confirmation,
+    );
+    await monitoring.logEvent(
+      "admin_remote_host_ssh_pin_reset",
+      `Admin reset the pinned SSH host key for platform remote host "${host.label}"`,
+      adminAuditMetadata(req, {
+        settings: { kind: "platform_remote_host", remoteHost: { id: host.id, label: host.label } },
+      }),
+    );
+    res.json(host);
+  }),
+);
+
+router.get(
+  "/remote-hosts/:id/access",
+  asyncHandler(async (req, res) => {
+    res.json(await remoteHosts.listPlatformRemoteHostAccess(req.params.id));
+  }),
+);
+
+router.put(
+  "/remote-hosts/:id/access",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = {
+      settings: { kind: "platform_remote_host_access", id: req.params.id },
+    };
+    const access = await remoteHosts.replacePlatformRemoteHostAccess(
+      req.params.id,
+      req.body || {},
+      req.user.id,
+    );
+    await monitoring.logEvent(
+      "admin_remote_host_access_updated",
+      `Admin replaced access grants for platform remote host "${req.params.id}"`,
+      adminAuditMetadata(req, {
+        settings: {
+          kind: "platform_remote_host_access",
+          remoteHost: { id: req.params.id },
+          result: {
+            version: access.version,
+            availableToAll: access.availableToAll,
+            userCount: access.users.length,
+            groupCount: access.groups.length,
+            workspaceCount: access.workspaces.length,
+          },
+        },
+      }),
+    );
+    res.json(access);
+  }),
+);
+
+router.delete(
+  "/remote-hosts/:id",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = {
+      settings: { kind: "platform_remote_host", id: req.params.id },
+    };
+    const host = await remoteHosts.deletePlatformRemoteHost(req.params.id, {
+      deletedByUserId: req.user.id,
+    });
+    await monitoring.logEvent(
+      "admin_remote_host_deleted",
+      `Admin deleted platform remote host "${host.label}"`,
+      adminAuditMetadata(req, {
+        settings: { kind: "platform_remote_host", remoteHost: { id: host.id, label: host.label } },
+      }),
+    );
+    res.json({ success: true, host });
+  }),
+);
+
+router.get(
+  "/user-groups",
+  asyncHandler(async (_req, res) => {
+    res.json(await userGroups.listUserGroups());
+  }),
+);
+
+router.post(
+  "/user-groups",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = { settings: { kind: "user_group" } };
+    const group = await userGroups.createUserGroup(req.body || {}, req.user.id);
+    await monitoring.logEvent(
+      "admin_user_group_created",
+      `Admin created user group "${group.name}"`,
+      adminAuditMetadata(req, { settings: { kind: "user_group", group } }),
+    );
+    res.status(201).json(group);
+  }),
+);
+
+router.put(
+  "/user-groups/:id",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = { settings: { kind: "user_group", id: req.params.id } };
+    const group = await userGroups.updateUserGroup(req.params.id, req.body || {});
+    await monitoring.logEvent(
+      "admin_user_group_updated",
+      `Admin updated user group "${group.name}"`,
+      adminAuditMetadata(req, { settings: { kind: "user_group", group } }),
+    );
+    res.json(group);
+  }),
+);
+
+router.delete(
+  "/user-groups/:id",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = { settings: { kind: "user_group", id: req.params.id } };
+    const group = await userGroups.deleteUserGroup(req.params.id);
+    await monitoring.logEvent(
+      "admin_user_group_deleted",
+      `Admin deleted user group "${group.name}"`,
+      adminAuditMetadata(req, { settings: { kind: "user_group", group } }),
+    );
+    res.json({ success: true, group });
+  }),
+);
+
+router.get(
+  "/user-groups/:id/members",
+  asyncHandler(async (req, res) => {
+    res.json(await userGroups.listUserGroupMembers(req.params.id));
+  }),
+);
+
+router.put(
+  "/user-groups/:id/members",
+  asyncHandler(async (req, res) => {
+    res.locals.auditContext = { settings: { kind: "user_group_members", id: req.params.id } };
+    const members = await userGroups.replaceUserGroupMembers(
+      req.params.id,
+      req.body?.users,
+      req.body?.expectedVersion,
+      req.user.id,
+    );
+    await monitoring.logEvent(
+      "admin_user_group_members_updated",
+      `Admin replaced members for user group "${req.params.id}"`,
+      adminAuditMetadata(req, {
+        settings: {
+          kind: "user_group_members",
+          group: { id: req.params.id },
+          result: { memberCount: members.members.length, version: members.version },
+        },
+      }),
+    );
+    res.json(members);
   }),
 );
 
@@ -1790,7 +2017,7 @@ router.post(
       },
       fallback: currentRuntimeFields,
     });
-    await assertRuntimeTargetAvailable(runtimeFields);
+    await assertRuntimeTargetAvailable(runtimeFields, { ownerUserId: agent.user_id });
     const containerName = resolveContainerName({
       requestedName: requestBody.container_name,
       currentName: agent.container_name,

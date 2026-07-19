@@ -83,26 +83,27 @@ WebSocket upgrades are handled at the nginx layer; the Express app attaches WS h
 - Security middleware: helmet, CORS, rate limiting, correlation IDs, prototype-pollution-safe input validation
 - Auth middleware (session JWT + workspace-scoped API key bearer auth)
 - Workspace-scoped route families for agents, alert rules, API keys, channels, integrations, LLM providers, monitoring, Agent Hub, and workspace members
-- Session-only, user-owned Remote Docker registration plus workspace-based host grants
-- Admin-only routes for fleet operations, audit, moderation, release upgrades, and platform settings
+- Session-only Remote Docker registration for personal hosts plus workspace-based host grants
+- Admin-only routes for platform Remote Docker hosts, fleet operations, audit, moderation, release upgrades, and platform settings
 - Gateway proxy with SSRF guards (`gatewayProxy.ts` — exposes `createGatewayRouter` + `attachGatewayWS`)
 - Background telemetry (`backgroundTasks.ts`, `scheduler.ts`) and release-availability checks (`releaseInfo.ts`)
 
 ### State and queue boundaries
 
-| Service        | What it stores or carries                                                                                                                                                                                                            |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| PostgreSQL     | Users, workspaces, workspace_members (RBAC), invitations, API keys (HMAC-hashed), agents, agent_versions, deployments, migration drafts, snapshots, Agent Hub listings/versions/reports, alert rules, backups, integrations, events. |
-| Redis + BullMQ | Four queues: `deployments`, `clawhub-jobs`, `backups`, `alert-deliveries`. Each has its own retry, backoff, and DLQ retention configured in `backend-api/redisQueue.ts`.                                                             |
+| Service        | What it stores or carries                                                                                                                                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PostgreSQL     | Users, user groups, workspaces, workspace members, personal/platform Remote Docker hosts and grants, API keys (HMAC-hashed), agents, deployments, migration drafts, snapshots, Agent Hub records, alert rules, backups, integrations, and events. |
+| Redis + BullMQ | Four queues: `deployments`, `clawhub-jobs`, `backups`, `alert-deliveries`. Each has its own retry, backoff, and DLQ retention configured in `backend-api/redisQueue.ts`.                                                                          |
 
 The API persists desired state first, then hands long-running work to a queue-backed worker. That keeps provisioning failures, retries, and delayed readiness out of the synchronous browser request path.
 
 ### Workspace RBAC
 
-Shared agents and other workspace resources use workspace RBAC. Remote Docker hosts remain directly
-user-owned and may be granted into a workspace without transferring their credentials or ownership.
-A workspace has a creator (`workspaces.user_id`) plus a row per member in `workspace_members` with
-one of four roles:
+Shared agents and other workspace resources use workspace RBAC. Personal Remote Docker hosts remain
+directly user-owned and may be granted into a workspace without transferring credentials or
+ownership. Platform hosts are owned by the control plane, managed by any platform admin, and may
+also grant access through workspaces, direct users, user groups, or all accounts. A workspace has a
+creator (`workspaces.user_id`) plus a row per member in `workspace_members` with one of four roles:
 
 | Role     | Can read | Can edit | Can manage members | Can delete workspace |
 | -------- | -------- | -------- | ------------------ | -------------------- |
@@ -113,8 +114,10 @@ one of four roles:
 
 Permission checks read from `workspace_members.role`, never from `workspaces.user_id` directly.
 Invitations land in `workspace_invitations` with a hashed token signed by
-`NORA_WORKSPACE_INVITE_SECRET` (falls back to `JWT_SECRET`). For a shared Remote Docker host, viewers
-can see the host and editors or higher can deploy; host configuration remains direct-owner-only.
+`NORA_WORKSPACE_INVITE_SECRET` (falls back to `JWT_SECRET`). For either host type, a workspace viewer
+can see the host and an editor or higher can deploy. Workspace access never permits connection or
+credential changes: the personal owner manages a personal host, while any platform admin manages a
+platform host.
 
 ### API keys and bearer auth
 
@@ -251,8 +254,9 @@ Failed jobs are retained on each queue for inspection. The DLQ surface for deplo
 - External execution systems such as Docker, experimental Remote Docker over SSH, Kubernetes,
   experimental Proxmox LXC placement, and NVIDIA secure sandboxes are reached through backend
   adapters instead of directly from browser surfaces.
-- Remote-host SSH credentials are encrypted at rest and remain direct-owner-only. A workspace grant
-  permits placement according to role but does not reveal the credential or transfer host ownership.
+- Remote-host SSH credentials are encrypted at rest and masked in API responses. Only the personal
+  owner or a platform admin for the corresponding host type can replace them; all-account, direct-user,
+  user-group, and workspace grants permit placement only and never reveal credentials.
 - Stored secrets — provider keys, integration credentials, OAuth tokens, backup encryption material, SMTP password — are AES-256-GCM encrypted with `ENCRYPTION_KEY`. API keys and Agent Hub installation keys are HMAC-hashed at rest, not encrypted.
 
 ## Deployment topologies

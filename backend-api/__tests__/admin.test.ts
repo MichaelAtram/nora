@@ -76,6 +76,7 @@ const mockDockerPing = jest.fn();
 const mockDockerGetContainer = jest.fn();
 const mockDockerContainerInspect = jest.fn();
 const mockAssertKubernetesExecutionTargetAvailable = jest.fn().mockResolvedValue();
+const mockAssertRemoteHostExecutionTargetAvailable = jest.fn().mockResolvedValue();
 const mockPersistLifecycleRuntimeAddress = jest.fn();
 const mockSyncAuthToUserAgents = jest.fn();
 const mockResumeAgentWithProviderAuth = jest.fn();
@@ -105,6 +106,10 @@ jest.mock("../kubernetesClusters", () => ({
   listKubernetesClusters: jest.fn().mockResolvedValue([]),
   getKubernetesClusterPolicySettings: jest.fn(),
   updateKubernetesClusterPolicySettings: jest.fn(),
+}));
+jest.mock("../remoteHosts", () => ({
+  ...jest.requireActual("../remoteHosts"),
+  assertRemoteHostExecutionTargetAvailable: mockAssertRemoteHostExecutionTargetAvailable,
 }));
 jest.mock("../scheduler", () => ({
   selectNode: jest.fn().mockResolvedValue({ name: "worker-01" }),
@@ -373,6 +378,7 @@ beforeEach(() => {
   mockDockerPing.mockReset().mockImplementation((callback) => callback(null));
   mockDockerContainerInspect.mockReset().mockResolvedValue({ Config: { Labels: {} } });
   mockDockerGetContainer.mockReset().mockReturnValue({ inspect: mockDockerContainerInspect });
+  mockAssertRemoteHostExecutionTargetAvailable.mockReset().mockResolvedValue(undefined);
   mockPersistLifecycleRuntimeAddress.mockReset().mockImplementation(async (_db, agent, result) => {
     const host = typeof result?.host === "string" ? result.host.trim() : "";
     const runtimeHost = typeof result?.runtimeHost === "string" ? result.runtimeHost.trim() : host;
@@ -2295,6 +2301,46 @@ describe("admin routes", () => {
       }),
     );
     expect(monitoring.logEvent).toHaveBeenCalled();
+  });
+
+  it("authorizes a Remote Docker admin redeploy as the persisted agent owner", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-remote-admin",
+            user_id: "user-remote-owner",
+            name: "Remote Agent",
+            status: "stopped",
+            runtime_family: "openclaw",
+            backend_type: "remote-docker",
+            deploy_target: "remote-docker",
+            execution_target_id: "remote:shared-vps",
+            sandbox_profile: "standard",
+            vcpu: 2,
+            ram_mb: 2048,
+            disk_gb: 20,
+            container_name: "remote-agent",
+            image: "nora-openclaw-agent:local",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await withToken(
+      request(app).post("/admin/agents/agent-remote-admin/redeploy"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockAssertRemoteHostExecutionTargetAvailable).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deploy_target: "remote-docker",
+        execution_target_id: "remote:shared-vps",
+      }),
+      { ownerUserId: "user-remote-owner" },
+    );
   });
 
   it("requeues admin redeploys from new runtime columns when legacy aliases are missing", async () => {

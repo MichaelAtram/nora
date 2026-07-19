@@ -41,9 +41,12 @@ Make sure you have at least one LLM provider key saved in **Settings** before de
     target on the agent and does not automatically place, fail over, or rebalance it onto a different
     target.
 
-    A Remote Docker host appears only when its latest manual connection test succeeded and you own it
-    or have an `editor`, `admin`, or `owner` workspace grant. Viewers can see a shared host but cannot
-    select it. The current picker exposes Remote Docker only for OpenClaw; see the
+    A Remote Docker host appears only when its latest manual connection test succeeded and you can
+    deploy to it. Personal hosts allow their owner plus `editor`, `admin`, or `owner` members of a
+    granted workspace. Platform hosts allow platform admins, all accounts when enabled, directly
+    granted users, matching user groups, and `editor+` members of a granted workspace. Workspace
+    viewers can see the host but cannot select it. The current picker exposes Remote Docker only for
+    OpenClaw; see the
     [Remote Docker backend reference](/configuration/provisioner-backends/remote-docker#hermes-advanced-api-path)
     for the experimental Hermes API path.
 
