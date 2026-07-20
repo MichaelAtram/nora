@@ -2,7 +2,6 @@
 const path = require("path");
 const express = require("express");
 
-const db = require("../db");
 const {
   createDirectory,
   deletePath,
@@ -16,10 +15,16 @@ const {
 } = require("../agentFiles");
 const { buildMigrationManifestFromAgent, packMigrationBundle } = require("../agentMigrations");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { requireSession } = require("../middleware/auth");
+const { findAgentForRequest } = require("../middleware/ownership");
 const { createMutationFailureAuditMiddleware } = require("../auditLog");
 
 const router = express.Router();
 router.use(createMutationFailureAuditMiddleware("agent_files"));
+// Runtime roots include provider credentials, gateway secrets, paired-device
+// state, and session data. Scope the session guard to this router's paths so
+// later /agents routers can still enforce their own API-key contracts.
+router.use("/:id/files", requireSession);
 
 /**
  * Load an agent only for its direct owner, responding with 404 when ownership
@@ -30,13 +35,7 @@ router.use(createMutationFailureAuditMiddleware("agent_files"));
  * @returns {Promise<Object|null>} Owned agent row, or `null` after responding.
  */
 async function loadOwnedAgent(req, res) {
-  const result = await db.query(
-    `SELECT *
-       FROM agents
-      WHERE id = $1 AND user_id = $2`,
-    [req.params.id, req.user.id],
-  );
-  const agent = result.rows[0];
+  const agent = await findAgentForRequest(req, req.params.id);
   if (!agent) {
     res.status(404).json({ error: "Agent not found" });
     return null;
@@ -55,6 +54,7 @@ function filenameFromHeader(req) {
 
 router.get(
   "/:id/export",
+  requireSession,
   asyncHandler(async (req, res) => {
     const agent = await loadOwnedAgent(req, res);
     if (!agent) return;

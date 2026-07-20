@@ -16,7 +16,7 @@
 # Build (once per host, or after bumping upstream):
 #   docker build \
 #     --build-arg TSX_VERSION=4.21.0 \
-#     --build-arg OPENCLAW_VERSION=2026.6.9 \
+#     --build-arg OPENCLAW_VERSION=2026.6.11 \
 #     -f agent-runtime/Dockerfile.nemoclaw-agent \
 #     -t nora-nemoclaw-agent:local \
 #     agent-runtime/
@@ -39,18 +39,34 @@ FROM ${NEMOCLAW_SANDBOX_BASE}
 ARG TSX_VERSION=4.21.0
 # Patched OpenClaw: >= 2026.4.15 clears the base image's sandbox-escape CVEs.
 # Pinned exactly (not a floating tag) so the build stays reproducible.
-ARG OPENCLAW_VERSION=2026.6.9
+ARG OPENCLAW_VERSION=2026.6.11
 
 # Need to install as root; the base image's final layer is `USER sandbox`.
 USER root
 
-# Global install so every user sees the tsx binary. npm on this base image
-# uses `/usr` as its global prefix (not `/usr/local`) — `which openclaw` on
-# the base resolves to `/usr/bin/openclaw` for the same reason.  We inherit
-# that prefix and let the install drop `tsx` alongside.
-RUN npm install -g "tsx@${TSX_VERSION}" "openclaw@${OPENCLAW_VERSION}" \
- && /usr/bin/tsx --version \
+# Global install so every user sees both binaries. npm on this base image uses
+# `/usr` as its global prefix (not `/usr/local`). Remove the inherited ~863 MB
+# OpenClaw tree before reinstalling because npm's rename/retire path can stall
+# on overlayfs during clean builds. Drop any inherited tsx tree and both bin
+# links too, then replace them in the same prefix so no old vulnerable copy
+# remains separately reachable.
+RUN test "$(npm config get prefix)" = "/usr" \
+ && test "$(npm root -g)" = "/usr/lib/node_modules" \
+ && rm -rf \
+      /usr/lib/node_modules/openclaw \
+      /usr/lib/node_modules/tsx \
+ && rm -f \
+      /usr/bin/openclaw \
+      /usr/bin/tsx \
+ && npm install -g "tsx@${TSX_VERSION}" "openclaw@${OPENCLAW_VERSION}" \
+ && test "$(npm config get prefix)" = "/usr" \
+ && test "$(npm root -g)" = "/usr/lib/node_modules" \
+ && test "$(node -p 'require("/usr/lib/node_modules/openclaw/package.json").version')" = "${OPENCLAW_VERSION}" \
+ && test "$(node -p 'require("/usr/lib/node_modules/tsx/package.json").version')" = "${TSX_VERSION}" \
+ && test -x /usr/bin/openclaw \
+ && test -x /usr/bin/tsx \
  && /usr/bin/openclaw --version \
+ && /usr/bin/tsx --version \
  && npm cache clean --force \
  && rm -rf /root/.npm
 

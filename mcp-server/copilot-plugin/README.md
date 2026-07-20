@@ -62,7 +62,7 @@ The plugin exposes only the following tools:
 | `get_agent_metrics_summary` | `monitoring:read` |
 | `get_agent_cost`            | `monitoring:read` |
 
-The configuration pins `@noraai/mcp-server@0.1.3`, sets `NORA_MCP_ALLOW_DESTRUCTIVE=false`, and applies an explicit Copilot MCP tool allowlist. The scoped Nora key provides an additional server-side permission boundary.
+The configuration pins `@noraai/mcp-server@0.1.4`, sets `NORA_MCP_ALLOW_DESTRUCTIVE=false`, and applies an explicit Copilot MCP tool allowlist. The scoped Nora key provides an additional server-side permission boundary.
 
 ## Updating
 

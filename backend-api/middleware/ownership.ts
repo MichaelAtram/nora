@@ -50,9 +50,35 @@ function enforceApiKeyWorkspace(req, res, workspaceId) {
   return true;
 }
 
+function isRemoteDockerAgent(agent = {}) {
+  const deployTarget = String(agent.deploy_target || agent.deployTarget || "")
+    .trim()
+    .toLowerCase();
+  const backendType = String(agent.backend_type || agent.backendType || "")
+    .trim()
+    .toLowerCase();
+  const executionTargetId = String(agent.execution_target_id || agent.executionTargetId || "")
+    .trim()
+    .toLowerCase();
+  return (
+    deployTarget === "remote-docker" ||
+    backendType === "remote-docker" ||
+    executionTargetId.startsWith("remote:")
+  );
+}
+
+function assertApiKeyCanAccessLoadedAgent(req, agent) {
+  if (!req?.apiKey || !agent || !isRemoteDockerAgent(agent)) return agent;
+
+  const error = new Error("Remote Docker agent operations require session authentication");
+  error.statusCode = 403;
+  error.code = "session_required";
+  throw error;
+}
+
 /**
- * Ensure an API-key target agent is assigned to the key's bound workspace.
- * Session-authenticated requests pass through unchanged.
+ * Ensure an API-key target agent is assigned to its bound workspace and is not
+ * a session-only Remote Docker agent. Session callers pass through unchanged.
  *
  * @param {Object} req - Authenticated Express request.
  * @param {Object} res - Express response used for binding failures.
@@ -66,18 +92,87 @@ async function enforceApiKeyAgentScope(req, res, agentId) {
     res.status(403).json({ error: "API key has no workspace binding", code: "wrong_workspace" });
     return false;
   }
+
+  const cached = req.apiKeyAgentScope;
+  if (cached?.workspaceId === bound && cached?.agentId === agentId) {
+    return true;
+  }
+
   const result = await db.query(
-    "SELECT 1 FROM workspace_agents WHERE workspace_id = $1 AND agent_id = $2 LIMIT 1",
+    `SELECT a.id, a.backend_type, a.deploy_target, a.execution_target_id
+       FROM workspace_agents wa
+       JOIN agents a ON a.id = wa.agent_id
+      WHERE wa.workspace_id = $1 AND wa.agent_id = $2
+      LIMIT 1`,
     [bound, agentId],
   );
-  if (result.rows.length === 0) {
+  const scopedAgent = result.rows[0];
+  if (!scopedAgent) {
     res.status(403).json({
       error: "API key is not scoped to this agent's workspace",
       code: "wrong_workspace",
     });
     return false;
   }
+
+  // Remote Docker registration, placement, and runtime access remain
+  // session-only. In particular, stop/delete use a deliberately privileged
+  // cleanup transport that can outlive a workspace host grant, so a workspace
+  // API key must never inherit that capability from its issuing user.
+  if (isRemoteDockerAgent(scopedAgent)) {
+    res.status(403).json({
+      error: "Remote Docker agent operations require session authentication",
+      code: "session_required",
+    });
+    return false;
+  }
+
+  req.apiKeyAgentScope = {
+    workspaceId: bound,
+    agentId,
+  };
   return true;
+}
+
+function requireApiKeyAgentScope(paramName = "id") {
+  return async (req, res, next) => {
+    try {
+      if (await enforceApiKeyAgentScope(req, res, req.params[paramName])) next();
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+// Mount this at /agents before every agent router, including the gateway.
+// Collection routes are the only paths whose first segment is not an agent id.
+function requireApiKeyAgentPathScope(options = {}) {
+  const collectionSegments = new Set(
+    options.collectionSegments || ["activate-demo", "adopt", "deploy"],
+  );
+  const sessionOnlyNestedSegments = new Set(
+    options.sessionOnlyNestedSegments || ["backups", "export", "files"],
+  );
+  return async (req, res, next) => {
+    if (!req.apiKey) return next();
+    const segments = String(req.path || "")
+      .split("/")
+      .filter(Boolean);
+    const firstSegment = segments[0];
+    if (
+      !firstSegment ||
+      collectionSegments.has(firstSegment) ||
+      (segments.length > 1 && sessionOnlyNestedSegments.has(segments[1]))
+    ) {
+      return next();
+    }
+
+    try {
+      if (await enforceApiKeyAgentScope(req, res, firstSegment)) next();
+    } catch (error) {
+      next(error);
+    }
+  };
 }
 
 // Resource access lookups
@@ -93,6 +188,51 @@ async function findOwnedAgent(agentId, userId) {
     [agentId, userId],
   );
   return result.rows[0] || null;
+}
+
+// Preserve legacy direct-owner semantics for browser sessions while treating
+// a workspace API key as the workspace capability it represents. Callers must
+// still apply the route's scope guard and, for agent-id routes, the exact
+// workspace/Remote-Docker guard before performing side effects.
+async function findAgentForRequest(req, agentId) {
+  if (!agentId) return null;
+  if (req?.apiKey) {
+    const workspaceId = apiKeyWorkspaceId(req);
+    if (!workspaceId) return null;
+    const result = await db.query(
+      `SELECT a.*
+         FROM workspace_agents wa
+         JOIN agents a ON a.id = wa.agent_id
+        WHERE wa.workspace_id = $1 AND wa.agent_id = $2
+        LIMIT 1`,
+      [workspaceId, agentId],
+    );
+    const agent = result.rows[0] || null;
+    // Re-check the loaded row instead of relying only on the earlier path
+    // guard. Placement can change between middleware and the route loader;
+    // returning no capability here keeps that race fail-closed.
+    return assertApiKeyCanAccessLoadedAgent(req, agent);
+  }
+
+  const userId = req?.user?.id;
+  if (!userId) return null;
+  const result = await db.query("SELECT * FROM agents WHERE id = $1 AND user_id = $2", [
+    agentId,
+    userId,
+  ]);
+  return result.rows[0] || null;
+}
+
+async function findAccessibleAgentForRequest(req, agentId, requiredRole = "viewer") {
+  if (req?.apiKey) {
+    // API keys are workspace capabilities. Re-query the exact bound assignment
+    // on every authoritative load instead of falling back to the issuer's
+    // direct ownership or membership in another workspace after a grant is
+    // removed between the path guard and the route handler.
+    return findAgentForRequest(req, agentId);
+  }
+  const agent = await findAccessibleAgent(agentId, req?.user?.id, requiredRole);
+  return assertApiKeyCanAccessLoadedAgent(req, agent);
 }
 
 /**
@@ -206,12 +346,15 @@ function requireOwnedAgent(paramName = "id", attachAs = "agent") {
     try {
       const agentId = req.params[paramName];
       if (!(await enforceApiKeyAgentScope(req, res, agentId))) return;
-      const agent = await findOwnedAgent(agentId, req.user.id);
+      const agent = await findAgentForRequest(req, agentId);
       if (!agent) return res.status(404).json({ error: "Agent not found" });
       req[attachAs] = agent;
       next();
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      res.status(e.statusCode || 500).json({
+        error: e.message,
+        ...(e.code ? { code: e.code } : {}),
+      });
     }
   };
 }
@@ -232,8 +375,8 @@ function requireOwnedWorkspace(paramName = "id", attachAs = "workspace") {
 }
 
 /**
- * Build an agent guard that enforces API-key binding and a minimum workspace
- * role, returning 404 for inaccessible resources and attaching the agent.
+ * Build an agent guard that enforces API-key binding or a session caller's
+ * minimum workspace role, returning 404 when access is unavailable.
  *
  * @param {string} [requiredRole="viewer"] - Minimum workspace role.
  * @param {string} [paramName="id"] - Route parameter containing the agent id.
@@ -248,12 +391,15 @@ function requireAccessibleAgent(requiredRole = "viewer", paramName = "id", attac
     try {
       const agentId = req.params[paramName];
       if (!(await enforceApiKeyAgentScope(req, res, agentId))) return;
-      const agent = await findAccessibleAgent(agentId, req.user.id, requiredRole);
+      const agent = await findAccessibleAgentForRequest(req, agentId, requiredRole);
       if (!agent) return res.status(404).json({ error: "Agent not found" });
       req[attachAs] = agent;
       next();
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      res.status(e.statusCode || 500).json({
+        error: e.message,
+        ...(e.code ? { code: e.code } : {}),
+      });
     }
   };
 }
@@ -295,8 +441,14 @@ module.exports = {
   apiKeyWorkspaceId,
   enforceApiKeyWorkspace,
   enforceApiKeyAgentScope,
+  isRemoteDockerAgent,
+  assertApiKeyCanAccessLoadedAgent,
+  requireApiKeyAgentScope,
+  requireApiKeyAgentPathScope,
   findOwnedAgent,
+  findAgentForRequest,
   findAccessibleAgent,
+  findAccessibleAgentForRequest,
   findAccessibleAgentForActor,
   findOwnedWorkspace,
   findWorkspaceMembership,

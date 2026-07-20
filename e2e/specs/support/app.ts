@@ -2,9 +2,19 @@ import { request as playwrightRequest } from "@playwright/test";
 import type { APIRequestContext, APIResponse, Page } from "@playwright/test";
 
 export const DEFAULT_PASSWORD = "SmokePassword123!";
+export const DEMO_ADMIN_EMAIL = "nora-demo-activation-admin@example.com";
 
 const E2E_BASE_URL = process.env.BASE_URL || "http://127.0.0.1:18080";
 const IGNORE_HTTPS_ERRORS = process.env.ALLOW_LOCAL_HTTPS_ERRORS === "1";
+
+class LoginRequestError extends Error {
+  status: number;
+
+  constructor(status: number, detail: string) {
+    super(`POST /api/auth/login failed with ${status}: ${detail}`);
+    this.status = status;
+  }
+}
 
 // /auth/login responses include a Set-Cookie for `nora_auth`; if that cookie
 // lands in the shared test `request` jar, every subsequent apiJson(_, _,
@@ -20,7 +30,7 @@ async function loginInFreshContext(email: string, password: string): Promise<str
     const res = await ctx.post("/api/auth/login", { data: { email, password } });
     if (!res.ok()) {
       const detail = await res.text().catch(() => "");
-      throw new Error(`POST /api/auth/login failed with ${res.status()}: ${detail}`);
+      throw new LoginRequestError(res.status(), detail);
     }
     const body = (await res.json().catch(() => ({}))) as { token?: unknown };
     if (typeof body.token !== "string" || !body.token) {
@@ -37,6 +47,7 @@ type ApiJsonOptions = {
   token?: string | null;
   data?: unknown;
   failOnStatus?: boolean;
+  timeout?: number;
 };
 
 type ApiJsonResult<T = unknown> = {
@@ -96,7 +107,7 @@ function uniqueName(prefix = "Nora E2E") {
 async function apiJson<T = unknown>(
   request: APIRequestContext,
   path: string,
-  { method = "GET", token = null, data, failOnStatus = true }: ApiJsonOptions = {},
+  { method = "GET", token = null, data, failOnStatus = true, timeout }: ApiJsonOptions = {},
 ): Promise<ApiJsonResult<T>> {
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -106,6 +117,7 @@ async function apiJson<T = unknown>(
     method,
     headers,
     data,
+    timeout,
   });
   const raw = await response.text();
 
@@ -137,6 +149,32 @@ async function createUserSession(
     method: "POST",
     data: { email, password },
   });
+  const token = await loginInFreshContext(email, password);
+  return { email, password, token };
+}
+
+async function ensureUserSession(
+  request: APIRequestContext,
+  { email, password = DEFAULT_PASSWORD }: { email: string; password?: string },
+): Promise<UserSession> {
+  try {
+    const token = await loginInFreshContext(email, password);
+    return { email, password, token };
+  } catch (error) {
+    if (!(error instanceof LoginRequestError) || error.status !== 401) {
+      throw error;
+    }
+  }
+
+  const { response, body } = await apiJson(request, "/api/auth/signup", {
+    method: "POST",
+    data: { email, password },
+    failOnStatus: false,
+  });
+  if (!response.ok()) {
+    const detail = typeof body === "string" ? body : JSON.stringify(body);
+    throw new Error(`POST /api/auth/signup failed with ${response.status()}: ${detail}`);
+  }
   const token = await loginInFreshContext(email, password);
   return { email, password, token };
 }
@@ -313,6 +351,7 @@ export {
   assertJsonRecord,
   authenticatePage,
   createUserSession,
+  ensureUserSession,
   extractIdFromUrl,
   getCurrentUser,
   getPreferredProvider,

@@ -26,6 +26,10 @@ const SCOPE_DEFINITIONS = [
   { value: "monitoring:read", description: "Read monitoring metrics and events" },
   { value: "integrations:read", description: "Read integration configurations" },
   { value: "integrations:write", description: "Create and remove integrations" },
+  {
+    value: "admin:read",
+    description: "Run read-only platform diagnostics as an issuing platform admin",
+  },
 ];
 
 const KNOWN_SCOPES = new Set(SCOPE_DEFINITIONS.map((entry) => entry.value));
@@ -170,8 +174,11 @@ async function verifyApiKey(rawKey) {
             u.role AS user_role,
             u.name AS user_name
        FROM api_keys k
-       LEFT JOIN workspaces w ON w.id = k.workspace_id
-       LEFT JOIN users u ON u.id = k.created_by
+       JOIN workspaces w ON w.id = k.workspace_id
+       JOIN users u ON u.id = k.created_by
+       JOIN workspace_members issuer_membership
+         ON issuer_membership.workspace_id = k.workspace_id
+        AND issuer_membership.user_id = k.created_by
       WHERE k.key_hash = ANY($1::text[])
         AND k.status = $2
         AND k.revoked_at IS NULL
@@ -181,7 +188,7 @@ async function verifyApiKey(rawKey) {
     [candidates, KEY_STATUS_ACTIVE, primaryHash],
   );
   const row = result.rows[0];
-  if (!row) return null;
+  if (!row?.created_by) return null;
 
   if (row.key_hash && row.key_hash !== primaryHash) {
     await db.query("UPDATE api_keys SET key_hash = $1, last_used_at = NOW() WHERE id = $2", [

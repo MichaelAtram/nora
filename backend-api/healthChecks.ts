@@ -21,12 +21,20 @@ async function waitForHttpReady(url, options = {}) {
     timeoutMs = 5000,
     acceptStatuses = [200],
     fetchImpl = fetch,
+    beforeAttempt = null,
   } = options;
 
   let lastStatus = null;
   let lastError = null;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    // Authorization hooks run outside the network-error catch so revocation or
+    // an authorization-store failure stops polling instead of being flattened
+    // into a retryable runtime reachability error.
+    if (typeof beforeAttempt === "function") {
+      await beforeAttempt({ attempt, url });
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -78,7 +86,7 @@ async function waitForAgentReadiness(
     runtimePort = AGENT_RUNTIME_PORT,
     gatewayHostPort = null,
     gatewayHost = null,
-    gatewayPort = OPENCLAW_GATEWAY_PORT,
+    gatewayPort = null,
     checkGateway = true,
   } = {},
   options = {},
@@ -93,22 +101,36 @@ async function waitForAgentReadiness(
       intervalMs: 5000,
       timeoutMs: 5000,
       acceptStatuses: [200],
+      ...(typeof options.beforeAttempt === "function"
+        ? { beforeAttempt: options.beforeAttempt }
+        : {}),
       ...options.runtime,
     },
   );
 
   let gateway = null;
   if (checkGateway) {
-    const resolvedGatewayHost = gatewayHostPort
-      ? gatewayHost || process.env.GATEWAY_HOST || "host.docker.internal"
-      : gatewayHost || host;
-    const resolvedGatewayPort = gatewayHostPort || gatewayPort || OPENCLAW_GATEWAY_PORT;
+    // Prefer an explicit runtime-internal endpoint when the backend supplies
+    // one. Local Docker can then bind its optional host-published port to
+    // loopback without breaking readiness from the provisioner container.
+    const hasExplicitGatewayEndpoint = Boolean(gatewayHost && gatewayPort);
+    const resolvedGatewayHost = hasExplicitGatewayEndpoint
+      ? gatewayHost
+      : gatewayHostPort
+        ? gatewayHost || process.env.GATEWAY_HOST || "host.docker.internal"
+        : gatewayHost || host;
+    const resolvedGatewayPort = hasExplicitGatewayEndpoint
+      ? gatewayPort
+      : gatewayHostPort || gatewayPort || OPENCLAW_GATEWAY_PORT;
 
     gateway = await waitForHttpReady(gatewayUrl(resolvedGatewayHost, resolvedGatewayPort, "/"), {
       attempts: 15,
       intervalMs: 10000,
       timeoutMs: 5000,
       acceptStatuses: [200, 401, 403],
+      ...(typeof options.beforeAttempt === "function"
+        ? { beforeAttempt: options.beforeAttempt }
+        : {}),
       ...options.gateway,
     });
     gateway = {

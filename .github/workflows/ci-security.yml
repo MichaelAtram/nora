@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+env:
+  KUBECONFORM_VERSION: v0.7.0
+  KUBECONFORM_CHECKSUMS_SHA256: 3b8bfbac6e662823a51292368b0c25bc04001a32b006f04aafdf348c091d243f
+
 jobs:
   secret-scan:
     name: Sensitive config scan
@@ -38,6 +42,7 @@ jobs:
           - frontend-marketing
           - backend-api
           - agent-runtime
+          - workers/backup
           - workers/provisioner
           - e2e
           - mcp-server
@@ -68,6 +73,7 @@ jobs:
           - frontend-marketing
           - backend-api
           - agent-runtime
+          - workers/backup
           - workers/provisioner
           - e2e
           - mcp-server
@@ -104,7 +110,56 @@ jobs:
       - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
       - name: Install kubeconform
         run: |
-          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz \
-            | tar -xz kubeconform
-          sudo mv kubeconform /usr/local/bin/kubeconform
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/kubeconform"
+          archive="kubeconform-linux-amd64.tar.gz"
+          release_url="https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}"
+          mkdir -p "${install_dir}"
+          curl --retry 3 --retry-all-errors -fsSLo "${install_dir}/${archive}" \
+            "${release_url}/${archive}"
+          curl --retry 3 --retry-all-errors -fsSLo "${install_dir}/CHECKSUMS" \
+            "${release_url}/CHECKSUMS"
+          printf '%s  %s\n' "${KUBECONFORM_CHECKSUMS_SHA256}" \
+            "${install_dir}/CHECKSUMS" | sha256sum -c -
+          expected="$(awk -v name="${archive}" '$2 == name {print $1}' "${install_dir}/CHECKSUMS")"
+          test -n "${expected}"
+          printf '%s  %s\n' "${expected}" "${install_dir}/${archive}" | sha256sum -c -
+          tar -xzf "${install_dir}/${archive}" -C "${install_dir}" kubeconform
+          sudo install -m 0755 "${install_dir}/kubeconform" /usr/local/bin/kubeconform
       - run: npm run ci:validate-infra
+
+  security-gate:
+    name: Security gate
+    if: ${{ always() }}
+    needs:
+      - secret-scan
+      - dependency-audit
+      - license-compliance
+      - infra-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every security job to succeed
+        shell: bash
+        env:
+          SECURITY_RESULTS: >-
+            secret-scan=${{ needs.secret-scan.result }}
+            dependency-audit=${{ needs.dependency-audit.result }}
+            license-compliance=${{ needs.license-compliance.result }}
+            infra-validation=${{ needs.infra-validation.result }}
+        run: |
+          set -euo pipefail
+          failed=()
+          for job_result in ${SECURITY_RESULTS}; do
+            job="${job_result%%=*}"
+            result="${job_result#*=}"
+            if [ "${result}" != "success" ]; then
+              failed+=("${job}=${result}")
+            fi
+          done
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf 'Security gate failed: %s\n' "${failed[*]}" >&2
+            exit 1
+          fi
+
+          echo "Every CI Security job succeeded."

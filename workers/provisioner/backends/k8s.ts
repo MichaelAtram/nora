@@ -3,12 +3,15 @@ const k8s = require("@kubernetes/client-node");
 const crypto = require("crypto");
 const ProvisionerBackend = require("./interface");
 const {
-  buildMcpServersConfig,
   buildOpenClawAuthImportFromFileCommand,
+  buildOpenClawGatewayPairingCommand,
   buildOpenClawInstallCommand,
+  buildOpenClawManagedConfigEnvPruneCommand,
   buildRuntimeBootstrapCommand,
   buildTemplatePayloadBootstrapCommand,
   buildRuntimeEnv,
+  encodeOpenClawManagedMcpServers,
+  OPENCLAW_MANAGED_MCP_SERVERS_ENV,
 } = require("../../../agent-runtime/lib/runtimeBootstrap");
 const {
   OPENCLAW_GATEWAY_PORT,
@@ -42,6 +45,14 @@ const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
 const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
+const HERMES_INIT_CAPABILITIES = Object.freeze([
+  "CHOWN",
+  "DAC_OVERRIDE",
+  "FOWNER",
+  "KILL",
+  "SETGID",
+  "SETUID",
+]);
 const BOOTSTRAP_CONFIGMAP_KEY = "bootstrap.sh";
 const BOOTSTRAP_MOUNT_PATH = "/opt/nora-bootstrap";
 const BOOTSTRAP_SCRIPT_PATH = `${BOOTSTRAP_MOUNT_PATH}/${BOOTSTRAP_CONFIGMAP_KEY}`;
@@ -62,6 +73,8 @@ const K8S_UNAVAILABLE_CAPABILITIES = Object.freeze({
   pids: false,
 });
 const OPERATOR_POLICY_FAMILIES = Object.freeze(["openclaw", "hermes"]);
+const MANAGED_ENV_NAMES_ANNOTATION = "nora.solomontsao.com/managed-env-names";
+const K8S_MANAGED_ENV_STATE_ENV = "NORA_K8S_MANAGED_ENV_B64";
 const SENSITIVE_ENV_PATTERNS = Object.freeze([
   /API_KEY/i,
   /TOKEN/i,
@@ -80,6 +93,7 @@ const SENSITIVE_ENV_PATTERNS = Object.freeze([
   /^NORA_HERMES_MANAGED_ENV_B64$/i,
   /^NORA_HERMES_MODEL_CONFIG_B64$/i,
 ]);
+const RUNTIME_IDENTITY_SECRET_ENV_NAMES = new Set(["API_SERVER_KEY", "OPENCLAW_GATEWAY_TOKEN"]);
 
 function parseK8sCpuCores(value) {
   if (value == null) return null;
@@ -175,6 +189,22 @@ function safeHostname(name, fallback) {
   );
 }
 
+function podSecurityContext() {
+  return {
+    seccompProfile: { type: "RuntimeDefault" },
+  };
+}
+
+function containerSecurityContext({ hermesInit = false } = {}) {
+  const capabilities = { drop: ["ALL"] };
+  if (hermesInit) capabilities.add = [...HERMES_INIT_CAPABILITIES];
+
+  return {
+    allowPrivilegeEscalation: false,
+    capabilities,
+  };
+}
+
 function safeK8sName(name, fallback) {
   return safeHostname(name, fallback).slice(0, 63) || fallback;
 }
@@ -183,12 +213,33 @@ function isSensitiveEnvName(name) {
   return SENSITIVE_ENV_PATTERNS.some((pattern) => pattern.test(String(name || "")));
 }
 
-function buildEnvEntries(envMap = {}, secretName = "") {
+function parseManagedEnvNamesAnnotation(value) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(String(value));
+    return Array.isArray(parsed)
+      ? [...new Set(parsed.map((name) => String(name || "").trim()).filter(Boolean))]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function managedEnvNamesAnnotation(names = []) {
+  return JSON.stringify(
+    [...new Set((Array.isArray(names) ? names : []).map(String).map((name) => name.trim()))]
+      .filter(Boolean)
+      .sort(),
+  );
+}
+
+function buildEnvEntries(envMap = {}, secretName = "", { forceSecretNames = [] } = {}) {
   const env = [];
   const stringData = {};
+  const forced = new Set((forceSecretNames || []).map((name) => String(name || "").trim()));
   for (const [key, value] of Object.entries(envMap || {})) {
     if (!key || value == null) continue;
-    if (isSensitiveEnvName(key)) {
+    if (forced.has(key) || isSensitiveEnvName(key)) {
       stringData[key] = String(value);
       env.push({
         name: key,
@@ -196,6 +247,7 @@ function buildEnvEntries(envMap = {}, secretName = "") {
           secretKeyRef: {
             name: secretName,
             key,
+            optional: true,
           },
         },
       });
@@ -206,6 +258,53 @@ function buildEnvEntries(envMap = {}, secretName = "") {
   return { env, stringData };
 }
 
+function ensureManagedSecretEnvEntries(env = [], managedNames = [], secretName = "") {
+  const next = [...env];
+  const existing = new Set(next.map((entry) => String(entry?.name || "")).filter(Boolean));
+  for (const rawName of managedNames || []) {
+    const name = String(rawName || "").trim();
+    if (!name || existing.has(name)) continue;
+    next.push({
+      name,
+      valueFrom: { secretKeyRef: { name: secretName, key: name, optional: true } },
+    });
+    existing.add(name);
+  }
+  return next;
+}
+
+function encodeKubernetesManagedEnvState(managedNames = [], values = {}) {
+  return Buffer.from(
+    JSON.stringify({
+      managedNames: [...new Set((managedNames || []).map(String).filter(Boolean))].sort(),
+      values: Object.fromEntries(
+        Object.entries(values || {}).map(([name, value]) => [String(name), String(value ?? "")]),
+      ),
+    }),
+    "utf8",
+  ).toString("base64");
+}
+
+function buildKubernetesManagedEnvApplyCommand() {
+  return [
+    `if [ -n "\${${K8S_MANAGED_ENV_STATE_ENV}:-}" ]; then`,
+    "  nora_k8s_managed_env_commands=\"$(node <<'__NORA_K8S_MANAGED_ENV__'",
+    `const encoded = String(process.env.${K8S_MANAGED_ENV_STATE_ENV} || '');`,
+    "const state = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));",
+    "const validName = /^[A-Za-z_][A-Za-z0-9_]*$/;",
+    "const names = Array.isArray(state.managedNames) ? state.managedNames : [];",
+    "const values = state && state.values && typeof state.values === 'object' && !Array.isArray(state.values) ? state.values : {};",
+    "const quote = (value) => `'${String(value).replace(/'/g, `'\\\"'\\\"'`)}'`;",
+    "for (const name of names) { if (!validName.test(String(name))) throw new Error('Invalid managed env name'); process.stdout.write(`unset ${name}\\n`); }",
+    "for (const [name, value] of Object.entries(values)) { if (!validName.test(name)) throw new Error('Invalid managed env name'); process.stdout.write(`export ${name}=${quote(value)}\\n`); }",
+    "__NORA_K8S_MANAGED_ENV__",
+    '  )"',
+    '  eval "$nora_k8s_managed_env_commands"',
+    "  unset nora_k8s_managed_env_commands",
+    "fi",
+  ].join("\n");
+}
+
 function defaultDeployNameForRuntime(runtimeFamily, id, name) {
   const prefix = runtimeFamily === "hermes" ? "nora-hermes" : "nora-oclaw";
   return safeK8sName(`${prefix}-${name || "agent"}-${id}`, `${prefix}-${id}`);
@@ -214,6 +313,7 @@ function defaultDeployNameForRuntime(runtimeFamily, id, name) {
 function buildHermesStartCommand() {
   const hermesRuntimeCommand = [
     "set -eu",
+    buildKubernetesManagedEnvApplyCommand(),
     buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
@@ -238,7 +338,7 @@ function buildHermesPostStartCommand() {
   ].join("\n");
 }
 
-function buildOpenClawRuntimeAuthBootstrapCommand({ mcpServers = null } = {}) {
+function buildOpenClawRuntimeAuthBootstrapCommand() {
   const providerMap = {
     ANTHROPIC_API_KEY: "anthropic",
     OPENAI_API_KEY: "openai",
@@ -331,9 +431,9 @@ function buildOpenClawRuntimeAuthBootstrapCommand({ mcpServers = null } = {}) {
     `const staticEndpointMap = ${JSON.stringify(staticEndpointMap)};`,
     `const apiVersionEnvMap = ${JSON.stringify(apiVersionEnvMap)};`,
     `const foundryModels = ${JSON.stringify(foundryModels)};`,
-    `const mcpServers = ${JSON.stringify(mcpServers && typeof mcpServers === "object" ? mcpServers : null)};`,
     "const authPath = '/root/.openclaw/agents/main/agent/auth-profiles.json';",
     "const configPath = '/root/.openclaw/openclaw.json';",
+    "const defaultModelMarkerPath = '/root/.openclaw/.nora-managed-default-model';",
     "const auth = { version: 1, profiles: {}, order: {}, lastGood: {} };",
     "for (const [envKey, provider] of Object.entries(providerMap)) {",
     "  const key = process.env[envKey];",
@@ -371,32 +471,47 @@ function buildOpenClawRuntimeAuthBootstrapCommand({ mcpServers = null } = {}) {
     "}",
     "const foundryKey = process.env.MICROSOFT_FOUNDRY_API_KEY;",
     "const foundryBaseUrlRaw = process.env.MICROSOFT_FOUNDRY_BASE_URL;",
+    "config.models = config.models && typeof config.models === 'object' && !Array.isArray(config.models) ? config.models : {};",
+    "config.models.providers = config.models.providers && typeof config.models.providers === 'object' && !Array.isArray(config.models.providers) ? config.models.providers : {};",
+    "delete config.models.providers['azure-openai-responses'];",
     "if (foundryKey && foundryBaseUrlRaw) {",
-    "  config.models = config.models && typeof config.models === 'object' ? config.models : {};",
-    "  config.models.providers = config.models.providers && typeof config.models.providers === 'object' ? config.models.providers : {};",
     "  config.models.providers['azure-openai-responses'] = {",
     "    api: 'azure-openai-responses',",
     "    baseUrl: String(foundryBaseUrlRaw).replace(/\\/+$/, ''),",
-    "    apiKey: foundryKey,",
     "    models: buildFoundryModelEntries(),",
     "  };",
     "}",
-    "if (defaultModel) {",
-    "  config.agents = config.agents && typeof config.agents === 'object' ? config.agents : {};",
-    "  config.agents.defaults = config.agents.defaults && typeof config.agents.defaults === 'object' ? config.agents.defaults : {};",
-    "  config.agents.defaults.model = { primary: defaultModel };",
-    "  config.agents.defaults.models = config.agents.defaults.models && typeof config.agents.defaults.models === 'object' ? config.agents.defaults.models : {};",
-    "  config.agents.defaults.models[defaultModel] = config.agents.defaults.models[defaultModel] || {};",
+    "if (Object.keys(config.models.providers).length === 0) delete config.models.providers;",
+    "if (Object.keys(config.models).length === 0) delete config.models;",
+    "let previousManagedModel = '';",
+    "try { previousManagedModel = String(fs.readFileSync(defaultModelMarkerPath, 'utf8') || '').trim(); } catch {}",
+    "config.agents = config.agents && typeof config.agents === 'object' && !Array.isArray(config.agents) ? config.agents : {};",
+    "config.agents.defaults = config.agents.defaults && typeof config.agents.defaults === 'object' && !Array.isArray(config.agents.defaults) ? config.agents.defaults : {};",
+    "config.agents.defaults.model = config.agents.defaults.model && typeof config.agents.defaults.model === 'object' && !Array.isArray(config.agents.defaults.model) ? config.agents.defaults.model : {};",
+    "config.agents.defaults.models = config.agents.defaults.models && typeof config.agents.defaults.models === 'object' && !Array.isArray(config.agents.defaults.models) ? config.agents.defaults.models : {};",
+    "if (previousManagedModel) {",
+    "  delete config.agents.defaults.models[previousManagedModel];",
+    "  if (config.agents.defaults.model.primary === previousManagedModel) delete config.agents.defaults.model.primary;",
     "}",
-    // Nora owns the mcpServers block: replace it wholesale with the
-    // provision-time value (same semantics as the docker backend, which bakes
-    // it into the create-time openclaw.json; changes flow via redeploy).
-    "if (mcpServers) {",
-    "  if (Object.keys(mcpServers).length > 0) {",
-    "    config.mcpServers = mcpServers;",
-    "  } else {",
-    "    delete config.mcpServers;",
-    "  }",
+    "if (defaultModel) {",
+    "  config.agents.defaults.model.primary = defaultModel;",
+    "  config.agents.defaults.models[defaultModel] = config.agents.defaults.models[defaultModel] || {};",
+    "  fs.writeFileSync(defaultModelMarkerPath, `${defaultModel}\\n`, { mode: 0o600 });",
+    "} else {",
+    "  try { fs.rmSync(defaultModelMarkerPath, { force: true }); } catch {}",
+    "}",
+    "if (Object.keys(config.agents.defaults.model).length === 0) delete config.agents.defaults.model;",
+    "if (Object.keys(config.agents.defaults.models).length === 0) delete config.agents.defaults.models;",
+    "if (Object.keys(config.agents.defaults).length === 0) delete config.agents.defaults;",
+    "if (Object.keys(config.agents).length === 0) delete config.agents;",
+    `const managedMcpEncoded = String(process.env.${OPENCLAW_MANAGED_MCP_SERVERS_ENV} || '');`,
+    "if (managedMcpEncoded) {",
+    "  let desiredMcpServers = {};",
+    "  try { desiredMcpServers = JSON.parse(Buffer.from(managedMcpEncoded, 'base64').toString('utf8')); } catch { throw new Error('Invalid managed MCP server configuration'); }",
+    "  if (!desiredMcpServers || typeof desiredMcpServers !== 'object' || Array.isArray(desiredMcpServers)) throw new Error('Managed MCP server configuration must be an object');",
+    "  for (const server of Object.values(desiredMcpServers)) { if (server && typeof server === 'object') delete server.env; }",
+    "  if (Object.keys(desiredMcpServers).length > 0) config.mcpServers = desiredMcpServers;",
+    "  else delete config.mcpServers;",
     "}",
     "fs.mkdirSync('/root/.openclaw', { recursive: true });",
     "fs.writeFileSync(configPath, JSON.stringify(config, null, 2));",
@@ -1714,6 +1829,41 @@ class K8sBackend extends ProvisionerBackend {
     return name;
   }
 
+  async _replaceManagedEnvSecretData(
+    deployName,
+    stringData = {},
+    managedNames = [],
+    namespace = this.namespace,
+  ) {
+    const name = this._envSecretName(deployName);
+    const managed = new Set((managedNames || []).map((entry) => String(entry || "").trim()));
+    let current = null;
+    try {
+      current = this._serviceObject(await this.coreApi.readNamespacedSecret({ name, namespace }));
+    } catch (error) {
+      if (!this._isNotFoundError(error)) throw error;
+    }
+
+    if (!current) {
+      if (Object.keys(stringData).length === 0) return name;
+      return this._upsertEnvSecret(deployName, stringData, {}, namespace);
+    }
+
+    const data = Object.fromEntries(
+      Object.entries(current.data || {}).filter(([key]) => !managed.has(key)),
+    );
+    const body = {
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: current.metadata,
+      type: current.type || "Opaque",
+      data,
+      stringData,
+    };
+    await this.coreApi.replaceNamespacedSecret({ name, namespace, body });
+    return name;
+  }
+
   async _deleteEnvSecretIfExists(deployName, namespace) {
     const name = this._envSecretName(deployName);
     try {
@@ -1758,6 +1908,9 @@ class K8sBackend extends ProvisionerBackend {
 
   async _createHermes(config, deployName) {
     const { id, name, image, vcpu, ram_mb, disk_gb, env } = config;
+    const credentialManagedEnvNames = Array.isArray(config.credentialManagedEnvNames)
+      ? config.credentialManagedEnvNames
+      : [];
     const namespace = this._namespaceForRuntimeFamily("hermes");
     const imgName = image || getHermesDockerAgentImage();
     const apiServerKey = config.gatewayToken || crypto.randomBytes(32).toString("hex");
@@ -1788,6 +1941,7 @@ class K8sBackend extends ProvisionerBackend {
 
     const hermesEnvMap = {
       ...(env || {}),
+      [K8S_MANAGED_ENV_STATE_ENV]: encodeKubernetesManagedEnvState(credentialManagedEnvNames, {}),
       HERMES_HOME,
       HOME: `${HERMES_HOME}/home`,
       API_SERVER_ENABLED: "true",
@@ -1799,10 +1953,12 @@ class K8sBackend extends ProvisionerBackend {
       TERMINAL_CWD: HERMES_WORKSPACE,
     };
     const hermesSecretName = this._envSecretName(deployName);
-    const { env: envVars, stringData: hermesSecretData } = buildEnvEntries(
+    const { env: baseEnvVars, stringData: hermesSecretData } = buildEnvEntries(
       hermesEnvMap,
       hermesSecretName,
+      { forceSecretNames: [...credentialManagedEnvNames, K8S_MANAGED_ENV_STATE_ENV] },
     );
+    const envVars = baseEnvVars;
     if (Object.keys(hermesSecretData).length > 0) {
       await this._upsertEnvSecret(
         deployName,
@@ -1832,6 +1988,9 @@ class K8sBackend extends ProvisionerBackend {
       metadata: {
         name: deployName,
         namespace,
+        annotations: {
+          [MANAGED_ENV_NAMES_ANNOTATION]: managedEnvNamesAnnotation(credentialManagedEnvNames),
+        },
         labels: {
           app: "hermes-agent",
           "nora.agent.id": String(id),
@@ -1865,6 +2024,7 @@ class K8sBackend extends ProvisionerBackend {
           },
           spec: {
             hostname: safeHostname(name || deployName, `hermes-${id}`),
+            securityContext: podSecurityContext(),
             containers: [
               {
                 name: "agent",
@@ -1872,6 +2032,7 @@ class K8sBackend extends ProvisionerBackend {
                 args: hermesLaunchArgs,
                 workingDir: HERMES_HOME,
                 env: envVars,
+                securityContext: containerSecurityContext({ hermesInit: true }),
                 lifecycle: {
                   postStart: {
                     exec: {
@@ -1956,6 +2117,9 @@ class K8sBackend extends ProvisionerBackend {
     }
     const namespace = this._namespaceForRuntimeFamily("openclaw");
     const isNemoClaw = sandboxProfile === "nemoclaw";
+    const credentialManagedEnvNames = Array.isArray(config.credentialManagedEnvNames)
+      ? config.credentialManagedEnvNames
+      : [];
     const sandboxLabelMap = this._sandboxProfileLabelMap(isNemoClaw);
     const nemoModel = env?.NEMOCLAW_MODEL || getNemoClawDefaultModel(process.env);
 
@@ -1971,56 +2135,6 @@ class K8sBackend extends ProvisionerBackend {
     // Generate per-agent Gateway auth token
     const gatewayToken = config.gatewayToken || crypto.randomBytes(16).toString("hex");
 
-    // Derive deterministic Ed25519 device identity from gatewayToken
-    const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
-    const PKCS8_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
-    const seed = crypto
-      .createHash("sha256")
-      .update("openclaw-device:" + gatewayToken)
-      .digest();
-    const privateDer = Buffer.concat([PKCS8_PREFIX, seed]);
-    const privateKey = crypto.createPrivateKey({ key: privateDer, format: "der", type: "pkcs8" });
-    const publicKey = crypto.createPublicKey(privateKey);
-    const spki = publicKey.export({ type: "spki", format: "der" });
-    const rawPub = spki.subarray(ED25519_SPKI_PREFIX.length);
-    const deviceId = crypto.createHash("sha256").update(rawPub).digest("hex");
-    const pubB64 = rawPub
-      .toString("base64")
-      .replaceAll("+", "-")
-      .replaceAll("/", "_")
-      .replace(/=+$/g, "");
-    const allScopes = [
-      "operator.admin",
-      "operator.read",
-      "operator.write",
-      "operator.approvals",
-      "operator.pairing",
-    ];
-    const nowMs = Date.now();
-    const pairedJson = JSON.stringify({
-      [deviceId]: {
-        deviceId,
-        publicKey: pubB64,
-        platform: "linux",
-        clientId: "gateway-client",
-        clientMode: "backend",
-        role: "operator",
-        roles: ["operator"],
-        scopes: allScopes,
-        approvedScopes: allScopes,
-        tokens: {
-          operator: {
-            token: crypto.randomBytes(32).toString("hex"),
-            role: "operator",
-            scopes: allScopes,
-            createdAtMs: nowMs,
-          },
-        },
-        createdAtMs: nowMs,
-        approvedAtMs: nowMs,
-      },
-    });
-
     const openClawEnvMap = {
       ...(env || {}),
       ...buildRuntimeEnv(),
@@ -2030,18 +2144,20 @@ class K8sBackend extends ProvisionerBackend {
             OPENCLAW_CLI_PATH: "/usr/bin/openclaw",
             OPENCLAW_TSX_BIN: "/usr/bin/tsx",
             NEMOCLAW_MODEL: nemoModel,
-            ...(process.env.NVIDIA_API_KEY && !env?.NVIDIA_API_KEY
-              ? { NVIDIA_API_KEY: process.env.NVIDIA_API_KEY }
-              : {}),
           }
         : {}),
       OPENCLAW_GATEWAY_TOKEN: gatewayToken,
+      [OPENCLAW_MANAGED_MCP_SERVERS_ENV]:
+        env?.[OPENCLAW_MANAGED_MCP_SERVERS_ENV] || encodeOpenClawManagedMcpServers({}),
+      [K8S_MANAGED_ENV_STATE_ENV]: encodeKubernetesManagedEnvState(credentialManagedEnvNames, {}),
     };
     const openClawSecretName = this._envSecretName(deployName);
-    const { env: envVars, stringData: openClawSecretData } = buildEnvEntries(
+    const { env: baseEnvVars, stringData: openClawSecretData } = buildEnvEntries(
       openClawEnvMap,
       openClawSecretName,
+      { forceSecretNames: [...credentialManagedEnvNames, K8S_MANAGED_ENV_STATE_ENV] },
     );
+    const envVars = baseEnvVars;
     if (Object.keys(openClawSecretData).length > 0) {
       await this._upsertEnvSecret(
         deployName,
@@ -2058,7 +2174,6 @@ class K8sBackend extends ProvisionerBackend {
 
     // CMD: install openclaw, configure gateway with pre-paired device, start the
     // runtime sidecar, then launch the gateway.
-    const escapedPaired = pairedJson.replace(/'/g, "'\\''");
     const runtimeBootstrapCmd = buildRuntimeBootstrapCommand();
     const templateBootstrapCmd = buildTemplatePayloadBootstrapCommand(templatePayload);
     // Same package spec as the docker backend (OPENCLAW_DOCKER_PACKAGE /
@@ -2105,28 +2220,33 @@ class K8sBackend extends ProvisionerBackend {
           },
         }).replace(/'/g, "'\\''")}' > /opt/openclaw/policy.yaml && `
       : "";
-    const mcpServersConfig =
-      Array.isArray(config.mcpServers) && config.mcpServers.length > 0
-        ? buildMcpServersConfig(config.mcpServers)
-        : {};
     // openclaw.json is seeded only when absent: the pod's state volume outlives
     // pod replacement, and an unconditional write would wipe channel config,
     // provider registrations, and default-model changes accumulated since
     // provisioning. The auth bootstrap below MERGES into the existing file.
     const gatewayScript =
       "set -eu\n" +
+      buildKubernetesManagedEnvApplyCommand() +
+      "\n" +
+      buildOpenClawManagedConfigEnvPruneCommand(
+        [K8S_MANAGED_ENV_STATE_ENV, "OPENCLAW_GATEWAY_TOKEN"],
+        {
+          managedStateEnvName: K8S_MANAGED_ENV_STATE_ENV,
+          defaultHome: isNemoClaw ? "/sandbox" : "/root",
+        },
+      ) +
+      "\n" +
       ensureOpenClawCmd +
       "mkdir -p ~/.openclaw/devices && " +
       `[ -f ~/.openclaw/openclaw.json ] || echo '{"gateway":{"port":${OPENCLAW_GATEWAY_PORT},"bind":"lan","mode":"local"}}' > ~/.openclaw/openclaw.json && ` +
-      `echo '${escapedPaired}' > ~/.openclaw/devices/paired.json && ` +
-      `echo '{}' > ~/.openclaw/devices/pending.json && ` +
+      buildOpenClawGatewayPairingCommand({ defaultHome: isNemoClaw ? "/sandbox" : "/root" }) +
+      "\n" +
       nemoPolicyCmd +
-      buildOpenClawRuntimeAuthBootstrapCommand({ mcpServers: mcpServersConfig }) +
+      buildOpenClawRuntimeAuthBootstrapCommand() +
       templateBootstrapCmd +
       runtimeBootstrapCmd +
       '"$OPENCLAW_BIN" gateway --port ' +
-      OPENCLAW_GATEWAY_PORT +
-      ` --password ${gatewayToken}`;
+      OPENCLAW_GATEWAY_PORT;
     const gatewayBootstrap = buildContainerBootstrap(gatewayScript);
     const bootstrapConfigMapName = await this._upsertBootstrapConfigMap(
       deployName,
@@ -2164,6 +2284,9 @@ class K8sBackend extends ProvisionerBackend {
       metadata: {
         name: deployName,
         namespace,
+        annotations: {
+          [MANAGED_ENV_NAMES_ANNOTATION]: managedEnvNamesAnnotation([...credentialManagedEnvNames]),
+        },
         labels: {
           app: "openclaw-agent",
           "nora.agent.id": String(id),
@@ -2208,6 +2331,7 @@ class K8sBackend extends ProvisionerBackend {
                 .replace(/-+/g, "-")
                 .replace(/^-|-$/g, "")
                 .slice(0, 63) || `agent-${id}`,
+            securityContext: podSecurityContext(),
             containers: [
               {
                 name: "agent",
@@ -2216,6 +2340,7 @@ class K8sBackend extends ProvisionerBackend {
                 args: gatewayLaunch.args,
                 workingDir: isNemoClaw ? "/sandbox" : undefined,
                 env: envVars,
+                securityContext: containerSecurityContext(),
                 volumeMounts: [
                   this._bootstrapVolumeMount(),
                   this._stateVolumeMount(stateMountPath),
@@ -2635,36 +2760,110 @@ class K8sBackend extends ProvisionerBackend {
   async updateEnv(containerId, envVars = {}, options = {}) {
     const deployName = containerId;
     const entries = Object.entries(envVars || {}).filter(([key]) => key);
-    if (entries.length === 0) return;
+    const managedEnvNames = new Set(
+      (Array.isArray(options?.managedEnvNames) ? options.managedEnvNames : [])
+        .map((name) => String(name || "").trim())
+        .filter(Boolean),
+    );
+    if (entries.length === 0 && managedEnvNames.size === 0) return;
 
     const { deployment, namespace } = await this._readDeploymentInCandidateNamespace(
       deployName,
       options,
     );
+    const previousManagedEnvNames = new Set(
+      parseManagedEnvNamesAnnotation(
+        deployment?.metadata?.annotations?.[MANAGED_ENV_NAMES_ANNOTATION],
+      ),
+    );
     const containers = deployment?.spec?.template?.spec?.containers || [];
     const containerIndex = containers.findIndex((container) => container?.name === "agent");
     const index = containerIndex >= 0 ? containerIndex : 0;
     const env = Array.isArray(containers[index]?.env) ? containers[index].env : [];
-    const envIndexByName = new Map(env.map((entry, entryIndex) => [entry.name, entryIndex]));
+    if (options?.replaceManagedState === true && previousManagedEnvNames.size === 0) {
+      // Upgrade path for Deployments created before the managed-name annotation
+      // existed. Nora owns provider/integration credential env on these pods;
+      // retain only runtime identity tokens that are managed by their own
+      // lifecycle, not by provider reconciliation.
+      for (const entry of env) {
+        const name = String(entry?.name || "");
+        if (isSensitiveEnvName(name) && !RUNTIME_IDENTITY_SECRET_ENV_NAMES.has(name)) {
+          previousManagedEnvNames.add(name);
+        }
+      }
+    }
+    if (options?.replaceManagedState === true) {
+      const nextManagedEnvNames = new Set([...previousManagedEnvNames, ...managedEnvNames]);
+      const managedValues = Object.fromEntries(
+        entries
+          .map(([name, value]) => [String(name), String(value ?? "")])
+          .filter(([name]) => nextManagedEnvNames.has(name)),
+      );
+      const secretName = this._envSecretName(deployName);
+      await this._replaceManagedEnvSecretData(
+        deployName,
+        {
+          [K8S_MANAGED_ENV_STATE_ENV]: encodeKubernetesManagedEnvState(
+            [...nextManagedEnvNames],
+            managedValues,
+          ),
+        },
+        [...nextManagedEnvNames, K8S_MANAGED_ENV_STATE_ENV],
+        namespace,
+      );
+
+      let nextEnv = env.filter((entry) => !nextManagedEnvNames.has(String(entry?.name || "")));
+      nextEnv = ensureManagedSecretEnvEntries(nextEnv, [K8S_MANAGED_ENV_STATE_ENV], secretName);
+      const nextAnnotations = {
+        ...(deployment?.metadata?.annotations || {}),
+        [MANAGED_ENV_NAMES_ANNOTATION]: managedEnvNamesAnnotation([...nextManagedEnvNames]),
+      };
+      const patch = [];
+      if (JSON.stringify(nextEnv) !== JSON.stringify(env)) {
+        patch.push({
+          op: Array.isArray(containers[index]?.env) ? "replace" : "add",
+          path: `/spec/template/spec/containers/${index}/env`,
+          value: nextEnv,
+        });
+      }
+      if (
+        JSON.stringify(nextAnnotations) !== JSON.stringify(deployment?.metadata?.annotations || {})
+      ) {
+        patch.push({
+          op: deployment?.metadata?.annotations ? "replace" : "add",
+          path: "/metadata/annotations",
+          value: nextAnnotations,
+        });
+      }
+      if (patch.length > 0) {
+        await this.appsApi.patchNamespacedDeployment({
+          name: deployName,
+          namespace,
+          body: patch,
+        });
+      }
+      console.log(`[k8s] Staged ${entries.length} managed env var(s) on deployment ${deployName}`);
+      return;
+    }
     const envPath = `/spec/template/spec/containers/${index}/env`;
     const patch = [];
+    const replaceManagedState = false;
 
     if (options?.runtimeFamily === "hermes") {
-      patch.push({
-        op: containers[index]?.lifecycle ? "replace" : "add",
-        path: `/spec/template/spec/containers/${index}/lifecycle`,
-        value: {
-          postStart: {
-            exec: {
-              command: ["/bin/sh", "-lc", buildHermesPostStartCommand()],
-            },
+      const lifecycle = {
+        postStart: {
+          exec: {
+            command: ["/bin/sh", "-lc", buildHermesPostStartCommand()],
           },
         },
-      });
-    }
-
-    if (!Array.isArray(containers[index]?.env)) {
-      patch.push({ op: "add", path: envPath, value: [] });
+      };
+      if (JSON.stringify(containers[index]?.lifecycle || null) !== JSON.stringify(lifecycle)) {
+        patch.push({
+          op: containers[index]?.lifecycle ? "replace" : "add",
+          path: `/spec/template/spec/containers/${index}/lifecycle`,
+          value: lifecycle,
+        });
+      }
     }
 
     // Sensitive values go into the env Secret and are referenced via
@@ -2673,35 +2872,82 @@ class K8sBackend extends ProvisionerBackend {
     // anyone with `get deployment`) and let the Secret drift.
     const secretName = this._envSecretName(deployName);
     const sensitiveData = {};
+    const nextEntries = [];
     for (const [name, value] of entries) {
       const key = String(name);
       const stringValue = String(value ?? "");
       let nextEntry;
-      if (isSensitiveEnvName(key)) {
+      if (replaceManagedState || managedEnvNames.has(key) || isSensitiveEnvName(key)) {
         sensitiveData[key] = stringValue;
-        nextEntry = { name: key, valueFrom: { secretKeyRef: { name: secretName, key } } };
+        nextEntry = {
+          name: key,
+          valueFrom: { secretKeyRef: { name: secretName, key, optional: true } },
+        };
       } else {
         nextEntry = { name: key, value: stringValue };
       }
-      const existingIndex = envIndexByName.get(key);
-      if (Number.isInteger(existingIndex)) {
-        patch.push({ op: "replace", path: `${envPath}/${existingIndex}`, value: nextEntry });
-      } else {
-        patch.push({ op: "add", path: `${envPath}/-`, value: nextEntry });
-      }
+      nextEntries.push(nextEntry);
+    }
+
+    const replacedNames = new Set([
+      ...(replaceManagedState ? previousManagedEnvNames : []),
+      ...managedEnvNames,
+      ...entries.map(([name]) => String(name)),
+    ]);
+    let nextEnv = [
+      ...env.filter((entry) => !replacedNames.has(String(entry?.name || ""))),
+      ...nextEntries,
+    ];
+    if (replaceManagedState) {
+      nextEnv = ensureManagedSecretEnvEntries(
+        nextEnv,
+        [...new Set([...previousManagedEnvNames, ...managedEnvNames])],
+        secretName,
+      );
+    }
+    if (JSON.stringify(nextEnv) !== JSON.stringify(env)) {
+      patch.push({
+        op: Array.isArray(containers[index]?.env) ? "replace" : "add",
+        path: envPath,
+        value: nextEnv,
+      });
+    }
+    const nextManagedEnvNames = new Set([...previousManagedEnvNames, ...managedEnvNames]);
+    const annotations = {
+      ...(deployment?.metadata?.annotations || {}),
+      [MANAGED_ENV_NAMES_ANNOTATION]: managedEnvNamesAnnotation([...nextManagedEnvNames]),
+    };
+    if (JSON.stringify(annotations) !== JSON.stringify(deployment?.metadata?.annotations || {})) {
+      patch.push({
+        op: deployment?.metadata?.annotations ? "replace" : "add",
+        path: "/metadata/annotations",
+        value: annotations,
+      });
     }
 
     // Update the Secret before the Deployment so secretKeyRef entries resolve
     // as soon as the rollout (or the caller's explicit restart) starts pods.
-    if (Object.keys(sensitiveData).length > 0) {
+    const managedSecretNames = replaceManagedState
+      ? [...new Set([...previousManagedEnvNames, ...managedEnvNames])]
+      : [...replacedNames].filter(isSensitiveEnvName);
+    if (managedSecretNames.length > 0) {
+      await this._replaceManagedEnvSecretData(
+        deployName,
+        sensitiveData,
+        managedSecretNames,
+        namespace,
+      );
+    } else if (Object.keys(sensitiveData).length > 0) {
       await this._mergeEnvSecretData(deployName, sensitiveData, namespace);
     }
 
-    await this.appsApi.patchNamespacedDeployment({
-      name: deployName,
-      namespace,
-      body: patch,
-    });
+    if (patch.length > 0) {
+      await this.appsApi.patchNamespacedDeployment({
+        name: deployName,
+        namespace,
+        body: patch,
+      });
+    }
     console.log(`[k8s] Updated ${entries.length} env var(s) on deployment ${deployName}`);
   }
 

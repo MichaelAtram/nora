@@ -75,6 +75,11 @@ function providerMatchedLlmKey(providerId: string) {
 }
 
 const real = {
+  // Optional reusable operator. User-owned execution targets such as Remote
+  // Docker are intentionally invisible to a throwaway account.
+  operatorEmail: requireEnv("REAL_OPERATOR_EMAIL"),
+  operatorPassword: requireEnv("REAL_OPERATOR_PASSWORD"),
+
   // LLM provider — at least one must be set.
   llmProviderId,
   llmApiKey: providerMatchedLlmKey(llmProviderId),
@@ -116,6 +121,7 @@ const real = {
 
   // Enable/disable matrix cells explicitly
   enableOpenclawDocker: (requireEnv("REAL_ENABLE_OPENCLAW_DOCKER") || "1") !== "0",
+  enableOpenclawRemoteDocker: (requireEnv("REAL_ENABLE_OPENCLAW_REMOTE_DOCKER") || "0") === "1",
   enableOpenclawK8s: (requireEnv("REAL_ENABLE_OPENCLAW_K8S") || "0") === "1",
   enableOpenclawNemoclaw: (requireEnv("REAL_ENABLE_OPENCLAW_NEMOCLAW") || "0") === "1",
   enableOpenclawNemoclawRemoteDocker:

@@ -11,6 +11,7 @@ process.env.JWT_SECRET = JWT_SECRET;
 
 const mockDb = { query: jest.fn() };
 const mockAddDeploymentJob = jest.fn();
+const mockCancelDeploymentJobsForAgent = jest.fn();
 const mockAddKubernetesPolicyReconcileJob = jest.fn();
 const mockGetDLQJobs = jest.fn();
 const mockRetryDLQJob = jest.fn();
@@ -75,13 +76,28 @@ const mockDockerPing = jest.fn();
 const mockDockerGetContainer = jest.fn();
 const mockDockerContainerInspect = jest.fn();
 const mockAssertKubernetesExecutionTargetAvailable = jest.fn().mockResolvedValue();
+const mockPersistLifecycleRuntimeAddress = jest.fn();
+const mockSyncAuthToUserAgents = jest.fn();
+const mockResumeAgentWithProviderAuth = jest.fn();
+const mockAgentProvisionLockRelease = jest.fn();
+const mockAcquireAgentProvisionLock = jest.fn();
 
 jest.mock("../db", () => mockDb);
 jest.mock("../redisQueue", () => ({
   addDeploymentJob: mockAddDeploymentJob,
+  cancelDeploymentJobsForAgent: mockCancelDeploymentJobsForAgent,
   addKubernetesPolicyReconcileJob: mockAddKubernetesPolicyReconcileJob,
   getDLQJobs: mockGetDLQJobs,
   retryDLQJob: mockRetryDLQJob,
+}));
+jest.mock("../agentProvisionLock", () => ({
+  ...jest.requireActual("../agentProvisionLock"),
+  acquireAgentProvisionLock: mockAcquireAgentProvisionLock,
+}));
+jest.mock("../authSync", () => ({
+  ...jest.requireActual("../authSync"),
+  syncAuthToUserAgents: mockSyncAuthToUserAgents,
+  resumeAgentWithProviderAuth: mockResumeAgentWithProviderAuth,
 }));
 jest.mock("../kubernetesClusters", () => ({
   assertKubernetesExecutionTargetAvailable: mockAssertKubernetesExecutionTargetAvailable,
@@ -98,6 +114,10 @@ jest.mock("../containerManager", () => ({
   stop: jest.fn().mockResolvedValue({}),
   restart: jest.fn().mockResolvedValue({}),
   destroy: jest.fn().mockResolvedValue({}),
+  persistLifecycleRuntimeAddress: mockPersistLifecycleRuntimeAddress,
+  isIgnorableStopError: jest.fn((error) =>
+    /already stopped|not running/i.test(String(error?.message || "")),
+  ),
   canMutate: jest.fn(
     (agent) =>
       Boolean(agent?.container_id) ||
@@ -280,6 +300,7 @@ jest.mock("dockerode", () =>
 );
 
 const app = require("../server");
+const { normalizeHealthcheckBudget } = require("../releaseUpgrade");
 
 const adminToken = jwt.sign(
   { id: "admin-1", email: "admin@nora.test", role: "admin" },
@@ -331,6 +352,11 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockDb.query.mockReset();
   mockAddDeploymentJob.mockReset();
+  mockCancelDeploymentJobsForAgent.mockReset().mockResolvedValue({ removed: 0, active: 0 });
+  mockAgentProvisionLockRelease.mockReset().mockResolvedValue(undefined);
+  mockAcquireAgentProvisionLock.mockReset().mockResolvedValue({
+    release: mockAgentProvisionLockRelease,
+  });
   mockAddKubernetesPolicyReconcileJob.mockReset();
   mockGetDLQJobs.mockReset();
   mockRetryDLQJob.mockReset();
@@ -347,6 +373,21 @@ beforeEach(() => {
   mockDockerPing.mockReset().mockImplementation((callback) => callback(null));
   mockDockerContainerInspect.mockReset().mockResolvedValue({ Config: { Labels: {} } });
   mockDockerGetContainer.mockReset().mockReturnValue({ inspect: mockDockerContainerInspect });
+  mockPersistLifecycleRuntimeAddress.mockReset().mockImplementation(async (_db, agent, result) => {
+    const host = typeof result?.host === "string" ? result.host.trim() : "";
+    const runtimeHost = typeof result?.runtimeHost === "string" ? result.runtimeHost.trim() : host;
+    if (host) agent.host = host;
+    if (runtimeHost) agent.runtime_host = runtimeHost;
+    return agent;
+  });
+  mockSyncAuthToUserAgents
+    .mockReset()
+    .mockImplementation(async (_userId, agentId) => [{ agentId, status: "synced" }]);
+  mockResumeAgentWithProviderAuth.mockReset().mockImplementation(async (agent) => ({
+    agent: { ...agent, status: "running", paused_reason: null },
+    lifecycleResult: null,
+    syncResult: { agentId: agent.id, status: "synced" },
+  }));
   mockGetDeploymentDefaults.mockReset().mockResolvedValue({
     vcpu: 1,
     ram_mb: 1024,
@@ -912,6 +953,85 @@ describe("admin routes", () => {
     expect(res.body.runnerReachable).toBe(true);
   });
 
+  it("uses the migration-aware release upgrade health-check defaults", () => {
+    const warn = jest.fn();
+
+    expect(normalizeHealthcheckBudget({}, warn)).toEqual({
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("upgrades the former 40x3 built-in health-check budget", () => {
+    const warn = jest.fn();
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "40",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual({
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("preserves valid release upgrade health-check overrides", () => {
+    const warn = jest.fn();
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "101",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "6",
+        },
+        warn,
+      ),
+    ).toEqual({
+      attempts: 101,
+      intervalSeconds: 6,
+      firstToFinalWindowSeconds: 600,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("falls back safely for invalid or over-budget release upgrade health checks", () => {
+    const warn = jest.fn();
+    const defaults = {
+      attempts: 221,
+      intervalSeconds: 3,
+      firstToFinalWindowSeconds: 660,
+    };
+
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "not-a-number",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual(defaults);
+    expect(
+      normalizeHealthcheckBudget(
+        {
+          NORA_UPGRADE_HEALTHCHECK_ATTEMPTS: "1302",
+          NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS: "3",
+        },
+        warn,
+      ),
+    ).toEqual(defaults);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenLastCalledWith(expect.stringContaining("no greater than 3900s"));
+  });
+
   it("starts a direct GitHub release upgrade runner for admins", async () => {
     const monitoringModule = require("../monitoring");
     process.env.NORA_CURRENT_VERSION = "1.0.0";
@@ -942,6 +1062,8 @@ describe("admin routes", () => {
           "NORA_HOST_REPO_DIR=/srv/nora",
           "NORA_ENV_FILE=deploy.env",
           "NORA_UPGRADE_COMPOSE_FILES=docker-compose.yml:infra/docker-compose.public-tls.yml:docker-compose.kubernetes.yml",
+          "NORA_UPGRADE_HEALTHCHECK_ATTEMPTS=221",
+          "NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS=3",
           "NORA_UPGRADE_PUBLIC_HEALTH_URL=https://nora.test/api/health",
         ]),
         Cmd: expect.arrayContaining([
@@ -1471,7 +1593,6 @@ describe("admin routes", () => {
           },
         ],
       });
-
     const res = await withToken(
       request(app).put("/admin/users/user-2/agent-limit").send({ agent_limit_override: 6 }),
       adminToken,
@@ -1703,6 +1824,38 @@ describe("admin routes", () => {
     );
   });
 
+  it.each(["provider_auth_reconciliation_pending", "provider_auth_reconciliation_failed"])(
+    "does not live-promote an admin agent held for provider auth (%s)",
+    async (pausedReason) => {
+      const containerManager = require("../containerManager");
+      mockDb.query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-provider-auth-held",
+            user_id: "user-1",
+            name: "Admin Provider Auth Held",
+            status: "error",
+            paused_reason: pausedReason,
+            container_id: "container-admin-provider-auth-held",
+            ownerEmail: "owner@example.com",
+          },
+        ],
+      });
+
+      const res = await withToken(
+        request(app).get("/admin/agents/agent-admin-provider-auth-held"),
+        adminToken,
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(
+        expect.objectContaining({ status: "error", paused_reason: pausedReason }),
+      );
+      expect(containerManager.status).not.toHaveBeenCalled();
+      expect(mockDb.query).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("returns admin agent stats through the telemetry builder", async () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
@@ -1762,9 +1915,234 @@ describe("admin routes", () => {
     expect(res.body.samples).toHaveLength(1);
   });
 
+  it("persists a refreshed runtime address when an admin starts an agent", async () => {
+    const containerManager = require("../containerManager");
+    mockResumeAgentWithProviderAuth.mockImplementationOnce(async (agent) => ({
+      agent: {
+        ...agent,
+        status: "running",
+        paused_reason: null,
+        host: "10.40.50.61",
+        runtime_host: "10.40.50.61",
+      },
+      lifecycleResult: { host: "10.40.50.61", runtimeHost: "10.40.50.61" },
+    }));
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-start-address",
+            user_id: "user-proxmox",
+            name: "Admin Start Address",
+            status: "stopped",
+            backend_type: "proxmox",
+            container_id: "401",
+            host: "10.40.50.10",
+            runtime_host: "10.40.50.10",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-start-address",
+            user_id: "user-proxmox",
+            name: "Admin Start Address",
+            status: "stopped",
+            backend_type: "proxmox",
+            container_id: "401",
+            host: "10.40.50.10",
+            runtime_host: "10.40.50.10",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-start-address",
+            user_id: "user-proxmox",
+            name: "Admin Start Address",
+            status: "running",
+            backend_type: "proxmox",
+            container_id: "401",
+            host: "10.40.50.61",
+            runtime_host: "10.40.50.61",
+          },
+        ],
+      });
+    mockSyncAuthToUserAgents.mockResolvedValueOnce([
+      { agentId: "agent-admin-start-address", status: "synced" },
+    ]);
+
+    const res = await withToken(
+      request(app).post("/admin/agents/agent-admin-start-address/start"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(
+      expect.objectContaining({ host: "10.40.50.61", runtime_host: "10.40.50.61" }),
+    );
+    expect(mockResumeAgentWithProviderAuth).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "agent-admin-start-address", user_id: "user-proxmox" }),
+      "start",
+    );
+    expect(mockResumeAgentWithProviderAuth.mock.invocationCallOrder[0]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
+    expect(containerManager.start).not.toHaveBeenCalled();
+  });
+
+  it("persists a refreshed runtime address when an admin restarts an agent", async () => {
+    const containerManager = require("../containerManager");
+    mockResumeAgentWithProviderAuth.mockImplementationOnce(async (agent) => ({
+      agent: {
+        ...agent,
+        status: "running",
+        paused_reason: null,
+        host: "10.40.50.62",
+        runtime_host: "10.40.50.62",
+      },
+      lifecycleResult: { host: "10.40.50.62", runtimeHost: "10.40.50.62" },
+    }));
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-restart-address",
+            user_id: "user-proxmox",
+            name: "Admin Restart Address",
+            status: "running",
+            backend_type: "proxmox",
+            container_id: "402",
+            host: "10.40.50.11",
+            runtime_host: "10.40.50.11",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-restart-address",
+            user_id: "user-proxmox",
+            name: "Admin Restart Address",
+            status: "running",
+            backend_type: "proxmox",
+            container_id: "402",
+            host: "10.40.50.11",
+            runtime_host: "10.40.50.11",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-restart-address",
+            user_id: "user-proxmox",
+            name: "Admin Restart Address",
+            status: "running",
+            backend_type: "proxmox",
+            container_id: "402",
+            host: "10.40.50.62",
+            runtime_host: "10.40.50.62",
+          },
+        ],
+      });
+    mockSyncAuthToUserAgents.mockResolvedValueOnce([
+      { agentId: "agent-admin-restart-address", status: "synced" },
+    ]);
+
+    const res = await withToken(
+      request(app).post("/admin/agents/agent-admin-restart-address/restart"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(
+      expect.objectContaining({ host: "10.40.50.62", runtime_host: "10.40.50.62" }),
+    );
+    expect(mockResumeAgentWithProviderAuth).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "agent-admin-restart-address", user_id: "user-proxmox" }),
+      "restart",
+    );
+    expect(mockResumeAgentWithProviderAuth.mock.invocationCallOrder[0]).toBeLessThan(
+      mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+    );
+    expect(containerManager.restart).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["start", "stopped", false],
+    ["restart", "running", true],
+  ])(
+    "returns the provider-fenced %s failure without publishing a success audit",
+    async (action, initialStatus) => {
+      const containerManager = require("../containerManager");
+      const monitoringModule = require("../monitoring");
+      const agent = {
+        id: `agent-admin-${action}-auth-failure`,
+        user_id: "durable-owner-1",
+        name: `Admin ${action} Auth Failure`,
+        status: initialStatus,
+        backend_type: "proxmox",
+        container_id: action === "start" ? "405" : "406",
+      };
+      mockDb.query
+        .mockResolvedValueOnce({ rows: [agent] })
+        .mockResolvedValueOnce({ rows: [{ ...agent }] })
+        .mockResolvedValueOnce({ rows: [{ ...agent, status: "running" }] })
+        .mockResolvedValueOnce({ rows: [] });
+
+      mockResumeAgentWithProviderAuth.mockRejectedValueOnce(
+        Object.assign(new Error("Current provider authentication could not be reconciled"), {
+          statusCode: 502,
+          code: "AGENT_AUTH_RECONCILIATION_FAILED",
+        }),
+      );
+
+      const res = await withToken(
+        request(app).post(`/admin/agents/${agent.id}/${action}`),
+        adminToken,
+      );
+
+      expect(res.status).toBe(502);
+      expect(res.body.code).toBe("AGENT_AUTH_RECONCILIATION_FAILED");
+      expect(mockResumeAgentWithProviderAuth).toHaveBeenCalledWith(
+        expect.objectContaining({ id: agent.id, user_id: "durable-owner-1" }),
+        action,
+      );
+      expect(mockResumeAgentWithProviderAuth.mock.invocationCallOrder[0]).toBeLessThan(
+        mockAgentProvisionLockRelease.mock.invocationCallOrder[0],
+      );
+      expect(containerManager[action]).not.toHaveBeenCalled();
+      expect(monitoringModule.logEvent).not.toHaveBeenCalledWith(
+        action === "start" ? "admin_agent_started" : "admin_agent_restarted",
+        expect.anything(),
+        expect.anything(),
+      );
+    },
+  );
+
   it("stops a Kubernetes deployment by container_name from admin when container_id is missing", async () => {
     const containerManager = require("../containerManager");
     mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-k8s-stop",
+            user_id: "user-k8s",
+            name: "K8s Stop",
+            status: "running",
+            runtime_family: "openclaw",
+            backend_type: "k8s",
+            deploy_target: "k8s",
+            execution_target_id: "k8s:test-cluster",
+            sandbox_profile: "standard",
+            container_id: null,
+            container_name: "nora-oclaw-admin-k8s-stop",
+          },
+        ],
+      })
       .mockResolvedValueOnce({
         rows: [
           {
@@ -1796,6 +2174,91 @@ describe("admin routes", () => {
       }),
     );
     expect(res.body).toEqual(expect.objectContaining({ status: "stopped" }));
+  });
+
+  it("keeps a Proxmox agent running when an admin stop fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.stop.mockRejectedValueOnce(new Error("Proxmox admin shutdown failed"));
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-proxmox-stop-fail",
+            user_id: "user-proxmox",
+            name: "Admin Proxmox Stop Fail",
+            status: "running",
+            backend_type: "proxmox",
+            deploy_target: "proxmox",
+            container_id: "403",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-admin-proxmox-stop-fail",
+            user_id: "user-proxmox",
+            name: "Admin Proxmox Stop Fail",
+            status: "running",
+            backend_type: "proxmox",
+            deploy_target: "proxmox",
+            container_id: "403",
+          },
+        ],
+      });
+
+    const res = await withToken(
+      request(app).post("/admin/agents/agent-admin-proxmox-stop-fail/stop"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(500);
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["start", "queued"],
+    ["start", "deploying"],
+    ["stop", "queued"],
+    ["stop", "deploying"],
+    ["restart", "queued"],
+    ["restart", "deploying"],
+  ])("rejects an admin %s while the locked agent is %s", async (action, lockedStatus) => {
+    const containerManager = require("../containerManager");
+    const agent = {
+      id: `agent-admin-${action}-${lockedStatus}`,
+      user_id: "user-proxmox",
+      name: `Admin ${action} ${lockedStatus}`,
+      status: action === "start" ? "stopped" : "running",
+      backend_type: "proxmox",
+      deploy_target: "proxmox",
+      container_id: "404",
+    };
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [agent] })
+      .mockResolvedValueOnce({ rows: [{ ...agent, status: lockedStatus }] });
+
+    const res = await withToken(
+      request(app).post(`/admin/agents/${agent.id}/${action}`),
+      adminToken,
+    );
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual(
+      expect.objectContaining({
+        error:
+          "Agent deployment is queued or in progress. Wait for provisioning to finish before changing lifecycle state.",
+        code: "AGENT_PROVISIONING_IN_PROGRESS",
+      }),
+    );
+    expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith(agent.id, {
+      applicationName: `nora-backend-admin-agent-${action}`,
+    });
+    expect(containerManager[action]).not.toHaveBeenCalled();
+    expect(mockPersistLifecycleRuntimeAddress).not.toHaveBeenCalled();
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
   });
 
   it("requeues an agent redeploy with the owning user id", async () => {
@@ -1907,22 +2370,22 @@ describe("admin routes", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockDb.query).toHaveBeenNthCalledWith(2, expect.stringContaining("deploy_target = $5"), [
-      "agent-3",
-      "docker",
-      "nemoclaw",
-      "openclaw",
-      "docker",
-      "docker",
-      "nemoclaw",
-      "standard-agent",
-      getDefaultAgentImage({
-        runtime_family: "openclaw",
-        deploy_target: "docker",
-        sandbox_profile: "nemoclaw",
-        backend: "docker",
-      }),
-    ]);
+    expect(mockDb.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("SET status = 'queued'"),
+      [
+        "agent-3",
+        "stopped",
+        null,
+        "standard-agent",
+        "docker",
+        "openclaw",
+        "docker",
+        "docker",
+        "standard",
+        null,
+      ],
+    );
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "agent-3",
@@ -1930,6 +2393,10 @@ describe("admin routes", () => {
         backend: "docker",
         execution_target_id: "docker",
         sandbox: "nemoclaw",
+        replace_existing_runtime: true,
+        previous_container_id: null,
+        previous_container_name: "standard-agent",
+        previous_sandbox_profile: "standard",
         image: getDefaultAgentImage({
           runtime_family: "openclaw",
           deploy_target: "docker",
@@ -1973,17 +2440,22 @@ describe("admin routes", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockDb.query).toHaveBeenNthCalledWith(2, expect.stringContaining("image = $9"), [
-      "agent-4",
-      "k8s",
-      "standard",
-      "openclaw",
-      "k8s",
-      "k8s:test-cluster",
-      "standard",
-      "docker-agent",
-      "node:24-slim",
-    ]);
+    expect(mockDb.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("SET status = 'queued'"),
+      [
+        "agent-4",
+        "stopped",
+        null,
+        "docker-agent",
+        "docker",
+        "openclaw",
+        "docker",
+        "docker",
+        "standard",
+        null,
+      ],
+    );
     expect(mockAddDeploymentJob).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "agent-4",
@@ -1991,6 +2463,9 @@ describe("admin routes", () => {
         backend: "k8s",
         execution_target_id: "k8s:test-cluster",
         sandbox: "standard",
+        replace_existing_runtime: true,
+        previous_container_name: "docker-agent",
+        previous_deploy_target: "docker",
         image: "node:24-slim",
       }),
     );
@@ -2044,8 +2519,17 @@ describe("admin routes", () => {
         previous_deploy_target: "k8s",
         previous_execution_target_id: "k8s:test-cluster",
         previous_sandbox_profile: "standard",
+        replace_existing_runtime: true,
       }),
     );
+    expect(mockAcquireAgentProvisionLock).toHaveBeenCalledWith("agent-k8s-admin", {
+      applicationName: "nora-backend-admin-agent-replacement",
+    });
+    expect(mockCancelDeploymentJobsForAgent).toHaveBeenCalledWith("agent-k8s-admin");
+    expect(mockAgentProvisionLockRelease).toHaveBeenCalledTimes(1);
+    expect(
+      mockDb.query.mock.calls.some(([sql]) => String(sql).includes("container_id = NULL")),
+    ).toBe(false);
   });
 
   it("destroys agent containers before deleting the user", async () => {
@@ -2054,6 +2538,7 @@ describe("admin routes", () => {
       .mockResolvedValueOnce({
         rows: [{ id: "user-7", email: "user@example.com", role: "user" }],
       })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({
         rows: [
           {
@@ -2074,6 +2559,59 @@ describe("admin routes", () => {
       expect.objectContaining({ id: "agent-7" }),
     );
     expect(mockDb.query).toHaveBeenLastCalledWith("DELETE FROM users WHERE id = $1", ["user-7"]);
+  });
+
+  it("keeps the user and agent rows when owned runtime cleanup fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.destroy.mockRejectedValueOnce(new Error("Proxmox user cleanup failed"));
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "user-proxmox-fail", email: "proxmox@example.com", role: "user" }],
+      })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "agent-proxmox-user-fail",
+            user_id: "user-proxmox-fail",
+            name: "Proxmox User Agent",
+            backend_type: "proxmox",
+            container_id: "404",
+          },
+        ],
+      });
+
+    const res = await withToken(request(app).delete("/admin/users/user-proxmox-fail"), adminToken);
+
+    expect(res.status).toBe(500);
+    expect(mockDb.query).toHaveBeenCalledTimes(3);
+    expect(mockDb.query).not.toHaveBeenCalledWith("DELETE FROM users WHERE id = $1", [
+      "user-proxmox-fail",
+    ]);
+  });
+
+  it("blocks user deletion before cleanup when an owned Remote Docker host is referenced", async () => {
+    const containerManager = require("../containerManager");
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [{ id: "host-owner", email: "owner@example.com", role: "user" }],
+      })
+      .mockResolvedValueOnce({
+        rows: [{ id: "shared-build-host", label: "Shared build host", agentCount: 2 }],
+      });
+
+    const res = await withToken(request(app).delete("/admin/users/host-owner"), adminToken);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/Shared build host.*2 agents/i);
+    expect(res.body.code).toBe("REMOTE_HOSTS_IN_USE");
+    expect(containerManager.destroy).not.toHaveBeenCalled();
+    expect(mockDb.query).toHaveBeenCalledTimes(2);
+    expect(mockDb.query.mock.calls[1][0]).toMatch(/a\.execution_target_id = 'remote:' \|\| rh\.id/);
+    expect(mockDb.query.mock.calls[1][0]).not.toMatch(/a\.user_id/);
+    expect(mockDb.query).not.toHaveBeenCalledWith("DELETE FROM users WHERE id = $1", [
+      "host-owner",
+    ]);
   });
 
   it("deletes global agents with admin privileges", async () => {
@@ -2098,6 +2636,33 @@ describe("admin routes", () => {
       expect.objectContaining({ id: "agent-9" }),
     );
     expect(res.body).toEqual({ success: true });
+  });
+
+  it("keeps a global agent row when non-Kubernetes runtime cleanup fails", async () => {
+    const containerManager = require("../containerManager");
+    containerManager.destroy.mockRejectedValueOnce(new Error("Proxmox admin destroy failed"));
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "agent-proxmox-admin-fail",
+          user_id: "user-proxmox",
+          name: "Delete Proxmox Agent",
+          backend_type: "proxmox",
+          container_id: "405",
+        },
+      ],
+    });
+
+    const res = await withToken(
+      request(app).delete("/admin/agents/agent-proxmox-admin-fail"),
+      adminToken,
+    );
+
+    expect(res.status).toBe(500);
+    expect(mockDb.query).toHaveBeenCalledTimes(1);
+    expect(mockDb.query).not.toHaveBeenCalledWith("DELETE FROM agents WHERE id = $1", [
+      "agent-proxmox-admin-fail",
+    ]);
   });
 
   it("destroys Kubernetes resources by container_name before admin agent deletion", async () => {

@@ -23,6 +23,18 @@ const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
 const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
+const DEFAULT_AGENT_PIDS_LIMIT = 512;
+// The official Hermes image starts s6 as root, repairs mounted-state
+// ownership, then drops its supervised services to the hermes user. Drop the
+// default Docker capability set and add back only that lifecycle subset.
+const HERMES_INIT_CAPABILITIES = Object.freeze([
+  "CHOWN",
+  "DAC_OVERRIDE",
+  "FOWNER",
+  "KILL",
+  "SETGID",
+  "SETUID",
+]);
 
 function isMutableImageReference(imgName) {
   const ref = String(imgName || "").trim();
@@ -38,6 +50,7 @@ function isMutableImageReference(imgName) {
 function buildHermesStartCommand() {
   const hermesRuntimeCommand = [
     "set -eu",
+    "if [ -r /opt/nora-managed-env/apply.sh ]; then . /opt/nora-managed-env/apply.sh; fi",
     buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
@@ -95,6 +108,16 @@ function safeContainerName(prefix, name, id) {
 }
 
 class HermesBackend extends DockerBackend {
+  async _initialManagedEnvFileOwnership(_container) {
+    // The official Hermes image runs its application user as 10000:10000.
+    // Existing-container reconciliation still verifies the live passwd entry.
+    return { uid: 10000, gid: 10000 };
+  }
+
+  async _managedEnvFileOwnership(container) {
+    return this._containerUserOwnership(container, "hermes");
+  }
+
   async _pullImage(imgName) {
     console.log(`[hermes] Pulling image ${imgName}...`);
     await new Promise((resolve, reject) => {
@@ -147,7 +170,17 @@ class HermesBackend extends DockerBackend {
   }
 
   async create(config) {
-    const { id, name, image, vcpu, ram_mb, env, container_name, abortSignal } = config;
+    const {
+      id,
+      name,
+      image,
+      vcpu,
+      ram_mb,
+      env,
+      container_name,
+      abortSignal,
+      credentialManagedEnvNames = [],
+    } = config;
     const containerName = container_name || safeContainerName("nora-hermes", name, id);
     const imgName = image || getHermesDockerAgentImage();
     let container = null;
@@ -175,13 +208,11 @@ class HermesBackend extends DockerBackend {
 
     const apiServerKey = crypto.randomBytes(32).toString("hex");
     const envArray = Object.entries({
-      ...(env || {}),
       HERMES_HOME,
       HOME: `${HERMES_HOME}/home`,
       API_SERVER_ENABLED: "true",
       API_SERVER_HOST: "0.0.0.0",
       API_SERVER_PORT: String(HERMES_RUNTIME_PORT),
-      API_SERVER_KEY: apiServerKey,
       GATEWAY_HEALTH_URL: `http://127.0.0.1:${HERMES_RUNTIME_PORT}`,
       MESSAGING_CWD: HERMES_WORKSPACE,
       TERMINAL_CWD: HERMES_WORKSPACE,
@@ -210,6 +241,10 @@ class HermesBackend extends DockerBackend {
           NanoCpus: (vcpu || 2) * 1e9,
           Memory: (ram_mb || 2048) * 1024 * 1024,
           RestartPolicy: { Name: "unless-stopped" },
+          CapDrop: ["ALL"],
+          CapAdd: [...HERMES_INIT_CAPABILITIES],
+          SecurityOpt: ["no-new-privileges:true"],
+          PidsLimit: DEFAULT_AGENT_PIDS_LIMIT,
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
           // Local Hermes is reached via the container IP on the shared compose
           // network (no host publish). The remote variant overrides this to
@@ -230,6 +265,16 @@ class HermesBackend extends DockerBackend {
         },
       });
 
+      await this.updateEnv(
+        container.id,
+        { ...(env || {}), API_SERVER_KEY: apiServerKey },
+        {
+          managedEnvNames: credentialManagedEnvNames,
+          replaceManagedState: true,
+          initializeManagedState: true,
+          runtimeFamily: "hermes",
+        },
+      );
       throwIfAborted(abortSignal, `hermes start for ${containerName}`);
       await container.start();
 

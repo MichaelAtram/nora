@@ -37,9 +37,31 @@ router.use("/:id/alert-rules", alertRulesRouter);
 
 router.get("/cost", async (req, res) => {
   try {
-    res.json(
-      await metrics.getAccessibleWorkspaceCosts(req.user.id, metrics.parseCostQuery(req.query)),
-    );
+    const costOptions = metrics.parseCostQuery(req.query);
+    const boundWorkspaceId = apiKeyWorkspaceId(req);
+    if (req.apiKey) {
+      if (!boundWorkspaceId) {
+        return res
+          .status(403)
+          .json({ error: "API key has no workspace binding", code: "wrong_workspace" });
+      }
+      const cost = await metrics.getWorkspaceCost(boundWorkspaceId, costOptions);
+      const workspace = {
+        workspaceName: req.apiKeyWorkspace?.name || null,
+        role: null,
+        ...cost,
+      };
+      return res.json({
+        periodDays: cost.periodDays,
+        periodStart: cost.periodStart,
+        periodEnd: cost.periodEnd,
+        workspaceTotalUsd: cost.totalUsd,
+        uniqueFleetTotalUsd: cost.totalUsd,
+        workspaces: [workspace],
+        unassigned: { totalUsd: 0, perAgent: [] },
+      });
+    }
+    res.json(await metrics.getAccessibleWorkspaceCosts(req.user.id, costOptions));
   } catch (e) {
     res.status(e.statusCode || 500).json({ error: e.message });
   }

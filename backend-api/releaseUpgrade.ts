@@ -15,6 +15,13 @@ const DEFAULT_UPGRADE_REF = "master";
 const DEFAULT_ENV_FILE = ".env";
 const DEFAULT_COMPOSE_FILES = ["docker-compose.yml"];
 const DEFAULT_LOG_TAIL_LINES = 80;
+const DEFAULT_HEALTHCHECK_ATTEMPTS = 221;
+const DEFAULT_HEALTHCHECK_INTERVAL_SECONDS = 3;
+const LEGACY_HEALTHCHECK_ATTEMPTS = 40;
+const LEGACY_HEALTHCHECK_INTERVAL_SECONDS = 3;
+const MAX_HEALTHCHECK_WINDOW_SECONDS = 3900;
+const DEFAULT_HEALTHCHECK_WINDOW_SECONDS =
+  (DEFAULT_HEALTHCHECK_ATTEMPTS - 1) * DEFAULT_HEALTHCHECK_INTERVAL_SECONDS;
 const HOST_REPO_MOUNT = "/nora-host-repo";
 const RUNNING_PHASES = new Set([
   "queued",
@@ -45,6 +52,61 @@ function parsePositiveInteger(value, fallback) {
   const parsed = Number.parseInt(String(value || "").trim(), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return parsed;
+}
+
+function parseHealthcheckInteger(value, fallback, max) {
+  const normalized = readString(value);
+  if (!normalized) return fallback;
+  if (!/^\d+$/.test(normalized)) return null;
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) return null;
+  return parsed;
+}
+
+function normalizeHealthcheckBudget(env = process.env, warn = console.warn) {
+  let attemptsRaw = readString(env.NORA_UPGRADE_HEALTHCHECK_ATTEMPTS);
+  let intervalRaw = readString(env.NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS);
+  if (
+    attemptsRaw === String(LEGACY_HEALTHCHECK_ATTEMPTS) &&
+    intervalRaw === String(LEGACY_HEALTHCHECK_INTERVAL_SECONDS)
+  ) {
+    attemptsRaw = String(DEFAULT_HEALTHCHECK_ATTEMPTS);
+    intervalRaw = String(DEFAULT_HEALTHCHECK_INTERVAL_SECONDS);
+  }
+  const attempts = parseHealthcheckInteger(
+    attemptsRaw,
+    DEFAULT_HEALTHCHECK_ATTEMPTS,
+    MAX_HEALTHCHECK_WINDOW_SECONDS + 1,
+  );
+  const intervalSeconds = parseHealthcheckInteger(
+    intervalRaw,
+    DEFAULT_HEALTHCHECK_INTERVAL_SECONDS,
+    MAX_HEALTHCHECK_WINDOW_SECONDS,
+  );
+  const firstToFinalWindowSeconds =
+    attempts === null || intervalSeconds === null ? null : (attempts - 1) * intervalSeconds;
+
+  if (
+    attempts === null ||
+    intervalSeconds === null ||
+    firstToFinalWindowSeconds > MAX_HEALTHCHECK_WINDOW_SECONDS
+  ) {
+    if (typeof warn === "function") {
+      warn(
+        `Invalid NORA_UPGRADE health-check overrides (attempts='${attemptsRaw}', interval='${intervalRaw}s'); ` +
+          `using ${DEFAULT_HEALTHCHECK_ATTEMPTS} attempts every ${DEFAULT_HEALTHCHECK_INTERVAL_SECONDS}s ` +
+          `(${DEFAULT_HEALTHCHECK_WINDOW_SECONDS}s from first to final attempt). Values must be positive ` +
+          `integers with a first-to-final window no greater than ${MAX_HEALTHCHECK_WINDOW_SECONDS}s.`,
+      );
+    }
+    return {
+      attempts: DEFAULT_HEALTHCHECK_ATTEMPTS,
+      intervalSeconds: DEFAULT_HEALTHCHECK_INTERVAL_SECONDS,
+      firstToFinalWindowSeconds: DEFAULT_HEALTHCHECK_WINDOW_SECONDS,
+    };
+  }
+
+  return { attempts, intervalSeconds, firstToFinalWindowSeconds };
 }
 
 function createHttpError(message, statusCode = 400) {
@@ -442,6 +504,7 @@ async function launchRunnerContainer(job, config, env = process.env) {
   const repoSlug = normalizeGithubRepoSlug(sourceRepo);
   const envFile = config.envFile || DEFAULT_ENV_FILE;
   const composeFiles = normalizeComposeFiles(config.composeFiles);
+  const healthcheckBudget = normalizeHealthcheckBudget(env);
 
   await docker.createVolume({ Name: stateVolume });
   await ensureRunnerImage(image);
@@ -459,8 +522,8 @@ async function launchRunnerContainer(job, config, env = process.env) {
       `NORA_HOST_REPO_DIR=${config.hostRepoDir}`,
       `NORA_ENV_FILE=${envFile}`,
       `NORA_UPGRADE_COMPOSE_FILES=${composeFiles.join(":")}`,
-      `NORA_UPGRADE_HEALTHCHECK_ATTEMPTS=${readString(env.NORA_UPGRADE_HEALTHCHECK_ATTEMPTS) || "40"}`,
-      `NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS=${readString(env.NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS) || "3"}`,
+      `NORA_UPGRADE_HEALTHCHECK_ATTEMPTS=${healthcheckBudget.attempts}`,
+      `NORA_UPGRADE_HEALTHCHECK_INTERVAL_SECONDS=${healthcheckBudget.intervalSeconds}`,
       `NORA_UPGRADE_PUBLIC_HEALTH_URL=${readString(env.NORA_UPGRADE_PUBLIC_HEALTH_URL)}`,
     ],
     WorkingDir: config.hostRepoDir,
@@ -796,6 +859,7 @@ module.exports = {
   buildReleaseUpgradePreflight,
   getReleaseUpgradeStatus,
   launchRunnerContainer,
+  normalizeHealthcheckBudget,
   readState,
   redactText,
   resolveUpgradeConfig,

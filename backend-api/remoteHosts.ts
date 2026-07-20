@@ -2,21 +2,32 @@
 // Remote-host registry — Phase A of the Bring-Your-Own-Compute epic.
 //
 // Mirrors kubernetesClusters.ts: a registry of operator-owned remote machines
-// (Mac/Windows/VPS/cloud) that Nora can reach over SSH to run the Docker
-// adapter. A registered host surfaces as the execution target `remote:<id>`,
+// (normally a Linux Docker server, VPS, or cloud VM) that Nora can reach over
+// SSH to run the Docker adapter. A registered host surfaces as the execution
+// target `remote:<id>`,
 // the same way a Kubernetes cluster surfaces as `k8s:<id>`. SSH credentials are
 // encrypted at rest with the shared AES-256-GCM helper.
 //
-// This module stays self-contained (db + crypto only). Deployment adapters and
-// the gateway allowlist consume its secret-bearing and masked profile APIs.
+// This module centralizes registry persistence, credential encryption, address
+// validation, and mutation locks. Runtime adapters and the gateway consume its
+// secret-bearing and masked profile APIs.
 
 const db = require("./db");
 const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
+const { Client } = require("pg");
+const { buildPostgresConfig } = require("./lib/connectionConfig");
+const dns = require("node:dns").promises;
+const net = require("node:net");
+const { PRIVATE_IP_RE } = require("./networkSafety");
 
 const AUTH_MODES = new Set(["key", "password"]);
 const DEFAULT_SSH_PORT = 22;
 const DEFAULT_TEST_TIMEOUT_MS = 10000;
+const DEFAULT_MUTATION_LOCK_TIMEOUT_MS = 15000;
+const MUTATION_LOCK_POLL_MS = 50;
 const DOCKER_VERSION_PROBE = "docker version --format '{{.Server.Version}}'";
+const REMOTE_HOSTNAME_RE = /^[A-Za-z0-9._-]+$/;
+const REMOTE_HOST_MUTATION_LOCK_PREFIX = "nora:remote-host-mutation:";
 
 let sshClientCtor = null;
 
@@ -31,6 +42,102 @@ function getSshClientCtor() {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function isPaaSMode() {
+  return (
+    String(process.env.PLATFORM_MODE || "selfhosted")
+      .trim()
+      .toLowerCase() === "paas"
+  );
+}
+
+function assertRemoteHostsSupported() {
+  if (!isPaaSMode()) return;
+  const error = new Error(
+    "Remote Docker hosts are disabled in hosted mode because agent runtime traffic is not end-to-end encrypted; use a self-hosted Nora control plane on the same private network",
+  );
+  error.statusCode = 403;
+  error.code = "REMOTE_HOSTS_DISABLED_IN_PAAS";
+  throw error;
+}
+
+function normalizeRemoteAddress(value, label) {
+  const host = normalizeText(value);
+  if (!host) return "";
+  if (host.length > 253 || (!net.isIP(host) && !REMOTE_HOSTNAME_RE.test(host))) {
+    const error = new Error(
+      `${label} must be a plain hostname or IP address without a scheme or port`,
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+  return host;
+}
+
+function isUnroutableRemoteAddress(address) {
+  const normalized = String(address || "")
+    .trim()
+    .toLowerCase();
+  if (PRIVATE_IP_RE.test(normalized)) return true;
+  if (normalized.startsWith("ff")) return true;
+  if (net.isIP(normalized) === 4) {
+    const first = Number.parseInt(normalized.split(".")[0], 10);
+    return first >= 224;
+  }
+  return false;
+}
+
+async function resolveRemoteAddressForRuntime(value, label, { publicOnly = isPaaSMode() } = {}) {
+  const host = normalizeRemoteAddress(value, label);
+  if (!host) return "";
+  if (net.isIP(host)) {
+    if (publicOnly && isUnroutableRemoteAddress(host)) {
+      const error = new Error(`${label} must use a public address in hosted mode`);
+      error.statusCode = 400;
+      throw error;
+    }
+    return host;
+  }
+  if (!publicOnly) return host;
+
+  let addresses;
+  try {
+    addresses = await dns.lookup(host, { all: true, verbatim: true });
+  } catch (error) {
+    const validationError = new Error(
+      `${label} hostname ${host} could not be resolved (${error.code || error.message})`,
+    );
+    validationError.statusCode = 400;
+    throw validationError;
+  }
+  const unsafe = addresses.find((entry) => isUnroutableRemoteAddress(entry.address));
+  if (unsafe) {
+    const error = new Error(
+      `${label} must resolve only to public addresses in hosted mode (${unsafe.address} is private or unroutable)`,
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!addresses[0]?.address) {
+    const error = new Error(`${label} hostname ${host} did not resolve to an address`);
+    error.statusCode = 400;
+    throw error;
+  }
+  // Hosted-mode callers use the validated IP directly, closing the DNS
+  // rebinding window between registry lookup and SSH/readiness/proxy traffic.
+  return addresses[0].address;
+}
+
+async function resolveRemoteHostRuntimeProfile(profile) {
+  if (!profile) return null;
+  const rawSshHost = profile.sshHost;
+  const rawGatewayHost = profile.gatewayHost || profile.sshHost;
+  const [sshHost, gatewayHost] = await Promise.all([
+    resolveRemoteAddressForRuntime(rawSshHost, "Remote SSH host"),
+    resolveRemoteAddressForRuntime(rawGatewayHost, "Remote gateway address"),
+  ]);
+  return { ...profile, rawSshHost, rawGatewayHost, sshHost, gatewayHost };
 }
 
 function normalizeSlug(value) {
@@ -57,6 +164,100 @@ function normalizeHostId(value, fallbackLabel = "") {
   return normalized;
 }
 
+function requireRemoteHostOwnerUserId(value) {
+  const ownerUserId = normalizeText(value);
+  if (ownerUserId) return ownerUserId;
+  const error = new Error("Remote host owner is required");
+  error.statusCode = 400;
+  error.code = "REMOTE_HOST_OWNER_REQUIRED";
+  throw error;
+}
+
+function createRemoteHostNotFoundError() {
+  const error = new Error("Remote host not found");
+  error.statusCode = 404;
+  return error;
+}
+
+function remoteHostMutationLockKey(hostId) {
+  return `${REMOTE_HOST_MUTATION_LOCK_PREFIX}${normalizeHostId(hostId)}`;
+}
+
+function remoteHostMutationLockTimeoutMs() {
+  const configured = Number.parseInt(process.env.REMOTE_HOST_MUTATION_LOCK_TIMEOUT_MS || "", 10);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_MUTATION_LOCK_TIMEOUT_MS;
+}
+
+function waitForMutationLockPoll(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createRemoteHostMutationClient() {
+  const {
+    max: _max,
+    min: _min,
+    idleTimeoutMillis: _idleTimeoutMillis,
+    ...clientConfig
+  } = buildPostgresConfig({
+    ...process.env,
+    DB_APPLICATION_NAME: "nora-backend-remote-host-mutation",
+  });
+  return new Client(clientConfig);
+}
+
+async function withRemoteHostMutationLock(hostId, operation) {
+  const lockKey = remoteHostMutationLockKey(hostId);
+  const client = createRemoteHostMutationClient();
+  let connected = false;
+  let lockHeld = false;
+  try {
+    await client.connect();
+    connected = true;
+    const timeoutMs = remoteHostMutationLockTimeoutMs();
+    const deadline = Date.now() + timeoutMs;
+    while (!lockHeld) {
+      const acquired = await client.query(
+        "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+        [lockKey],
+      );
+      lockHeld = Boolean(acquired.rows[0]?.locked);
+      if (lockHeld) break;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        const error = new Error(
+          `Another remote host operation is still active for ${normalizeHostId(hostId)}`,
+        );
+        error.statusCode = 409;
+        error.code = "REMOTE_HOST_MUTATION_LOCK_TIMEOUT";
+        throw error;
+      }
+      await waitForMutationLockPoll(Math.min(MUTATION_LOCK_POLL_MS, remaining));
+    }
+    return await operation();
+  } finally {
+    if (lockHeld) {
+      await client
+        .query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey])
+        .catch((error) =>
+          console.warn(
+            `[remoteHosts] advisory unlock failed for host ${normalizeHostId(hostId)}: ${error.message}`,
+          ),
+        );
+    }
+    if (connected) {
+      await client
+        .end()
+        .catch((error) =>
+          console.warn(
+            `[remoteHosts] mutation lock connection close failed for host ${normalizeHostId(hostId)}: ${error.message}`,
+          ),
+        );
+    }
+  }
+}
+
 // `remote:<id>` execution-target identifiers. Self-contained so this module
 // does not depend on backendCatalog recognizing the `remote-docker` target yet.
 function normalizeRemoteExecutionTargetId(value) {
@@ -72,6 +273,64 @@ function isRemoteDockerTarget(value) {
   return (
     normalized === "remote-docker" || normalized === "remote" || normalized.startsWith("remote:")
   );
+}
+
+function isRemoteDockerAgent(agent = {}) {
+  return [
+    agent.deploy_target,
+    agent.deployTarget,
+    agent.backend_type,
+    agent.backendType,
+    agent.execution_target_id,
+    agent.executionTargetId,
+  ].some((value) => isRemoteDockerTarget(value));
+}
+
+function createRemoteHostAccessRevokedError() {
+  const error = new Error(
+    "Remote Docker host access has been revoked; stop or delete the agent, or ask the host owner to share the host again",
+  );
+  error.statusCode = 403;
+  error.code = "REMOTE_HOST_ACCESS_REVOKED";
+  return error;
+}
+
+function createRemoteHostRetestRequiredError(host) {
+  const error = new Error(
+    `${host?.label || "Remote Docker host"} must pass Test before Nora can use it again`,
+  );
+  error.statusCode = 409;
+  error.code = "REMOTE_HOST_RETEST_REQUIRED";
+  return error;
+}
+
+function createRemoteHostCleanupPinRequiredError(host) {
+  const error = new Error(
+    `Cannot safely clean up Remote Docker runtime on ${host?.label || host?.id || "the registered host"}: ` +
+      "the SSH host-key pin is missing. Nora refused the connection because accepting an unknown key " +
+      "could send cleanup credentials or destructive Docker commands to an impersonated host. The " +
+      "runtime may still be running; verify the host out of band, restore a trusted pin with Test where " +
+      "available, or remove the runtime manually on the verified host.",
+  );
+  error.statusCode = 409;
+  error.code = "REMOTE_HOST_CLEANUP_PIN_REQUIRED";
+  error.orphanRisk = true;
+  return error;
+}
+
+function toPublicRemoteHostAuthorizationError(error) {
+  if (
+    isRemoteHostAccessRevokedError(error) ||
+    error?.code === "REMOTE_HOST_RETEST_REQUIRED" ||
+    error?.code === "REMOTE_HOST_AUTH_CHECK_FAILED"
+  ) {
+    return error;
+  }
+  const publicError = new Error("Unable to verify Remote Docker host access");
+  publicError.statusCode = 503;
+  publicError.code = "REMOTE_HOST_AUTH_CHECK_FAILED";
+  if (error) publicError.cause = error;
+  return publicError;
 }
 
 function normalizeAuthMode(value, fallback = "key") {
@@ -127,7 +386,11 @@ function rowToProfile(row, { includeSecret = false } = {}) {
   const hasPassword = Boolean(row.ssh_password_encrypted);
   const hasCredential = authMode === "password" ? hasPassword : hasPrivateKey;
   const configured = Boolean(sshHost) && Boolean(sshUser) && hasCredential;
-  const testedOk = row.last_test_status === "ok";
+  const hasHostKeyPin = Boolean(normalizeText(row.ssh_host_key));
+  // A legacy `last_test_status=ok` row without the key captured by that test is
+  // not a trusted connection. Treat it exactly like a host that needs a fresh
+  // Test so ordinary lifecycle/runtime traffic never falls back to TOFU.
+  const testedOk = row.last_test_status === "ok" && hasHostKeyPin;
   const issue = !configured
     ? !sshHost
       ? "Remote host requires an SSH host address."
@@ -139,7 +402,9 @@ function rowToProfile(row, { includeSecret = false } = {}) {
     : !testedOk
       ? row.last_test_status === "failed"
         ? row.last_test_message || "Remote host connection test failed."
-        : "Remote host must pass the connection test before deployment."
+        : row.last_test_status === "ok"
+          ? "Remote host must pass Test again so Nora can pin its SSH host key."
+          : "Remote host must pass the connection test before deployment."
       : null;
 
   let sshPrivateKey = null;
@@ -244,14 +509,20 @@ function normalizeHostInput(input = {}, existing = null) {
     label: label || id,
     enabled: normalizeBool(input.enabled, existing?.enabled ?? true),
     isDefault: normalizeBool(input.isDefault ?? input.is_default, existing?.is_default ?? false),
-    sshHost: normalizeText(input.sshHost ?? input.ssh_host ?? existing?.ssh_host),
+    sshHost: normalizeRemoteAddress(
+      input.sshHost ?? input.ssh_host ?? existing?.ssh_host,
+      "Remote SSH host",
+    ),
     sshPort: parsePort(input.sshPort ?? input.ssh_port, existing?.ssh_port ?? DEFAULT_SSH_PORT),
     sshUser: normalizeText(input.sshUser ?? input.ssh_user ?? existing?.ssh_user),
     sshAuthMode: authMode,
     sshPrivateKeyEncrypted: privateKeyEncrypted,
     sshPasswordEncrypted: passwordEncrypted,
     sshPassphraseEncrypted: passphraseEncrypted,
-    gatewayHost: normalizeText(input.gatewayHost ?? input.gateway_host ?? existing?.gateway_host),
+    gatewayHost: normalizeRemoteAddress(
+      input.gatewayHost ?? input.gateway_host ?? existing?.gateway_host,
+      "Remote gateway address",
+    ),
     dockerHost: normalizeText(input.dockerHost ?? input.docker_host ?? existing?.docker_host),
   };
 }
@@ -268,7 +539,16 @@ function connectionInputChanged(existing, host) {
     normalizeText(existing.ssh_password_encrypted) !== normalizeText(host.sshPasswordEncrypted) ||
     normalizeText(existing.ssh_passphrase_encrypted) !==
       normalizeText(host.sshPassphraseEncrypted) ||
+    normalizeText(existing.gateway_host) !== host.gatewayHost ||
     normalizeText(existing.docker_host) !== host.dockerHost
+  );
+}
+
+function sshHostIdentityChanged(existing, host) {
+  if (!existing) return false;
+  return (
+    normalizeText(existing.ssh_host) !== host.sshHost ||
+    parsePort(existing.ssh_port, DEFAULT_SSH_PORT) !== host.sshPort
   );
 }
 
@@ -312,6 +592,7 @@ async function listRemoteHosts(options = {}) {
 }
 
 async function listRemoteHostExecutionTargets(options = {}) {
+  if (isPaaSMode()) return [];
   const hosts = await listRemoteHosts({ ...options, includeDisabled: false });
   return hosts.filter((host) => host.available);
 }
@@ -322,18 +603,95 @@ async function getHostRow(hostId) {
   return result.rows[0] || null;
 }
 
+async function getOwnedHostRow(hostId, expectedOwnerUserId) {
+  const id = normalizeHostId(hostId);
+  const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
+  const result = await db.query("SELECT * FROM remote_hosts WHERE id = $1 AND owner_user_id = $2", [
+    id,
+    ownerUserId,
+  ]);
+  return result.rows[0] || null;
+}
+
 /**
  * Load a secret-bearing remote-host profile for trusted provisioning callers.
- * This lookup does not perform user authorization or availability checks.
+ * This lookup performs no user authorization or availability check and returns
+ * null in hosted mode.
  *
  * @param {string} executionTargetId - Target in `remote:<id>` form.
  * @returns {Promise<Object|null>} Decrypted provisioning profile or `null`.
  */
 async function getRemoteHostProfile(executionTargetId) {
+  if (isPaaSMode()) return null;
   const normalized = normalizeRemoteExecutionTargetId(executionTargetId);
   if (!normalized) return null;
   const row = await getHostRow(normalized.slice("remote:".length));
-  return rowToProfile(row, { includeSecret: true });
+  return resolveRemoteHostRuntimeProfile(rowToProfile(row, { includeSecret: true }));
+}
+
+function createRemoteHostCleanupTargetError(message) {
+  const error = new Error(message);
+  error.statusCode = 409;
+  error.code = "REMOTE_HOST_CLEANUP_TARGET_INVALID";
+  return error;
+}
+
+// Stop/destroy need one deliberately narrower escape hatch than ordinary
+// Remote Docker use. It reads only the host named by the persisted agent's
+// explicit execution target, including in PaaS mode, where registration and
+// every active-use lookup remain disabled. Callers must not derive this target
+// from deploy_target/backend_type because those identify only the adapter, not
+// the exact machine that owns the runtime being retired.
+async function getRemoteHostCleanupProfile(agent = {}) {
+  const rawExecutionTargetId = normalizeText(
+    agent.execution_target_id ?? agent.executionTargetId,
+  ).toLowerCase();
+  const executionTargetId = normalizeRemoteExecutionTargetId(rawExecutionTargetId);
+  if (!executionTargetId || rawExecutionTargetId !== executionTargetId) {
+    throw createRemoteHostCleanupTargetError(
+      "Remote Docker cleanup requires the agent's exact remote:<host-id> execution target",
+    );
+  }
+
+  const row = await getHostRow(executionTargetId.slice("remote:".length));
+  if (!row) return null;
+
+  // Verify the returned registry identity before decrypting credentials. The
+  // equality is redundant with a healthy primary-key lookup but keeps this
+  // privileged cleanup path fail-closed under corrupt/misrouted data access.
+  const rowExecutionTargetId = `remote:${normalizeHostId(row.id)}`;
+  if (rowExecutionTargetId !== executionTargetId) {
+    throw createRemoteHostCleanupTargetError(
+      "Remote Docker cleanup host does not match the agent execution target",
+    );
+  }
+
+  // Cleanup deliberately bypasses the current workspace grant and Test status,
+  // but it must never bypass machine identity. A retained pin lets stop/delete
+  // target the exact previously trusted host after revocation or a failed
+  // retest. Without one (legacy row, explicit reset, or host-address change),
+  // fail with an orphan-risk warning before decrypting credentials.
+  if (!normalizeText(row.ssh_host_key)) {
+    throw createRemoteHostCleanupPinRequiredError({
+      id: row.id,
+      label: normalizeText(row.label),
+    });
+  }
+
+  const profile = rowToProfile(row, { includeSecret: true });
+  // Existing agents may reference private-network hosts registered before a
+  // control plane switched to PaaS mode. Cleanup uses that immutable stored
+  // address only; PaaS still blocks create/update/test/list/use paths, so this
+  // cannot register or activate a new private target.
+  const rawSshHost = profile.sshHost;
+  const rawGatewayHost = profile.gatewayHost || profile.sshHost;
+  const [sshHost, gatewayHost] = await Promise.all([
+    resolveRemoteAddressForRuntime(rawSshHost, "Remote SSH host", { publicOnly: false }),
+    resolveRemoteAddressForRuntime(rawGatewayHost, "Remote gateway address", {
+      publicOnly: false,
+    }),
+  ]);
+  return { ...profile, rawSshHost, rawGatewayHost, sshHost, gatewayHost };
 }
 
 // Masked single-host lookup by id (no secrets) — used by the route layer to
@@ -350,9 +708,11 @@ async function getRemoteHost(hostId) {
  * @returns {Promise<Object|null>} Masked host profile or `null`.
  */
 async function getRemoteHostByExecutionTarget(executionTargetId) {
+  if (isPaaSMode()) return null;
   const normalized = normalizeRemoteExecutionTargetId(executionTargetId);
   if (!normalized) return null;
-  return getRemoteHost(normalized.slice("remote:".length));
+  const host = await getRemoteHost(normalized.slice("remote:".length));
+  return resolveRemoteHostRuntimeProfile(host);
 }
 
 async function clearOtherDefaults(hostId, ownerUserId) {
@@ -365,15 +725,7 @@ async function clearOtherDefaults(hostId, ownerUserId) {
   );
 }
 
-/**
- * Register a remote host with encrypted SSH credentials and owner-scoped default selection.
- * Caller authorization and owner assignment are enforced by the route layer.
- *
- * @param {Object} [input={}] - Remote-host registration fields.
- * @returns {Promise<Object>} Persisted masked host profile.
- */
-async function createRemoteHost(input = {}) {
-  const host = normalizeHostInput(input);
+async function createRemoteHostLocked(host) {
   const result = await db.query(
     `INSERT INTO remote_hosts(
        id, owner_user_id, label, enabled, is_default,
@@ -409,22 +761,38 @@ async function createRemoteHost(input = {}) {
 }
 
 /**
- * Update a remote host, invalidating its test result and host-key pin when connection inputs change.
- * Caller authorization and owner pinning are enforced by the route layer.
+ * Register an owner-scoped remote host under a per-host mutation lock, validating
+ * its runtime addresses and encrypting supplied SSH credentials.
  *
- * @param {string} hostId - Remote host to update.
- * @param {Object} [input={}] - Replacement and credential-clear fields.
- * @returns {Promise<Object>} Updated masked host profile.
+ * @param {Object} [input={}] - Remote-host registration fields from a trusted caller.
+ * @returns {Promise<Object>} Persisted masked host profile.
  */
-async function updateRemoteHost(hostId, input = {}) {
-  const existing = await getHostRow(hostId);
-  if (!existing) {
-    const error = new Error("Remote host not found");
-    error.statusCode = 404;
-    throw error;
-  }
+async function createRemoteHost(input = {}) {
+  assertRemoteHostsSupported();
+  const host = normalizeHostInput(input);
+  host.ownerUserId = requireRemoteHostOwnerUserId(host.ownerUserId);
+  await resolveRemoteHostRuntimeProfile({
+    sshHost: host.sshHost,
+    gatewayHost: host.gatewayHost || host.sshHost,
+  });
+  return withRemoteHostMutationLock(host.id, () => createRemoteHostLocked(host));
+}
+
+async function updateRemoteHostLocked(hostId, input = {}, expectedOwnerUserId) {
+  assertRemoteHostsSupported();
+  const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
+  const existing = await getOwnedHostRow(hostId, ownerUserId);
+  if (!existing) throw createRemoteHostNotFoundError();
   const host = normalizeHostInput(input, existing);
+  // Ownership is immutable. The expected owner comes from the authenticated
+  // route, not from a request body that could try to reassign the row.
+  host.ownerUserId = ownerUserId;
   const resetTest = connectionInputChanged(existing, host);
+  const resetHostKey = sshHostIdentityChanged(existing, host);
+  await resolveRemoteHostRuntimeProfile({
+    sshHost: host.sshHost,
+    gatewayHost: host.gatewayHost || host.sshHost,
+  });
   const result = await db.query(
     `UPDATE remote_hosts
         SET label = $2,
@@ -443,13 +811,13 @@ async function updateRemoteHost(hostId, input = {}) {
             last_test_status = CASE WHEN $15 THEN NULL ELSE last_test_status END,
             last_test_message = CASE WHEN $15 THEN NULL ELSE last_test_message END,
             last_tested_at = CASE WHEN $15 THEN NULL ELSE last_tested_at END,
-            -- Clear the host-key pin too when connection inputs change, so the
-            -- next test re-pins (trust-on-first-use) the now-different host. A
-            -- key change WITHOUT a connection-input change keeps the pin, so a
-            -- silent MITM on the same target still fails closed.
-            ssh_host_key = CASE WHEN $15 THEN NULL ELSE ssh_host_key END,
+            -- The host-key pin belongs to the SSH network identity, not to the
+            -- credential. Rotating a password/key must retain the pin; only an
+            -- explicit SSH host/port change returns to trust-on-first-use.
+            ssh_host_key = CASE WHEN $16 THEN NULL ELSE ssh_host_key END,
             updated_at = NOW()
       WHERE id = $1
+        AND owner_user_id = $17
       RETURNING *`,
     [
       existing.id,
@@ -467,20 +835,85 @@ async function updateRemoteHost(hostId, input = {}) {
       host.gatewayHost,
       host.dockerHost,
       resetTest,
+      resetHostKey,
+      ownerUserId,
     ],
   );
+  if (!result.rows[0]) throw createRemoteHostNotFoundError();
   if (host.isDefault) await clearOtherDefaults(existing.id, host.ownerUserId);
   return maskHost(result.rows[0]);
 }
 
 /**
- * Delete a remote host only when no non-deleted agent still references its execution target.
+ * Update an owner-scoped host under its mutation lock, invalidating the test
+ * result for connection changes and the SSH pin only for host identity changes.
  *
- * @param {string} hostId - Remote host to delete.
- * @returns {Promise<Object>} Deleted masked host profile.
+ * @param {string} hostId - Remote host to update.
+ * @param {Object} [input={}] - Replacement and credential-clear fields.
+ * @param {Object} [options={}] - Required expected owner scope.
+ * @returns {Promise<Object>} Updated masked host profile.
  */
-async function deleteRemoteHost(hostId) {
+async function updateRemoteHost(hostId, input = {}, options = {}) {
+  assertRemoteHostsSupported();
+  const expectedOwnerUserId = requireRemoteHostOwnerUserId(options.expectedOwnerUserId);
+  return withRemoteHostMutationLock(hostId, () =>
+    updateRemoteHostLocked(hostId, input, expectedOwnerUserId),
+  );
+}
+
+function assertHostKeyPinResetConfirmation(existing, confirmation) {
+  const provided = normalizeText(confirmation);
+  const label = normalizeText(existing?.label);
+  const id = normalizeHostId(existing?.id || existing?.host_id || label);
+  if (provided && (provided === label || provided === id)) return;
+
+  const error = new Error(`Type the remote host label "${label}" or id "${id}" to confirm`);
+  error.statusCode = 400;
+  error.code = "REMOTE_HOST_PIN_RESET_CONFIRMATION_INVALID";
+  throw error;
+}
+
+// Explicit recovery for an intentionally rebuilt host at the same SSH address.
+// This is deliberately separate from ordinary edits: credentials and network
+// identity stay untouched, while clearing the pin also invalidates the previous
+// Test result so active use remains fail-closed until a fresh successful probe
+// observes and pins the replacement SSH key.
+async function resetRemoteHostHostKeyPinLocked(hostId, confirmation, expectedOwnerUserId) {
+  assertRemoteHostsSupported();
+  const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
+  const existing = await getOwnedHostRow(hostId, ownerUserId);
+  if (!existing) throw createRemoteHostNotFoundError();
+  assertHostKeyPinResetConfirmation(existing, confirmation);
+
+  const result = await db.query(
+    `UPDATE remote_hosts
+        SET ssh_host_key = NULL,
+            last_test_status = NULL,
+            last_test_message = NULL,
+            last_tested_at = NULL,
+            updated_at = NOW()
+      WHERE id = $1
+        AND owner_user_id = $2
+      RETURNING *`,
+    [existing.id, ownerUserId],
+  );
+  if (!result.rows[0]) throw createRemoteHostNotFoundError();
+  return maskHost(result.rows[0]);
+}
+
+async function resetRemoteHostHostKeyPin(hostId, confirmation, options = {}) {
+  assertRemoteHostsSupported();
+  const expectedOwnerUserId = requireRemoteHostOwnerUserId(options.expectedOwnerUserId);
+  return withRemoteHostMutationLock(hostId, () =>
+    resetRemoteHostHostKeyPinLocked(hostId, confirmation, expectedOwnerUserId),
+  );
+}
+
+async function deleteRemoteHostLocked(hostId, expectedOwnerUserId) {
   const id = normalizeHostId(hostId);
+  const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
+  const existing = await getOwnedHostRow(id, ownerUserId);
+  if (!existing) throw createRemoteHostNotFoundError();
   const executionTargetId = `remote:${id}`;
   const usage = await db.query(
     "SELECT COUNT(*)::int AS count FROM agents WHERE execution_target_id = $1 AND status <> 'deleted'",
@@ -491,13 +924,27 @@ async function deleteRemoteHost(hostId) {
     error.statusCode = 409;
     throw error;
   }
-  const result = await db.query("DELETE FROM remote_hosts WHERE id = $1 RETURNING *", [id]);
-  if (!result.rows[0]) {
-    const error = new Error("Remote host not found");
-    error.statusCode = 404;
-    throw error;
-  }
+  const result = await db.query(
+    "DELETE FROM remote_hosts WHERE id = $1 AND owner_user_id = $2 RETURNING *",
+    [id, ownerUserId],
+  );
+  if (!result.rows[0]) throw createRemoteHostNotFoundError();
   return maskHost(result.rows[0]);
+}
+
+/**
+ * Delete an owner-scoped host under its mutation lock only when no non-deleted
+ * agent still references its execution target.
+ *
+ * @param {string} hostId - Remote host to delete.
+ * @param {Object} [options={}] - Required expected owner scope.
+ * @returns {Promise<Object>} Deleted masked host profile.
+ */
+async function deleteRemoteHost(hostId, options = {}) {
+  const expectedOwnerUserId = requireRemoteHostOwnerUserId(options.expectedOwnerUserId);
+  return withRemoteHostMutationLock(hostId, () =>
+    deleteRemoteHostLocked(hostId, expectedOwnerUserId),
+  );
 }
 
 // SSH connectivity verification
@@ -550,6 +997,8 @@ function runRemoteDockerProbe(profile, { timeoutMs = DEFAULT_TEST_TIMEOUT_MS } =
     const expectedHostKey = normalizeText(profile.sshHostKey);
     let capturedHostKey = null;
     let hostKeyMismatch = false;
+    const boundedTimeoutMs = Math.max(1, Number(timeoutMs) || DEFAULT_TEST_TIMEOUT_MS);
+    let probeTimer = null;
     const onHostKey = (presented) => {
       capturedHostKey = presented;
       if (expectedHostKey && presented !== expectedHostKey) hostKeyMismatch = true;
@@ -557,6 +1006,7 @@ function runRemoteDockerProbe(profile, { timeoutMs = DEFAULT_TEST_TIMEOUT_MS } =
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      if (probeTimer) clearTimeout(probeTimer);
       try {
         conn.end();
       } catch {
@@ -564,6 +1014,13 @@ function runRemoteDockerProbe(profile, { timeoutMs = DEFAULT_TEST_TIMEOUT_MS } =
       }
       resolve(result);
     };
+    probeTimer = setTimeout(() => {
+      finish({
+        ok: false,
+        message: `Remote Docker probe timed out after ${boundedTimeoutMs}ms.`,
+      });
+    }, boundedTimeoutMs);
+    probeTimer.unref?.();
 
     conn.on("ready", () => {
       conn.exec(DOCKER_VERSION_PROBE, (err, stream) => {
@@ -607,7 +1064,7 @@ function runRemoteDockerProbe(profile, { timeoutMs = DEFAULT_TEST_TIMEOUT_MS } =
           hostKeyMismatch: true,
           message:
             "Remote host key does not match the pinned key — connection refused (possible " +
-            "man-in-the-middle, or the host was rebuilt). Delete and re-register the host if this is expected.",
+            "man-in-the-middle, or the host was rebuilt). Use the explicit host-key pin reset only after independently verifying an expected rebuild or key rotation.",
         });
         return;
       }
@@ -615,27 +1072,19 @@ function runRemoteDockerProbe(profile, { timeoutMs = DEFAULT_TEST_TIMEOUT_MS } =
     });
 
     try {
-      conn.connect(buildSshConnectConfig(profile, timeoutMs, { onHostKey }));
+      conn.connect(buildSshConnectConfig(profile, boundedTimeoutMs, { onHostKey }));
     } catch (err) {
       finish({ ok: false, message: err?.message || "SSH connection could not be started." });
     }
   });
 }
 
-/**
- * Test a registered host, persist its latest result, and pin its SSH host key on first success.
- *
- * @param {string} hostId - Remote host to test.
- * @param {Object} [options={}] - SSH probe options.
- * @returns {Promise<Object>} Updated masked host profile, including the stored test result.
- */
-async function testRemoteHost(hostId, options = {}) {
-  const profile = await getRemoteHostProfile(`remote:${hostId}`);
-  if (!profile) {
-    const error = new Error("Remote host not found");
-    error.statusCode = 404;
-    throw error;
-  }
+async function testRemoteHostLocked(hostId, options = {}) {
+  assertRemoteHostsSupported();
+  const ownerUserId = requireRemoteHostOwnerUserId(options.expectedOwnerUserId);
+  const row = await getOwnedHostRow(hostId, ownerUserId);
+  if (!row) throw createRemoteHostNotFoundError();
+  const profile = await resolveRemoteHostRuntimeProfile(rowToProfile(row, { includeSecret: true }));
   let status = "ok";
   let message = "Docker is reachable over SSH.";
   let pinHostKey = null;
@@ -644,13 +1093,17 @@ async function testRemoteHost(hostId, options = {}) {
     message = profile.issue || "Remote host is not configured.";
   } else {
     const probe = await runRemoteDockerProbe(profile, options);
-    status = probe.ok ? "ok" : "failed";
-    message = probe.message;
+    const presentedHostKey = normalizeText(probe.hostKey);
+    status = probe.ok && presentedHostKey ? "ok" : "failed";
+    message =
+      probe.ok && !presentedHostKey
+        ? "SSH connected, but Nora could not verify and pin the presented host key; the host remains unavailable."
+        : probe.message;
     // Trust-on-first-use: pin the host key on the first successful test. Once
     // pinned it's never overwritten here — a changed key fails the probe above
-    // (hostKeyMismatch), so re-pinning requires an explicit re-register.
-    if (probe.ok && probe.hostKey && !normalizeText(profile.sshHostKey)) {
-      pinHostKey = probe.hostKey;
+    // (hostKeyMismatch), so re-pinning requires the explicit reset flow.
+    if (status === "ok" && !normalizeText(profile.sshHostKey)) {
+      pinHostKey = presentedHostKey;
     }
   }
   const result = await db.query(
@@ -661,10 +1114,28 @@ async function testRemoteHost(hostId, options = {}) {
             last_tested_at = NOW(),
             updated_at = NOW()
       WHERE id = $1
+        AND owner_user_id = $5
       RETURNING *`,
-    [profile.id, status, message, pinHostKey],
+    [profile.id, status, message, pinHostKey, ownerUserId],
   );
+  if (!result.rows[0]) throw createRemoteHostNotFoundError();
   return maskHost(result.rows[0]);
+}
+
+/**
+ * Test an owner-scoped host under its mutation lock, persist the result, and
+ * pin its SSH host key on first success.
+ *
+ * @param {string} hostId - Remote host to test.
+ * @param {Object} [options={}] - Required owner scope and SSH probe options.
+ * @returns {Promise<Object>} Updated masked host profile with the stored result.
+ */
+async function testRemoteHost(hostId, options = {}) {
+  assertRemoteHostsSupported();
+  const expectedOwnerUserId = requireRemoteHostOwnerUserId(options.expectedOwnerUserId);
+  return withRemoteHostMutationLock(hostId, () =>
+    testRemoteHostLocked(hostId, { ...options, expectedOwnerUserId }),
+  );
 }
 
 // Workspace grants and deployment eligibility
@@ -675,9 +1146,46 @@ async function testRemoteHost(hostId, options = {}) {
 // shared host (visibility) but not deploy to it. Host config stays owner-only.
 const HOST_USE_ROLES = Object.freeze(["editor", "admin", "owner"]);
 
+// Return the exact registry row authorized by the same PostgreSQL statement.
+// This prevents an id from being deleted/recreated between checking a grant and
+// loading/decrypting the profile for a different tenant's replacement row.
+async function getAuthorizedRemoteHostRow(userId, hostId) {
+  if (!userId || !hostId) return null;
+  try {
+    const result = await db.query(
+      `SELECT rh.*
+         FROM remote_hosts rh
+        WHERE rh.id = $1
+          AND (
+            rh.owner_user_id = $2
+            OR EXISTS (
+              SELECT 1
+                FROM workspace_remote_hosts wrh
+                JOIN workspace_members wm ON wm.workspace_id = wrh.workspace_id
+               WHERE wrh.remote_host_id = rh.id
+                 AND wm.user_id = $2
+                 AND wm.role = ANY($3)
+            )
+          )
+        LIMIT 1`,
+      [hostId, userId, HOST_USE_ROLES],
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    if (error?.code !== "42P01") throw error;
+    // During a rolling migration, fail closed for shared access while keeping
+    // direct owners operational from one owner-bound row lookup.
+    const owned = await db.query(
+      "SELECT * FROM remote_hosts WHERE id = $1 AND owner_user_id = $2",
+      [hostId, userId],
+    );
+    return owned.rows[0] || null;
+  }
+}
+
 /**
  * Check whether a user owns a host or has an editor-or-higher workspace grant to use it.
- * Missing grant tables fail closed.
+ * Missing grant tables fail closed for shared access.
  *
  * @param {string} userId - User requesting deployment or gateway reachability.
  * @param {string} hostId - Remote host being used.
@@ -708,6 +1216,43 @@ async function userCanUseRemoteHost(userId, hostId) {
   }
 }
 
+// Active Remote Docker operations must re-check the CURRENT positive grant.
+// Agent ownership is intentionally separate from host ownership: keeping an
+// agent row after a workspace share is removed must not let Nora keep using the
+// former host owner's decrypted SSH/Docker credentials as a confused deputy.
+// Stop/destroy cleanup paths bypass this guard explicitly in containerManager;
+// all normal runtime access, queued work, proxying, and backups call it.
+async function assertRemoteHostAgentUse(agent = {}, options = {}) {
+  if (!isRemoteDockerAgent(agent)) return null;
+  try {
+    if (isPaaSMode()) throw createRemoteHostAccessRevokedError();
+    const executionTargetId = normalizeRemoteExecutionTargetId(
+      agent.execution_target_id || agent.executionTargetId,
+    );
+    const userId = agent.user_id || agent.userId || agent.ownerUserId || null;
+    if (!executionTargetId || !userId) {
+      throw createRemoteHostAccessRevokedError();
+    }
+
+    const hostId = executionTargetId.slice("remote:".length);
+    const row = await getAuthorizedRemoteHostRow(userId, hostId);
+    if (!row) throw createRemoteHostAccessRevokedError();
+    const host = await resolveRemoteHostRuntimeProfile(rowToProfile(row, { includeSecret: false }));
+    if (!host.connected) throw createRemoteHostRetestRequiredError(host);
+
+    if (options.includeProfile === false) return host;
+
+    // Decrypt the SAME owner/grant-verified row; never reload by global id.
+    return await resolveRemoteHostRuntimeProfile(rowToProfile(row, { includeSecret: true }));
+  } catch (error) {
+    throw toPublicRemoteHostAuthorizationError(error);
+  }
+}
+
+function isRemoteHostAccessRevokedError(error) {
+  return error?.code === "REMOTE_HOST_ACCESS_REVOKED";
+}
+
 /**
  * List masked hosts a user owns or can see through workspace sharing.
  * Shared entries include whether the user's highest workspace role permits deployment.
@@ -716,6 +1261,7 @@ async function userCanUseRemoteHost(userId, hostId) {
  * @returns {Promise<Array>} Owned and shared profiles annotated with access rights.
  */
 async function listAccessibleRemoteHosts(userId) {
+  if (isPaaSMode()) return [];
   const owned = (await listRemoteHosts({ ownerUserId: userId, includeDisabled: true })).map(
     (host) => ({
       ...host,
@@ -749,39 +1295,100 @@ async function listAccessibleRemoteHosts(userId) {
   return [...owned, ...shared];
 }
 
+// Share a host into a workspace (idempotent). Both host ownership and current
+// workspace membership are rechecked inside the per-host lock by the same SQL
+// statement that creates the grant.
+async function shareRemoteHostLocked(hostId, workspaceId, expectedOwnerUserId) {
+  const id = normalizeHostId(hostId);
+  const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
+  const existing = await getOwnedHostRow(id, ownerUserId);
+  if (!existing) throw createRemoteHostNotFoundError();
+  const result = await db.query(
+    `WITH authorized AS (
+       SELECT rh.id AS remote_host_id,
+              wm.workspace_id,
+              w.name AS workspace_name
+         FROM remote_hosts rh
+         JOIN workspace_members wm
+           ON wm.workspace_id = $1
+          AND wm.user_id = $3
+         JOIN workspaces w ON w.id = wm.workspace_id
+        WHERE rh.id = $2
+          AND rh.owner_user_id = $3
+     ), inserted AS (
+       INSERT INTO workspace_remote_hosts (workspace_id, remote_host_id, created_by)
+       SELECT workspace_id, remote_host_id, $3
+         FROM authorized
+        WHERE TRUE
+       ON CONFLICT (workspace_id, remote_host_id) DO NOTHING
+       RETURNING workspace_id
+     )
+     SELECT authorized.workspace_id AS "workspaceId",
+            authorized.workspace_name AS "workspaceName",
+            EXISTS (SELECT 1 FROM inserted) AS "inserted"
+       FROM authorized`,
+    [workspaceId, id, ownerUserId],
+  );
+  if (!result.rows[0]) {
+    const error = new Error("Workspace not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  return result.rows[0];
+}
+
 /**
- * Idempotently share a host into a workspace; assumes the caller completed authorization checks.
+ * Idempotently share an owner-scoped host after atomically rechecking current
+ * host ownership and workspace membership under the per-host lock.
  *
  * @param {string} hostId - Remote host to share.
  * @param {string} workspaceId - Workspace receiving visibility and role-based use.
- * @param {string} byUserId - User recorded as creating the share.
- * @returns {Promise<void>}
+ * @param {string} expectedOwnerUserId - Expected host owner and current workspace member.
+ * @returns {Promise<Object>} Workspace metadata and whether a new grant was inserted.
  */
-async function shareRemoteHost(hostId, workspaceId, byUserId) {
-  await db.query(
-    `INSERT INTO workspace_remote_hosts (workspace_id, remote_host_id, created_by)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (workspace_id, remote_host_id) DO NOTHING`,
-    [workspaceId, hostId, byUserId || null],
+async function shareRemoteHost(hostId, workspaceId, expectedOwnerUserId) {
+  const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
+  return withRemoteHostMutationLock(hostId, () =>
+    shareRemoteHostLocked(hostId, workspaceId, ownerUserId),
   );
 }
 
-async function unshareRemoteHost(hostId, workspaceId) {
+async function unshareRemoteHostLocked(hostId, workspaceId, expectedOwnerUserId) {
+  const id = normalizeHostId(hostId);
+  const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
+  const existing = await getOwnedHostRow(id, ownerUserId);
+  if (!existing) throw createRemoteHostNotFoundError();
   await db.query(
-    "DELETE FROM workspace_remote_hosts WHERE remote_host_id = $1 AND workspace_id = $2",
-    [hostId, workspaceId],
+    `DELETE FROM workspace_remote_hosts wrh
+      USING remote_hosts rh
+      WHERE wrh.remote_host_id = $1
+        AND wrh.workspace_id = $2
+        AND rh.id = wrh.remote_host_id
+        AND rh.owner_user_id = $3`,
+    [id, workspaceId, ownerUserId],
   );
 }
 
-async function listRemoteHostShares(hostId) {
+async function unshareRemoteHost(hostId, workspaceId, expectedOwnerUserId) {
+  const ownerUserId = requireRemoteHostOwnerUserId(expectedOwnerUserId);
+  return withRemoteHostMutationLock(hostId, () =>
+    unshareRemoteHostLocked(hostId, workspaceId, ownerUserId),
+  );
+}
+
+async function listRemoteHostShares(hostId, options = {}) {
+  const id = normalizeHostId(hostId);
+  const ownerUserId = requireRemoteHostOwnerUserId(options.expectedOwnerUserId);
   try {
     const rows = await db.query(
       `SELECT wrh.workspace_id AS "workspaceId", w.name AS "workspaceName", wrh.created_at AS "createdAt"
          FROM workspace_remote_hosts wrh
          JOIN workspaces w ON w.id = wrh.workspace_id
+         JOIN remote_hosts rh ON rh.id = wrh.remote_host_id
         WHERE wrh.remote_host_id = $1
+          AND rh.owner_user_id = $2
         ORDER BY w.name`,
-      [hostId],
+      [id, ownerUserId],
     );
     return rows.rows;
   } catch (error) {
@@ -802,6 +1409,7 @@ async function assertRemoteHostExecutionTargetAvailable(runtimeFields = {}, opti
   if (!isRemoteDockerTarget(runtimeFields.deploy_target ?? runtimeFields.deployTarget)) {
     return null;
   }
+  assertRemoteHostsSupported();
   const executionTargetId = normalizeRemoteExecutionTargetId(
     runtimeFields.execution_target_id || runtimeFields.executionTargetId,
   );
@@ -812,62 +1420,62 @@ async function assertRemoteHostExecutionTargetAvailable(runtimeFields = {}, opti
     error.statusCode = 400;
     throw error;
   }
-  const profile = await getRemoteHostProfile(executionTargetId);
+  const hostId = executionTargetId.slice("remote:".length);
   const ownerUserId = options.ownerUserId || null;
-  // Owner-scoped, widened for sharing (C3): a host the user neither owns nor has an
-  // editor+ grant on is treated as unknown (don't leak its existence, never deploy
-  // cross-tenant). The grant check is positive — only explicit shares to a
-  // workspace the user belongs to as editor+ unlock it.
-  if (!profile) {
+  // When a user owns the deployment, authorize and return the host row in one
+  // statement. The admin path has no tenant owner and uses the direct row.
+  const row = ownerUserId
+    ? await getAuthorizedRemoteHostRow(ownerUserId, hostId)
+    : await getHostRow(hostId);
+  const host = row ? rowToProfile(row, { includeSecret: false }) : null;
+  if (!host) {
     const error = new Error(`Unknown remote host execution target: ${executionTargetId}`);
     error.statusCode = 400;
     throw error;
   }
-  // Fail closed: a host the caller doesn't own — INCLUDING one with a null owner
-  // (orphaned/corrupt) — is only reachable via an explicit editor+ grant, never by
-  // the owner check short-circuiting on a null owner.
-  if (ownerUserId && profile.ownerUserId !== ownerUserId) {
-    const allowed = await userCanUseRemoteHost(ownerUserId, profile.id);
-    if (!allowed) {
-      const error = new Error(`Unknown remote host execution target: ${executionTargetId}`);
-      error.statusCode = 400;
-      throw error;
-    }
-  }
-  if (!profile.enabled) {
-    const error = new Error(`${profile.label} is disabled for new deployments.`);
+  if (!host.enabled) {
+    const error = new Error(`${host.label} is disabled for new deployments.`);
     error.statusCode = 400;
     throw error;
   }
-  if (!profile.configured) {
-    const error = new Error(profile.issue || `${profile.label} is not configured.`);
+  if (!host.configured) {
+    const error = new Error(host.issue || `${host.label} is not configured.`);
     error.statusCode = 400;
     throw error;
   }
-  if (!profile.connected) {
+  if (!host.connected) {
     const error = new Error(
-      profile.issue || `${profile.label} must pass the connection test before deployment.`,
+      host.issue || `${host.label} must pass the connection test before deployment.`,
     );
     error.statusCode = 400;
     throw error;
   }
-  return profile;
+  return await resolveRemoteHostRuntimeProfile(rowToProfile(row, { includeSecret: true }));
 }
 
 module.exports = {
+  assertRemoteHostAgentUse,
   assertRemoteHostExecutionTargetAvailable,
+  assertRemoteHostsSupported,
   createRemoteHost,
   deleteRemoteHost,
   getRemoteHost,
   getRemoteHostByExecutionTarget,
+  getRemoteHostCleanupProfile,
   getRemoteHostProfile,
   isRemoteDockerTarget,
+  isRemoteDockerAgent,
+  isRemoteHostAccessRevokedError,
   listRemoteHosts,
   listAccessibleRemoteHosts,
   listRemoteHostExecutionTargets,
   normalizeRemoteExecutionTargetId,
+  resolveRemoteAddressForRuntime,
+  resolveRemoteHostRuntimeProfile,
+  resetRemoteHostHostKeyPin,
   rowToProfile,
   testRemoteHost,
+  toPublicRemoteHostAuthorizationError,
   updateRemoteHost,
   userCanUseRemoteHost,
   shareRemoteHost,

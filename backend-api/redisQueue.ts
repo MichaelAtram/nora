@@ -4,6 +4,9 @@
 const { Queue } = require("bullmq");
 const { randomUUID } = require("crypto");
 const IORedis = require("ioredis");
+const { createRedisClient } = require("./lib/connectionConfig");
+
+const IS_TEST_ENV = process.env.NODE_ENV === "test" || !!process.env.JEST_WORKER_ID;
 
 function parseTimeoutMs(rawValue, fallbackMs) {
   const parsed = Number.parseInt(rawValue, 10);
@@ -26,11 +29,17 @@ const ALERT_DELIVERY_ATTEMPTS = (() => {
   return Math.min(parsed, 10);
 })();
 
-const connection = new IORedis({
-  host: process.env.REDIS_HOST || "redis",
-  port: parseInt(process.env.REDIS_PORT || "6379"),
-  ...(process.env.REDIS_PASSWORD ? { password: process.env.REDIS_PASSWORD } : {}),
+const connection = createRedisClient(IORedis, process.env, {
   maxRetriesPerRequest: null,
+  ...(IS_TEST_ENV
+    ? {
+        // Unit tests mock queue behavior at the module boundary. Keep imports
+        // from opening a retrying DNS/socket loop when a suite loads server.ts.
+        lazyConnect: true,
+        enableOfflineQueue: false,
+        retryStrategy: () => null,
+      }
+    : {}),
 });
 
 // ── Queue definitions and retry policy ──────────────────────────
@@ -109,11 +118,78 @@ const agentScheduleQueue = new Queue("agent-schedules", {
   },
 });
 
-// ── Enqueue operations ──────────────────────────────────────────
-
-async function addDeploymentJob(agent) {
-  await deployQueue.add("deploy-agent", agent);
+if (IS_TEST_ENV) {
+  for (const queue of [
+    deployQueue,
+    clawhubJobsQueue,
+    policySettingsQueue,
+    backupsQueue,
+    alertDeliveryQueue,
+    agentScheduleQueue,
+  ]) {
+    if (typeof queue.removeAllListeners === "function" && typeof queue.on === "function") {
+      queue.removeAllListeners("error");
+      queue.on("error", () => {});
+    }
+  }
 }
+
+// ── Deployment enqueue and cancellation ────────────────────────
+
+async function addDeploymentJob(agent, options = undefined) {
+  const jobId = options?.jobId ? String(options.jobId) : "";
+  if (jobId) {
+    const existing = await deployQueue.getJob(jobId);
+    if (existing) {
+      const state = typeof existing.getState === "function" ? await existing.getState() : "unknown";
+      if (["active", "waiting", "waiting-children", "delayed", "prioritized"].includes(state)) {
+        return existing;
+      }
+      if (typeof existing.remove === "function") {
+        await existing.remove();
+      }
+    }
+    return deployQueue.add("deploy-agent", agent, { ...options, jobId });
+  }
+  return deployQueue.add("deploy-agent", agent);
+}
+
+async function cancelDeploymentJobsForAgent(agentId) {
+  if (!agentId) return { removed: 0, active: 0 };
+
+  const jobs = await deployQueue.getJobs([
+    "active",
+    "waiting",
+    "waiting-children",
+    "delayed",
+    "prioritized",
+    "failed",
+  ]);
+  const normalizedAgentId = String(agentId);
+  let removed = 0;
+  let active = 0;
+
+  for (const job of jobs) {
+    if (!job || String(job.data?.id || "") !== normalizedAgentId) continue;
+    const state = typeof job.getState === "function" ? await job.getState() : "unknown";
+    if (state === "active") {
+      // BullMQ cannot remove a locked job from another process. The provisioner
+      // treats a missing agent row as cancellation before create, after create,
+      // and in its failure path, so an in-flight job cannot retry or orphan a
+      // runtime after the control-plane row is deleted.
+      active += 1;
+      continue;
+    }
+    if (typeof job.remove === "function") {
+      await job.remove();
+      removed += 1;
+    }
+  }
+
+  return { removed, active };
+}
+
+// ── Other enqueue operations ───────────────────────────────────
 
 /**
  * Enqueue one schedule execution, using runId as payload and BullMQ job identity.
@@ -325,6 +401,7 @@ module.exports = {
   alertDeliveryQueue,
   agentScheduleQueue,
   addDeploymentJob,
+  cancelDeploymentJobsForAgent,
   addScheduleRunJob,
   addClawhubJob,
   addClawhubInstallJob,

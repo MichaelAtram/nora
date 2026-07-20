@@ -4,6 +4,22 @@ const containerManager = require("./containerManager");
 const { reconcileAgentStatus } = require("./agentStatus");
 const { collectAgentTelemetrySample } = require("./agentTelemetry");
 const { probeExternalAgentHealth } = require("./externalHealth");
+const { isRemoteHostAccessRevokedError } = require("./remoteHosts");
+
+const REMOTE_HOST_STATUS_PRESERVING_ERRORS = new Set([
+  "REMOTE_HOST_RETEST_REQUIRED",
+  "REMOTE_HOST_AUTH_CHECK_FAILED",
+]);
+const PROVIDER_AUTH_STATUS_HOLD_REASONS = new Set([
+  "provider_auth_reconciliation_pending",
+  "provider_auth_reconciliation_failed",
+]);
+
+function shouldPreserveStatusAfterRemoteHostError(error) {
+  return (
+    isRemoteHostAccessRevokedError(error) || REMOTE_HOST_STATUS_PRESERVING_ERRORS.has(error?.code)
+  );
+}
 
 /**
  * Collect telemetry for running container-backed agents and prune samples older
@@ -18,7 +34,7 @@ async function collectBackgroundTelemetry({
 } = {}) {
   try {
     const agents = await dbClient.query(
-      `SELECT id, container_id, backend_type, sandbox_type,
+      `SELECT id, user_id, container_id, backend_type, sandbox_type,
               runtime_family, deploy_target, execution_target_id, sandbox_profile, status,
               host, runtime_host, runtime_port, gateway_host, gateway_port
          FROM agents
@@ -55,14 +71,16 @@ async function reconcileBackgroundAgentStatuses({
 } = {}) {
   try {
     const agents = await dbClient.query(
-      `SELECT id, container_id, backend_type,
-              runtime_family, deploy_target, execution_target_id, sandbox_profile, status
+      `SELECT id, user_id, container_id, backend_type,
+              runtime_family, deploy_target, execution_target_id, sandbox_profile, status,
+              paused_reason
          FROM agents
         WHERE container_id IS NOT NULL
           AND status IN ('running','warning','stopped','error')`,
     );
 
     for (const agent of agents.rows) {
+      if (PROVIDER_AUTH_STATUS_HOLD_REASONS.has(agent.paused_reason)) continue;
       try {
         const live = await statusResolver(agent);
         const reconciledStatus = reconcileAgentStatus(agent.status, Boolean(live?.running));
@@ -72,7 +90,11 @@ async function reconcileBackgroundAgentStatuses({
             agent.id,
           ]);
         }
-      } catch {
+      } catch (error) {
+        // Authorization/retest failures mean Nora cannot prove live state, not
+        // that the container stopped. Preserve durable status until an
+        // authorized and trusted check can run again.
+        if (shouldPreserveStatusAfterRemoteHostError(error)) continue;
         const reconciledStatus = reconcileAgentStatus(agent.status, false);
         if (reconciledStatus !== agent.status) {
           await dbClient.query("UPDATE agents SET status = $1 WHERE id = $2", [

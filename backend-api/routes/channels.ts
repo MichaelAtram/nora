@@ -13,9 +13,11 @@ const {
 } = require("../channels/openclaw");
 const { resolveAgentRuntimeFamily } = require("../agentRuntimeFields");
 const { requireOwnedAgent } = require("../middleware/ownership");
+const { scopeByMethod } = require("../middleware/auth");
 
 const router = express.Router();
 
+router.use("/:id/channels", scopeByMethod("integrations:read", "integrations:write"));
 router.use("/:id/channels", requireOwnedAgent("id"));
 
 function normalizeChannelType(value) {

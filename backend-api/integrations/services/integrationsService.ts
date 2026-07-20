@@ -20,23 +20,25 @@ const { buildIntegrationToolCatalogEntries } = require("./toolCatalogBuilder");
 const { createProviderRegistry } = require("../providers/base/registry");
 
 /**
- * Build a permissive fallback that stores credentials but neither validates nor exports them.
+ * Build a fail-closed fallback that rejects verification and runtime environment mapping.
+ * This prevents stale catalog entries from appearing connected without a strategy.
  *
  * @param {string} providerId - Unregistered catalog provider ID.
- * @returns {Object} Provider strategy that reports storage-only success.
+ * @returns {Object} Provider strategy that reports the missing registration.
  */
 function createStubProvider(providerId) {
+  const unsupportedMessage = `No integration strategy is registered for provider "${providerId}"`;
   return {
     id: providerId,
     authType: "custom",
     async test() {
       return {
-        success: true,
-        message: "Credentials stored — no strategy registered for this provider yet",
+        success: false,
+        error: unsupportedMessage,
       };
     },
     mapToEnv() {
-      return { primary: null, config: {} };
+      throw new Error(unsupportedMessage);
     },
   };
 }

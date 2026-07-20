@@ -252,20 +252,25 @@ export const wecomProvider: Provider = {
   authType: "custom",
 
   async test(ctx: DecryptedIntegration, _deps: ProviderDeps): Promise<ConnectivityResult> {
-    const normalized = normalizeWecomConfigInput(ctx.config || {});
-    const errors = validateRequiredFields(normalized);
-    if (errors.length) {
-      return {
-        success: false,
-        error: errors[0],
-        message: errors[0],
-      };
-    }
+    try {
+      const normalized = normalizeWecomConfigInput(ctx.config || {});
+      const errors = validateRequiredFields(normalized);
+      if (errors.length) {
+        return {
+          success: false,
+          error: errors[0],
+          message: errors[0],
+        };
+      }
 
-    return {
-      success: true,
-      message: "WeCom configuration saved and ready for activation wiring.",
-    };
+      return {
+        success: true,
+        message: "WeCom configuration saved and ready for activation wiring.",
+      };
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      return { success: false, error: message, message };
+    }
   },
 
   mapToEnv(_ctx: DecryptedIntegration): EnvMapping {

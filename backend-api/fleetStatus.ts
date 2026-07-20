@@ -108,16 +108,29 @@ function deriveAttention(agent, ctx = {}) {
 }
 
 /**
- * Return attention-only results for agents owned by or workspace-accessible to a
- * user. The total still counts every accessible agent considered by the roll-up.
+ * Return attention-only results for a user's accessible fleet or a selected
+ * workspace. The total still counts every agent considered by the roll-up.
  *
- * @param {Object} options - User scope, database override, and evaluation time.
+ * @param {Object} options - User/workspace scope, database override, and evaluation time.
  * @returns {Promise<Object>} Scoped fleet totals and attention entries.
  */
-async function getFleetAttention({ userId, dbClient = db, now = Date.now() } = {}) {
-  if (!userId) {
+async function getFleetAttention({ userId, workspaceId, dbClient = db, now = Date.now() } = {}) {
+  if (!userId && !workspaceId) {
     return { generatedAt: new Date(now).toISOString(), total: 0, attentionCount: 0, agents: [] };
   }
+
+  const scopeClause = workspaceId
+    ? `EXISTS (
+         SELECT 1 FROM workspace_agents scoped_workspace_agents
+          WHERE scoped_workspace_agents.workspace_id = $1
+            AND scoped_workspace_agents.agent_id = a.id
+       )`
+    : `a.user_id = $1
+         OR a.id IN (
+              SELECT wa.agent_id FROM workspace_agents wa
+                JOIN workspace_members wm ON wm.workspace_id = wa.workspace_id
+               WHERE wm.user_id = $1
+            )`;
 
   const result = await dbClient.query(
     `SELECT a.id, a.name, a.status, a.paused_reason, a.runtime_family, a.deploy_target,
@@ -138,13 +151,8 @@ async function getFleetAttention({ userId, dbClient = db, now = Date.now() } = {
                   AS soft_crossed
            FROM agent_budgets b WHERE b.agent_id = a.id
        ) bud ON true
-      WHERE a.user_id = $1
-         OR a.id IN (
-              SELECT wa.agent_id FROM workspace_agents wa
-                JOIN workspace_members wm ON wm.workspace_id = wa.workspace_id
-               WHERE wm.user_id = $1
-            )`,
-    [userId],
+      WHERE ${scopeClause}`,
+    [workspaceId || userId],
   );
 
   const toMs = (value) => (value == null ? null : new Date(value).getTime());

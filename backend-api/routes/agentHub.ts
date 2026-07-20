@@ -22,6 +22,7 @@ const {
   resolveContainerName,
   sanitizeAgentName,
   serializeAgent,
+  stripInternalTemplateMetadata,
   summarizeTemplatePayload,
 } = require("../agentPayloads");
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
@@ -33,6 +34,7 @@ const {
   normalizeBackendName,
 } = require("../../agent-runtime/lib/backendCatalog");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { requireSession } = require("../middleware/auth");
 const {
   buildAgentContext,
   buildAuditMetadata,
@@ -47,6 +49,11 @@ const {
 } = require("../agentRuntimeFields");
 
 const router = express.Router();
+// Agent Hub publishing, installation, reporting, and installation-key
+// lifecycle can cross workspace and upstream-hub boundaries. Keep the entire
+// authenticated UI surface behind a browser session until dedicated scopes
+// and workspace-bound contracts are introduced.
+router.use(requireSession);
 router.use(createMutationFailureAuditMiddleware("agent_hub"));
 
 function stripAsciiControlCharacters(value) {
@@ -333,12 +340,16 @@ function isRemoteListingId(value) {
 }
 
 function buildRemoteTemplateDetail(remoteDetail, options = {}) {
-  const templatePayload = remoteDetail.templatePayload || remoteDetail.template_payload || {};
+  const templatePayload = stripInternalTemplateMetadata(
+    remoteDetail.templatePayload || remoteDetail.template_payload || {},
+  );
   const template = summarizeTemplatePayload(templatePayload, {
     includeContent: options.includeContent === true,
   });
   return {
     ...remoteDetail,
+    templatePayload,
+    template_payload: undefined,
     id: remoteDetail.id || `hub:${remoteDetail.remote_id}`,
     remote: true,
     source_type: "community",
@@ -390,7 +401,7 @@ function buildCentralSubmissionPayload(listing, snapshot, templatePayload) {
       templateKey: snapshot.template_key || null,
     },
     defaults: extractTemplateDefaultsFromSnapshot(snapshot),
-    templatePayload,
+    templatePayload: stripInternalTemplateMetadata(templatePayload),
   };
 }
 
@@ -672,7 +683,7 @@ router.post(
         template_key: detail.snapshot?.templateKey || detail.snapshot?.template_key || null,
       };
       defaults = detail.defaults || {};
-      templatePayload = remoteDetail.templatePayload || remoteDetail.template_payload || {};
+      templatePayload = detail.templatePayload;
       remoteInstall = true;
     } else {
       listing = await agentHubStore.getListing(listingId);
@@ -961,7 +972,7 @@ router.get(
         },
         snapshot: detail.snapshot || null,
         defaults: detail.defaults || {},
-        templatePayload: remoteDetail.templatePayload || remoteDetail.template_payload || {},
+        templatePayload: detail.templatePayload,
       };
       const filenameSeed = detail.slug || detail.name || "nora-agent-hub-template";
       const filename = `${filenameSeed.replace(/[^a-z0-9-]+/gi, "-").toLowerCase() || "nora-agent-hub-template"}.nora-template.json`;

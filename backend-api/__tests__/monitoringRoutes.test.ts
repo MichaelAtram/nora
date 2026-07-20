@@ -15,10 +15,12 @@ const mockMetrics = {
   getAgentSummary: jest.fn(),
   getAgentCost: jest.fn(),
 };
+const mockFleetStatus = { getFleetAttention: jest.fn() };
 
 jest.mock("../db", () => mockDb);
 jest.mock("../monitoring", () => mockMonitoring);
 jest.mock("../metrics", () => mockMetrics);
+jest.mock("../fleetStatus", () => mockFleetStatus);
 
 const router = require("../routes/monitoring");
 
@@ -32,6 +34,7 @@ describe("monitoring route ownership", () => {
     mockMonitoring.getRecentEvents.mockReset();
     mockMonitoring.getUserRecentEvents.mockReset();
     mockMonitoring.getUserEventsPage.mockReset();
+    mockFleetStatus.getFleetAttention.mockReset();
     currentUser = { id: "user-1", role: "user" };
 
     app = express();
@@ -92,6 +95,56 @@ describe("monitoring route ownership", () => {
       "user-1",
       expect.objectContaining({ limit: 10 }),
     );
+  });
+
+  it("passes an API key's exact workspace to monitoring collections", async () => {
+    mockMonitoring.getMetrics.mockResolvedValueOnce({ totalAgents: 1 });
+    mockFleetStatus.getFleetAttention.mockResolvedValueOnce({ total: 1, agents: [] });
+    mockMonitoring.getUserRecentEvents.mockResolvedValueOnce([]);
+
+    app = express();
+    app.use(express.json());
+    app.use((req, res, next) => {
+      req.user = currentUser;
+      req.apiKey = { workspaceId: "ws-A", scopes: ["monitoring:read"] };
+      next();
+    });
+    app.use(router);
+
+    expect((await request(app).get("/monitoring/metrics")).status).toBe(200);
+    expect((await request(app).get("/monitoring/fleet-status")).status).toBe(200);
+    expect((await request(app).get("/monitoring/events")).status).toBe(200);
+    expect(mockMonitoring.getMetrics).toHaveBeenCalledWith({
+      userId: "user-1",
+      workspaceId: "ws-A",
+    });
+    expect(mockFleetStatus.getFleetAttention).toHaveBeenCalledWith({
+      userId: "user-1",
+      workspaceId: "ws-A",
+    });
+    expect(mockMonitoring.getUserRecentEvents).toHaveBeenCalledWith("user-1", {
+      workspaceId: "ws-A",
+      limit: 50,
+    });
+  });
+
+  it("rejects an API-key agent event filter outside the bound workspace", async () => {
+    app = express();
+    app.use(express.json());
+    app.use((req, res, next) => {
+      req.user = currentUser;
+      req.apiKey = { workspaceId: "ws-A", scopes: ["monitoring:read"] };
+      next();
+    });
+    app.use(router);
+    mockDb.query.mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app).get("/monitoring/events?agentId=agent-other");
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("wrong_workspace");
+    expect(mockMonitoring.getUserRecentEvents).not.toHaveBeenCalled();
+    expect(mockMonitoring.getUserEventsPage).not.toHaveBeenCalled();
   });
 
   it("returns paginated filtered events for the current user", async () => {
@@ -161,5 +214,23 @@ describe("monitoring route ownership", () => {
       "SELECT value, metadata, recorded_at FROM usage_metrics WHERE metric_type = 'api_performance' AND recorded_at >= $1 ORDER BY recorded_at",
       ["2026-04-09T00:00:00.000Z"],
     );
+  });
+
+  it("keeps platform-wide performance metrics session-only for admin-issued API keys", async () => {
+    currentUser = { id: "admin-1", role: "admin" };
+    app = express();
+    app.use(express.json());
+    app.use((req, res, next) => {
+      req.user = currentUser;
+      req.apiKey = { workspaceId: "ws-A", scopes: ["monitoring:read"] };
+      next();
+    });
+    app.use(router);
+
+    const res = await request(app).get("/monitoring/performance");
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("session_required");
+    expect(mockDb.query).not.toHaveBeenCalled();
   });
 });

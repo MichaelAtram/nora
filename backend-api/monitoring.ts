@@ -89,11 +89,49 @@ function joinWhereClauses(clauses = []) {
  */
 function buildUserEventScopeClause(
   userId,
-  { agentId = null, tableAlias = "e", startIndex = 1 } = {},
+  { agentId = null, workspaceId = null, tableAlias = "e", startIndex = 1 } = {},
 ) {
   const prefix = tableAlias ? `${tableAlias}.` : "";
   const params = [];
   let parameterIndex = startIndex - 1;
+
+  if (workspaceId) {
+    params.push(workspaceId);
+    parameterIndex += 1;
+    const workspaceParamIndex = parameterIndex;
+    const clauses = [
+      `(
+        ${prefix}metadata #>> '{workspace,id}' = $${workspaceParamIndex}::text
+        OR EXISTS (
+          SELECT 1
+            FROM workspace_agents scoped_workspace_agents
+           WHERE scoped_workspace_agents.workspace_id = $${workspaceParamIndex}::uuid
+             AND (
+               scoped_workspace_agents.agent_id::text = ${prefix}metadata->>'agentId'
+               OR scoped_workspace_agents.agent_id::text = ${prefix}metadata #>> '{agent,id}'
+               OR scoped_workspace_agents.agent_id::text = ${prefix}metadata #>> '{sourceAgent,id}'
+             )
+        )
+      )`,
+    ];
+
+    if (agentId) {
+      params.push(agentId);
+      parameterIndex += 1;
+      clauses.push(
+        `(
+          ${prefix}metadata #>> '{agent,id}' = $${parameterIndex}
+          OR ${prefix}metadata #>> '{sourceAgent,id}' = $${parameterIndex}
+          OR ${prefix}metadata->>'agentId' = $${parameterIndex}
+        )`,
+      );
+    }
+
+    return {
+      whereClause: joinWhereClauses(clauses),
+      params,
+    };
+  }
 
   params.push(userId);
   parameterIndex += 1;
@@ -172,6 +210,10 @@ async function queryUserEvents(userId, options = {}, { limit = null, offset = 0 
   const scope = buildUserEventScopeClause(userId, {
     agentId:
       typeof options.agentId === "string" && options.agentId.trim() ? options.agentId.trim() : null,
+    workspaceId:
+      typeof options.workspaceId === "string" && options.workspaceId.trim()
+        ? options.workspaceId.trim()
+        : null,
     tableAlias: "e",
   });
   const filter = buildEventWhereClause(normalizeEventFilters(options), {
@@ -212,36 +254,58 @@ async function getMetrics(options = {}) {
     typeof normalizedOptions.userId === "string" && normalizedOptions.userId.trim()
       ? normalizedOptions.userId.trim()
       : null;
+  const workspaceId =
+    typeof normalizedOptions.workspaceId === "string" && normalizedOptions.workspaceId.trim()
+      ? normalizedOptions.workspaceId.trim()
+      : null;
 
-  const agentCountsQuery = userId
+  const agentCountsQuery = workspaceId
     ? db.query(
         `SELECT a.status, count(DISTINCT a.id)::int
+           FROM workspace_agents wa
+           INNER JOIN agents a ON a.id = wa.agent_id
+          WHERE wa.workspace_id = $1
+          GROUP BY a.status`,
+        [workspaceId],
+      )
+    : userId
+      ? db.query(
+          `SELECT a.status, count(DISTINCT a.id)::int
            FROM agents a
            LEFT JOIN workspace_agents wa ON wa.agent_id = a.id
            LEFT JOIN workspace_members wm
              ON wm.workspace_id = wa.workspace_id AND wm.user_id = $1
           WHERE a.user_id = $1 OR wm.user_id = $1
           GROUP BY a.status`,
-        [userId],
-      )
-    : db.query("SELECT status, count(*)::int FROM agents GROUP BY status");
+          [userId],
+        )
+      : db.query("SELECT status, count(*)::int FROM agents GROUP BY status");
 
-  const deploymentCountQuery = userId
+  const deploymentCountQuery = workspaceId
     ? db.query(
         `SELECT count(DISTINCT d.id)::int as total
+           FROM deployments d
+           INNER JOIN workspace_agents wa ON wa.agent_id = d.agent_id
+          WHERE wa.workspace_id = $1`,
+        [workspaceId],
+      )
+    : userId
+      ? db.query(
+          `SELECT count(DISTINCT d.id)::int as total
            FROM deployments d
            INNER JOIN agents a ON a.id = d.agent_id
            LEFT JOIN workspace_agents wa ON wa.agent_id = a.id
            LEFT JOIN workspace_members wm
              ON wm.workspace_id = wa.workspace_id AND wm.user_id = $1
           WHERE a.user_id = $1 OR wm.user_id = $1`,
-        [userId],
-      )
-    : db.query("SELECT count(*)::int as total FROM deployments");
+          [userId],
+        )
+      : db.query("SELECT count(*)::int as total FROM deployments");
 
-  const userCountQuery = userId
-    ? Promise.resolve({ rows: [] })
-    : db.query("SELECT count(*)::int as total FROM users");
+  const userCountQuery =
+    userId || workspaceId
+      ? Promise.resolve({ rows: [] })
+      : db.query("SELECT count(*)::int as total FROM users");
 
   const [agentCounts, deploymentCount, userCount] = await Promise.all([
     agentCountsQuery,
@@ -255,7 +319,7 @@ async function getMetrics(options = {}) {
   });
 
   let queueStats = { waiting: 0, active: 0, completed: 0, failed: 0 };
-  if (userId) {
+  if (userId || workspaceId) {
     queueStats = {
       waiting: statusMap.queued || 0,
       active: statusMap.deploying || 0,
@@ -282,7 +346,7 @@ async function getMetrics(options = {}) {
     queue: queueStats,
   };
 
-  if (!userId) {
+  if (!userId && !workspaceId) {
     result.totalUsers = userCount.rows[0]?.total || 0;
   }
 
@@ -331,6 +395,10 @@ async function getUserEventsPage(userId, options = {}) {
     typeof options.agentId === "string" && options.agentId.trim() ? options.agentId.trim() : null;
   const scope = buildUserEventScopeClause(userId, {
     agentId: scopedAgentId,
+    workspaceId:
+      typeof options.workspaceId === "string" && options.workspaceId.trim()
+        ? options.workspaceId.trim()
+        : null,
     tableAlias: "e",
   });
   const filter = buildEventWhereClause(normalizeEventFilters(options), {

@@ -72,6 +72,10 @@ The token must carry the matching scope for the operation:
 
 Issuing API keys, mutating workspace membership, and other privileged flows require session authentication and are not available through the CLI.
 
+## Contributing
+
+From the repository root, run `npm run contributor:setup -- --scope cli` once, then `npm run contributor:check -- cli` before opening a pull request. CLI changes should keep command help, token-scope documentation, and mocked Node tests aligned with the public REST API.
+
 ## Support Nora
 
 If Nora is useful to you, consider starring the [GitHub repository](https://github.com/solomon2773/nora). It helps other operators discover the project.

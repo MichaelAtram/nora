@@ -4,6 +4,7 @@ const containerManager = require("./containerManager");
 const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
 const { runContainerCommand } = require("./authSync");
 const { waitForAgentReadiness } = require("./healthChecks");
+const { assertRemoteHostAgentUse } = require("./remoteHosts");
 const { buildHermesRuntimeBootstrapEnv } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
 
 const HERMES_CHANNEL_REDACTED = "[REDACTED]";
@@ -764,6 +765,8 @@ if api_key_present:
         model.pop("api_key", None)
 elif provider and provider != "custom":
     model.pop("api_key", None)
+elif not provider:
+    model.pop("api_key", None)
 
 if model:
     config["model"] = model
@@ -1069,7 +1072,8 @@ print(json.dumps({
  * @returns {Promise<void>} Resolves when the runtime recovers.
  */
 async function restartHermesRuntime(agent) {
-  await containerManager.restart(agent);
+  const lifecycleResult = await containerManager.restart(agent);
+  await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
   const readiness = await waitForAgentReadiness(
     {
       host: agent.host,
@@ -1081,6 +1085,7 @@ async function restartHermesRuntime(agent) {
       checkGateway: false,
     },
     {
+      beforeAttempt: () => assertRemoteHostAgentUse(agent, { includeProfile: false }),
       runtime: {
         attempts: 8,
         intervalMs: 5000,

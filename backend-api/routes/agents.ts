@@ -1,9 +1,11 @@
 // @ts-nocheck
 const express = require("express");
+const { Client } = require("pg");
 const db = require("../db");
 const { encrypt, decrypt } = require("../crypto");
-const { addDeploymentJob } = require("../redisQueue");
+const { addDeploymentJob, cancelDeploymentJobsForAgent } = require("../redisQueue");
 const billing = require("../billing");
+const llmProviders = require("../llmProviders");
 const {
   clampDeploymentDefaults,
   getDeploymentDefaults,
@@ -25,6 +27,7 @@ const {
   resolveContainerName,
   sanitizeAgentName,
   serializeAgent,
+  stripInternalTemplateMetadata,
 } = require("../agentPayloads");
 const {
   attachDraftToAgent,
@@ -32,7 +35,10 @@ const {
   materializeManagedMigrationState,
 } = require("../agentMigrations");
 const { isGatewayAvailableStatus, reconcileAgentStatus } = require("../agentStatus");
-const { assertExternalEndpointReachable } = require("../gatewayProxy");
+const {
+  assertExternalEndpointReachable,
+  assertStrongExternalGatewayToken,
+} = require("../gatewayProxy");
 const {
   HERMES_DASHBOARD_PORT,
   OPENCLAW_GATEWAY_PORT,
@@ -72,19 +78,375 @@ const {
   saveHermesChannel,
   testHermesChannel,
 } = require("../hermesUi");
-const { runContainerCommand, syncAuthToUserAgents } = require("../authSync");
-const { findAccessibleAgent } = require("../middleware/ownership");
-const { scopeByMethod } = require("../middleware/auth");
+const {
+  isProviderAuthStatusHoldReason,
+  runContainerCommand,
+  resumeAgentWithProviderAuth,
+  syncAuthToUserAgents,
+} = require("../authSync");
+const {
+  apiKeyWorkspaceId,
+  findAccessibleAgentForRequest,
+  requireApiKeyAgentScope,
+} = require("../middleware/ownership");
+const { requireSession, scopeByMethod } = require("../middleware/auth");
 const agentVersions = require("../agentVersions");
 const { assertKubernetesExecutionTargetAvailable } = require("../kubernetesClusters");
-const { assertRemoteHostExecutionTargetAvailable } = require("../remoteHosts");
+const {
+  assertRemoteHostAgentUse,
+  assertRemoteHostExecutionTargetAvailable,
+} = require("../remoteHosts");
 const { releaseGatewayPort } = require("../portAllocations");
+const { buildPostgresConfig } = require("../lib/connectionConfig");
+const {
+  acquireAgentProvisionLock,
+  buildReplacementDeploymentJob,
+  enqueueReplacementDeployment: enqueueReplacementDeploymentWithLock,
+} = require("../agentProvisionLock");
 
 const router = express.Router();
 router.use(createMutationFailureAuditMiddleware("agent"));
-// API-key requests need agents:read for GET/HEAD, agents:write for everything
-// else. Session-authenticated requests skip this check (req.apiKey is unset).
-router.use(scopeByMethod("agents:read", "agents:write"));
+const coreAgentScope = scopeByMethod("agents:read", "agents:write");
+const ROUTE_SPECIFIC_SCOPE_SEGMENTS = new Set([
+  "backups",
+  "channels",
+  "cost",
+  "export",
+  "files",
+  "integrations",
+  "mcp-servers",
+  "metrics",
+]);
+
+// Core agent routes use agents:read/write. Nested resources with their own
+// public scope contract must reach that router without accidentally requiring
+// both scopes. Session-only backup, export, and live-filesystem routes likewise
+// need to return their explicit session_required result without a scope or DB lookup.
+router.use((req, res, next) => {
+  if (req.apiKey) {
+    const segments = String(req.path || "")
+      .split("/")
+      .filter(Boolean);
+    if (
+      segments[0] === "activate-demo" ||
+      (segments.length > 1 && ROUTE_SPECIFIC_SCOPE_SEGMENTS.has(segments[1]))
+    ) {
+      return next();
+    }
+  }
+  return coreAgentScope(req, res, next);
+});
+router.param("id", requireApiKeyAgentScope("id"));
+
+const DEMO_ACTIVATION_MARKER = "local-docker-demo-v1";
+
+async function enqueueReplacementDeployment(agent, jobData, options = {}) {
+  return enqueueReplacementDeploymentWithLock(agent, jobData, {
+    queryable: db,
+    cancelDeploymentJobsForAgent,
+    addDeploymentJob,
+    acquireLock: acquireAgentProvisionLock,
+    ...options,
+  });
+}
+
+function createAgentNotFoundError() {
+  const error = new Error("Agent not found");
+  error.statusCode = 404;
+  return error;
+}
+
+function createApiKeyWorkspaceBindingError() {
+  const error = new Error("API key has no workspace binding");
+  error.statusCode = 403;
+  error.code = "wrong_workspace";
+  return error;
+}
+
+async function insertAgentForRequest(req, insertSql, params) {
+  if (!req.apiKey) return db.query(insertSql, params);
+
+  const workspaceId = apiKeyWorkspaceId(req);
+  if (!workspaceId) throw createApiKeyWorkspaceBindingError();
+  const workspaceParam = `$${params.length + 1}`;
+  return db.query(
+    `WITH created_agent AS (
+       ${insertSql}
+     ), workspace_assignment AS (
+       INSERT INTO workspace_agents(workspace_id, agent_id, role)
+       SELECT ${workspaceParam}, id, 'member'
+         FROM created_agent
+       RETURNING agent_id
+     )
+     SELECT created_agent.*
+       FROM created_agent
+       JOIN workspace_assignment ON workspace_assignment.agent_id = created_agent.id`,
+    [...params, workspaceId],
+  );
+}
+
+function assertLifecycleNotProvisioning(agent) {
+  if (!["queued", "deploying"].includes(agent?.status)) return;
+  const error = new Error(
+    "Agent deployment is queued or in progress. Wait for provisioning to finish before changing lifecycle state.",
+  );
+  error.statusCode = 409;
+  error.code = "AGENT_PROVISIONING_IN_PROGRESS";
+  throw error;
+}
+
+async function withAccessibleAgentLifecycleLock(
+  { agentId, req, role = "editor", applicationName },
+  callback,
+) {
+  const visible = await findAccessibleAgentForRequest(req, agentId, role);
+  if (!visible) throw createAgentNotFoundError();
+
+  const provisionLock = await acquireAgentProvisionLock(agentId, { applicationName });
+  try {
+    const agent = await findAccessibleAgentForRequest(req, agentId, role);
+    if (!agent) throw createAgentNotFoundError();
+    assertLifecycleNotProvisioning(agent);
+    return await callback(agent);
+  } finally {
+    await provisionLock.release();
+  }
+}
+
+function createDemoActivationLockClient() {
+  const {
+    max: _max,
+    idleTimeoutMillis: _idleTimeoutMillis,
+    ...clientConfig
+  } = buildPostgresConfig({
+    ...process.env,
+    DB_APPLICATION_NAME: "nora-backend-demo-activation",
+  });
+  return new Client(clientConfig);
+}
+
+function demoActivationJobId(agentId) {
+  return `demo-activation-${agentId}`;
+}
+
+function buildDemoDeploymentJob(agent, userId, demoProviderId, plan = "selfhosted") {
+  return {
+    id: agent.id,
+    name: agent.name,
+    userId,
+    plan,
+    backend: agent.backend_type || agent.deploy_target || "docker",
+    execution_target_id: agent.execution_target_id || "docker",
+    sandbox: agent.sandbox_profile || agent.sandbox_type || "standard",
+    specs: {
+      vcpu: agent.vcpu,
+      ram_mb: agent.ram_mb,
+      disk_gb: agent.disk_gb,
+    },
+    container_name: agent.container_name,
+    image: agent.image,
+    model: null,
+    migration_draft_id: null,
+    clawhub_skills: [],
+    llm_provider_id: demoProviderId,
+  };
+}
+
+async function ensureDemoDeploymentQueued(agent, userId, demoProviderId, plan, queryable = db) {
+  if (!agent) return agent;
+
+  let deploymentAgent = agent;
+  if (agent.status === "error") {
+    const provisionLock = await acquireAgentProvisionLock(agent.id, {
+      applicationName: "nora-backend-demo-activation-retry",
+    });
+    let resetPerformed = false;
+    try {
+      const currentResult = await queryable.query("SELECT * FROM agents WHERE id = $1", [agent.id]);
+      const currentAgent = currentResult.rows[0];
+      if (!currentAgent) throw createAgentNotFoundError();
+      if (currentAgent.status !== "error") return currentAgent;
+      agent = currentAgent;
+
+      const canceledJobs = await cancelDeploymentJobsForAgent(agent.id);
+      if (canceledJobs.active > 0) {
+        const error = new Error(
+          "The previous demo deployment is still finishing. Try again shortly.",
+        );
+        error.statusCode = 409;
+        throw error;
+      }
+      const hasRuntimeIdentity = [agent.container_id, agent.container_name].some(
+        (value) => value != null && String(value).trim() !== "",
+      );
+      if (hasRuntimeIdentity && !containerManager.canDestroy(agent)) {
+        const error = new Error(
+          "The failed demo runtime identity cannot be cleaned up safely. Remove it manually before retrying activation.",
+        );
+        error.code = "DEMO_RUNTIME_CLEANUP_UNAVAILABLE";
+        error.statusCode = 409;
+        throw error;
+      }
+      if (hasRuntimeIdentity) {
+        await containerManager.destroy(agent);
+      }
+      const reset = await queryable.query(
+        `UPDATE agents
+            SET status = 'queued',
+                container_id = NULL,
+                container_name = NULL,
+                host = NULL,
+                runtime_host = NULL,
+                runtime_port = NULL,
+                gateway_host = NULL,
+                gateway_port = NULL,
+                gateway_host_port = NULL,
+                gateway_token = NULL
+          WHERE id = $1
+            AND status = 'error'
+            AND container_id IS NOT DISTINCT FROM $2
+            AND container_name IS NOT DISTINCT FROM $3
+            AND host IS NOT DISTINCT FROM $4
+          RETURNING *`,
+        [agent.id, agent.container_id || null, agent.container_name || null, agent.host || null],
+      );
+      if (!reset.rows[0]) {
+        const error = new Error("The demo runtime changed while activation was being retried");
+        error.code = "DEMO_RUNTIME_STATE_CHANGED";
+        error.statusCode = 409;
+        throw error;
+      }
+      resetPerformed = true;
+      deploymentAgent = reset.rows[0];
+      await queryable.query("UPDATE deployments SET status = 'queued' WHERE agent_id = $1", [
+        agent.id,
+      ]);
+
+      await addDeploymentJob(
+        buildDemoDeploymentJob(deploymentAgent, userId, demoProviderId, plan),
+        {
+          jobId: demoActivationJobId(deploymentAgent.id),
+        },
+      );
+      return deploymentAgent;
+    } catch (error) {
+      if (resetPerformed) {
+        const compensation = await Promise.allSettled([
+          queryable.query(
+            "UPDATE agents SET status = 'error' WHERE id = $1 AND status = 'queued'",
+            [agent.id],
+          ),
+          queryable.query(
+            "UPDATE deployments SET status = 'failed' WHERE agent_id = $1 AND status = 'queued'",
+            [agent.id],
+          ),
+        ]);
+        const compensationFailure = compensation.find((result) => result.status === "rejected");
+        if (compensationFailure) error.compensationError = compensationFailure.reason;
+      }
+      throw error;
+    } finally {
+      await provisionLock.release();
+    }
+  }
+
+  if (!["queued", "deploying"].includes(deploymentAgent.status)) return deploymentAgent;
+  await addDeploymentJob(buildDemoDeploymentJob(deploymentAgent, userId, demoProviderId, plan), {
+    jobId: demoActivationJobId(deploymentAgent.id),
+  });
+  return deploymentAgent;
+}
+
+async function reconcileReadyDemoAgent(agent, userId) {
+  if (!agent || !["running", "warning", "stopped"].includes(agent.status)) return agent;
+
+  const results = await syncAuthToUserAgents(userId, agent.id, {
+    providerLockHeld: true,
+  });
+  const result = results.find((entry) => entry?.agentId === agent.id);
+  if (result?.status !== "synced") {
+    const error = new Error(
+      "The demo provider was restored, but the existing demo runtime could not be reconciled",
+    );
+    error.statusCode = 502;
+    error.code = "DEMO_PROVIDER_RECONCILIATION_FAILED";
+    error.syncResult = result || null;
+    throw error;
+  }
+
+  return agent;
+}
+
+function demoActivationMarkerPayload() {
+  return JSON.stringify({ metadata: { activation: DEMO_ACTIVATION_MARKER } });
+}
+
+async function findDemoActivationAgent(queryable, userId) {
+  const result = await queryable.query(
+    `SELECT *
+       FROM agents
+      WHERE user_id = $1
+        AND template_payload @> $2::jsonb
+        AND runtime_family = 'openclaw'
+        AND deploy_target = 'docker'
+        AND execution_target_id = 'docker'
+        AND sandbox_profile = 'standard'
+        AND backend_type = 'docker'
+      ORDER BY created_at, id
+      LIMIT 1`,
+    [userId, demoActivationMarkerPayload()],
+  );
+  return result.rows[0] || null;
+}
+
+async function assertLocalDockerAvailable() {
+  try {
+    const Docker = require("dockerode");
+    const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+    if (typeof docker.ping !== "function") {
+      throw new Error("Docker client does not expose ping()");
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (error) reject(error);
+        else resolve();
+      };
+      const timeout = setTimeout(
+        () => finish(new Error("Timed out while checking the local Docker daemon")),
+        3000,
+      );
+      try {
+        docker.ping((error) => finish(error));
+      } catch (error) {
+        finish(error);
+      }
+    });
+  } catch (error) {
+    console.warn("[agents.activate-demo] Local Docker is unavailable:", error.message);
+    const unavailable = new Error(
+      "Local Docker is unavailable. Start Docker and make sure Nora can access /var/run/docker.sock, then try again.",
+    );
+    unavailable.statusCode = 503;
+    unavailable.code = "LOCAL_DOCKER_UNAVAILABLE";
+    throw unavailable;
+  }
+}
+
+async function removeFailedDemoActivation(queryable, agentId, userId) {
+  await queryable.query("BEGIN");
+  try {
+    await queryable.query("DELETE FROM deployments WHERE agent_id = $1", [agentId]);
+    await queryable.query("DELETE FROM agents WHERE id = $1 AND user_id = $2", [agentId, userId]);
+    await queryable.query("COMMIT");
+  } catch (error) {
+    await queryable.query("ROLLBACK").catch(() => {});
+    throw error;
+  }
+}
 
 /**
  * Resolve the image Nora should deploy for a requested runtime selection,
@@ -155,14 +517,9 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
   return status;
 }
 
-function isIgnorableStopError(error) {
-  const message = String(error?.message || "");
-  return message.includes("already stopped") || message.includes("not running");
-}
-
 /**
- * Validate the requested runtime path and, for Kubernetes-backed runtimes,
- * ensure the referenced execution target is available to the owning user.
+ * Validate the requested runtime path and ensure any Kubernetes or Remote
+ * Docker execution target is available to the owning user.
  *
  * @param {Object} runtimeFields - Requested runtime/backend selection fields.
  * @param {string} ownerUserId - User id used to validate remote-host-backed execution targets.
@@ -173,6 +530,19 @@ async function assertRuntimeTargetAvailable(runtimeFields, ownerUserId) {
   await assertKubernetesExecutionTargetAvailable(runtimeFields);
   await assertRemoteHostExecutionTargetAvailable(runtimeFields, { ownerUserId });
   return status;
+}
+
+function requireSessionForRemoteDockerPlacement(req, res, ...runtimeSelections) {
+  const targetsRemoteDocker = runtimeSelections.some(
+    (runtimeFields) => runtimeFields?.deploy_target === "remote-docker",
+  );
+  if (!req.apiKey || !targetsRemoteDocker) return true;
+
+  res.status(403).json({
+    error: "Remote Docker placement requires session authentication",
+    code: "session_required",
+  });
+  return false;
 }
 
 function normalizeGatewayHost(value) {
@@ -299,7 +669,17 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const scope = req.query.scope === "owned" ? "owned" : "accessible";
-    const agents = await workspaces.listAccessibleAgents(req.user.id, { scope });
+    const listOptions = { scope };
+    if (req.apiKey) {
+      const workspaceId = apiKeyWorkspaceId(req);
+      if (!workspaceId) {
+        return res
+          .status(403)
+          .json({ error: "API key has no workspace binding", code: "wrong_workspace" });
+      }
+      listOptions.workspaceId = workspaceId;
+    }
+    const agents = await workspaces.listAccessibleAgents(req.user.id, listOptions);
     res.json(agents.map(serializeAgent));
   }),
 );
@@ -307,7 +687,7 @@ router.get(
 router.get(
   "/:id",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     let runtimeStatus = null;
 
@@ -315,6 +695,7 @@ router.get(
     // warning as a first-class degraded state until the container actually stops.
     if (
       containerManager.canMutate(agent) &&
+      !isProviderAuthStatusHoldReason(agent.paused_reason) &&
       ["running", "warning", "error", "stopped"].includes(agent.status)
     ) {
       try {
@@ -346,7 +727,7 @@ router.get(
 router.get(
   "/:id/stats/history",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
 
     const rangeMap = {
@@ -398,7 +779,7 @@ function agentAuditMetadata(req, agent, extra = {}) {
 router.get(
   "/:id/gateway-url",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, {
       ownerEmail: req.user.email || null,
@@ -506,7 +887,7 @@ function createStatusCodeError(message, statusCode) {
  * @returns {Promise<Object>} Accessible Hermes agent ready for downstream WebUI actions.
  */
 async function loadHermesUiAgent(req, { requiredRole = "viewer" } = {}) {
-  const agent = await findAccessibleAgent(req.params.id, req.user.id, requiredRole);
+  const agent = await findAccessibleAgentForRequest(req, req.params.id, requiredRole);
   if (!agent) {
     throw createStatusCodeError("Agent not found", 404);
   }
@@ -522,6 +903,11 @@ async function loadHermesUiAgent(req, { requiredRole = "viewer" } = {}) {
   if (!isGatewayAvailableStatus(agent.status)) {
     throw createStatusCodeError("Hermes WebUI is only available while the agent is running", 409);
   }
+
+  // Hermes status, chat, cron, channel, and dashboard routes can use runtime
+  // bearer credentials or the remote host directly. Agent ownership alone is
+  // not a durable capability after a workspace host share is revoked.
+  await assertRemoteHostAgentUse(agent, { includeProfile: false });
 
   // Belt-and-braces: gateway-available status should imply container_id is set
   // (the worker writes both atomically in the final UPDATE). If they've drifted
@@ -729,6 +1115,9 @@ async function resolveHermesApiToken(agent) {
 }
 
 async function fetchHermesApi(agent, path, options = {}) {
+  // Re-check at the credential-use boundary as defense in depth. This closes
+  // the race between the shared route loader and a later runtime request.
+  await assertRemoteHostAgentUse(agent, { includeProfile: false });
   const runtimeUrl = runtimeUrlForAgent(agent, path);
   if (!runtimeUrl) {
     const error = new Error("Hermes runtime endpoint not available");
@@ -785,6 +1174,7 @@ async function fetchHermesApi(agent, path, options = {}) {
 }
 
 async function fetchHermesDashboard(agent, path, options = {}) {
+  await assertRemoteHostAgentUse(agent, { includeProfile: false });
   const dashboardUrl = dashboardUrlForAgent(agent, path);
   if (!dashboardUrl) {
     const error = new Error("Hermes dashboard endpoint not available");
@@ -1364,24 +1754,207 @@ router.post(
 router.get(
   "/:id/stats",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.json(await buildAgentStatsResponse(agent));
   }),
 );
 
+router.post("/activate-demo", requireSession, async (req, res) => {
+  const userId = req.user.id;
+  const lockKey = llmProviders.providerMutationLockKey(userId);
+  let client;
+  let connected = false;
+  let lockHeld = false;
+  let transactionOpen = false;
+
+  try {
+    // The activation lock spans pool-backed capability, billing, scheduler,
+    // queue, and audit work. Keep it off the main pool so DB_POOL_MAX=1 does
+    // not self-deadlock while the session lock is held.
+    client = createDemoActivationLockClient();
+    await client.connect();
+    connected = true;
+    await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [lockKey]);
+    lockHeld = true;
+
+    // Validate the hard-coded local-Docker demo target before returning or
+    // requeueing any durable demo row. This prevents restored demo metadata
+    // from bypassing a Kubernetes-only Helm deployment's target policy.
+    const runtimeFields = resolveRequestedRuntimeFields({
+      request: {
+        runtime_family: "openclaw",
+        deploy_target: "docker",
+        execution_target_id: "docker",
+        sandbox_profile: "standard",
+      },
+    });
+    const runtimeSelectionStatus = await assertRuntimeTargetAvailable(runtimeFields, userId);
+    await assertLocalDockerAvailable();
+
+    const existingAgent = await findDemoActivationAgent(client, userId);
+    if (existingAgent) {
+      const demoProvider = await llmProviders.ensureDemoProvider(userId, client);
+      const activatedAgent = await ensureDemoDeploymentQueued(
+        existingAgent,
+        userId,
+        demoProvider.id,
+        undefined,
+        client,
+      );
+      await reconcileReadyDemoAgent(activatedAgent, userId);
+      return res.json(serializeAgent(activatedAgent));
+    }
+
+    const limits = await billing.enforceLimits(userId);
+    if (!limits.allowed) {
+      return res.status(402).json({
+        error: limits.error,
+        subscription: limits.subscription,
+      });
+    }
+
+    const name = "Demo Agent";
+    const deploymentDefaults = await getDeploymentDefaults();
+    const specs = billing.IS_PAAS
+      ? deploymentDefaults
+      : clampDeploymentDefaults(
+          normalizeDeploymentDefaults({}, deploymentDefaults),
+          billing.SELFHOSTED_LIMITS,
+        );
+    const node = await scheduler.selectNode({ fallback: runtimeFields.deploy_target });
+    const nodeName = node ? node.name : runtimeFields.deploy_target;
+    const containerName = resolveContainerName({
+      agentName: name,
+      runtimeSelection: runtimeFields,
+    });
+    const image = resolveRequestedImage({ runtimeFields });
+    const templatePayload = ensureCoreTemplateFiles(
+      createEmptyTemplatePayload({
+        source: "demo-activation",
+        activation: DEMO_ACTIVATION_MARKER,
+      }),
+      {
+        name,
+        sourceType: "platform",
+        includeBootstrap: true,
+      },
+    );
+
+    await client.query("BEGIN");
+    transactionOpen = true;
+    const demoProvider = await llmProviders.ensureDemoProvider(userId, client);
+    const result = await client.query(
+      `INSERT INTO agents(
+         user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
+         container_name, image, template_payload, clawhub_skills, runtime_family, deploy_target,
+         execution_target_id, sandbox_profile
+       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, '[]'::jsonb, $12, $13, $14, $15)
+       RETURNING *`,
+      [
+        userId,
+        name,
+        nodeName,
+        runtimeFields.backend_type,
+        runtimeFields.sandbox_type,
+        specs.vcpu,
+        specs.ram_mb,
+        specs.disk_gb,
+        containerName,
+        image,
+        JSON.stringify(templatePayload),
+        runtimeFields.runtime_family,
+        runtimeFields.deploy_target,
+        runtimeFields.execution_target_id,
+        runtimeFields.sandbox_profile,
+      ],
+    );
+    const agent = result.rows[0];
+    await client.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [
+      agent.id,
+    ]);
+    await client.query("COMMIT");
+    transactionOpen = false;
+
+    try {
+      await ensureDemoDeploymentQueued(
+        agent,
+        userId,
+        demoProvider.id,
+        limits.subscription?.plan || "selfhosted",
+      );
+    } catch (queueError) {
+      try {
+        await removeFailedDemoActivation(client, agent.id, userId);
+      } catch (cleanupError) {
+        console.error(
+          `[agents.activate-demo] Failed to remove agent ${agent.id} after queue failure:`,
+          cleanupError.message,
+        );
+      }
+      throw queueError;
+    }
+
+    try {
+      const deployType = `${runtimeSelectionStatus.runtimeFamily}/${runtimeSelectionStatus.deployTarget}/${runtimeSelectionStatus.sandboxProfile}`;
+      await monitoring.logEvent(
+        "agent_deployed",
+        `Agent "${name}" (${deployType}) queued for demo deployment`,
+        agentAuditMetadata(req, agent, {
+          deploy: {
+            runtimeFamily: runtimeFields.runtime_family,
+            deployTarget: runtimeFields.deploy_target,
+            executionTargetId: runtimeFields.execution_target_id,
+            sandboxProfile: runtimeFields.sandbox_profile,
+            backend: runtimeFields.backend_type,
+            type: deployType,
+            specs,
+            image,
+            containerName,
+            llmProviderId: demoProvider.id,
+          },
+        }),
+      );
+    } catch (auditError) {
+      console.warn("[agents.activate-demo] Failed to record deploy event:", auditError.message);
+    }
+
+    return res.json(serializeAgent(agent));
+  } catch (error) {
+    if (transactionOpen && client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+    return res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    if (connected && client) {
+      if (lockHeld) {
+        await client
+          .query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey])
+          .catch((error) =>
+            console.warn("[agents.activate-demo] Advisory unlock failed:", error.message),
+          );
+      }
+      await client
+        .end()
+        .catch((error) =>
+          console.warn("[agents.activate-demo] Lock connection close failed:", error.message),
+        );
+    }
+  }
+});
+
 router.post("/deploy", async (req, res) => {
   try {
     const requestBody = req.body || {};
     const clawhubSkills = normalizeClawhubSkills(requestBody.clawhub_skills);
-    // Enforce billing limits
-    const limits = await billing.enforceLimits(req.user.id);
-    if (!limits.allowed)
-      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
-
-    const sub = limits.subscription;
     let migrationDraft = null;
     if (requestBody.migration_draft_id) {
+      if (req.apiKey) {
+        return res.status(403).json({
+          error: "Migration-draft deployment requires session authentication",
+          code: "session_required",
+        });
+      }
       migrationDraft = await getOwnedMigrationDraft(requestBody.migration_draft_id, req.user.id);
       if (!migrationDraft) {
         return res.status(404).json({ error: "Migration draft not found" });
@@ -1411,6 +1984,14 @@ router.post("/deploy", async (req, res) => {
         runtime_family: runtimeFamily || DEFAULT_RUNTIME_FAMILY,
       },
     });
+    if (!requireSessionForRemoteDockerPlacement(req, res, runtimeFields)) return;
+    // Enforce billing only after authorization has rejected session-only
+    // Remote Docker placement for workspace API keys.
+    const limits = await billing.enforceLimits(req.user.id);
+    if (!limits.allowed)
+      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
+
+    const sub = limits.subscription;
     const containerName = resolveContainerName({
       requestedName: requestBody.container_name,
       agentName: name,
@@ -1443,39 +2024,42 @@ router.post("/deploy", async (req, res) => {
       requestedImage: requestBody.image,
       runtimeFields,
     });
-    const templatePayload = migrationDraft
-      ? migrationDraft.manifest.runtimeFamily === "openclaw"
-        ? migrationDraft.manifest.templatePayload ||
-          ensureCoreTemplateFiles(
-            createEmptyTemplatePayload({
+    const templatePayload = stripInternalTemplateMetadata(
+      migrationDraft
+        ? migrationDraft.manifest.runtimeFamily === "openclaw"
+          ? migrationDraft.manifest.templatePayload ||
+            ensureCoreTemplateFiles(
+              createEmptyTemplatePayload({
+                source: "migration-draft",
+              }),
+              {
+                name,
+                sourceType: "platform",
+                includeBootstrap: true,
+              },
+            )
+          : createEmptyTemplatePayload({
               source: "migration-draft",
-            }),
-            {
-              name,
-              sourceType: "platform",
-              includeBootstrap: true,
-            },
-          )
-        : createEmptyTemplatePayload({
-            source: "migration-draft",
-            migrationDraftId: migrationDraft.id,
-          })
-      : runtimeFields.runtime_family === "openclaw"
-        ? ensureCoreTemplateFiles(
-            createEmptyTemplatePayload({
+              migrationDraftId: migrationDraft.id,
+            })
+        : runtimeFields.runtime_family === "openclaw"
+          ? ensureCoreTemplateFiles(
+              createEmptyTemplatePayload({
+                source: "blank-deploy",
+              }),
+              {
+                name,
+                sourceType: "platform",
+                includeBootstrap: true,
+              },
+            )
+          : createEmptyTemplatePayload({
               source: "blank-deploy",
             }),
-            {
-              name,
-              sourceType: "platform",
-              includeBootstrap: true,
-            },
-          )
-        : createEmptyTemplatePayload({
-            source: "blank-deploy",
-          });
+    );
 
-    const result = await db.query(
+    const result = await insertAgentForRequest(
+      req,
       `INSERT INTO agents(
          user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
          container_name, image, template_payload, clawhub_skills, runtime_family, deploy_target,
@@ -1600,12 +2184,13 @@ router.post("/adopt", async (req, res) => {
       return res.status(400).json({ error: "Agent name must be 100 characters or less" });
     }
 
-    const token = String(body.gateway_token || body.token || "").trim();
-    if (!token) {
+    const rawToken = String(body.gateway_token || body.token || "").trim();
+    if (!rawToken) {
       return res
         .status(400)
         .json({ error: "gateway_token is required to adopt an external runtime" });
     }
+    const token = assertStrongExternalGatewayToken(rawToken);
 
     // Accept either a full URL or an explicit host (+ optional port). Default the
     // port to the runtime family's contract port (OpenClaw gateway / Hermes dashboard).
@@ -1647,7 +2232,8 @@ router.post("/adopt", async (req, res) => {
     // 'running' (optimistic); the external health-poll (Phase C2) reconciles it.
     // dashboard_port mirrors the published port so resolveHermesDashboardAddress is
     // correct even via its runtime_host fallback (not just the gateway_host branch).
-    const result = await db.query(
+    const result = await insertAgentForRequest(
+      req,
       `INSERT INTO agents(
          user_id, name, status, runtime_family, deploy_target, execution_target_id,
          sandbox_profile, sandbox_type, backend_type, gateway_host, gateway_port,
@@ -1680,7 +2266,7 @@ router.post("/adopt", async (req, res) => {
 router.patch(
   "/:id",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
 
     const name = sanitizeAgentName(req.body.name, agent.name || "OpenClaw-Agent");
@@ -1710,12 +2296,7 @@ router.post(
   "/:id/duplicate",
   asyncHandler(async (req, res) => {
     const requestBody = req.body || {};
-    const limits = await billing.enforceLimits(req.user.id);
-    if (!limits.allowed) {
-      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
-    }
-
-    const sourceAgent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const sourceAgent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!sourceAgent) return res.status(404).json({ error: "Agent not found" });
     const sourceRuntime = buildAgentRuntimeFields(sourceAgent);
     res.locals.auditContext = buildAgentContext(sourceAgent, {
@@ -1746,6 +2327,11 @@ router.post(
       },
       fallback: sourceRuntime,
     });
+    if (!requireSessionForRemoteDockerPlacement(req, res, sourceRuntime, runtimeFields)) return;
+    const limits = await billing.enforceLimits(req.user.id);
+    if (!limits.allowed) {
+      return res.status(402).json({ error: limits.error, subscription: limits.subscription });
+    }
     await assertRuntimeTargetAvailable(runtimeFields, req.user.id);
     const node = await scheduler.selectNode({
       fallback: runtimeFields.deploy_target,
@@ -1774,7 +2360,8 @@ router.post(
       return res.status(409).json({ error: err.message });
     }
 
-    const inserted = await db.query(
+    const inserted = await insertAgentForRequest(
+      req,
       `INSERT INTO agents(
        user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
        container_name, image, template_payload, runtime_family, deploy_target,
@@ -1844,44 +2431,38 @@ router.post(
 
 router.post("/:id/start", async (req, res, next) => {
   try {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent, {
-      ownerEmail: req.user.email || null,
-    });
-    if (!containerManager.canMutate(agent))
-      return res.status(400).json({ error: "No container — redeploy the agent first" });
+    const result = await withAccessibleAgentLifecycleLock(
+      {
+        agentId: req.params.id,
+        req,
+        applicationName: "nora-backend-agent-start",
+      },
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent, {
+          ownerEmail: req.user.email || null,
+        });
+        if (!containerManager.canMutate(agent)) {
+          const error = new Error("No container — redeploy the agent first");
+          error.statusCode = 400;
+          throw error;
+        }
 
-    await containerManager.start(agent);
+        // The lifecycle lock is already held here. Provider state remains
+        // locked from offline staging through readiness and the final status
+        // publish, so a concurrent key rotation cannot race this start.
+        const resumed = await resumeAgentWithProviderAuth(agent, "start");
 
-    // Manual start is an explicit operator override of a budget pause; the
-    // budget sweep re-pauses on its next cycle if the agent is still over cap.
-    const updated = await db.query(
-      "UPDATE agents SET status = 'running', paused_reason = NULL WHERE id = $1 RETURNING *",
-      [agent.id],
-    );
-    try {
-      const authSyncResults = await syncAuthToUserAgents(req.user.id, agent.id, {
-        onlyIfAuthPresent: true,
-      });
-      const failedSync = authSyncResults.find((result) => result.status === "failed");
-      if (failedSync) {
-        console.warn(
-          `[agents.start] Auth sync failed for agent ${agent.id}: ${failedSync.error || "unknown error"}`,
+        await monitoring.logEvent(
+          "agent_started",
+          `Agent "${agent.name}" started`,
+          agentAuditMetadata(req, resumed.agent, {
+            result: { status: "running" },
+          }),
         );
-      }
-    } catch (syncError) {
-      console.warn(`[agents.start] Auth sync errored for agent ${agent.id}: ${syncError.message}`);
-    }
-
-    await monitoring.logEvent(
-      "agent_started",
-      `Agent "${agent.name}" started`,
-      agentAuditMetadata(req, updated.rows[0], {
-        result: { status: "running" },
-      }),
+        return serializeAgent(resumed.agent);
+      },
     );
-    res.json(serializeAgent(updated.rows[0]));
+    res.json(result);
   } catch (e) {
     next(e);
   }
@@ -1889,88 +2470,116 @@ router.post("/:id/start", async (req, res, next) => {
 
 router.post("/:id/stop", async (req, res, next) => {
   try {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent, {
-      ownerEmail: req.user.email || null,
-    });
+    const result = await withAccessibleAgentLifecycleLock(
+      {
+        agentId: req.params.id,
+        req,
+        applicationName: "nora-backend-agent-stop",
+      },
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent, {
+          ownerEmail: req.user.email || null,
+        });
 
-    if (containerManager.canMutate(agent)) {
-      try {
-        await containerManager.stop(agent);
-      } catch (e) {
-        if (!isIgnorableStopError(e)) {
-          console.error("Container stop error:", e.message);
-          if (containerManager.isKubernetesAgent(agent)) {
-            return res.status(e.statusCode || 500).json({ error: e.message });
+        if (containerManager.canMutate(agent)) {
+          try {
+            await containerManager.stop(agent);
+          } catch (error) {
+            if (!containerManager.isIgnorableStopError(error)) {
+              console.error("Container stop error:", error.message);
+              throw error;
+            }
           }
         }
-      }
-    }
 
-    const updated = await db.query(
-      "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
-      [agent.id],
+        const updated = await db.query(
+          "UPDATE agents SET status = 'stopped' WHERE id = $1 RETURNING *",
+          [agent.id],
+        );
+        await monitoring.logEvent(
+          "agent_stopped",
+          `Agent "${agent.name}" stopped`,
+          agentAuditMetadata(req, updated.rows[0], {
+            result: { status: "stopped" },
+          }),
+        );
+        return serializeAgent(updated.rows[0]);
+      },
     );
-    await monitoring.logEvent(
-      "agent_stopped",
-      `Agent "${agent.name}" stopped`,
-      agentAuditMetadata(req, updated.rows[0], {
-        result: { status: "stopped" },
-      }),
-    );
-    res.json(serializeAgent(updated.rows[0]));
+    res.json(result);
   } catch (e) {
     next(e);
   }
 });
 
-async function destroyAgent(agentId, userId, req, res) {
-  const agent = await findAccessibleAgent(agentId, userId, "viewer");
-  if (!agent) return res.status(404).json({ error: "Agent not found" });
-  if (agent.user_id !== userId) {
+async function destroyAgent(agentId, req, res) {
+  const visibleAgent = await findAccessibleAgentForRequest(req, agentId, "viewer");
+  if (!visibleAgent) return res.status(404).json({ error: "Agent not found" });
+  if (visibleAgent.user_id !== req.user.id) {
     return res.status(403).json({
       error:
         "Only the direct agent owner can delete this agent. Remove the workspace assignment instead.",
     });
   }
-  res.locals.auditContext = buildAgentContext(agent, {
-    ownerEmail: req.user.email || null,
-  });
 
-  if (containerManager.canDestroy(agent)) {
-    try {
-      await containerManager.destroy(agent);
-    } catch (e) {
-      console.error("Container cleanup error:", e.message);
-      if (containerManager.isKubernetesAgent(agent)) {
-        return res.status(e.statusCode || 500).json({
+  const provisionLock = await acquireAgentProvisionLock(visibleAgent.id, {
+    applicationName: "nora-backend-agent-delete",
+  });
+  try {
+    // The agent may have been redeployed or its workspace access may have
+    // changed while this request waited for an active provisioner. Reload the
+    // complete row while holding the shared lock so cleanup always targets the
+    // authoritative placement, including a newly created Remote Docker runtime.
+    const agent = await findAccessibleAgentForRequest(req, agentId, "viewer");
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    if (agent.user_id !== req.user.id) {
+      return res.status(403).json({
+        error:
+          "Only the direct agent owner can delete this agent. Remove the workspace assignment instead.",
+      });
+    }
+    res.locals.auditContext = buildAgentContext(agent, {
+      ownerEmail: req.user.email || null,
+    });
+
+    // Remove waiting/delayed retries before deleting the durable row. Holding
+    // the provision lock keeps a producer or worker from publishing a new
+    // runtime between this cancellation, cleanup, and the durable deletion.
+    await cancelDeploymentJobsForAgent(agent.id);
+
+    if (containerManager.canDestroy(agent)) {
+      try {
+        await containerManager.destroy(agent);
+      } catch (error) {
+        console.error("Container cleanup error:", error.message);
+        return res.status(error.statusCode || 500).json({
           error:
-            e.message ||
-            "Failed to delete Kubernetes runtime resources; agent record was kept for retry.",
+            error.message || "Failed to delete runtime resources; agent record was kept for retry.",
         });
       }
     }
-  }
 
-  // Free the agent's reserved gateway port. The FK is ON DELETE CASCADE so the
-  // hard delete below already releases it, but release explicitly so the
-  // allocation can't leak if agent deletion ever becomes a soft-delete.
-  await releaseGatewayPort(agent.id).catch(() => {});
-  await db.query("DELETE FROM agents WHERE id = $1", [agent.id]);
-  await monitoring.logEvent(
-    "agent_deleted",
-    `Agent "${agent.name}" deleted`,
-    agentAuditMetadata(req, agent, {
-      result: { deleted: true },
-    }),
-  );
-  res.json({ success: true });
+    // Free the agent's reserved gateway port. The FK is ON DELETE CASCADE so the
+    // hard delete below already releases it, but release explicitly so the
+    // allocation can't leak if agent deletion ever becomes a soft-delete.
+    await releaseGatewayPort(agent.id).catch(() => {});
+    await db.query("DELETE FROM agents WHERE id = $1", [agent.id]);
+    await monitoring.logEvent(
+      "agent_deleted",
+      `Agent "${agent.name}" deleted`,
+      agentAuditMetadata(req, agent, {
+        result: { deleted: true },
+      }),
+    );
+    return res.json({ success: true });
+  } finally {
+    await provisionLock.release();
+  }
 }
 
 router.post("/:id/delete", async (req, res, next) => {
   try {
-    await destroyAgent(req.params.id, req.user.id, req, res);
+    await destroyAgent(req.params.id, req, res);
   } catch (e) {
     next(e);
   }
@@ -1978,7 +2587,7 @@ router.post("/:id/delete", async (req, res, next) => {
 
 router.delete("/:id", async (req, res, next) => {
   try {
-    await destroyAgent(req.params.id, req.user.id, req, res);
+    await destroyAgent(req.params.id, req, res);
   } catch (e) {
     next(e);
   }
@@ -1986,23 +2595,33 @@ router.delete("/:id", async (req, res, next) => {
 
 router.post("/:id/restart", async (req, res, next) => {
   try {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
-    if (!agent) return res.status(404).json({ error: "Agent not found" });
-    res.locals.auditContext = buildAgentContext(agent, {
-      ownerEmail: req.user.email || null,
-    });
-    if (!containerManager.canMutate(agent))
-      return res.status(400).json({ error: "No container — redeploy the agent first" });
+    await withAccessibleAgentLifecycleLock(
+      {
+        agentId: req.params.id,
+        req,
+        applicationName: "nora-backend-agent-restart",
+      },
+      async (agent) => {
+        res.locals.auditContext = buildAgentContext(agent, {
+          ownerEmail: req.user.email || null,
+        });
+        if (!containerManager.canMutate(agent)) {
+          const error = new Error("No container — redeploy the agent first");
+          error.statusCode = 400;
+          throw error;
+        }
 
-    await containerManager.restart(agent);
-
-    await db.query("UPDATE agents SET status = 'running' WHERE id = $1", [agent.id]);
-    await monitoring.logEvent(
-      "agent_restarted",
-      `Agent "${agent.name}" restarted`,
-      agentAuditMetadata(req, agent, {
-        result: { status: "running" },
-      }),
+        // Auth sync owns the one exact restart. Do not restart once here and a
+        // second time during provider reconciliation.
+        const resumed = await resumeAgentWithProviderAuth(agent, "restart");
+        await monitoring.logEvent(
+          "agent_restarted",
+          `Agent "${agent.name}" restarted`,
+          agentAuditMetadata(req, resumed.agent, {
+            result: { status: "running" },
+          }),
+        );
+      },
     );
     res.json({ success: true });
   } catch (e) {
@@ -2013,7 +2632,7 @@ router.post("/:id/restart", async (req, res, next) => {
 router.post("/:id/redeploy", async (req, res) => {
   try {
     const requestBody = req.body || {};
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, {
       ownerEmail: req.user.email || null,
@@ -2039,7 +2658,13 @@ router.post("/:id/redeploy", async (req, res) => {
       },
       fallback: currentRuntimeFields,
     });
-    await assertRuntimeTargetAvailable(runtimeFields, req.user.id);
+    if (!requireSessionForRemoteDockerPlacement(req, res, currentRuntimeFields, runtimeFields)) {
+      return;
+    }
+    // Workspace editors may trigger a redeploy, but the runtime always belongs
+    // to the persisted agent owner. Validate and queue using that owner so the
+    // editor's provider credentials can never be selected by the worker.
+    await assertRuntimeTargetAvailable(runtimeFields, agent.user_id);
     const containerName = resolveContainerName({
       requestedName: requestBody.container_name,
       currentName: agent.container_name,
@@ -2053,60 +2678,18 @@ router.post("/:id/redeploy", async (req, res) => {
       fallbackRuntimeFields: currentRuntimeFields,
     });
 
-    await db.query(
-      `UPDATE agents
-          SET status = 'queued',
-              container_id = NULL,
-              host = NULL,
-              runtime_host = NULL,
-              runtime_port = NULL,
-              gateway_host = NULL,
-              gateway_port = NULL,
-              gateway_host_port = NULL,
-              gateway_token = NULL,
-              backend_type = $2,
-              sandbox_type = $3,
-              runtime_family = $4,
-              deploy_target = $5,
-              execution_target_id = $6,
-              sandbox_profile = $7,
-              container_name = $8,
-              image = $9
-        WHERE id = $1`,
-      [
-        agent.id,
-        runtimeFields.backend_type,
-        runtimeFields.sandbox_type,
-        runtimeFields.runtime_family,
-        runtimeFields.deploy_target,
-        runtimeFields.execution_target_id,
-        runtimeFields.sandbox_profile,
+    // Preserve the exact previous runtime identity and placement until the
+    // provisioner has validated the new target and owns its per-agent lock.
+    // This keeps enqueue rejection, deployment-row failure, or target-auth
+    // failure cleanup-safe.
+    await enqueueReplacementDeployment(
+      agent,
+      buildReplacementDeploymentJob(agent, {
+        runtimeFields,
         containerName,
         image,
-      ],
+      }),
     );
-
-    await db.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [agent.id]);
-
-    await addDeploymentJob({
-      id: agent.id,
-      name: agent.name,
-      userId: req.user.id,
-      backend: runtimeFields.backend_type,
-      execution_target_id: runtimeFields.execution_target_id,
-      sandbox: runtimeFields.sandbox_profile,
-      specs: { vcpu: agent.vcpu || 2, ram_mb: agent.ram_mb || 2048, disk_gb: agent.disk_gb || 20 },
-      container_name: containerName,
-      previous_container_id: agent.container_id || null,
-      previous_container_name: agent.container_name || null,
-      previous_host: agent.host || null,
-      previous_backend: currentRuntimeFields.backend_type,
-      previous_runtime_family: currentRuntimeFields.runtime_family,
-      previous_deploy_target: currentRuntimeFields.deploy_target,
-      previous_execution_target_id: currentRuntimeFields.execution_target_id,
-      previous_sandbox_profile: currentRuntimeFields.sandbox_profile,
-      image,
-    });
 
     await monitoring.logEvent(
       "agent_redeployed",
@@ -2136,7 +2719,7 @@ router.post("/:id/redeploy", async (req, res) => {
 router.get(
   "/:id/budget",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.json({
       budgets: await agentBudgets.listBudgetsWithSpend(agent.id),
@@ -2148,7 +2731,7 @@ router.get(
 router.put(
   "/:id/budget",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, {
       ownerEmail: req.user.email || null,
@@ -2173,7 +2756,7 @@ router.put(
 router.delete(
   "/:id/budget/:budgetId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, {
       ownerEmail: req.user.email || null,
@@ -2194,7 +2777,7 @@ router.delete(
 router.get(
   "/:id/schedules",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.json(await agentSchedules.listSchedules(agent.id));
   }),
@@ -2203,7 +2786,7 @@ router.get(
 router.post(
   "/:id/schedules",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
     let schedule;
@@ -2227,7 +2810,7 @@ router.post(
 router.put(
   "/:id/schedules/:scheduleId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
     let schedule;
@@ -2256,7 +2839,7 @@ router.put(
 router.delete(
   "/:id/schedules/:scheduleId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     res.locals.auditContext = buildAgentContext(agent, { ownerEmail: req.user.email || null });
     const deleted = await agentSchedules.deleteSchedule(agent.id, req.params.scheduleId);
@@ -2273,7 +2856,7 @@ router.delete(
 router.get(
   "/:id/schedules/:scheduleId/runs",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 25));
     // Runs are recorded as agent.schedule.run events (audit-integrated).
@@ -2282,9 +2865,10 @@ router.get(
          FROM events
         WHERE type = 'agent.schedule.run'
           AND metadata #>> '{result,scheduleId}' = $1
+          AND metadata #>> '{result,agentId}' = $2
         ORDER BY created_at DESC
-        LIMIT $2`,
-      [req.params.scheduleId, limit],
+        LIMIT $3`,
+      [req.params.scheduleId, agent.id, limit],
     );
     res.json(result.rows);
   }),
@@ -2295,7 +2879,7 @@ router.get(
 router.get(
   "/:id/versions",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
     res.json(await agentVersions.listVersions(agent.id, { limit }));
@@ -2305,7 +2889,7 @@ router.get(
 router.get(
   "/:id/versions/:versionId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "viewer");
+    const agent = await findAccessibleAgentForRequest(req, req.params.id, "viewer");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     const version = await agentVersions.getVersion(agent.id, req.params.versionId);
     if (!version) return res.status(404).json({ error: "Version not found" });
@@ -2320,77 +2904,111 @@ router.get(
 router.post(
   "/:id/rollback/:versionId",
   asyncHandler(async (req, res) => {
-    const agent = await findAccessibleAgent(req.params.id, req.user.id, "editor");
+    let agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
     if (!agent) return res.status(404).json({ error: "Agent not found" });
+    let currentRuntimeFields = buildAgentRuntimeFields(agent);
+    if (!requireSessionForRemoteDockerPlacement(req, res, currentRuntimeFields)) return;
     const target = await agentVersions.getVersion(agent.id, req.params.versionId);
     if (!target) return res.status(404).json({ error: "Version not found" });
 
-    res.locals.auditContext = buildAgentContext(agent, {
-      ownerEmail: req.user.email || null,
+    const provisionLock = await acquireAgentProvisionLock(agent.id, {
+      applicationName: "nora-backend-agent-rollback",
     });
-
-    // Snapshot the current state first so rollback is itself reversible.
-    const currentResult = await db.query("SELECT template_payload FROM agents WHERE id = $1", [
-      agent.id,
-    ]);
-    const currentPayload = currentResult.rows[0]?.template_payload || {};
-    await agentVersions.recordVersionBestEffort(agent.id, currentPayload, {
-      createdBy: req.user.id,
-      message: `Pre-rollback snapshot (rolling back to v${target.versionNumber})`,
-      source: "rollback",
-    });
-
-    // Replace the agent's template_payload with the target version.
-    await db.query("UPDATE agents SET template_payload = $1::jsonb WHERE id = $2", [
-      JSON.stringify(target.config),
-      agent.id,
-    ]);
-
-    // Record the rolled-back state as the new "current" version.
-    const restored = await agentVersions.recordVersion(agent.id, target.config, {
-      createdBy: req.user.id,
-      message: `Rolled back to v${target.versionNumber}`,
-      source: "rollback",
-    });
-
-    // Re-materialize wiring + queue redeploy if the agent has a container.
+    let shouldRedeploy = false;
+    let restored;
+    let currentPayload = null;
+    let payloadUpdated = false;
     try {
-      await materializeTemplateWiring(agent.id, target.config);
-    } catch (err) {
-      console.warn(`[agents.rollback] wiring materialize failed: ${err.message}`);
-    }
-    if (agent.container_id) {
-      // Validate the agent's execution target is still deployable before
-      // queuing the redeploy — a remote host / k8s cluster may have been
-      // removed or disconnected since the original deploy. Owner-scoped to the
-      // agent's owner (an editor may trigger the rollback). Fail before we
-      // clear container_id so a rejected rollback leaves the agent intact.
-      await assertRuntimeTargetAvailable(
-        buildAgentRuntimeFields(agent),
-        agent.user_id || req.user.id,
-      );
-      await db.query(
-        `UPDATE agents
-            SET status = 'queued',
-                container_id = NULL
-          WHERE id = $1`,
-        [agent.id],
-      );
-      await db.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [agent.id]);
-      await addDeploymentJob({
-        id: agent.id,
-        name: agent.name,
-        userId: req.user.id,
-        backend: agent.backend_type,
-        sandbox: agent.sandbox_profile,
-        specs: {
-          vcpu: agent.vcpu || 2,
-          ram_mb: agent.ram_mb || 2048,
-          disk_gb: agent.disk_gb || 20,
-        },
-        container_name: agent.container_name,
-        image: agent.image,
+      // The access check above keeps lock acquisition unavailable to callers
+      // who cannot see the agent. Re-read after acquiring the shared lock so a
+      // deployment that finished while rollback was waiting cannot make us
+      // restore config without redeploying the now-running runtime.
+      agent = await findAccessibleAgentForRequest(req, req.params.id, "editor");
+      if (!agent) throw createAgentNotFoundError();
+      currentRuntimeFields = buildAgentRuntimeFields(agent);
+      if (!requireSessionForRemoteDockerPlacement(req, res, currentRuntimeFields)) return;
+      res.locals.auditContext = buildAgentContext(agent, {
+        ownerEmail: req.user.email || null,
       });
+      shouldRedeploy = containerManager.canDestroy(agent);
+
+      let runtimeFields = null;
+      if (shouldRedeploy) {
+        const canceledJobs = await cancelDeploymentJobsForAgent(agent.id);
+        if (canceledJobs.active > 0) {
+          return res.status(409).json({
+            error:
+              "An earlier deployment is still active for this agent. Try rollback again shortly.",
+          });
+        }
+        // Validate while the shared lock is held and before mutating the
+        // rollback config. A removed target must leave the current config and
+        // runtime identity untouched.
+        runtimeFields = currentRuntimeFields;
+        await assertRuntimeTargetAvailable(runtimeFields, agent.user_id);
+      }
+
+      // Snapshot the current state first so rollback is itself reversible.
+      const currentResult = await db.query("SELECT template_payload FROM agents WHERE id = $1", [
+        agent.id,
+      ]);
+      currentPayload = currentResult.rows[0]?.template_payload || {};
+      await agentVersions.recordVersionBestEffort(agent.id, currentPayload, {
+        createdBy: req.user.id,
+        message: `Pre-rollback snapshot (rolling back to v${target.versionNumber})`,
+        source: "rollback",
+      });
+
+      // Replace the agent's template_payload with the target version.
+      await db.query("UPDATE agents SET template_payload = $1::jsonb WHERE id = $2", [
+        JSON.stringify(target.config),
+        agent.id,
+      ]);
+      payloadUpdated = true;
+
+      // Record the rolled-back state as the new "current" version.
+      restored = await agentVersions.recordVersion(agent.id, target.config, {
+        createdBy: req.user.id,
+        message: `Rolled back to v${target.versionNumber}`,
+        source: "rollback",
+      });
+
+      // Re-materialize wiring + queue redeploy if the agent has a container.
+      await materializeTemplateWiring(agent.id, target.config);
+      if (shouldRedeploy) {
+        await enqueueReplacementDeployment(
+          agent,
+          buildReplacementDeploymentJob(agent, {
+            runtimeFields,
+            containerName: agent.container_name,
+            image: agent.image,
+          }),
+          {
+            provisionLock,
+            skipCancellation: true,
+          },
+        );
+      }
+    } catch (error) {
+      if (payloadUpdated) {
+        try {
+          await db.query("UPDATE agents SET template_payload = $1::jsonb WHERE id = $2", [
+            JSON.stringify(currentPayload || {}),
+            agent.id,
+          ]);
+          await materializeTemplateWiring(agent.id, currentPayload || {});
+          await agentVersions.recordVersionBestEffort(agent.id, currentPayload || {}, {
+            createdBy: req.user.id,
+            message: `Rollback to v${target.versionNumber} could not be queued; restored previous config`,
+            source: "rollback",
+          });
+        } catch (compensationError) {
+          error.rollbackCompensationError = compensationError;
+        }
+      }
+      throw error;
+    } finally {
+      await provisionLock.release();
     }
 
     await monitoring.logEvent(
@@ -2408,7 +3026,7 @@ router.post(
     res.json({
       success: true,
       restored,
-      redeployed: Boolean(agent.container_id),
+      redeployed: shouldRedeploy,
     });
   }),
 );

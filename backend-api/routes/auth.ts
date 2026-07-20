@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const db = require("../db");
+const { allowsFirstAdminSignupClaim } = require("../bootstrapAdmin");
 const { authenticateToken, requireSession } = require("../middleware/auth");
 const { setAuthCookie, clearAuthCookie } = require("../authCookie");
 const { normalizeEmail, normalizeProvider, verifyOAuthIdentity } = require("../oauthProviders");
@@ -24,20 +25,34 @@ function isOAuthLoginEnabled() {
   return process.env.OAUTH_LOGIN_ENABLED === "true";
 }
 
+function getPublicPlatformMode() {
+  return String(process.env.PLATFORM_MODE || "selfhosted")
+    .trim()
+    .toLowerCase() === "paas"
+    ? "paas"
+    : "selfhosted";
+}
+
+function parsePositiveIntegerEnv(name, fallback) {
+  const raw = String(process.env[name] || "").trim();
+  if (!/^[1-9]\d*$/.test(raw)) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : fallback;
+}
+
+function getAuthRateLimitConfig() {
+  return {
+    windowMs: parsePositiveIntegerEnv("AUTH_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000),
+    max: parsePositiveIntegerEnv("AUTH_RATE_LIMIT_MAX", 20),
+  };
+}
+
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
+  ...getAuthRateLimitConfig(),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many attempts, please try again later" },
 });
-
-function parsePositiveIntegerEnv(name, fallback) {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 const signupBurstLimiter = rateLimit({
   windowMs: parsePositiveIntegerEnv("SIGNUP_RATE_LIMIT_BURST_WINDOW_MS", 10 * 60 * 1000),
@@ -70,47 +85,138 @@ function normalizeSignupBotProtectionProvider(value) {
   return "invalid";
 }
 
+function readFirstSignupEnv(...names) {
+  for (const name of names) {
+    const value = String(process.env[name] || "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+function getSignupBotProtectionSiteKey(provider) {
+  return provider === "turnstile"
+    ? readFirstSignupEnv("SIGNUP_TURNSTILE_SITE_KEY", "NEXT_PUBLIC_SIGNUP_TURNSTILE_SITE_KEY")
+    : readFirstSignupEnv("SIGNUP_RECAPTCHA_SITE_KEY", "NEXT_PUBLIC_SIGNUP_RECAPTCHA_SITE_KEY");
+}
+
+function getNoSignupBotProtectionConfig() {
+  if (getPublicPlatformMode() === "paas") {
+    return {
+      enabled: true,
+      provider: "none",
+      configured: false,
+      siteKey: "",
+      error:
+        "Public PaaS signup requires SIGNUP_BOT_PROTECTION_PROVIDER=turnstile or recaptcha with matching site and secret keys",
+      publicError:
+        "Signup verification is required for this hosted service, but no challenge provider is configured. Contact the administrator.",
+    };
+  }
+  return { enabled: false, provider: "none", configured: true, siteKey: "" };
+}
+
 function getSignupBotProtectionConfig() {
   const explicitProvider = normalizeSignupBotProtectionProvider(
-    process.env.SIGNUP_BOT_PROTECTION_PROVIDER,
+    readFirstSignupEnv(
+      "SIGNUP_BOT_PROTECTION_PROVIDER",
+      "NEXT_PUBLIC_SIGNUP_BOT_PROTECTION_PROVIDER",
+    ),
   );
 
-  if (explicitProvider === "none") return { provider: "none" };
+  if (explicitProvider === "none") {
+    return getNoSignupBotProtectionConfig();
+  }
   if (explicitProvider === "invalid") {
-    return { provider: "invalid", error: "Invalid SIGNUP_BOT_PROTECTION_PROVIDER" };
-  }
-
-  const hasTurnstileSecret = Boolean(process.env.SIGNUP_TURNSTILE_SECRET);
-  const hasRecaptchaSecret = Boolean(process.env.SIGNUP_RECAPTCHA_SECRET);
-  let provider = explicitProvider;
-
-  if (!provider) {
-    if (hasTurnstileSecret && hasRecaptchaSecret) {
-      return {
-        provider: "invalid",
-        error:
-          "Both signup bot protection secrets are configured; set SIGNUP_BOT_PROTECTION_PROVIDER",
-      };
-    }
-    if (hasTurnstileSecret) provider = "turnstile";
-    if (hasRecaptchaSecret) provider = "recaptcha";
-  }
-
-  if (!provider) return { provider: "none" };
-
-  const secret =
-    provider === "turnstile"
-      ? process.env.SIGNUP_TURNSTILE_SECRET
-      : process.env.SIGNUP_RECAPTCHA_SECRET;
-
-  if (!secret) {
     return {
+      enabled: true,
       provider: "invalid",
-      error: `Missing secret for signup ${provider} bot protection`,
+      configured: false,
+      siteKey: "",
+      error: "Invalid SIGNUP_BOT_PROTECTION_PROVIDER",
+      publicError:
+        "Signup verification is enabled, but its provider configuration is invalid. Contact the administrator.",
     };
   }
 
-  return { provider, secret };
+  const turnstileSecret = readFirstSignupEnv("SIGNUP_TURNSTILE_SECRET");
+  const recaptchaSecret = readFirstSignupEnv("SIGNUP_RECAPTCHA_SECRET");
+  const turnstileSiteKey = getSignupBotProtectionSiteKey("turnstile");
+  const recaptchaSiteKey = getSignupBotProtectionSiteKey("recaptcha");
+  const hasTurnstileConfig = Boolean(turnstileSecret || turnstileSiteKey);
+  const hasRecaptchaConfig = Boolean(recaptchaSecret || recaptchaSiteKey);
+  let provider = explicitProvider;
+
+  if (!provider) {
+    if (hasTurnstileConfig && hasRecaptchaConfig) {
+      return {
+        enabled: true,
+        provider: "invalid",
+        configured: false,
+        siteKey: "",
+        error:
+          "Both signup bot protection providers are configured; set SIGNUP_BOT_PROTECTION_PROVIDER",
+        publicError:
+          "Signup verification is enabled for multiple providers. Select one provider in the server configuration.",
+      };
+    }
+    if (hasTurnstileConfig) provider = "turnstile";
+    if (hasRecaptchaConfig) provider = "recaptcha";
+  }
+
+  if (!provider) {
+    return getNoSignupBotProtectionConfig();
+  }
+
+  const secret = provider === "turnstile" ? turnstileSecret : recaptchaSecret;
+  const siteKey = provider === "turnstile" ? turnstileSiteKey : recaptchaSiteKey;
+
+  if (!secret) {
+    return {
+      enabled: true,
+      provider,
+      configured: false,
+      siteKey,
+      error: `Missing secret for signup ${provider} bot protection`,
+      publicError:
+        "Signup verification is enabled, but server verification is incomplete. Contact the administrator.",
+    };
+  }
+
+  if (!siteKey) {
+    return {
+      enabled: true,
+      provider,
+      configured: false,
+      siteKey: "",
+      secret,
+      error: `Missing public site key for signup ${provider} bot protection`,
+      publicError:
+        "Signup verification is enabled, but its public site key is missing. Contact the administrator.",
+    };
+  }
+
+  return { enabled: true, provider, configured: true, siteKey, secret };
+}
+
+function getPublicSignupBotProtectionConfig() {
+  const config = getSignupBotProtectionConfig();
+  const provider = ["turnstile", "recaptcha"].includes(config.provider)
+    ? config.provider
+    : config.provider === "none" && config.enabled !== true
+      ? "none"
+      : null;
+
+  return {
+    enabled: config.enabled === true,
+    provider,
+    siteKey: provider && provider !== "none" ? config.siteKey || null : null,
+    configured: config.configured === true,
+    configurationError:
+      config.configured === true
+        ? null
+        : config.publicError ||
+          "Signup verification is enabled, but its runtime configuration is incomplete.",
+  };
 }
 
 function getSignupBotProtectionToken(body = {}) {
@@ -126,8 +232,8 @@ function getSignupBotProtectionToken(body = {}) {
  */
 async function verifySignupBotProtection(req) {
   const config = getSignupBotProtectionConfig();
-  if (config.provider === "none") return;
-  if (config.provider === "invalid") {
+  if (!config.enabled) return;
+  if (!config.configured || config.provider === "invalid") {
     throw createHttpError(config.error || "Signup bot protection is misconfigured", 500);
   }
 
@@ -241,7 +347,16 @@ async function withUserCreationLock(work) {
 
 async function nextRegisteredUserRole(client) {
   const result = await client.query("SELECT EXISTS(SELECT 1 FROM users) AS has_users");
-  return result.rows[0]?.has_users ? "user" : "admin";
+  if (result.rows[0]?.has_users) return "user";
+  if (!allowsFirstAdminSignupClaim()) {
+    const error = createHttpError(
+      "Hosted PaaS requires an operator-provisioned bootstrap administrator before public signup can create accounts",
+      503,
+    );
+    error.code = "PAAS_BOOTSTRAP_ADMIN_REQUIRED";
+    throw error;
+  }
+  return "admin";
 }
 
 async function findExistingUserByEmail(email) {
@@ -260,13 +375,20 @@ function isDuplicateUserError(error) {
 // ─── Public routes ────────────────────────────────────────────────
 
 // First-run claim check: true until the first user registers (who becomes the
-// platform admin). The login/signup pages use it to render "Claim this server"
-// instead of a generic signup. Deliberately exposes only a boolean — user
-// count or emails would aid enumeration.
+// platform admin). Login/signup also consume runtime OAuth and platform-mode
+// metadata from this endpoint so reusable frontend images do not bake deploy-time
+// auth behavior. Only the public portion of signup-challenge configuration is
+// exposed; secret verification keys stay server-side.
 router.get("/bootstrap-status", async (req, res) => {
   try {
     const { rows } = await db.query("SELECT 1 FROM users LIMIT 1");
-    res.json({ needsFirstAdmin: rows.length === 0 });
+    const firstAdminClaimAllowed = allowsFirstAdminSignupClaim();
+    res.json({
+      needsFirstAdmin: rows.length === 0 && firstAdminClaimAllowed,
+      oauthLoginEnabled: isOAuthLoginEnabled(),
+      platformMode: getPublicPlatformMode(),
+      signupBotProtection: getPublicSignupBotProtectionConfig(),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -299,6 +421,9 @@ router.post("/signup", signupBurstLimiter, signupDailyLimiter, async (req, res) 
       return res.status(409).json({ error: DUPLICATE_SIGNUP_MESSAGE });
     }
     const statusCode = e.statusCode || 500;
+    if (e.code === "PAAS_BOOTSTRAP_ADMIN_REQUIRED") {
+      return res.status(statusCode).json({ error: e.message, code: e.code });
+    }
     if (statusCode >= 500) {
       console.error("Signup failed:", e.message);
       return res.status(500).json({ error: "Could not create account" });
@@ -614,3 +739,4 @@ router.post("/logout", (req, res) => {
 });
 
 module.exports = router;
+module.exports.__test = Object.freeze({ getAuthRateLimitConfig, parsePositiveIntegerEnv });

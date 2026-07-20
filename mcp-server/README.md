@@ -74,6 +74,10 @@ The Nora MCP connector runs locally and does not collect telemetry or persist cr
 
 The connector retains no data after its process exits. Your Nora operator controls the storage and retention of account, agent, log, metric, and integration data in that deployment, and connected providers may apply their own policies when Nora invokes them. See the full [Nora Privacy Policy](https://nora.solomontsao.com/privacy) or contact [privacy@solomontsao.com](mailto:privacy@solomontsao.com).
 
+## Contributing
+
+From the repository root, run `npm run contributor:setup -- --scope mcp-server` once, then `npm run contributor:check -- mcp-server`. Keep tool schemas, safety annotations, README tool lists, and mocked transport tests synchronized with the public REST endpoints.
+
 If Nora is useful to you, a ⭐ on the [GitHub repo](https://github.com/solomon2773/nora) helps other self-hosters find it.
 
 ## License

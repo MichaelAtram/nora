@@ -32,9 +32,11 @@ describe("remote-docker deploy target recognition", () => {
       expect(normalizeDeployTargetName("REMOTE:My-Laptop")).toBe("remote-docker");
     });
 
-    it("does not let remote-docker change the docker fallback for unknown targets", () => {
-      expect(normalizeDeployTargetName("moon")).toBe("docker");
+    it("defaults only absent targets to docker and rejects unknown targets", () => {
+      expect(() => normalizeDeployTargetName("moon")).toThrow("Unknown deploy target: moon");
       expect(normalizeDeployTargetName("")).toBe("docker");
+      expect(normalizeDeployTargetName(null)).toBe("docker");
+      expect(normalizeDeployTargetName(undefined)).toBe("docker");
       expect(normalizeDeployTargetName("docker")).toBe("docker");
     });
 

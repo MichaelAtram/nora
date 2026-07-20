@@ -39,9 +39,10 @@ try {
 }
 const { listKubernetesExecutionTargets } = require("./kubernetesClusters");
 const { STARTER_TEMPLATES } = require("./starterTemplates");
-const { getBootstrapAdminSeedConfig } = require("./bootstrapAdmin");
+const { allowsFirstAdminSignupClaim, getBootstrapAdminSeedConfig } = require("./bootstrapAdmin");
 const { ensureFirstRegisteredUserIsAdmin } = require("./ensureAdminUser");
 const { authenticateToken } = require("./middleware/auth");
+const { requireApiKeyAgentPathScope } = require("./middleware/ownership");
 const { correlationId, errorHandler } = require("./middleware/errorHandler");
 const {
   createGatewayRouter,
@@ -50,6 +51,7 @@ const {
   resolveSafeHermesDashboardTarget,
 } = require("./gatewayProxy");
 const { isGatewayAvailableStatus } = require("./agentStatus");
+const { assertRemoteHostAgentUse, toPublicRemoteHostAuthorizationError } = require("./remoteHosts");
 const { repairHermesAgentConfig } = require("./hermesUi");
 const { HERMES_EMBED_AGENT_COLUMNS, GATEWAY_EMBED_AGENT_COLUMNS } = require("./embedAgentColumns");
 const {
@@ -68,12 +70,14 @@ const {
   getEnabledSandboxProfiles,
   getExecutionTargetCatalog,
   getRuntimeCatalog,
+  getRuntimeSelectionStatus,
   getSandboxProfileCatalog,
 } = require("../agent-runtime/lib/backendCatalog");
 
 // ─── JWT Secret ───────────────────────────────────────────────────
 const IS_TEST_ENV = process.env.NODE_ENV === "test" || !!process.env.JEST_WORKER_ID;
 const { looksLikePlaceholderSecret } = require("./lib/secretValidation");
+const { runVersionedMigrations } = require("./lib/migrationRunner");
 const MIN_JWT_SECRET_LENGTH = 32;
 // When a dev boot generated an ephemeral JWT secret, we persist/restore it via
 // platform_settings after the DB is up so sessions survive restarts (dev only;
@@ -570,6 +574,18 @@ async function resolveEmbedAccess(
     return null;
   }
 
+  try {
+    // Embed sessions and the OpenClaw bootstrap script expose live runtime
+    // traffic and, for bootstrap.js, the decrypted gateway password. Re-check
+    // the current host grant before minting/accepting an embed session so a
+    // stale agent row cannot remain a credential oracle after unshare.
+    await assertRemoteHostAgentUse(agent, { includeProfile: false });
+  } catch (error) {
+    const publicError = toPublicRemoteHostAuthorizationError(error);
+    res.status(publicError.statusCode || 503).send(publicError.message);
+    return null;
+  }
+
   if (!relayToken) {
     relayToken = jwt.sign({ id: userId, agentId, scope }, process.env.JWT_SECRET, {
       expiresIn: Math.floor(EMBED_SESSION_TTL_MS / 1000),
@@ -693,6 +709,24 @@ function defaultExecutionTargetFromCatalog(executionTargets = []) {
   );
 }
 
+function localDockerDemoCapability() {
+  const status = getRuntimeSelectionStatus({
+    runtime_family: "openclaw",
+    deploy_target: "docker",
+    execution_target_id: "docker",
+    sandbox_profile: "standard",
+  });
+  return {
+    enabled: status.available === true,
+    runtimeFamily: status.runtimeFamily,
+    deployTarget: status.deployTarget,
+    executionTargetId: status.executionTargetId,
+    sandboxProfile: status.sandboxProfile,
+    requiresLiveDocker: true,
+    issue: status.available ? null : status.issue || "Local Docker demo is not enabled.",
+  };
+}
+
 app.get("/config/platform", async (_req, res) => {
   try {
     const kubernetesClusters = await listKubernetesExecutionTargets();
@@ -731,6 +765,9 @@ app.get("/config/platform", async (_req, res) => {
       systemBanner,
       language,
       release,
+      capabilities: {
+        localDockerDemo: localDockerDemoCapability(),
+      },
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1155,6 +1192,11 @@ app.use("/agent-hub", require("./routes/agentHubPublic"));
 // ─── Auth Wall ────────────────────────────────────────────────────
 app.use(authenticateToken);
 
+// Agent-id paths enforce the API key's exact workspace assignment before any
+// router can touch runtime state. Each router then applies its own public scope
+// contract (agents, integrations, monitoring, or session-only).
+app.use("/agents", requireApiKeyAgentPathScope());
+
 // ─── Gateway Proxy ────────────────────────────────────────────────
 app.use(createGatewayRouter());
 
@@ -1185,13 +1227,152 @@ app.use("/admin", require("./routes/admin"));
 app.use(errorHandler);
 
 // ─── DB Migration ─────────────────────────────────────────────────
+// These repairs are intentionally outside the positional migration ledger.
+// They are idempotent compatibility preconditions for replaying the historical
+// reconciliation list on databases that predate the checksum ledger. Keeping
+// them separate avoids renumbering or changing checksums for deployed entries.
+const LEGACY_COMPATIBILITY_REPAIRS = [
+  {
+    name: "normalize-legacy-backup-kinds",
+    sql: `DO $nora$
+      DECLARE
+        backups_table REGCLASS := to_regclass('backups');
+        schedules_table REGCLASS := to_regclass('backup_schedules');
+        backups_have_scope BOOLEAN := false;
+      BEGIN
+        IF backups_table IS NOT NULL THEN
+          SELECT EXISTS (
+            SELECT 1
+              FROM pg_attribute
+             WHERE attrelid = backups_table
+               AND attname = 'scope'
+               AND NOT attisdropped
+          ) INTO backups_have_scope;
+
+          IF backups_have_scope THEN
+            EXECUTE $repair$
+              UPDATE backups
+                 SET kind = CASE
+                   WHEN LOWER(BTRIM(COALESCE(kind, ''))) = 'installation' THEN 'installation'
+                   WHEN LOWER(BTRIM(COALESCE(kind, ''))) = 'agent' THEN 'agent'
+                   WHEN COALESCE(scope, '{}'::jsonb) @> '{"installation": true}'::jsonb
+                     THEN 'installation'
+                   ELSE 'agent'
+                 END
+               WHERE kind IS DISTINCT FROM 'agent'
+                 AND kind IS DISTINCT FROM 'installation'
+            $repair$;
+          ELSE
+            EXECUTE $repair$
+              UPDATE backups
+                 SET kind = CASE
+                   WHEN LOWER(BTRIM(COALESCE(kind, ''))) = 'installation' THEN 'installation'
+                   WHEN LOWER(BTRIM(COALESCE(kind, ''))) = 'agent' THEN 'agent'
+                   WHEN agent_id IS NULL THEN 'installation'
+                   ELSE 'agent'
+                 END
+               WHERE kind IS DISTINCT FROM 'agent'
+                 AND kind IS DISTINCT FROM 'installation'
+            $repair$;
+          END IF;
+        END IF;
+
+        IF schedules_table IS NOT NULL THEN
+          EXECUTE $repair$
+            UPDATE backup_schedules
+               SET kind = CASE
+                 WHEN LOWER(BTRIM(COALESCE(kind, ''))) = 'installation' THEN 'installation'
+                 WHEN LOWER(BTRIM(COALESCE(kind, ''))) = 'agent' THEN 'agent'
+                 WHEN schedule_key = 'installation' OR agent_id IS NULL THEN 'installation'
+                 ELSE 'agent'
+               END
+             WHERE kind IS DISTINCT FROM 'agent'
+               AND kind IS DISTINCT FROM 'installation'
+          $repair$;
+        END IF;
+      END
+    $nora$`,
+  },
+  {
+    name: "deduplicate-legacy-agent-hub-slugs",
+    sql: `DO $nora$
+      DECLARE
+        listings_table REGCLASS := to_regclass('agent_hub_listings');
+        listings_have_slug BOOLEAN := false;
+      BEGIN
+        IF listings_table IS NOT NULL THEN
+          SELECT EXISTS (
+            SELECT 1
+              FROM pg_attribute
+             WHERE attrelid = listings_table
+               AND attname = 'slug'
+               AND NOT attisdropped
+          ) INTO listings_have_slug;
+        END IF;
+
+        IF listings_have_slug THEN
+          EXECUTE $repair$
+            UPDATE agent_hub_listings
+               SET slug = NULL
+             WHERE slug IS NOT NULL AND BTRIM(slug) = ''
+          $repair$;
+
+          EXECUTE $repair$
+            WITH ranked AS (
+              SELECT id,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY slug
+                       ORDER BY created_at ASC NULLS LAST, id ASC
+                     ) AS slug_position
+                FROM agent_hub_listings
+               WHERE slug IS NOT NULL
+            )
+            UPDATE agent_hub_listings AS listing
+               SET slug = NULL
+              FROM ranked
+             WHERE listing.id = ranked.id
+               AND ranked.slug_position > 1
+          $repair$;
+        END IF;
+      END
+    $nora$`,
+  },
+  {
+    name: "repair-llm-provider-defaults",
+    sql: `DO $nora$
+      BEGIN
+        IF to_regclass('llm_providers') IS NOT NULL THEN
+          WITH ranked AS (
+            SELECT id,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY user_id
+                     ORDER BY is_default DESC,
+                              CASE WHEN provider = 'demo' THEN 1 ELSE 0 END,
+                              created_at ASC NULLS LAST,
+                              id ASC
+                   ) AS provider_position
+              FROM llm_providers
+          )
+          UPDATE llm_providers AS provider
+             SET is_default = (ranked.provider_position = 1)
+            FROM ranked
+           WHERE provider.id = ranked.id
+             AND provider.is_default IS DISTINCT FROM (ranked.provider_position = 1);
+        END IF;
+      END
+    $nora$`,
+  },
+];
+
 /**
- * Apply idempotent control-plane schema migrations needed by the running API.
- * Individual statement failures are logged so later compatibility migrations continue.
+ * Apply compatibility repairs and append-only schema migrations under one
+ * transactional advisory lock; any failure rolls back and blocks startup.
  *
- * @returns {Promise<void>} Resolves after every migration statement is attempted.
+ * @param {Object} [database=db] - PostgreSQL pool or client used for migration work.
+ * @param {Object} [env=process.env] - Migration timeout configuration.
+ * @returns {Promise<Object>} Total and newly applied migration counts after commit.
  */
-async function migrateDB() {
+async function migrateDB(database = db, env = process.env) {
   const migrations = [
     `DO $$ BEGIN
        ALTER TABLE agents ADD COLUMN backend_type VARCHAR(20) NOT NULL DEFAULT 'docker';
@@ -2010,14 +2191,11 @@ async function migrateDB() {
     `DO $$ BEGIN ALTER TABLE platform_settings ADD COLUMN smtp_from_name TEXT NOT NULL DEFAULT 'Nora'; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
   ];
 
-  for (const sql of migrations) {
-    try {
-      await db.query(sql);
-    } catch (e) {
-      console.error("Migration step failed:", e.message);
-    }
-  }
-  console.log("DB migrations applied");
+  return runVersionedMigrations(database, migrations, {
+    compatibilityRepairs: LEGACY_COMPATIBILITY_REPAIRS,
+    lockTimeoutMs: env.DB_MIGRATION_LOCK_TIMEOUT_MS,
+    statementTimeoutMs: env.DB_MIGRATION_STATEMENT_TIMEOUT_MS,
+  });
 }
 
 function stableStringify(value) {
@@ -2094,6 +2272,47 @@ async function seedStarterAgentHub() {
   console.log(`Agent Hub seeded with ${STARTER_TEMPLATES.length} built-in starter templates`);
 }
 
+async function seedBootstrapAdminAccount() {
+  const { rows } = await db.query("SELECT id FROM users LIMIT 1");
+  if (rows.length > 0) return;
+
+  const adminEmail = process.env.DEFAULT_ADMIN_EMAIL;
+  const adminPassword = process.env.DEFAULT_ADMIN_PASSWORD;
+  const bootstrapAdmin = getBootstrapAdminSeedConfig({ adminEmail, adminPassword });
+
+  if (!bootstrapAdmin.shouldSeed) {
+    const emailConfigured = typeof adminEmail === "string" && adminEmail.trim() !== "";
+    const passwordConfigured = typeof adminPassword === "string" && adminPassword !== "";
+    if (!emailConfigured && !passwordConfigured) {
+      if (!allowsFirstAdminSignupClaim()) {
+        const error = new Error(
+          "Hosted PaaS requires explicit DEFAULT_ADMIN_EMAIL and DEFAULT_ADMIN_PASSWORD before the API can start with an empty user database.",
+        );
+        error.code = "PAAS_BOOTSTRAP_ADMIN_REQUIRED";
+        throw error;
+      }
+      console.warn(
+        "Skipping bootstrap admin seed: set explicit DEFAULT_ADMIN_EMAIL and a non-default DEFAULT_ADMIN_PASSWORD with at least 12 characters, or claim the first account through signup.",
+      );
+      return;
+    }
+
+    const error = new Error(
+      `Invalid bootstrap admin configuration (${bootstrapAdmin.reason}). Refusing to start with an empty user database because the configured account would not be created.`,
+    );
+    error.code = "BOOTSTRAP_ADMIN_CONFIGURATION_INVALID";
+    throw error;
+  }
+
+  const bcrypt = require("bcryptjs");
+  const hash = await bcrypt.hash(bootstrapAdmin.password, 10);
+  await db.query(
+    "INSERT INTO users(email, password_hash, role, name) VALUES($1, $2, 'admin', 'Admin') ON CONFLICT DO NOTHING",
+    [bootstrapAdmin.email, hash],
+  );
+  console.log(`Bootstrap admin account created: ${bootstrapAdmin.email}`);
+}
+
 // ─── Startup ──────────────────────────────────────────────────────
 if (require.main === module) {
   const { attachLogStream } = require("./logStream");
@@ -2101,161 +2320,152 @@ if (require.main === module) {
   const { attachMetricsStream } = require("./metricsStream");
 
   const PORT = parseInt(process.env.PORT || "4000");
-  const server = app.listen(PORT, async () => {
-    console.log(`api running on ${PORT}`);
+  async function startServer() {
+    // Schema reconciliation is a hard startup gate. The migration runner uses
+    // a transaction, advisory lock, append-only ledger, and checksums; Nora
+    // must never serve traffic against a partially migrated database.
+    await migrateDB();
+    // Bootstrap credentials are an activation and security gate. Validate and
+    // seed them before binding the HTTP listener so a copied placeholder or a
+    // password rejected by policy cannot silently leave first-run signup open.
+    await seedBootstrapAdminAccount();
 
-    try {
-      await migrateDB();
-    } catch (e) {
-      console.error("DB migration error:", e.message);
-    }
+    const server = app.listen(PORT, async () => {
+      console.log(`api running on ${PORT}`);
 
-    // Dev-mode only: persist the generated JWT secret in platform_settings so
-    // sessions survive restarts; on later boots restore the stored one. The
-    // restore happens before real traffic in practice, and the worst case of a
-    // racing request is one invalidated token — the prior behavior for ALL
-    // tokens on every restart. Production never reaches this branch (boot
-    // fails without an explicit JWT_SECRET).
-    if (usedEphemeralJwtSecret) {
-      try {
-        const existing = await db.query("SELECT dev_jwt_secret FROM platform_settings LIMIT 1");
-        const stored = existing.rows[0]?.dev_jwt_secret;
-        if (stored && stored.length >= MIN_JWT_SECRET_LENGTH) {
-          process.env.JWT_SECRET = stored;
-          console.log("Restored persisted dev JWT secret — existing sessions remain valid.");
-        } else {
-          await db.query(
-            `INSERT INTO platform_settings(singleton, dev_jwt_secret) VALUES (TRUE, $1)
+      // Dev-mode only: persist the generated JWT secret in platform_settings so
+      // sessions survive restarts; on later boots restore the stored one. The
+      // restore happens before real traffic in practice, and the worst case of a
+      // racing request is one invalidated token — the prior behavior for ALL
+      // tokens on every restart. Production never reaches this branch (boot
+      // fails without an explicit JWT_SECRET).
+      if (usedEphemeralJwtSecret) {
+        try {
+          const existing = await db.query("SELECT dev_jwt_secret FROM platform_settings LIMIT 1");
+          const stored = existing.rows[0]?.dev_jwt_secret;
+          if (stored && stored.length >= MIN_JWT_SECRET_LENGTH) {
+            process.env.JWT_SECRET = stored;
+            console.log("Restored persisted dev JWT secret — existing sessions remain valid.");
+          } else {
+            await db.query(
+              `INSERT INTO platform_settings(singleton, dev_jwt_secret) VALUES (TRUE, $1)
              ON CONFLICT (singleton) DO UPDATE SET dev_jwt_secret = EXCLUDED.dev_jwt_secret`,
-            [process.env.JWT_SECRET],
-          );
-          console.log("Persisted generated dev JWT secret — sessions will survive restarts.");
+              [process.env.JWT_SECRET],
+            );
+            console.log("Persisted generated dev JWT secret — sessions will survive restarts.");
+          }
+        } catch (e) {
+          console.warn("Could not persist/restore dev JWT secret:", e.message);
+        }
+      }
+
+      try {
+        const promotedUser = await ensureFirstRegisteredUserIsAdmin(db);
+        if (promotedUser) {
+          console.log(`Promoted first registered user to admin: ${promotedUser.email}`);
         }
       } catch (e) {
-        console.warn("Could not persist/restore dev JWT secret:", e.message);
+        console.error("Failed to ensure an admin user exists:", e.message);
       }
-    }
 
-    // Seed bootstrap admin account on first boot only when explicit secure credentials are provided.
-    try {
-      const { rows } = await db.query("SELECT id FROM users LIMIT 1");
-      if (rows.length === 0) {
-        const bootstrapAdmin = getBootstrapAdminSeedConfig({
-          adminEmail: process.env.DEFAULT_ADMIN_EMAIL,
-          adminPassword: process.env.DEFAULT_ADMIN_PASSWORD,
-        });
-
-        if (!bootstrapAdmin.shouldSeed) {
-          console.warn(
-            "Skipping bootstrap admin seed: set explicit DEFAULT_ADMIN_EMAIL and a non-default DEFAULT_ADMIN_PASSWORD with at least 12 characters.",
-          );
-        } else {
-          const bcrypt = require("bcryptjs");
-          const hash = await bcrypt.hash(bootstrapAdmin.password, 10);
-          await db.query(
-            "INSERT INTO users(email, password_hash, role, name) VALUES($1, $2, 'admin', 'Admin') ON CONFLICT DO NOTHING",
-            [bootstrapAdmin.email, hash],
-          );
-          console.log(`Bootstrap admin account created: ${bootstrapAdmin.email}`);
-        }
-      }
-    } catch (e) {
-      console.error("Failed to seed admin account:", e.message);
-    }
-
-    try {
-      const promotedUser = await ensureFirstRegisteredUserIsAdmin(db);
-      if (promotedUser) {
-        console.log(`Promoted first registered user to admin: ${promotedUser.email}`);
-      }
-    } catch (e) {
-      console.error("Failed to ensure an admin user exists:", e.message);
-    }
-
-    try {
-      await integrations.seedCatalog();
-    } catch (e) {
-      console.error("Failed to seed integration catalog:", e.message);
-    }
-
-    try {
-      await seedStarterAgentHub();
-    } catch (e) {
-      console.error("Failed to seed Agent Hub:", e.message);
-    }
-
-    _startupComplete = true;
-    console.log("Startup complete — health check now returning ok");
-
-    // ── Background stats collector: sample supported backends every 5s ──
-    const STATS_INTERVAL = 5000;
-    setInterval(async () => {
-      await collectBackgroundTelemetry({
-        dbClient: db,
-        telemetryCollector: collectAgentTelemetrySample,
-      });
-    }, STATS_INTERVAL);
-
-    // ── Background status reconciler: sync DB status with real container state every 30s ──
-    const RECONCILE_INTERVAL = 30000;
-    setInterval(async () => {
-      await reconcileBackgroundAgentStatuses({ dbClient: db });
-    }, RECONCILE_INTERVAL);
-
-    // ── External runtime reconciler: adopted runtimes have no container, so probe
-    // their endpoint over HTTP (SSRF-safe) and reconcile status every 30s. ──
-    setInterval(async () => {
-      await reconcileExternalAgentStatuses({ dbClient: db });
-    }, RECONCILE_INTERVAL);
-
-    // ── Budget sweep: re-enforce per-agent hard caps every 60s. The status
-    // reconciler above flips stopped->running whenever a container is live,
-    // so re-enforcement is what keeps a budget pause stuck. ──
-    const BUDGET_SWEEP_INTERVAL = 60000;
-    setInterval(async () => {
-      await agentBudgets.sweepAgentBudgets({ dbClient: db });
-    }, BUDGET_SWEEP_INTERVAL);
-
-    // ── Schedule sweep: claim due agent_schedules and enqueue each run for the
-    // worker to execute. Replica-safe (FOR UPDATE SKIP LOCKED in the module).
-    // The re-entrancy guard prevents a slow sweep from overlapping the next
-    // tick (setInterval doesn't await), bounding concurrent enqueue load. ──
-    const SCHEDULE_SWEEP_INTERVAL = 30000;
-    let scheduleSweepRunning = false;
-    setInterval(async () => {
-      if (scheduleSweepRunning) return;
-      scheduleSweepRunning = true;
       try {
-        await agentSchedules.sweepDueSchedules({
-          dbClient: db,
-          enqueue: addScheduleRunJob,
-        });
-      } catch (err) {
-        console.error("[schedules] sweep failed:", err?.message || err);
-      } finally {
-        scheduleSweepRunning = false;
+        await integrations.seedCatalog();
+      } catch (e) {
+        console.error("Failed to seed integration catalog:", e.message);
       }
-    }, SCHEDULE_SWEEP_INTERVAL);
-  });
 
-  attachLogStream(server);
-  attachExecStream(server);
-  attachMetricsStream(server);
-  attachGatewayWS(server);
+      try {
+        await seedStarterAgentHub();
+      } catch (e) {
+        console.error("Failed to seed Agent Hub:", e.message);
+      }
 
-  // Flush batched OpenTelemetry spans/metrics on shutdown — only when OTel is
-  // actually enabled, so the default/disabled path (and tests) keep Node's
-  // stock signal behavior. Bounded so a stuck exporter can't block exit.
-  if (otel.isEnabled()) {
-    for (const sig of ["SIGTERM", "SIGINT"]) {
-      process.once(sig, () => {
-        Promise.race([
-          otel.shutdown(),
-          new Promise((resolve) => setTimeout(resolve, 3000)),
-        ]).finally(() => process.exit(0));
-      });
+      _startupComplete = true;
+      console.log("Startup complete — health check now returning ok");
+
+      // ── Background stats collector: sample supported backends every 5s ──
+      const STATS_INTERVAL = 5000;
+      setInterval(async () => {
+        await collectBackgroundTelemetry({
+          dbClient: db,
+          telemetryCollector: collectAgentTelemetrySample,
+        });
+      }, STATS_INTERVAL);
+
+      // ── Background status reconciler: sync DB status with real container state every 30s ──
+      const RECONCILE_INTERVAL = 30000;
+      setInterval(async () => {
+        await reconcileBackgroundAgentStatuses({ dbClient: db });
+      }, RECONCILE_INTERVAL);
+
+      // ── External runtime reconciler: adopted runtimes have no container, so probe
+      // their endpoint over HTTP (SSRF-safe) and reconcile status every 30s. ──
+      setInterval(async () => {
+        await reconcileExternalAgentStatuses({ dbClient: db });
+      }, RECONCILE_INTERVAL);
+
+      // ── Budget sweep: re-enforce per-agent hard caps every 60s. The status
+      // reconciler above flips stopped->running whenever a container is live,
+      // so re-enforcement is what keeps a budget pause stuck. ──
+      const BUDGET_SWEEP_INTERVAL = 60000;
+      setInterval(async () => {
+        await agentBudgets.sweepAgentBudgets({ dbClient: db });
+      }, BUDGET_SWEEP_INTERVAL);
+
+      // ── Schedule sweep: claim due agent_schedules and enqueue each run for the
+      // worker to execute. Replica-safe (FOR UPDATE SKIP LOCKED in the module).
+      // The re-entrancy guard prevents a slow sweep from overlapping the next
+      // tick (setInterval doesn't await), bounding concurrent enqueue load. ──
+      const SCHEDULE_SWEEP_INTERVAL = 30000;
+      let scheduleSweepRunning = false;
+      setInterval(async () => {
+        if (scheduleSweepRunning) return;
+        scheduleSweepRunning = true;
+        try {
+          await agentSchedules.sweepDueSchedules({
+            dbClient: db,
+            enqueue: addScheduleRunJob,
+          });
+        } catch (err) {
+          console.error("[schedules] sweep failed:", err?.message || err);
+        } finally {
+          scheduleSweepRunning = false;
+        }
+      }, SCHEDULE_SWEEP_INTERVAL);
+    });
+
+    attachLogStream(server);
+    attachExecStream(server);
+    attachMetricsStream(server);
+    attachGatewayWS(server);
+
+    // Flush batched OpenTelemetry spans/metrics on shutdown — only when OTel is
+    // actually enabled, so the default/disabled path (and tests) keep Node's
+    // stock signal behavior. Bounded so a stuck exporter can't block exit.
+    if (otel.isEnabled()) {
+      for (const sig of ["SIGTERM", "SIGINT"]) {
+        process.once(sig, () => {
+          Promise.race([
+            otel.shutdown(),
+            new Promise((resolve) => setTimeout(resolve, 3000)),
+          ]).finally(() => process.exit(0));
+        });
+      }
     }
   }
+
+  startServer().catch(async (error) => {
+    console.error(`Fatal startup error: ${error?.message || error}`);
+    try {
+      await db.end();
+    } catch (closeError) {
+      console.error(
+        `Failed to close PostgreSQL pool after startup failure: ${closeError?.message || closeError}`,
+      );
+    }
+    process.exit(1);
+  });
 }
 
 module.exports = app;
+module.exports.__test = Object.freeze({ migrateDB, seedBootstrapAdminAccount });
