@@ -68,19 +68,19 @@ beforeEach(() => {
   mockLockClient.end.mockReset().mockResolvedValue(undefined);
 });
 
-// Route db.query on SQL shape: the ownership probe vs the workspace-grant probe.
+// Return the authoritative row snapshot produced by the combined grant query.
 function fakeAccess({ owned = false, sharedEditorPlus = false, grantsTableMissing = false } = {}) {
+  let platformQueryAttempted = false;
   mockDb.query.mockImplementation(async (sql) => {
-    if (/FROM remote_hosts WHERE id = \$1 AND owner_user_id/.test(sql)) {
-      return { rows: owned ? [{ "?column?": 1 }] : [] };
-    }
-    if (/FROM workspace_remote_hosts/.test(sql)) {
-      if (grantsTableMissing) {
+    const text = String(sql);
+    if (/SELECT rh\.\*/.test(text)) {
+      if (grantsTableMissing && !platformQueryAttempted && /management_scope/.test(text)) {
+        platformQueryAttempted = true;
         const err = new Error('relation "workspace_remote_hosts" does not exist');
         err.code = "42P01";
         throw err;
       }
-      return { rows: sharedEditorPlus ? [{ "?column?": 1 }] : [] };
+      return { rows: owned || sharedEditorPlus ? [hostRow(owned ? "user-1" : "host-owner")] : [] };
     }
     return { rows: [] };
   });
@@ -90,14 +90,13 @@ describe("userCanUseRemoteHost", () => {
   it("allows the host owner", async () => {
     fakeAccess({ owned: true });
     expect(await userCanUseRemoteHost("user-1", "host-1")).toBe(true);
-    // owner short-circuits before the workspace-grant query
+    // Authorization and row loading are deliberately one query.
     expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
 
   it("allows an editor+ member of a workspace the host is shared into", async () => {
     fakeAccess({ owned: false, sharedEditorPlus: true });
     expect(await userCanUseRemoteHost("user-2", "host-1")).toBe(true);
-    // The grant query filters role = ANY(editor/admin/owner).
     const grantCall = mockDb.query.mock.calls.find((c) => /workspace_remote_hosts/.test(c[0]));
     expect(grantCall[0]).toMatch(/wm\.role = ANY/);
     expect(grantCall[1]).toEqual(["host-1", "user-2", ["editor", "admin", "owner"]]);
@@ -167,6 +166,37 @@ describe("assertRemoteHostAgentUse", () => {
     });
     expect(mockDb.query).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    ["global", "rh.available_to_all = true"],
+    ["direct user", "remote_host_user_grants"],
+    ["user group", "remote_host_group_grants"],
+    ["current platform admin", "actor.role = 'admin'"],
+  ])(
+    "authorizes a platform host through the %s grant in the authoritative query",
+    async (_kind, sqlFragment) => {
+      mockDb.query.mockImplementation(async (sql) => {
+        expect(String(sql)).toContain(sqlFragment);
+        return {
+          rows: [hostRow(null)].map((row) => ({
+            ...row,
+            management_scope: "platform",
+            owner_user_id: null,
+            available_to_all: sqlFragment.includes("available_to_all"),
+          })),
+        };
+      });
+
+      await expect(assertRemoteHostAgentUse(remoteAgent("user-2"))).resolves.toEqual(
+        expect.objectContaining({
+          id: "host-1",
+          managementScope: "platform",
+          ownerUserId: null,
+        }),
+      );
+      expect(mockDb.query).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("uses one authorized row snapshot instead of reloading a recreated host id", async () => {
     const releaseAuthorizedRow = deferred();

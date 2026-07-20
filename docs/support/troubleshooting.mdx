@@ -186,18 +186,20 @@ When digging into a specific failure, scope the log view to errors only — the 
 
     **Host is missing from the Deploy page**
 
-    Confirm the host is enabled, configured, and its latest manual test succeeded. You must own it or
-    hold an `editor`, `admin`, or `owner` role in a workspace where it is shared. Viewers see the host
-    read-only but cannot deploy. The current dashboard injects Remote Docker targets into OpenClaw's
-    picker only; Hermes Remote Docker uses the experimental
+    Confirm the host is enabled, configured, and its latest manual test succeeded. A personal host
+    requires ownership or an `editor+` workspace grant. A platform host permits platform admins,
+    all accounts when enabled, directly granted users, matching user groups, and `editor+` members of
+    a granted workspace. Workspace viewers see the host but cannot deploy. The current dashboard
+    injects Remote Docker targets into OpenClaw's picker only; Hermes Remote Docker uses the experimental
     [advanced API path](/configuration/provisioner-backends/remote-docker#hermes-advanced-api-path).
 
     ***
 
-    **Agent or container still exists after unsharing the host**
+    **Agent or container still exists after host access is revoked**
 
-    This is expected. Unsharing removes only the workspace grant. It does not stop, move, delete, or
-    rebalance existing containers. After the agent owner loses their final qualifying grant, Nora
+    This is expected. Unsharing or removing a platform access grant changes authorization only. It
+    does not stop, move, delete, or rebalance existing containers. After the agent owner loses their
+    final qualifying path, Nora
     denies active operations—including new/queued deployment work, start/restart, live runtime
     access, logs, terminal, backup capture, non-stop scheduled actions, and ClawHub—and closes
     rechecked active streams. Live status and telemetry collection stops. The stored agent record,
@@ -220,6 +222,10 @@ When digging into a specific failure, scope the log view to errors only — the 
     Nora returns `409` while any non-deleted agent still references the host's `remote:<id>` target.
     Migrate or delete those agents first. Unsharing a workspace does not remove the references.
 
+    After deletion succeeds, Nora permanently reserves the personal or platform host id. This
+    prevents a different machine and credential from later inheriting the old `remote:<id>` target.
+    If you need to register a replacement, choose a new label/id.
+
     See [Remote Docker setup and limitations](/configuration/provisioner-backends/remote-docker) for
     host compatibility, test scope, firewall rules, capacity limits, and sharing semantics.
 
@@ -228,11 +234,21 @@ When digging into a specific failure, scope the log view to errors only — the 
     **Remote host key changed after an intentional rebuild or rotation**
 
     First verify the replacement SSH host key through the machine console or another trusted
-    out-of-band channel. Then open **App -> Remote Hosts**, choose **Reset SSH pin**, type the exact
-    host label or id, and confirm. Nora clears the pin and previous Test state without changing the
-    stored credentials. Run **Test** immediately; deployments and active use remain blocked until
-    the new key is captured and pinned. If you cannot explain and independently verify the key
-    change, do not reset it.
+    out-of-band channel. Then open the host's owning surface—**App -> Remote Hosts** for a personal
+    host or **Admin -> Remote Hosts** for a platform host—choose **Reset SSH pin**, type the exact host
+    label or id, and confirm. Nora clears the pin and previous Test state without changing the stored
+    credentials. Run **Test** immediately; deployments and active use remain blocked until the new
+    key is captured and pinned. If you cannot explain and independently verify the key change, do not
+    reset it.
+
+    ***
+
+    **A personal host is read-only in Admin**
+
+    This is intentional. Platform admins manage platform hosts under **Admin -> Remote Hosts**. A
+    personal host remains managed by its user owner under **App -> Remote Hosts**; its Admin fleet row
+    exposes only masked inventory metadata. Do not copy its credentials into a new platform record to
+    work around the ownership boundary.
 
   </Accordion>
 

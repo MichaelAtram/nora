@@ -2,7 +2,7 @@
 
 > Compare Docker, Remote Docker, Kubernetes, experimental Proxmox LXC placement, and the experimental NemoClaw sandbox profile to pick the right agent isolation and scaling strategy for your Nora deployment.
 
-Nora provisions agent runtimes onto execution targets selected in the Deploy flow. Docker and Kubernetes are GA paths. Docker is the default. Remote Docker is a self-hosted-only, experimental bring-your-own-compute path for operator-registered Docker machines reached over SSH. Kubernetes clusters are registered in **Admin -> Kubernetes** so one Nora control plane can manage several clusters at once. Proxmox is an opt-in experimental LXC target for OpenClaw and prepared Hermes images. NemoClaw is an experimental OpenClaw sandbox profile layered onto supported targets, but NemoClaw on Proxmox remains blocked.
+Nora provisions agent runtimes onto execution targets selected in the Deploy flow. Docker and Kubernetes are GA paths. Docker is the default. Remote Docker is a self-hosted-only, experimental bring-your-own-compute path for personal or platform Docker machines reached over SSH. Personal hosts are registered in **App -> Remote Hosts**; platform admins register shared platform hosts in **Admin -> Remote Hosts**. Kubernetes clusters are registered in **Admin -> Kubernetes** so one Nora control plane can manage several clusters at once. Proxmox is an opt-in experimental LXC target for OpenClaw and prepared Hermes images. NemoClaw is an experimental OpenClaw sandbox profile layered onto supported targets, but NemoClaw on Proxmox remains blocked.
 
 ![Deploy wizard — Execution Target picker rendering the enabled backends](/images/configuration/deploy-backend-picker.png)
 
@@ -12,7 +12,8 @@ Nora provisions agent runtimes onto execution targets selected in the Deploy flo
   </Card>
 
 <Card title="Remote Docker (experimental)" icon="network-wired" href="/guides/remote-docker">
-  Connect and validate an operator-owned Docker host through encrypted credentials and pinned SSH.
+  Connect and validate a personal or platform Docker host through encrypted credentials and pinned
+  SSH.
 </Card>
 
 <Card
@@ -51,7 +52,7 @@ ENABLED_SANDBOX_PROFILES=standard
 
 Use `ENABLED_BACKENDS=docker` for normal onboarding, or `docker,proxmox` to opt into the experimental LXC path after secure API/SSH configuration. Cluster-only control planes such as the official Helm install use `ENABLED_BACKENDS=k8s` as a sentinel that disables the local Docker target; it does not create a generic selectable cluster. Concrete Kubernetes deploy targets still come only from the Admin cluster registry. Run the live Proxmox smoke before production use.
 
-Do not add `remote-docker` to `ENABLED_BACKENDS`. On a self-hosted Nora control plane, register hosts in **App -> Remote Hosts** and run **Test**; each enabled, configured host with a successful Docker-over-SSH test is injected dynamically as `remote:<id>`. The current Deploy picker exposes those registered targets only for OpenClaw. Hermes support exists in the backend and worker as an advanced API path, but the current Hermes picker does not list remote hosts. Start with [Connect a Remote Docker host](/guides/remote-docker), then use the [backend reference](/configuration/provisioner-backends/remote-docker) for the complete SSH host-key, firewall, capacity, sharing, and recovery contract.
+Do not add `remote-docker` to `ENABLED_BACKENDS`. On a self-hosted Nora control plane, register a personal host in **App -> Remote Hosts** or a platform host in **Admin -> Remote Hosts**, then run **Test**. Each enabled, configured host with a successful Docker-over-SSH test is injected dynamically as `remote:<id>` for users who can deploy to it. Personal hosts are private unless shared to a workspace; platform hosts default to restricted and support all-account, direct-user, user-group, and workspace grants. The current Deploy picker exposes registered targets only for OpenClaw. Hermes support exists in the backend and worker as an advanced API path, but the current Hermes picker does not list remote hosts. Start with [Connect a Remote Docker host](/guides/remote-docker), then use the [backend reference](/configuration/provisioner-backends/remote-docker) for the complete SSH host-key, firewall, capacity, access, and recovery contract.
 
 Register Kubernetes clusters in **Admin -> Kubernetes**. Each enabled registry row with a passing **Test** result becomes a separate deploy target with an id like `k8s:aks-eastus2`, while persisted agents still use the base `k8s` adapter internally. Failed, untested, or disabled clusters stay visible in Admin but are hidden from the Deploy page for both OpenClaw and Hermes. The Deploy page shows the cluster label, provider, actual cluster name, namespace, and exposure mode so operators can tell AKS, GKE, EKS, K3s, Kind, or generic clusters apart.
 

@@ -4,14 +4,25 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
-## [v1.16.5](https://github.com/solomon2773/nora/releases/tag/v1.16.5) — 2026-07-13
+## [v1.16.5](https://github.com/solomon2773/nora/releases/tag/v1.16.5) — 2026-07-19
 
-Activation, extension safety, and operator-readiness patch: the first-run path is browser-proven,
-configured bootstrap credentials fail closed, deployment targets cannot silently fall back to local
-Docker, and release/deploy automation preserves exact commit provenance.
+Activation, Remote Docker administration, extension safety, and operator-readiness patch: the
+first-run path is browser-proven, configured bootstrap credentials fail closed, deployment targets
+cannot silently fall back to local Docker, and release/deploy automation preserves exact commit
+provenance.
 
 ### Added
 
+- Self-hosted platform admins can now register and manage control-plane-owned Remote Docker hosts
+  from Admin, including connection testing, configuration and masked credential updates, enablement,
+  guarded SSH host-key reset, and confirmation-gated deletion. Personal/operator hosts remain masked
+  and read-only in the Admin fleet, while platform hosts survive deletion of the admin who created
+  them.
+- Platform hosts start restricted and can grant access to all accounts, direct users, reusable
+  admin-managed user groups, or workspaces. Admin now includes user-group create, rename, delete, and
+  versioned membership management; workspace viewers can see granted hosts while editors and above
+  can deploy, and version checks prevent concurrent access edits from silently overwriting one
+  another.
 - Browser E2E coverage now proves signup, HttpOnly cookie handoff, Getting Started demo activation,
   worker-backed deployment, running state, and the first rendered OpenClaw chat response in one
   operator journey.
@@ -64,6 +75,11 @@ Docker, and release/deploy automation preserves exact commit provenance.
 - Backend adapter scaffolds fail explicitly for lifecycle, telemetry, logs, and exec operations;
   extension validation and CI now cover provider strategy registration, tests, docs navigation, and
   the complete nine-method adapter contract.
+- The platform-host Admin flow is self-hosted-only and fails closed until `/api/config/platform`
+  verifies `selfhosted`. PaaS or unverified Admin pages hide credential and mutation controls, while
+  hosted-mode APIs reject Remote Docker registration and management. Durable lifecycle work resolves
+  credentials from the persisted agent owner rather than the admin or collaborator initiating an
+  operation.
 - Worker images cache bounded backend dependency installs before source copies, Cloudflare launch
   guidance now documents the exact cache/security rollout checks, and Mintlify metadata, exclusions,
   and SEO configuration are aligned with the current public docs surface.
@@ -113,6 +129,9 @@ Docker, and release/deploy automation preserves exact commit provenance.
   referenced agents, including workloads owned by workspace members. Docker and Remote Docker
   deletion also treats missing managed volumes as idempotent but retains the agent record and reports
   `DOCKER_VOLUME_CLEANUP_FAILED` when durable state cannot actually be removed.
+- Remote-host deletion now serializes against new placements, permanently retires deleted host ids,
+  and preserves the pinned SSH identity through credential rotation so queued work cannot be
+  redirected to a different machine or race a replacement registration.
 
 ## [v1.16.4](https://github.com/solomon2773/nora/releases/tag/v1.16.4) — 2026-07-13
 

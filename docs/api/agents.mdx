@@ -234,10 +234,11 @@ curl -X POST http://localhost:8080/api/agents/deploy \
 
 ### Remote Docker and Hermes
 
-Remote-host administration is intentionally session-only. Register and manually test the host in
-**App -> Remote Hosts** before using its `remote:<id>` target. Workspace API keys cannot call any
-`/remote-hosts` endpoint, and even session-authenticated responses mask stored SSH private keys,
-passwords, and passphrases.
+Remote-host administration is intentionally session-only. Register and manually test a personal
+host in **App -> Remote Hosts**, or have a platform admin create a platform host in **Admin -> Remote
+Hosts**, before using its `remote:<id>` target. Workspace API keys cannot call personal
+`/remote-hosts` or platform `/admin/remote-hosts` management endpoints, and every response masks
+stored SSH private keys, passwords, and passphrases.
 
 The dashboard currently lists registered Remote Docker hosts for OpenClaw only. Hermes Remote Docker
 is an experimental advanced API path. After registration and testing, deploy it with a session JWT:
@@ -261,9 +262,11 @@ curl -X POST http://localhost:8080/api/agents/deploy \
 ```
 </CodeGroup>
 
-The session user must own the host or have an `editor`, `admin`, or `owner` role in a workspace where
-the host is shared. The created agent belongs to the deploying user and is not automatically assigned
-to that workspace.
+For a personal host, the session user must own it or have an `editor`, `admin`, or `owner` role in a
+workspace where it is shared. For a platform host, a platform admin, the all-accounts setting, a
+direct-user grant, a matching user-group grant, or an `editor+` workspace grant permits deployment.
+A workspace viewer can see a granted host but cannot deploy to it. The created agent belongs to the
+deploying user and is not automatically assigned to any workspace that supplied host access.
 
 Remote Docker placement and every existing-agent Remote Docker operation are session-only. A
 workspace API key receives `403 session_required` before host lookup, persistence, queue publication,

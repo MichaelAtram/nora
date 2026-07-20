@@ -36,6 +36,30 @@ async function openMigrationControls(page: Page, token: string) {
   await expect(page.getByRole("button", { name: /upload bundle/i })).toBeVisible();
 }
 
+function trackAdminRemoteHostMutations(page: Page) {
+  const mutations: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      url.pathname.startsWith("/api/admin/remote-hosts") &&
+      request.method().toUpperCase() !== "GET"
+    ) {
+      mutations.push(`${request.method().toUpperCase()} ${url.pathname}`);
+    }
+  });
+  return mutations;
+}
+
+async function mockAdminRemoteHostInventory(page: Page) {
+  await page.route("**/api/admin/remote-hosts**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([]),
+    });
+  });
+}
+
 test("hosted mode hides Remote Hosts and blocks the direct management surface", async ({
   page,
   request,
@@ -130,4 +154,33 @@ test("unknown platform mode fails closed and hides Live Pull", async ({ page, re
 
   await openMigrationControls(page, user.token);
   await expect(page.getByRole("button", { name: /live pull/i })).toHaveCount(0);
+});
+
+for (const mode of ["paas", "unknown"] as const) {
+  test(`${mode} mode hides Admin Remote Host credentials and sends no mutation`, async ({
+    page,
+  }) => {
+    const mutations = trackAdminRemoteHostMutations(page);
+    await mockOperatorPolicy(page, { mode, role: "admin" });
+    await mockAdminRemoteHostInventory(page);
+
+    await authenticatePage(page, `admin-${mode}-token`, "/admin/remote-hosts");
+
+    await expect(page.getByRole("button", { name: /add platform host/i })).toHaveCount(0);
+    await expect(page.getByLabel(/ssh private key/i)).toHaveCount(0);
+    await expect(page.getByLabel(/ssh password/i)).toHaveCount(0);
+    await expect(page.getByLabel(/key passphrase/i)).toHaveCount(0);
+    expect(mutations).toEqual([]);
+  });
+}
+
+test("non-admin users cannot open the Admin Remote Hosts surface", async ({ page }) => {
+  const mutations = trackAdminRemoteHostMutations(page);
+  await mockOperatorPolicy(page, { mode: "selfhosted", role: "user" });
+  await mockAdminRemoteHostInventory(page);
+
+  await authenticatePage(page, "non-admin-remote-host-token", "/admin/remote-hosts");
+
+  await expect.poll(() => new URL(page.url()).pathname.startsWith("/admin")).toBe(false);
+  expect(mutations).toEqual([]);
 });

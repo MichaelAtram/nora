@@ -1,6 +1,6 @@
 # Connect a Remote Docker host
 
-> Register a private Docker server, VPS, or cloud VM with Nora, deploy an OpenClaw agent to it over SSH, and verify the complete lifecycle path.
+> Register a personal or platform Docker server, VPS, or cloud VM with Nora, deploy an OpenClaw agent to it over SSH, and verify the complete lifecycle path.
 
 Remote Docker is Nora's experimental bring-your-own-compute path. The Nora control plane stays on
 your existing installation while the selected agent containers run on a Docker machine that you own.
@@ -88,23 +88,47 @@ differ, both paths must be reachable.
 
 ## 3. Register the machine
 
-1. Sign in to Nora and open **App -> Remote Hosts** (`/app/remote-hosts`).
-2. Enter a distinctive **Label**. Nora derives the stable `remote:<id>` target from it.
-3. Enter the private **SSH host**, **Port**, and **SSH user**.
-4. Leave **Gateway address** empty when Nora should reach agent ports through the SSH hostname.
+Choose the ownership model before entering credentials:
+
+- **Personal host:** open **App -> Remote Hosts** (`/app/remote-hosts`). The signed-in user owns and
+  manages the registration. It starts private and can be shared only to workspaces.
+- **Platform host:** as a platform admin, open **Admin -> Remote Hosts**
+  (`/admin/remote-hosts`) and select **Add platform host**. The control plane owns the registration,
+  any platform admin can manage it, and it survives deletion of the admin account that created it.
+  It starts restricted; configure all-account, direct-user, user-group, or workspace access after
+  creation.
+
+For either type:
+
+1. Enter a distinctive **Label**. Nora derives the stable `remote:<id>` target from it.
+2. Enter the private **SSH host**, **Port**, and **SSH user**.
+3. Leave **Gateway address** empty when Nora should reach agent ports through the SSH hostname.
    Otherwise enter the private hostname or IP used for agent traffic. Do not include a scheme or
    port.
-5. Choose **SSH private key** or **Password** authentication. Private-key authentication is
+4. Choose **SSH private key** or **Password** authentication. Private-key authentication is
    preferred.
-6. Select **Register host**.
+5. Submit the registration.
+
+Treat the resulting host id as permanent. When a personal or platform host is deleted, Nora keeps a
+tombstone for that id so a different machine cannot later inherit the old `remote:<id>` identity.
+Create any replacement with a new label/id.
 
 Nora encrypts the private key, password, and key passphrase with `ENCRYPTION_KEY` before storing them.
-The API never returns the stored secret values. When you edit a host, leave a secret field blank to
-keep the current value.
+The API always masks stored secret values, including for owners and platform admins. When editing a
+host, leave a secret field blank to keep its current value. Users granted deployment access can never
+view or edit connection credentials.
+
+For a personal host, share it from **App -> Remote Hosts** to one or more workspaces. Workspace
+viewers can see the host; editors, admins, and owners can deploy. For a platform host, open
+**Platform access** in Admin. **Available to all accounts**, a direct-user grant, or a matching
+user-group grant permits deployment. Workspace grants keep the same viewer-versus-editor+ rule.
+These paths are additive, so a direct or group grant can permit deployment even when the same person
+is only a viewer in a granted workspace.
 
 ## 4. Test and pin the SSH host key
 
-Select **Test** on the registered host from a network where you can independently trust the endpoint.
+Select **Test** or **Test connection** on the registered host from a network where you can
+independently trust the endpoint.
 The first successful test:
 
 1. opens SSH from `backend-api` under a 10-second overall probe deadline;
@@ -122,8 +146,9 @@ trusted pin as unavailable for active use. A different host key fails closed.
 </Warning>
 
 If an intentional host rebuild or SSH key rotation changes the key, verify the replacement out of
-band before using **Reset SSH pin**. Resetting the pin blocks active use until a new **Test** succeeds.
-Do not reset trust merely to dismiss an unexplained mismatch.
+band before using **Reset SSH pin** from the host's owning App or Admin surface. The confirmation must
+match the exact host label or id. Resetting the pin clears the Test result and blocks active use until
+a new **Test** succeeds. Do not reset trust merely to dismiss an unexplained mismatch.
 
 ## 5. Deploy an agent
 
@@ -187,22 +212,24 @@ replace its existing agents. Those agents retain their original endpoint and por
 new **Test** validates only the edited host profile and does not migrate them. Keep the old private
 route and firewall rules until deletion of the old agents completes.
 
-Drain every agent from a user's owned Remote Docker registrations before deleting that user from
+Drain every agent from a user's personal Remote Docker registrations before deleting that user from
 Admin. Nora rejects the account deletion while any non-deleted agent—including an agent owned by a
-workspace member—still references one of those hosts.
+workspace member—still references one of those personal hosts. A platform host is not tied to its
+creator's account and remains manageable by other platform admins after that account is deleted.
 
 ## Troubleshooting fast path
 
-| Symptom                               | What to check first                                                                                                                                                                   |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SSH timeout or connection refused     | Private routing, VPN or overlay state, SSH service, configured port, and firewall access from `backend-api` and both workers.                                                         |
-| Authentication fails                  | SSH user, selected auth mode, complete private-key content, passphrase, server authorized keys, and password policy.                                                                  |
-| `docker version` fails                | Docker service state, the user's default Docker context, and non-interactive daemon permissions.                                                                                      |
-| Test passes but deployment fails      | `worker-provisioner` SSH reachability, registry egress, remote disk/capacity, provider access, and the worker logs. Re-run **Test** because its result does not expire automatically. |
-| Host is absent from the Deploy picker | The host must be configured, enabled, successfully tested with a stored pin, and available to the signed-in user. Select OpenClaw; workspace viewers cannot deploy.                   |
-| Agent never becomes ready             | **Gateway address**, the private route to the published port, the configured `19000-19999` subrange, and listeners on the remote host.                                                |
-| SSH host-key mismatch                 | Stop and verify the host identity out of band. Reset the pin only for an intentional, independently verified rebuild or key rotation.                                                 |
-| No free agent port                    | Remove stale agents or reservations, free unrelated listeners, or widen the configured subrange while keeping it within `19000-19999`.                                                |
+| Symptom                                | What to check first                                                                                                                                                                                            |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SSH timeout or connection refused      | Private routing, VPN or overlay state, SSH service, configured port, and firewall access from `backend-api` and both workers.                                                                                  |
+| Authentication fails                   | SSH user, selected auth mode, complete private-key content, passphrase, server authorized keys, and password policy.                                                                                           |
+| `docker version` fails                 | Docker service state, the user's default Docker context, and non-interactive daemon permissions.                                                                                                               |
+| Test passes but deployment fails       | `worker-provisioner` SSH reachability, registry egress, remote disk/capacity, provider access, and the worker logs. Re-run **Test** because its result does not expire automatically.                          |
+| Host is absent from the Deploy picker  | The host must be configured, enabled, successfully tested with a stored pin, and available through personal ownership or a current platform/workspace grant. Select OpenClaw; workspace viewers cannot deploy. |
+| Agent never becomes ready              | **Gateway address**, the private route to the published port, the configured `19000-19999` subrange, and listeners on the remote host.                                                                         |
+| SSH host-key mismatch                  | Stop and verify the host identity out of band. Reset the pin only for an intentional, independently verified rebuild or key rotation.                                                                          |
+| No free agent port                     | Remove stale agents or reservations, free unrelated listeners, or widen the configured subrange while keeping it within `19000-19999`.                                                                         |
+| A deleted host id cannot be registered | Expected: deleted ids are permanently reserved to prevent credential-target swaps. Choose a new label/id for the replacement host.                                                                             |
 
 For workspace sharing, grant revocation, cleanup after a missing SSH pin, disk behavior, backups, and
 the full symptom matrix, continue to the [Remote Docker backend

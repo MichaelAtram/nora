@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { fetchWithAuth } from "../../lib/api";
+import { partitionRemoteHosts, remoteHostAccessSource } from "../../lib/remoteHosts";
 import { useToast } from "../../components/Toast";
 
 const EMPTY_FORM = {
@@ -108,9 +109,7 @@ export default function RemoteHostsPage() {
       // Eager-load each owned host's workspace shares so the "Shared with N"
       // indicator is accurate without expanding every panel. Shared-with-me
       // hosts have no owner-only shares endpoint, so we skip them.
-      const owned = (Array.isArray(data) ? data : []).filter(
-        (h) => (h.access || "owned") !== "shared",
-      );
+      const owned = partitionRemoteHosts(Array.isArray(data) ? data : []).owned;
       const startSeq = ++shareSeq.current;
       const entries = await Promise.all(
         owned.map(async (h): Promise<[string, any[]]> => {
@@ -415,8 +414,7 @@ export default function RemoteHostsPage() {
     );
   }
 
-  const ownedHosts = hosts.filter((h) => (h.access || "owned") !== "shared");
-  const sharedHosts = hosts.filter((h) => h.access === "shared");
+  const { owned: ownedHosts, accessible: sharedHosts } = partitionRemoteHosts(hosts);
 
   function renderShareSection(host) {
     const shares = sharesByHost[host.id] || [];
@@ -874,13 +872,13 @@ export default function RemoteHostsPage() {
           </div>
         )}
 
-        {/* Hosts shared with the caller's workspaces (read-only) */}
+        {/* Hosts granted by the platform, a user group, direct access, or a workspace (read-only). */}
         {sharedHosts.length > 0 && (
           <>
             <div className="mb-3 mt-8 flex items-center gap-2">
               <h2 className="text-lg font-semibold text-slate-900">Shared with you</h2>
               <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-500">
-                via your workspaces
+                platform and team access
               </span>
             </div>
             <div className="space-y-3">
@@ -903,8 +901,8 @@ export default function RemoteHostsPage() {
                       </p>
                       <p className="mt-2 text-xs text-slate-500">
                         {host.canDeploy
-                          ? "You can deploy agents to this host using the owner's credentials."
-                          : "Read-only access — ask a workspace editor or the host owner to deploy."}
+                          ? `You can deploy agents to this host using its stored credentials (${remoteHostAccessSource(host)}).`
+                          : `Read-only access ${remoteHostAccessSource(host)} — ask an authorized editor, platform admin, or the host owner to deploy.`}
                       </p>
                     </div>
                   </div>
