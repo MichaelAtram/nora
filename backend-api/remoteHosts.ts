@@ -489,6 +489,15 @@ function maskHost(row) {
   };
 }
 
+/**
+ * Mask a host for a platform-admin listing. A platform-owned host is returned
+ * fully masked like any other; a personal host is reduced to identity and
+ * status fields only, so the operator's network address, credentials, host-key
+ * pin, and probe diagnostics stay private to the owner who registered it.
+ *
+ * @param {Object} row - Remote-host database row.
+ * @returns {Object} Admin-safe host profile.
+ */
 function maskAdminHost(row) {
   const host = maskHost(row);
   if (host.managementScope === "platform") return host;
@@ -897,6 +906,15 @@ async function createRemoteHost(input = {}) {
   return withRemoteHostMutationLock(host.id, () => createRemoteHostLocked(host));
 }
 
+/**
+ * Register a platform-owned host under its mutation lock. A host id retired by
+ * a prior deletion is never reused, and a requested default replaces any
+ * existing platform default.
+ *
+ * @param {Object} [input={}] - Remote-host registration fields from a trusted caller.
+ * @param {string|null} [createdByUserId=null] - Admin registering the host.
+ * @returns {Promise<Object>} Persisted masked host profile.
+ */
 async function createPlatformRemoteHost(input = {}, createdByUserId = null) {
   assertRemoteHostsSupported();
   const host = normalizeHostInput(input);
@@ -1102,6 +1120,14 @@ async function updatePlatformRemoteHostLocked(hostId, input = {}) {
   return maskHost(result.rows[0]);
 }
 
+/**
+ * Update a platform-owned host under its mutation lock, invalidating the test
+ * result on any connection change and the SSH pin only when host identity changes.
+ *
+ * @param {string} hostId - Platform remote host to update.
+ * @param {Object} [input={}] - Replacement and credential-clear fields.
+ * @returns {Promise<Object>} Updated masked host profile.
+ */
 async function updatePlatformRemoteHost(hostId, input = {}) {
   assertRemoteHostsSupported();
   return withRemoteHostMutationLock(hostId, () => updatePlatformRemoteHostLocked(hostId, input));
@@ -1155,6 +1181,16 @@ async function resetRemoteHostHostKeyPin(hostId, confirmation, options = {}) {
   );
 }
 
+/**
+ * Clear a platform host's pinned SSH key after explicit confirmation, for
+ * recovering an intentionally rebuilt host at the same SSH address. Credentials
+ * and network identity are untouched; clearing the pin also invalidates the
+ * prior test result so use stays fail-closed until a fresh probe re-pins.
+ *
+ * @param {string} hostId - Platform remote host to reset.
+ * @param {string} confirmation - Host label or id, required to confirm the reset.
+ * @returns {Promise<Object>} Updated masked host profile.
+ */
 async function resetPlatformRemoteHostHostKeyPin(hostId, confirmation) {
   assertRemoteHostsSupported();
   return withRemoteHostMutationLock(hostId, async () => {
@@ -1226,6 +1262,15 @@ async function deleteRemoteHost(hostId, options = {}) {
   );
 }
 
+/**
+ * Delete a platform-owned host under its mutation lock, refusing while any
+ * non-deleted agent still references its execution target. The id is
+ * tombstoned so it is never reused by a later registration.
+ *
+ * @param {string} hostId - Platform remote host to delete.
+ * @param {Object} [options={}] - Deleting-admin attribution.
+ * @returns {Promise<Object>} Deleted masked host profile.
+ */
 async function deletePlatformRemoteHost(hostId, options = {}) {
   assertRemoteHostsSupported();
   return withRemoteHostMutationLock(hostId, async () => {
@@ -1452,6 +1497,14 @@ async function testRemoteHost(hostId, options = {}) {
   );
 }
 
+/**
+ * Test a platform-owned host under its mutation lock, persist the result, and
+ * pin its SSH host key on first success.
+ *
+ * @param {string} hostId - Platform remote host to test.
+ * @param {Object} [options={}] - SSH probe timeout options.
+ * @returns {Promise<Object>} Updated masked host profile with the stored result.
+ */
 async function testPlatformRemoteHost(hostId, options = {}) {
   assertRemoteHostsSupported();
   return withRemoteHostMutationLock(hostId, async () => {
@@ -1865,6 +1918,15 @@ async function listRemoteHostShares(hostId, options = {}) {
   }
 }
 
+/**
+ * Normalize a requested grant list, accepting raw id strings or objects
+ * carrying the id under any of `keys`.
+ *
+ * @param {Array|undefined|null} value - Requested grant entries; `undefined`/`null` means none.
+ * @param {string} fieldName - Field name used in validation error messages.
+ * @param {Array<string>} keys - Object keys checked, in order, for the id.
+ * @returns {Array<string>} Deduplicated, lowercased grant ids.
+ */
 function normalizeGrantIds(value, fieldName, keys) {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) {
@@ -1933,6 +1995,14 @@ async function readPlatformRemoteHostAccess(queryable, host) {
   };
 }
 
+/**
+ * Read a platform host's current access grants from a consistent snapshot,
+ * alongside the access version callers must echo back to
+ * `replacePlatformRemoteHostAccess`.
+ *
+ * @param {string} hostId - Platform remote host to read.
+ * @returns {Promise<Object>} Access version, `availableToAll`, and granted users/groups/workspaces.
+ */
 async function listPlatformRemoteHostAccess(hostId) {
   const id = normalizeHostId(hostId);
   const client = await db.connect();
@@ -1977,6 +2047,17 @@ async function validateGrantIds(client, table, ids, fieldName) {
   throw error;
 }
 
+/**
+ * Replace a platform host's entire set of access grants under optimistic
+ * concurrency; this is a full replace, not a merge. Fails with a
+ * version-conflict 409 when `expectedVersion` no longer matches the persisted
+ * access version. All referenced users, groups, and workspaces must already exist.
+ *
+ * @param {string} hostId - Platform remote host whose access should be replaced.
+ * @param {Object} [input={}] - Complete desired grants and `availableToAll` flag.
+ * @param {string|null} [createdByUserId=null] - Admin performing the replacement.
+ * @returns {Promise<Object>} Updated access version and granted users/groups/workspaces.
+ */
 async function replacePlatformRemoteHostAccess(hostId, input = {}, createdByUserId = null) {
   assertRemoteHostsSupported();
   const id = normalizeHostId(hostId);

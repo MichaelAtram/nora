@@ -601,6 +601,14 @@ async function destroyUserAgents(userId) {
   return result.rows;
 }
 
+/**
+ * Guard against deleting a user whose personal Remote Docker host still has
+ * agents deployed on it — those agents would be orphaned from their host's
+ * credentials. Throws a 409 naming the first blocking host; no-ops otherwise.
+ *
+ * @param {string} userId - User targeted for deletion.
+ * @returns {Promise<void>}
+ */
 async function ensureOwnedRemoteHostsAreUnused(userId) {
   const result = await db.query(
     `SELECT rh.id,

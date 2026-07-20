@@ -2411,6 +2411,14 @@ async function seedStarterAgentHub() {
   console.log(`Agent Hub seeded with ${STARTER_TEMPLATES.length} built-in starter templates`);
 }
 
+/**
+ * Seed the first admin account on boot when the user table is empty. Hosted
+ * PaaS refuses to start without explicit, valid `DEFAULT_ADMIN_EMAIL` and
+ * `DEFAULT_ADMIN_PASSWORD`; selfhosted installs may instead leave the account
+ * to be claimed through first-run signup.
+ *
+ * @returns {Promise<void>}
+ */
 async function seedBootstrapAdminAccount() {
   const { rows } = await db.query("SELECT id FROM users LIMIT 1");
   if (rows.length > 0) return;
