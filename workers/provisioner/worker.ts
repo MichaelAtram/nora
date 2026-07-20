@@ -2130,7 +2130,10 @@ function wrapCommandWithContainerTimeout(command, timeoutMs) {
  * @param {number|string} params.gatewayHostPort Gateway port exposed on the host.
  * @param {string} params.gatewayHost Gateway host used for readiness checks.
  * @param {number|string} params.gatewayPort Gateway port used for readiness checks.
+ * @param {string} params.gatewayToken Gateway auth token used to authorize runtime commands.
  * @param {string} params.bootstrappedProviderFingerprint Canonical effective provider state injected before runtime creation.
+ * @param {string[]} [params.preservedEnvNames=[]] Managed env var names to exclude from
+ * this write so they are not overwritten or reported as caller-managed.
  * @returns {Promise<{status: "skipped" | "synced", reason?: string}>} `skipped` when there is
  * nothing to apply, otherwise `synced` after config write, restart, and
  * readiness verification succeed.
