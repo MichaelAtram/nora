@@ -87,7 +87,7 @@ function usesLifecycleOptions(agent = {}) {
 }
 
 /**
- * Resolve the agent runtime identifier to use for a lifecycle operation. 
+ * Resolve the agent runtime identifier to use for a lifecycle operation.
  *
  * @param {Object} agent - Agent row whose runtime should be addressed.
  * @param {string} operation - Human-readable lifecycle action name used in error messages.
@@ -201,7 +201,9 @@ function resolveBackendPath(name) {
 }
 
 /**
- * Lazily construct and cache the backend adapter used for a given agent to perform lifecycle operations.
+ * Resolve a backend adapter for lifecycle operations. Static local adapters are
+ * cached, while Kubernetes and Remote Docker adapters are rebuilt from their
+ * current stored profiles.
  *
  * @param {string} type - Normalized backend type such as `docker`, `docker:hermes`, `docker:nemoclaw`, `proxmox`, or `k8s`.
  * @param {Object} [agent={}] - Agent row used to resolve execution-target-scoped backends.
@@ -209,7 +211,7 @@ function resolveBackendPath(name) {
  * @returns {Promise<Object>} Backend adapter instance for the requested lifecycle operations.
  */
 async function getBackendInstance(type, agent = {}, cleanupOnly = false) {
-  const cacheKey = 
+  const cacheKey =
     type === "k8s" || type === "k3s" || type === "kubernetes" || type === "remote-docker"
       ? resolveAgentExecutionTargetId(agent)
       : type === "remote-hermes" || type === "remote-nemoclaw"
@@ -357,7 +359,11 @@ module.exports = {
   ensureContainerId,
 
   /**
-   * @param {{ backend_type?: string, deploy_target?: string, sandbox_profile?: string, container_id: string }} agent
+   * Start an agent's runtime through its backend adapter.
+   *
+   * @param {Object} agent - Agent whose runtime should be started.
+   * @returns {Promise<Object|void>} Backend start result, including a fresh
+   * host/runtimeHost when the backend's address can change on start.
    */
   async start(agent) {
     const id = resolveKubernetesRuntimeId(agent, "start");
@@ -367,6 +373,15 @@ module.exports = {
       : backend.start(id);
   },
 
+  /**
+   * Stop an agent's runtime through its backend adapter.
+   *
+   * Stop is a cleanup operation: a former grantee must be able to quiesce a
+   * runtime after host access is revoked, even though active use is blocked.
+   *
+   * @param {Object} agent - Agent whose runtime should be stopped.
+   * @returns {Promise<void>} Resolves once the backend reports the runtime stopped.
+   */
   async stop(agent) {
     const id = resolveKubernetesRuntimeId(agent, "stop");
     // Stop is a cleanup operation: a former grantee must be able to quiesce a
@@ -377,6 +392,13 @@ module.exports = {
       : backend.stop(id);
   },
 
+  /**
+   * Restart an agent's runtime through its backend adapter.
+   *
+   * @param {Object} agent - Agent whose runtime should be restarted.
+   * @returns {Promise<Object|void>} Backend restart result, including a fresh
+   * host/runtimeHost when the backend's address can change on restart.
+   */
   async restart(agent) {
     const id = resolveKubernetesRuntimeId(agent, "restart");
     const backend = await backendFor(agent);
@@ -385,6 +407,15 @@ module.exports = {
       : backend.restart(id);
   },
 
+  /**
+   * Replace an agent's managed runtime environment variables.
+   *
+   * @param {Object} agent - Agent whose runtime environment should be updated.
+   * @param {Object} [envVars={}] - Environment variable values to apply.
+   * @param {Object} [options={}] - Optional managed-name scoping, full-state
+   * replacement, and cancellation signal.
+   * @returns {Promise<Object>} Backend env-update result.
+   */
   async updateEnv(agent, envVars = {}, options = {}) {
     const id = resolveKubernetesRuntimeId(agent, "update env");
     const backend = await backendFor(agent);
@@ -402,6 +433,13 @@ module.exports = {
     });
   },
 
+  /**
+   * Read back an agent's currently applied managed runtime environment variables.
+   *
+   * @param {Object} agent - Agent whose runtime environment should be inspected.
+   * @param {string[]} [envNames=[]] - Env var names to report; empty reports none.
+   * @returns {Promise<Object>} Backend env-inspection result.
+   */
   async inspectEnv(agent, envNames = []) {
     const id = resolveKubernetesRuntimeId(agent, "inspect environment");
     const backend = await backendFor(agent);
@@ -416,6 +454,16 @@ module.exports = {
     });
   },
 
+  /**
+   * Permanently destroy an agent's runtime through its backend adapter.
+   *
+   * This is the final cleanup escape hatch for direct owners/admins: the route
+   * layer constrains who may call it, so it deliberately bypasses the same
+   * revoked-access guard that blocks normal start/restart/read/exec operations.
+   *
+   * @param {Object} agent - Agent whose runtime should be destroyed.
+   * @returns {Promise<void>} Resolves once the backend reports the runtime destroyed.
+   */
   async destroy(agent) {
     const id = resolveDestroyContainerId(agent);
     // Destroy is the final cleanup escape hatch for direct owners/admins. The
@@ -429,10 +477,11 @@ module.exports = {
   },
 
   /**
-   * status() is a best-effort read called from background reconciliation and
-   * live-status endpoints. Returning a stable "not running" shape (instead of
-   * throwing) lets callers treat null-container as equivalent to a stopped
-   * container without scattering try/catch everywhere.
+   * Return a stable not-running shape when an agent has no runtime identifier;
+   * otherwise delegate to the selected backend and propagate its failures.
+   *
+   * @param {Object} agent - Agent whose runtime status should be inspected.
+   * @returns {Promise<Object>} Backend status or the stable not-running fallback.
    */
   async status(agent) {
     const kubernetes = isKubernetesAgent(agent);
@@ -458,7 +507,10 @@ module.exports = {
 
   /**
    * Stream container logs.
-   * @returns {ReadableStream|null}
+   *
+   * @param {Object} agent - Agent whose logs should be streamed.
+   * @param {Object} [opts={}] - Backend log streaming options.
+   * @returns {Promise<ReadableStream|null>} Backend log stream when supported.
    */
   async logs(agent, opts = {}) {
     const id = ensureContainerId(agent, "stream logs");
@@ -474,7 +526,10 @@ module.exports = {
 
   /**
    * Create an interactive exec session.
-   * @returns {Object|null}
+   *
+   * @param {Object} agent - Agent whose runtime should host the exec session.
+   * @param {Object} [opts={}] - Backend command, TTY, and environment options.
+   * @returns {Promise<Object|null>} Backend exec handles when supported.
    */
   async exec(agent, opts = {}) {
     const id = ensureContainerId(agent, "exec");

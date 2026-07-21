@@ -1907,7 +1907,7 @@ function buildProvisionerCommandExitError(exitCode, output = "", timeout = null)
  *
  * This is the lowest-level provisioner exec helper used by ClawHub flows and
  * other runtime repair paths. Callers must shell-escape any interpolated
- * user-controlled values because `command` is executed via `/bin/sh -lc ...`,
+ * user-controlled values because `command` is executed via `/bin/sh -c ...`,
  * not as a direct argv array.
  *
  * @param {object} provisioner Backend-specific provisioner client with `exec`.
@@ -1918,6 +1918,8 @@ function buildProvisionerCommandExitError(exitCode, output = "", timeout = null)
  * @param {number} [options.maxOutputBytes=65536] Max output bytes to retain.
  * @param {boolean} [options.tty=false] Whether to allocate a TTY for exec.
  * @param {string[]} [options.env=[]] Extra env vars for the exec call.
+ * @param {string|null} [options.agentId=null] Agent id used for authorization
+ * and cleanup tracking.
  * @returns {Promise<{exitCode: number, output: string}>} Sanitized output and
  * the final container exit code. Rejects on timeout, exec transport failures,
  * or non-zero exit status.
@@ -2518,10 +2520,9 @@ function throwIfRemoteAuthorizationFailure(error) {
 }
 
 /**
- * Wrap a credential-bearing Remote Docker adapter so every worker operation
- * revalidates the current owner/workspace grant. `destroy` remains deliberately
- * unguarded: failure cleanup must be able to remove a runtime created just
- * before the grant was revoked.
+ * Wrap a credential-bearing Remote Docker adapter so normal worker operations
+ * revalidate the current owner/workspace grant. Runtime destruction and tracked
+ * command cleanup deliberately bypass the grant so revoked work can be removed.
  */
 function guardRemoteProvisioner(provisioner, runtimeFields = {}, ownerUserId = null) {
   if (!provisioner || !isRemoteDockerRuntime(runtimeFields)) return provisioner;
@@ -3058,12 +3059,12 @@ function normalizeInstalledSkillsLockfile(parsed = {}) {
  * list of installed skills.
  *
  * The helper uses a TTY plus base64 transport because raw Docker exec streams
- * can prepend framing bytes that corrupt JSON reads. It retries a few times so
- * short lockfile propagation delays after install/delete do not look like hard
- * failures.
+ * can prepend framing bytes that corrupt JSON reads. JSON decode or parse
+ * failures are retried; a valid missing-file result is returned immediately.
  *
  * @param {object} provisioner Backend-specific provisioner client with `exec`.
  * @param {string} containerId Runtime container identifier.
+ * @param {string} agentId Agent identifier used to authorize and track exec commands.
  * @returns {Promise<Array<{slug: string, version: string}>>} The installed
  * ClawHub skills currently represented in the runtime lockfile.
  */

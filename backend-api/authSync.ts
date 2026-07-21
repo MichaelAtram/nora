@@ -271,8 +271,9 @@ async function getIntegrationLlmEnvVars(agentId) {
 }
 
 /**
- * Build OpenClaw auth profiles by merging user provider keys with matching
- * per-agent integration tokens; explicit provider keys take precedence.
+ * Build OpenClaw auth profiles from user provider keys and any matching
+ * integration tokens available through a best-effort per-agent lookup.
+ * Explicit provider keys take precedence.
  *
  * @param {string} userId - User whose saved provider credentials should be loaded.
  * @param {string} agentId - Agent whose integration credentials should be considered.
@@ -311,13 +312,15 @@ async function getEnabledMcpRuntimeState(agentId) {
  * Build a set of OpenClaw managed environment variables from current providers,
  * endpoints, integrations, MCP-server, and model sources for runtime recreation.
  *
+ * Integration lookup is best effort; its failure omits integration environment
+ * values, while failures from the other credential sources still propagate.
+ *
  * On Kubernetes a restart is a rollout: the replacement pod gets a fresh
  * filesystem and re-seeds auth-profiles.json + the SQLite auth store from the
  * pod env alone, so exec-written files never survive it. Keys saved after
- * provisioning must therefore be patched onto the Deployment env. This is why
- * the result carries ALL integration env vars, not just LLM-overlapping ones —
- * a GITHUB_TOKEN/SLACK_TOKEN connected after provisioning otherwise lives only
- * in the pod's openclaw.json and dies with the pod.
+ * provisioning must therefore be patched onto the Deployment env. When the
+ * integration lookup succeeds, the result carries all integration env vars,
+ * not just LLM-overlapping ones, so they survive pod replacement.
  *
  * @param {string} userId - User whose provider credentials should be loaded.
  * @param {string} agentId - Agent whose integration environment should be included.
@@ -380,8 +383,9 @@ async function buildOpenClawManagedEnvForAgent(
 }
 
 /**
- * Build a set of Hermes managed environment variables from currently available
- * provider, endpoint, persisted-channel, and integration sources.
+ * Build Hermes managed environment variables from provider, endpoint,
+ * persisted-channel, and integration sources. Channel and integration lookups
+ * are best effort and may independently leave the result partial.
  *
  * @param {string} userId - User whose provider credentials should be loaded.
  * @param {string} agentId - Agent whose channel and integration values should be included.

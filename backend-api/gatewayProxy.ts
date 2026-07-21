@@ -608,7 +608,12 @@ class GatewayConnection {
     this._circuitThreshold = 3; // failures before opening circuit
   }
 
-  /** Open WS, complete challenge-response handshake, resolve when ready. */
+  /**
+   * Open the gateway WebSocket and complete its authorized challenge-response
+   * handshake.
+   *
+   * @returns {Promise<Object>} This connection after the gateway is ready.
+   */
   connect() {
     if (this._retired) {
       return Promise.reject(this._retireError || new Error("Gateway connection retired"));
@@ -816,7 +821,14 @@ class GatewayConnection {
     });
   }
 
-  /** Send an RPC call and await the response. */
+  /**
+   * Send an authorized gateway RPC call and await its response.
+   *
+   * @param {string} method - Gateway RPC method.
+   * @param {Object} [params={}] - RPC request parameters.
+   * @param {number} [timeout] - Response timeout in milliseconds.
+   * @returns {Promise<Object>} Gateway response envelope.
+   */
   async call(method, params = {}, timeout = CALL_TIMEOUT) {
     await this._assertAuthorized();
     return new Promise((resolve, reject) => {
@@ -904,7 +916,13 @@ class GatewayConnection {
     this.pending.clear();
   }
 
-  /** Subscribe to gateway events. */
+  /**
+   * Subscribe a callback to one gateway event name.
+   *
+   * @param {string} event - Gateway event name.
+   * @param {Function} callback - Event callback to register.
+   * @returns {void}
+   */
   on(event, callback) {
     if (!this.eventListeners.has(event)) this.eventListeners.set(event, new Set());
     this.eventListeners.get(event).add(callback);
@@ -914,6 +932,14 @@ class GatewayConnection {
     this.eventListeners.get(event)?.delete(callback);
   }
 
+  /**
+   * Register a callback for this connection's retirement. Fires immediately
+   * with the retirement error if the connection is already retired, otherwise
+   * queues the callback for when `retire()` runs.
+   *
+   * @param {Function} callback - Invoked with the retirement error.
+   * @returns {void}
+   */
   onRetire(callback) {
     if (typeof callback !== "function") return;
     if (this._retired) {
@@ -1027,7 +1053,13 @@ class GatewayConnection {
     return entry;
   }
 
-  /** Acquire one pooled session-message subscription reference. */
+  /**
+   * Acquire one pooled session-message subscription reference.
+   *
+   * @param {string} key - Requested session subscription key.
+   * @param {number} [timeout] - Subscription RPC timeout in milliseconds.
+   * @returns {Promise<boolean>} Whether the upstream subscription is active.
+   */
   acquireSessionMessageSubscription(key, timeout = SESSION_MESSAGE_SUBSCRIBE_TIMEOUT) {
     const target = this._sessionMessageSubscriptionTarget(key);
     const { requestedKey } = target;
@@ -1064,7 +1096,14 @@ class GatewayConnection {
     });
   }
 
-  /** Release one reference and unsubscribe after the final stream leaves. */
+  /**
+   * Release one reference and best-effort unsubscribe after the final stream
+   * leaves.
+   *
+   * @param {string} key - Requested session subscription key.
+   * @param {number} [timeout] - Unsubscribe RPC timeout in milliseconds.
+   * @returns {Promise<boolean>} Whether the final pooled reference was released.
+   */
   releaseSessionMessageSubscription(key, timeout = SESSION_MESSAGE_SUBSCRIBE_TIMEOUT) {
     const requestedKey = String(key || "").trim();
     if (!requestedKey) return Promise.resolve(false);
@@ -1215,7 +1254,13 @@ class GatewayConnection {
     }
   }
 
-  /** Permanently retire a pooled connection and suppress delayed reconnects. */
+  /**
+   * Permanently retire a pooled connection, reject pending work, and suppress
+   * reconnects.
+   *
+   * @param {Error|null} [error=null] - Failure exposed to pending connection consumers.
+   * @returns {void}
+   */
   retire(error = null) {
     if (this._retired) return;
     this._retired = true;
@@ -1297,8 +1342,9 @@ function retireConflictingConnections(key, agent, addr) {
 }
 
 /**
- * Get or establish a pooled gateway connection after applying port, host, and SSRF checks.
- * New upstream sockets open only after DNS and SSRF validation succeeds.
+ * Get or establish a pooled gateway connection after applying current Remote
+ * Docker authorization, port, host, and SSRF checks. Remote grants are checked
+ * before pool reuse and while an authorized socket remains open.
  *
  * @param {Object} agent - Agent whose OpenClaw gateway should be connected.
  * @returns {Promise<Object>} Connected gateway RPC transport.

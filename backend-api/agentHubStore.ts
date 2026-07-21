@@ -169,11 +169,13 @@ async function createUniqueSlug(seed, { listingId = null } = {}) {
 // Listing publication and version records
 
 /**
- * Check for and then insert a listing snapshot/version record. The operations
- * are non-atomic, so a concurrent insert can surface a unique conflict.
+ * Check for and then insert a listing snapshot/version record. Missing listing
+ * or snapshot ids are a no-op; the non-atomic check and insert can surface a
+ * concurrent unique conflict.
  *
  * @param {Object} version - Listing, snapshot, number, and clone-mode fields.
- * @returns {Promise<void>} Resolves after the version exists.
+ * @returns {Promise<void>} Resolves after the version exists or incomplete
+ * input is ignored.
  */
 async function ensureListingVersion({
   listingId,
