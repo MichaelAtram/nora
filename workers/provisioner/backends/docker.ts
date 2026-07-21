@@ -160,7 +160,7 @@ function buildManagedEnvApplyScript() {
     // `node <<'EOF' ... EOF)`: nesting a heredoc inside `$(...)` trips the lexer on
     // some /bin/sh implementations (observed: bash 3.2), which misparses quotes in
     // the heredoc body and fails with "unexpected EOF while looking for matching '".
-    "nora_managed_env_render=\"$(mktemp)\" || return $?",
+    'nora_managed_env_render="$(mktemp)" || return $?',
     "cat <<'__NORA_RENDER_MANAGED_ENV__' > \"$nora_managed_env_render\"",
     "const fs = require('fs');",
     "const statePath = process.env.NORA_MANAGED_ENV_STATE;",
@@ -168,7 +168,7 @@ function buildManagedEnvApplyScript() {
     "const validName = /^[A-Za-z_][A-Za-z0-9_]*$/;",
     "const names = Array.isArray(state.managedNames) ? state.managedNames : [];",
     "const values = state && state.values && typeof state.values === 'object' && !Array.isArray(state.values) ? state.values : {};",
-    "const quote = (value) => \"'\" + String(value).replace(/'/g, \"'\\\"'\\\"'\") + \"'\";",
+    'const quote = (value) => "\'" + String(value).replace(/\'/g, "\'\\"\'\\"\'") + "\'";',
     "for (const name of names) {",
     "  if (!validName.test(String(name))) throw new Error('Invalid Nora managed environment name');",
     "  process.stdout.write('unset ' + name + '\\n');",
