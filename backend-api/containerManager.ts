@@ -394,7 +394,7 @@ module.exports = {
     });
   },
 
-  async destroy(agent) {
+  async destroy(agent, { preserveState = false } = {}) {
     const id = resolveDestroyContainerId(agent);
     // Destroy is the final cleanup escape hatch for direct owners/admins. The
     // route layer constrains who may delete; do not expose this bypass to
@@ -403,6 +403,7 @@ module.exports = {
       agentId: agent.id,
       host: agent.host || null,
       runtimeFamily: resolveAgentRuntimeFamily(agent),
+      preserveState,
     });
   },
 
