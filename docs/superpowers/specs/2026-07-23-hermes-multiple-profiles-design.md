@@ -36,8 +36,11 @@ runtime**, from the Nora agent dashboard, with per-profile configuration.
 - **Create** (optionally cloning) and **delete** profiles from the Nora dashboard.
 - Run **all profile gateways concurrently** inside the runtime, so every profile is live on
   its channels at once.
-- Give the Nora dashboard a **profile selector** that scopes the Channels / Cron / Status /
-  Chat / Model-config views to the selected profile.
+- Give the Nora dashboard a **profile selector** that scopes the **Channels** view (and the
+  exec-read gateway-status summary) to the selected profile. Cron, Chat, live Status, and the
+  Official Dashboard stay on the default profile in v1 (see the API-server consequence in Key
+  decisions); named-profile cron/chat are managed via the official Hermes WebUI's native
+  profile switcher.
 - Store per-profile configuration in Nora (model + channels), keyed by `(agent, profile)`.
 
 ## Non-goals (v1)
@@ -47,6 +50,11 @@ runtime**, from the Nora agent dashboard, with per-profile configuration.
 - Per-profile **official** Hermes dashboards. A single official dashboard runs on the default
   profile; it has its own native profile switcher for WebUI users.
 - Per-profile published/host API ports.
+- Per-profile **Cron and Chat** management from the Nora dashboard. These routes proxy the
+  Hermes runtime **API server**, which named-profile gateways do not run (see Key decision 3),
+  so they stay default-only in v1. Named-profile cron/chat are managed via the official WebUI's
+  native profile switcher. (The profile's cron jobs still *execute* — the scheduler lives in
+  the gateway — this is only about managing them from Nora.)
 - Editing `SOUL.md` / skills per profile from Nora (use the official WebUI for those).
 
 ## Key decisions
@@ -73,7 +81,8 @@ Nora agent (runtime_family = hermes)  ── one container ──┐
   /opt/data/profiles/<name-A>      → profile A           │  gateway (bg, API_SERVER_ENABLED=false)
   /opt/data/profiles/<name-B>      → profile B           │  gateway (bg, API_SERVER_ENABLED=false)
                                                           ┘
-Nora dashboard  →  profile selector  →  scopes Channels/Cron/Status/Chat/Model to a profile
+Nora dashboard  →  profile selector  →  scopes Channels (exec-based) to a profile
+                                          (Cron/Chat/Status are default-only in v1 — API-based)
 Official Hermes dashboard (default profile, port 9119)  →  native profile switch (unchanged)
 ```
 
@@ -190,8 +199,11 @@ version" error from the profile routes, and the frontend hides profile managemen
   sub-tab bar, with "New profile" (create, optional clone-from), delete, and start/stop
   controls, plus a running/stopped badge per profile from `GET …/profiles`. Hold
   `selectedProfile` state (default `'default'`).
-- Pass `selectedProfile` into the **Status**, **Chat**, **Cron**, and **Channels** panels and
-  the **model config**, each of which appends `?profile=<name>` to its fetches.
+- Pass `selectedProfile` into the **Channels** panel, which appends `?profile=<name>` to its
+  fetches (channels are exec-based and fully per-profile).
+- The **Cron**, **Chat**, and **Status** sub-tabs stay default-profile in v1 (they proxy the
+  runtime API server, which named profiles don't run). When a non-default profile is selected,
+  show a short banner pointing users to the official WebUI's native switcher for those.
 - The **Official Dashboard** sub-tab is unchanged and shows a short hint that it reflects the
   default profile and uses Hermes's native profile switcher.
 - Profile controls are hidden for Kubernetes Hermes agents (v1 guard).
