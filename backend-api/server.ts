@@ -55,6 +55,11 @@ const { assertRemoteHostAgentUse, toPublicRemoteHostAuthorizationError } = requi
 const { repairHermesAgentConfig } = require("./hermesUi");
 const { HERMES_EMBED_AGENT_COLUMNS, GATEWAY_EMBED_AGENT_COLUMNS } = require("./embedAgentColumns");
 const {
+  establishHermesDashboardSession,
+  needsHermesLogin,
+} = require("./hermesDashboardSession");
+const { decrypt: decryptSecret } = require("./crypto");
+const {
   joinHttpUrl,
   hasGatewayEndpoint,
   hasHermesDashboardEndpoint,
@@ -149,7 +154,6 @@ const EMBED_SESSION_TTL_MS = 15 * 60 * 1000;
 const EMBED_SESSION_COOKIE_PREFIX = "__nora_gateway_embed_";
 const HERMES_EMBED_SESSION_COOKIE_PREFIX = "__nora_hermes_embed_";
 const HERMES_DASHBOARD_TOKEN_COOKIE_PREFIX = "__nora_hermes_dashboard_token_";
-const HERMES_DASHBOARD_SESSION_HEADER = "X-Hermes-Session-Token";
 const EMBED_CONTENT_SECURITY_POLICY = [
   "default-src 'self' data: blob: https:",
   "base-uri 'self'",
@@ -383,11 +387,6 @@ function rewriteHermesEmbedHtml(html, agentId) {
     .replace(/(["'])\/assets\//g, `$1${embedBase}/assets/`)
     .replace(/(["'])\/fonts\//g, `$1${embedBase}/fonts/`)
     .replace(/(["'])\/favicon\.ico(["'])/g, `$1${embedBase}/favicon.ico$2`);
-}
-
-function extractHermesDashboardSessionToken(html) {
-  const match = String(html || "").match(/window\.__HERMES_SESSION_TOKEN__\s*=\s*(["'])([^"']+)\1/);
-  return match?.[2] || "";
 }
 
 function rewriteHermesEmbedCss(css, agentId) {
@@ -995,19 +994,18 @@ async function proxyEmbeddedHermes(req, res) {
       access.agentId,
       HERMES_DASHBOARD_TOKEN_COOKIE_PREFIX,
     );
-    const dashboardSessionToken = cookies[dashboardTokenCookieName];
     const headers = {
       Accept: req.headers.accept || "*/*",
       "Accept-Encoding": "identity",
     };
-    if (dashboardSessionToken) {
-      headers[HERMES_DASHBOARD_SESSION_HEADER] = dashboardSessionToken;
-    }
-    // Intentionally do NOT forward the client's Authorization header to the
-    // tenant-owned Hermes container. The embed session cookie already
-    // authenticates this request at the proxy boundary; forwarding the
-    // platform JWT upstream would expose it to a process whose image may be
-    // operator-supplied and should be treated as untrusted.
+    // Relay the stored Hermes dashboard session (established via server-side
+    // login below) as the upstream Cookie. We intentionally do NOT forward the
+    // client's Authorization header to the tenant-owned Hermes container: the
+    // embed session cookie already authenticates this request at the proxy
+    // boundary, and forwarding the platform JWT would expose it to a process
+    // whose image may be operator-supplied and should be treated as untrusted.
+    let dashboardSession = cookies[dashboardTokenCookieName];
+    if (dashboardSession) headers.Cookie = dashboardSession;
 
     const method = req.method.toUpperCase();
     let body;
@@ -1027,10 +1025,33 @@ async function proxyEmbeddedHermes(req, res) {
         method,
         headers,
         body,
+        redirect: "manual",
         signal: AbortSignal.timeout(15000),
       });
 
     let resp = await fetchUpstream();
+
+    // If the dashboard says we're unauthenticated, log in once with the
+    // per-agent derived basic-auth credential, persist the Hermes session in
+    // the Nora-managed HttpOnly cookie, and retry with the new session.
+    if (needsHermesLogin(resp)) {
+      const seed = decryptSecret(access.agent.gateway_token);
+      if (seed) {
+        const session = await establishHermesDashboardSession(safeTarget, seed);
+        if (session) {
+          dashboardSession = session;
+          headers.Cookie = session;
+          res.cookie(dashboardTokenCookieName, session, {
+            httpOnly: true,
+            sameSite: "lax",
+            secure: cookieSecureFlag(req),
+            maxAge: EMBED_SESSION_TTL_MS,
+            path: "/",
+          });
+          resp = await fetchUpstream();
+        }
+      }
+    }
 
     const isApiRequest = hermesPath.startsWith("api/");
     // Self-heal: Hermes's response serializer (UTF-8) crashes on lone UTF-16
@@ -1061,16 +1082,6 @@ async function proxyEmbeddedHermes(req, res) {
 
     if (/text\/html/i.test(contentType)) {
       const rawHtml = await resp.text();
-      const hermesSessionToken = extractHermesDashboardSessionToken(rawHtml);
-      if (hermesSessionToken) {
-        res.cookie(dashboardTokenCookieName, hermesSessionToken, {
-          httpOnly: true,
-          sameSite: "lax",
-          secure: cookieSecureFlag(req),
-          maxAge: EMBED_SESSION_TTL_MS,
-          path: "/",
-        });
-      }
       const html = rewriteHermesEmbedHtml(rawHtml, access.agentId);
       setEmbedHtmlHeaders(res);
       res.send(html);
