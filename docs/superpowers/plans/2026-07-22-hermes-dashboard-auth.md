@@ -514,7 +514,37 @@ Then in `proxyEmbeddedHermes`, replace the header-building + single fetch block 
     }
 ```
 
-> Note: this repurposes the existing `dashboardTokenCookieName` cookie to hold the relayed Hermes session string. Leave the existing `extractHermesDashboardSessionToken` HTML handling in place (harmless); the `X-Hermes-Session-Token` header line is superseded by the `Cookie` relay and can be removed from the header block (done above by not re-adding it).
+> Note: this repurposes the existing `dashboardTokenCookieName` cookie to hold the relayed Hermes session string, and the block being replaced starts at the existing `const dashboardSessionToken = cookies[dashboardTokenCookieName];` line (that line and the `X-Hermes-Session-Token` header logic go away — superseded by the `Cookie` relay).
+
+- [ ] **Step 5b: Remove the conflicting HTML-branch token scrape**
+
+The HTML branch of `proxyEmbeddedHermes` currently writes the SAME `dashboardTokenCookieName` cookie from a scraped `window.__HERMES_SESSION_TOKEN__`:
+
+```js
+    if (/text\/html/i.test(contentType)) {
+      const rawHtml = await resp.text();
+      const hermesSessionToken = extractHermesDashboardSessionToken(rawHtml);
+      if (hermesSessionToken) {
+        res.cookie(dashboardTokenCookieName, hermesSessionToken, {
+          httpOnly: true,
+          sameSite: "lax",
+          secure: cookieSecureFlag(req),
+          maxAge: EMBED_SESSION_TTL_MS,
+          path: "/",
+        });
+      }
+      const html = rewriteHermesEmbedHtml(rawHtml, access.agentId);
+```
+
+That write would clobber the login session we now store in that cookie. Remove the scrape + cookie write so the branch becomes:
+
+```js
+    if (/text\/html/i.test(contentType)) {
+      const rawHtml = await resp.text();
+      const html = rewriteHermesEmbedHtml(rawHtml, access.agentId);
+```
+
+Then clean up now-unused symbols **only if they have no other references** (grep first): the `HERMES_DASHBOARD_SESSION_HEADER` constant (~line 152) and the `extractHermesDashboardSessionToken` function. If either is still referenced elsewhere, leave it. Do NOT remove `HERMES_DASHBOARD_TOKEN_COOKIE_PREFIX` (still used for the session cookie).
 
 - [ ] **Step 6: Run the full provisioning + new proxy tests**
 
