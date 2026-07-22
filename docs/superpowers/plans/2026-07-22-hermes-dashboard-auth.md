@@ -279,14 +279,15 @@ docker rm -f hermes-insecure
 
 - [ ] **Step 3: Record findings in the plan**
 
-Write the observed values below (edit this file), then use them in Task 4:
-- Login path (default assumed): `/login`
-- HTTP method / content-type (default assumed): `POST` / `application/x-www-form-urlencoded`
-- Form field names (default assumed): `username`, `password`
-- Session cookie name(s): `__RECORD_FROM_STEP_2__`
-- Unauthenticated response that signals "log in" (default assumed): `401` or `302 -> /login`
+**VERIFIED against `nousresearch/hermes-agent:latest` (2026-07-22):**
+- `--insecure` is DEPRECATED / NO-OP; a non-loopback (public) bind always requires an auth provider. Confirms dropping it + configuring basic-auth.
+- **Login endpoint:** `POST /auth/password-login`
+- **Content-type / body:** `application/json`, body `{"provider":"basic","username":"<u>","password":"<p>","next":"/"}`. The `provider` field is REQUIRED (omitting it → HTTP 422). The `/login` page itself is HTML; its form submits this JSON via `fetch` (a plain form POST to `/login` returns 405).
+- **Success:** HTTP 200 with three `HttpOnly; SameSite=lax; Path=/` cookies: `hermes_session_at` (access, Max-Age 43200), `hermes_session_rt` (refresh, Max-Age 2592000), `hermes_session_provider=basic`. All three must be relayed upstream.
+- **Wrong password:** HTTP 401. **Unauthenticated `GET /`:** HTTP 302 → `/login?next=%2F`.
+- **Observation (feeds Task 9):** the image also auto-runs its own s6 `dashboard` service. Watch for a 9119 bind conflict with Nora's manual `--host 0.0.0.0` launch during e2e.
 
-If any default differs, update the constants/predicate in Task 4 accordingly. No commit (documentation-only; commit alongside Task 4).
+Task 4 below is written to this verified contract. No commit here (committed alongside Task 4).
 
 ---
 
@@ -297,7 +298,7 @@ If any default differs, update the constants/predicate in Task 4 accordingly. No
 - Test: `backend-api/__tests__/hermesDashboardSession.test.ts`
 - Modify: `backend-api/server.ts` (`proxyEmbeddedHermes`, ~line 979-1107; constants ~line 151)
 
-> Uses the login contract confirmed in Task 3. The helper relays **whatever** `Set-Cookie` the login returns, so it does not hardcode the session-cookie name; only the login path and form field names come from Task 3 (defaults below).
+> Uses the login contract VERIFIED in Task 3: `POST /auth/password-login` with JSON `{provider:"basic",username,password,next:"/"}`. The helper relays **whatever** `Set-Cookie` the login returns (Hermes sets `hermes_session_at`/`_rt`/`_provider`), so it does not hardcode session-cookie names.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -323,8 +324,11 @@ describe("needsHermesLogin", () => {
     expect(needsHermesLogin(res(401))).toBe(true);
     expect(needsHermesLogin(res(403))).toBe(true);
   });
-  it("is true on a redirect to the login path", () => {
-    expect(needsHermesLogin(res(302, { location: `/${HERMES_DASHBOARD_LOGIN_PATH}` }))).toBe(true);
+  it("is true on a redirect to the login page", () => {
+    expect(needsHermesLogin(res(302, { location: "/login?next=%2F" }))).toBe(true);
+  });
+  it("is false on a redirect that is not the login page", () => {
+    expect(needsHermesLogin(res(302, { location: "/dashboard" }))).toBe(false);
   });
   it("is false on 200", () => {
     expect(needsHermesLogin(res(200))).toBe(false);
@@ -346,9 +350,11 @@ describe("establishHermesDashboardSession", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toContain(`:9119/${HERMES_DASHBOARD_LOGIN_PATH}`);
     expect(calls[0].opts.method).toBe("POST");
-    expect(calls[0].opts.headers["Content-Type"]).toBe("application/x-www-form-urlencoded");
-    expect(calls[0].opts.body).toContain("username=nora");
-    expect(calls[0].opts.body).toContain("password=");
+    expect(calls[0].opts.headers["Content-Type"]).toBe("application/json");
+    const sent = JSON.parse(calls[0].opts.body);
+    expect(sent).toMatchObject({ provider: "basic", username: "nora", next: "/" });
+    expect(typeof sent.password).toBe("string");
+    expect(sent.password.length).toBeGreaterThan(0);
     expect(cookie).toBe("hermes_session=abc; csrf=xyz");
   });
 
@@ -380,40 +386,45 @@ const {
   deriveHermesDashboardBasicAuth,
 } = require("../agent-runtime/lib/hermesDashboardAuth");
 
-// Confirmed against nousresearch/hermes-agent:latest in Task 3. If Task 3 found
-// a different login path / field names, update these three values.
-const HERMES_DASHBOARD_LOGIN_PATH = "login";
-const HERMES_LOGIN_USERNAME_FIELD = "username";
-const HERMES_LOGIN_PASSWORD_FIELD = "password";
+// VERIFIED against nousresearch/hermes-agent:latest (Task 3): the basic-auth
+// provider logs in via a JSON POST to /auth/password-login; the `provider`
+// field is required (omitting it → HTTP 422). The /login HTML page's form
+// submits this same JSON via fetch.
+const HERMES_DASHBOARD_LOGIN_PATH = "auth/password-login";
+const HERMES_DASHBOARD_LOGIN_PROVIDER = "basic";
 
 // True when an upstream dashboard response indicates the session is missing or
-// expired and we should (re)establish one.
+// expired and we should (re)establish one. Unauthenticated GET / → 302 to
+// /login?next=... ; expired/invalid session → 401.
 function needsHermesLogin(resp) {
   if (resp.status === 401 || resp.status === 403) return true;
   if (resp.status >= 300 && resp.status < 400) {
     const location = resp.headers.get("location") || "";
-    return location.includes(HERMES_DASHBOARD_LOGIN_PATH);
+    return /(^|\/)login(\?|$|\/)/.test(location);
   }
   return false;
 }
 
 // Log in to the Hermes dashboard with the per-agent derived basic-auth
 // credential and return the concatenated cookie string to replay upstream
-// (e.g. "hermes_session=...; csrf=..."), or null if login set no cookie.
+// (Hermes sets hermes_session_at / _rt / _provider), or null if login failed
+// or set no cookie.
 async function establishHermesDashboardSession(target, seed, { fetchImpl = fetch } = {}) {
   const creds = deriveHermesDashboardBasicAuth(seed);
   const loginUrl = joinHttpUrl(target.host, target.port, HERMES_DASHBOARD_LOGIN_PATH);
-  const body = new URLSearchParams({
-    [HERMES_LOGIN_USERNAME_FIELD]: creds.username,
-    [HERMES_LOGIN_PASSWORD_FIELD]: creds.password,
-  }).toString();
   const resp = await fetchImpl(loginUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "*/*" },
-    body,
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      provider: HERMES_DASHBOARD_LOGIN_PROVIDER,
+      username: creds.username,
+      password: creds.password,
+      next: "/",
+    }),
     redirect: "manual",
     signal: AbortSignal.timeout(15000),
   });
+  if (!resp.ok) return null;
   const setCookies = typeof resp.headers.getSetCookie === "function" ? resp.headers.getSetCookie() : [];
   const pairs = setCookies.map((c) => c.split(";")[0].trim()).filter(Boolean);
   return pairs.length ? pairs.join("; ") : null;
@@ -421,6 +432,7 @@ async function establishHermesDashboardSession(target, seed, { fetchImpl = fetch
 
 module.exports = {
   HERMES_DASHBOARD_LOGIN_PATH,
+  HERMES_DASHBOARD_LOGIN_PROVIDER,
   needsHermesLogin,
   establishHermesDashboardSession,
 };
