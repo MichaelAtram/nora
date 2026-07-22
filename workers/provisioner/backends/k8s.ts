@@ -23,10 +23,7 @@ const {
   getStandardDockerPackageSpec,
 } = require("../../../agent-runtime/lib/agentImages");
 const { getNemoClawDefaultModel } = require("../../../agent-runtime/lib/nemoclawDefaults");
-const {
-  buildContainerBootstrap,
-  shellSingleQuote,
-} = require("../../../agent-runtime/lib/containerCommand");
+const { buildContainerBootstrap } = require("../../../agent-runtime/lib/containerCommand");
 const {
   HERMES_MANAGED_ENV_ENV,
   HERMES_MODEL_CONFIG_ENV,
@@ -43,7 +40,6 @@ const HERMES_RUNTIME_PORT = 8642;
 const HERMES_HOME = "/opt/data";
 const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
-const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
 const HERMES_INIT_CAPABILITIES = Object.freeze([
   "CHOWN",
@@ -311,7 +307,14 @@ function defaultDeployNameForRuntime(runtimeFamily, id, name) {
 }
 
 function buildHermesStartCommand() {
-  const hermesRuntimeCommand = [
+  // The Hermes pod launches args-only (no `command:` override), so the image
+  // ENTRYPOINT — /init, s6-overlay running as PID 1 — stays intact and
+  // supervises this script directly. Do NOT re-exec /init here: a second s6
+  // init launched as a non-PID-1 child fatals with "s6-overlay-suexec: can
+  // only run as pid 1" and exits the container before the gateway can bind
+  // the runtime port for the startup probe (#297). Returning the runtime
+  // command directly lets the image's PID-1 /init supervise it naturally.
+  return [
     "set -eu",
     buildKubernetesManagedEnvApplyCommand(),
     buildHermesRuntimeConfigBootstrapCommand(),
@@ -319,11 +322,6 @@ function buildHermesStartCommand() {
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
     `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
     'exec "$HERMES_BIN" gateway run',
-  ].join("\n");
-
-  return [
-    "set -eu",
-    `exec ${HERMES_ENTRYPOINT} bash -lc ${shellSingleQuote(hermesRuntimeCommand)}`,
   ].join("\n");
 }
 
