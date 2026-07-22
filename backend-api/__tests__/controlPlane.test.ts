@@ -1719,6 +1719,58 @@ describe("Hermes dashboard embed", () => {
     );
   });
 
+  it("relays a rewritten Location when server-side login fails", async () => {
+    // Single embed request → single agent DB lookup.
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          host: "10.0.0.43",
+          runtime_host: "10.0.0.43",
+          runtime_port: 8642,
+          runtime_family: "hermes",
+          backend_type: "docker",
+          status: "running",
+          gateway_token: "test-seed",
+        },
+      ],
+    });
+
+    global.fetch
+      // 1) initial upstream GET → unauthenticated redirect to the login page.
+      .mockResolvedValueOnce({
+        status: 302,
+        ok: false,
+        headers: new Headers({ location: "/login?next=%2F" }),
+        text: async () => "",
+      })
+      // 2) server-side login POST → fails (401) and sets no cookie.
+      .mockResolvedValueOnce({
+        status: 401,
+        ok: false,
+        headers: {
+          get: () => null,
+          getSetCookie: () => [],
+        },
+        text: async () => "",
+      });
+
+    const res = await request(app)
+      .get(`/agents/agent-4/hermes-ui/embed?token=${encodeURIComponent(token)}`)
+      .set("Host", "nora.test")
+      .set("Accept", "text/html");
+
+    // Login was attempted once; because it returned no session there is no 3rd
+    // (retry) upstream call — the original 302 is relayed as-is.
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    const loginCall = global.fetch.mock.calls[1];
+    expect(loginCall[0]).toContain("/auth/password-login");
+
+    expect(res.status).toBe(302);
+    // The upstream Location is rewritten onto the embed base path so the iframe
+    // navigates within the proxied dashboard instead of the control-plane origin.
+    expect(res.headers.location).toBe("/api/agents/agent-4/hermes-ui/embed/login?next=%2F");
+  });
+
   it("rejects embed requests for stopped Hermes agents", async () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [

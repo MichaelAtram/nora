@@ -1039,7 +1039,6 @@ async function proxyEmbeddedHermes(req, res) {
       if (seed) {
         const session = await establishHermesDashboardSession(safeTarget, seed);
         if (session) {
-          dashboardSession = session;
           headers.Cookie = session;
           res.cookie(dashboardTokenCookieName, session, {
             httpOnly: true,
@@ -1051,6 +1050,23 @@ async function proxyEmbeddedHermes(req, res) {
           resp = await fetchUpstream();
         }
       }
+    }
+
+    // Relay any remaining redirect (login failed, or a non-login 3xx) instead of
+    // dropping it: fetch is in manual-redirect mode, so setProxyResponseHeaders /
+    // setEmbedHtmlHeaders would otherwise send a bare 3xx with no Location and
+    // strand the iframe. Rewrite same-origin targets onto the embed base path so
+    // the iframe stays within the proxied dashboard.
+    if (resp.status >= 300 && resp.status < 400) {
+      const location = resp.headers.get("location");
+      if (location) {
+        const rewritten = location.startsWith("/")
+          ? `${hermesEmbedBasePath(access.agentId)}${location}`
+          : location;
+        res.setHeader("Location", rewritten);
+      }
+      res.status(resp.status).end();
+      return;
     }
 
     const isApiRequest = hermesPath.startsWith("api/");
