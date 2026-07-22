@@ -1827,20 +1827,28 @@ describe("Hermes dashboard provisioning", () => {
     expect(config.Env).toEqual(
       expect.arrayContaining(["GATEWAY_HEALTH_URL=http://127.0.0.1:8642"]),
     );
+    // Bug #2 (#297): the gateway API key must be baked into the container env so
+    // the s6-supervised gateway (which reads /run/s6/container_environment, not
+    // the sourced managed-env file) inherits it on every boot, including
+    // auth-reconcile restarts. It must match the token returned to the control plane.
+    const apiServerKeyEnv = config.Env.find((entry) => entry.startsWith("API_SERVER_KEY="));
+    expect(apiServerKeyEnv).toBe(`API_SERVER_KEY=${result.gatewayToken}`);
     expect(config.Entrypoint).toBeUndefined();
     expect(config.Cmd).toEqual([
       "bash",
       "-lc",
       expect.stringContaining('HERMES_BIN="/opt/hermes/.venv/bin/hermes"'),
     ]);
-    expect(config.Cmd[2]).toContain("exec /init bash -lc");
+    // Bug #1 (#297): the CMD must NOT re-exec /init. The image's PID-1 /init
+    // (s6-overlay) supervises this command directly; a nested /init fatals with
+    // "s6-overlay-suexec: can only run as pid 1" and exits before port 8642 binds.
+    expect(config.Cmd[2]).not.toContain("/init");
     expect(config.Cmd[2]).toContain(
       'nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open',
     );
     expect(config.Cmd[2]).toContain(">> /opt/data/hermes-dashboard.log 2>&1");
     expect(config.Cmd[2]).not.toContain("/proc/1/fd");
     expect(config.Cmd[2]).toContain('exec "$HERMES_BIN" gateway run');
-    expect(config.Cmd[2].match(/\/init/g)).toHaveLength(1);
     expect(config.Cmd.join(" ")).not.toContain("/opt/hermes/docker/entrypoint.sh");
     expect(config.ExposedPorts).toEqual({
       "8642/tcp": {},
