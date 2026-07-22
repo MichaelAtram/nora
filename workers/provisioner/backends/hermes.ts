@@ -11,7 +11,6 @@ const { getHermesDockerAgentImage } = require("../../../agent-runtime/lib/agentI
 const { HERMES_DASHBOARD_PORT } = require("../../../agent-runtime/lib/contracts");
 const {
   buildContainerBootstrap,
-  shellSingleQuote,
 } = require("../../../agent-runtime/lib/containerCommand");
 const {
   buildHermesRuntimeConfigBootstrapCommand,
@@ -21,7 +20,6 @@ const HERMES_RUNTIME_PORT = 8642;
 const HERMES_HOME = "/opt/data";
 const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
-const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
 const DEFAULT_AGENT_PIDS_LIMIT = 512;
 // The official Hermes image starts s6 as root, repairs mounted-state
@@ -48,7 +46,13 @@ function isMutableImageReference(imgName) {
 }
 
 function buildHermesStartCommand() {
-  const hermesRuntimeCommand = [
+  // This runs as the container CMD, supervised directly by the image's PID-1
+  // /init (s6-overlay). Do NOT re-exec /init here: a second s6 init launched as
+  // a non-PID-1 child fatals with "s6-overlay-suexec: can only run as pid 1"
+  // and exits the container within seconds, before the gateway can bind
+  // port 8642 for the readiness probe (#297). Returning the runtime command
+  // directly lets the image's PID-1 /init supervise it naturally.
+  return [
     "set -eu",
     "if [ -r /opt/nora-managed-env/apply.sh ]; then . /opt/nora-managed-env/apply.sh; fi",
     buildHermesRuntimeConfigBootstrapCommand(),
@@ -56,13 +60,6 @@ function buildHermesStartCommand() {
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
     `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
     'exec "$HERMES_BIN" gateway run',
-  ].join("\n");
-
-  return [
-    "set -eu",
-    // Bootstrap the mounted Hermes home once, then fork dashboard and gateway
-    // from that initialized session so first-run file seeding cannot race.
-    `exec ${HERMES_ENTRYPOINT} bash -lc ${shellSingleQuote(hermesRuntimeCommand)}`,
   ].join("\n");
 }
 
@@ -213,6 +210,12 @@ class HermesBackend extends DockerBackend {
       API_SERVER_ENABLED: "true",
       API_SERVER_HOST: "0.0.0.0",
       API_SERVER_PORT: String(HERMES_RUNTIME_PORT),
+      // Bake the gateway API key into the container environment so the
+      // s6-supervised gateway service — which reads /run/s6/container_environment,
+      // not the sourced managed-env file — inherits it on every boot, including
+      // auth-reconcile restarts. Without this the gateway refuses to start with
+      // "Refusing to start: API_SERVER_KEY is required" (#297).
+      API_SERVER_KEY: apiServerKey,
       GATEWAY_HEALTH_URL: `http://127.0.0.1:${HERMES_RUNTIME_PORT}`,
       MESSAGING_CWD: HERMES_WORKSPACE,
       TERMINAL_CWD: HERMES_WORKSPACE,
