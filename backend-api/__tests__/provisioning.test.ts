@@ -1809,6 +1809,7 @@ describe("Hermes dashboard provisioning", () => {
       }),
       getContainer: jest.fn().mockReturnValue(existingContainer),
       createContainer: jest.fn().mockResolvedValue(createdContainer),
+      createVolume: jest.fn().mockResolvedValue({}),
       getNetwork: jest.fn().mockReturnValue({
         connect: bridgeConnect,
       }),
@@ -1874,6 +1875,8 @@ describe("Hermes dashboard provisioning", () => {
         PidsLimit: 512,
       }),
     );
+    expect(backend.docker.createVolume).toHaveBeenCalledWith({ Name: "nora_hermes_home_123" });
+    expect(config.HostConfig.Binds).toEqual(["nora_hermes_home_123:/opt/data"]);
     expect(config.Labels).toEqual(
       expect.objectContaining({
         "nora.dashboard.port": String(HERMES_DASHBOARD_PORT),

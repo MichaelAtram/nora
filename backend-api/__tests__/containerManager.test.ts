@@ -408,7 +408,10 @@ describe("containerManager NemoClaw routing", () => {
       { OPENAI_API_KEY: "rotated" },
       lifecycleOptions,
     );
-    expect(mockProxmoxDestroy).toHaveBeenCalledWith("108", lifecycleOptions);
+    expect(mockProxmoxDestroy).toHaveBeenCalledWith("108", {
+      ...lifecycleOptions,
+      preserveState: false,
+    });
     expect(mockProxmoxStatus).toHaveBeenCalledWith("108", lifecycleOptions);
     expect(mockProxmoxStats).toHaveBeenCalledWith("108", lifecycleOptions);
     expect(mockProxmoxLogs).toHaveBeenCalledWith("108", {
