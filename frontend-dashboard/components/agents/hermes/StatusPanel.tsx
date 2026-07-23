@@ -207,6 +207,16 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
   }, [providers, availableProviders]);
 
   const runtimeReady = Boolean(runtimeInfo?.health?.ok);
+  const connect = runtimeInfo?.connect || null;
+  const copyValue = async (label, value) => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(`${label} copied`);
+    } catch {
+      toast.error(`Could not copy ${label}`);
+    }
+  };
   const models = Array.isArray(runtimeInfo?.models) ? runtimeInfo.models : [];
   const gateway: any = runtimeInfo?.gateway || {};
   const platformStates =
@@ -670,6 +680,71 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
             </div>
           </div>
         </section>
+
+        {connect ? (
+          <section className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+            <div className="border-b border-slate-200 px-4 py-3">
+              <p className="text-sm font-bold text-slate-900">Connect Hermes Desktop</p>
+              <p className="mt-1 text-xs text-slate-500">
+                Point Hermes Desktop (or any direct client) at this address. Reachable only on the
+                interface Nora publishes agent ports to (DOCKER_AGENT_BIND_IP).
+              </p>
+            </div>
+            <div className="space-y-3 p-4">
+              <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                <Server size={16} className="mt-0.5 shrink-0 text-slate-500" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">
+                    Runtime API
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => copyValue("Runtime API URL", connect.runtimeApiUrl)}
+                    className="mt-1 block w-full break-all text-left text-sm font-medium text-slate-800 hover:text-slate-950"
+                  >
+                    {connect.runtimeApiUrl}
+                  </button>
+                </div>
+              </div>
+
+              {connect.dashboardUrl ? (
+                <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                  <Workflow size={16} className="mt-0.5 shrink-0 text-slate-500" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">
+                      Dashboard
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => copyValue("Dashboard URL", connect.dashboardUrl)}
+                      className="mt-1 block w-full break-all text-left text-sm font-medium text-slate-800 hover:text-slate-950"
+                    >
+                      {connect.dashboardUrl}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              {connect.apiKey ? (
+                <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                  <Key size={16} className="mt-0.5 shrink-0 text-slate-500" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">
+                      API Key
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => copyValue("API key", connect.apiKey)}
+                      className="mt-1 block w-full break-all text-left font-mono text-sm font-medium text-slate-800 hover:text-slate-950"
+                    >
+                      Click to copy API key
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </section>
+        ) : null}
 
         <aside className="space-y-4">
           <section className="rounded-2xl border border-slate-200 bg-white shadow-sm">
