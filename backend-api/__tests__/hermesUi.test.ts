@@ -278,8 +278,8 @@ describe("Hermes persisted runtime state", () => {
 
     expect(mockDb.query).toHaveBeenCalledTimes(1);
     const replaceParams = mockDb.query.mock.calls[0][1];
-    const storedModelConfig = replaceParams[1];
-    const storedChannelConfigs = replaceParams[2];
+    const storedModelConfig = replaceParams[2];
+    const storedChannelConfigs = replaceParams[3];
     const parsedStoredChannels = JSON.parse(storedChannelConfigs);
 
     expect(parsedStoredChannels.telegram.TELEGRAM_BOT_TOKEN).not.toBe("telegram-secret");
@@ -363,5 +363,27 @@ describe("profile scoping in python command", () => {
   it("scopes to a named profile home", () => {
     const cmd = buildHermesPythonCommand("print('x')", { profile: "coder" });
     expect(cmd).toContain('export HERMES_HOME="/opt/data/profiles/coder"');
+  });
+});
+
+describe("per-profile state persistence", () => {
+  beforeEach(() => {
+    mockDb.query.mockReset();
+  });
+
+  it("getPersistedHermesState filters by profile_name", async () => {
+    mockDb.query.mockResolvedValueOnce({ rows: [{ model_config: "{}", channel_configs: "{}" }] });
+    await getPersistedHermesState("agent-1", { profile: "coder" });
+    const [sql, params] = mockDb.query.mock.calls[0];
+    expect(sql).toContain("profile_name = $2");
+    expect(params).toEqual(["agent-1", "coder"]);
+  });
+
+  it("replacePersistedHermesState writes the profile_name", async () => {
+    mockDb.query.mockResolvedValue({ rows: [] });
+    await replacePersistedHermesState("agent-1", { modelConfig: {}, channels: [] }, { profile: "coder" });
+    const call = mockDb.query.mock.calls.find(([sql]) => sql.includes("INSERT INTO hermes_runtime_state"));
+    expect(call[0]).toContain("profile_name");
+    expect(call[1]).toContain("coder");
   });
 });

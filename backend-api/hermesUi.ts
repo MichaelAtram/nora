@@ -480,13 +480,13 @@ function normalizeHermesChannelStateList(rawChannels = []) {
     .filter(Boolean);
 }
 
-async function getPersistedHermesState(agentId) {
+async function getPersistedHermesState(agentId, { profile = "default" } = {}) {
   const result = await db.query(
     `SELECT model_config, channel_configs
        FROM hermes_runtime_state
-      WHERE agent_id = $1
+      WHERE agent_id = $1 AND profile_name = $2
       LIMIT 1`,
-    [agentId],
+    [agentId, profile],
   );
   const row = result.rows[0];
   if (!row) {
@@ -512,7 +512,7 @@ async function getPersistedHermesState(agentId) {
   };
 }
 
-async function replacePersistedHermesState(agentId, state = {}) {
+async function replacePersistedHermesState(agentId, state = {}, { profile = "default" } = {}) {
   const normalizedModelConfig = normalizeHermesModelConfig(state.modelConfig || {});
   const normalizedChannels = normalizeHermesChannelStateList(state.channels || []);
 
@@ -534,14 +534,14 @@ async function replacePersistedHermesState(agentId, state = {}) {
   }
 
   await db.query(
-    `INSERT INTO hermes_runtime_state(agent_id, model_config, channel_configs)
-     VALUES($1, $2, $3)
-     ON CONFLICT (agent_id)
+    `INSERT INTO hermes_runtime_state(agent_id, profile_name, model_config, channel_configs)
+     VALUES($1, $2, $3, $4)
+     ON CONFLICT (agent_id, profile_name)
      DO UPDATE SET
        model_config = EXCLUDED.model_config,
        channel_configs = EXCLUDED.channel_configs,
        updated_at = NOW()`,
-    [agentId, JSON.stringify(normalizedModelConfig), JSON.stringify(securedChannels)],
+    [agentId, profile, JSON.stringify(normalizedModelConfig), JSON.stringify(securedChannels)],
   );
 
   return {
@@ -550,25 +550,33 @@ async function replacePersistedHermesState(agentId, state = {}) {
   };
 }
 
-async function persistHermesChannelState(agentId, type, config) {
-  const current = await getPersistedHermesState(agentId);
+async function persistHermesChannelState(agentId, type, config, { profile = "default" } = {}) {
+  const current = await getPersistedHermesState(agentId, { profile });
   const channels = [
     ...current.channels.filter((entry) => entry.type !== type),
     { type, config },
   ].sort((left, right) => left.type.localeCompare(right.type));
 
-  return replacePersistedHermesState(agentId, {
-    modelConfig: current.modelConfig,
-    channels,
-  });
+  return replacePersistedHermesState(
+    agentId,
+    {
+      modelConfig: current.modelConfig,
+      channels,
+    },
+    { profile },
+  );
 }
 
-async function deletePersistedHermesChannelState(agentId, type) {
-  const current = await getPersistedHermesState(agentId);
-  return replacePersistedHermesState(agentId, {
-    modelConfig: current.modelConfig,
-    channels: current.channels.filter((entry) => entry.type !== type),
-  });
+async function deletePersistedHermesChannelState(agentId, type, { profile = "default" } = {}) {
+  const current = await getPersistedHermesState(agentId, { profile });
+  return replacePersistedHermesState(
+    agentId,
+    {
+      modelConfig: current.modelConfig,
+      channels: current.channels.filter((entry) => entry.type !== type),
+    },
+    { profile },
+  );
 }
 
 function snapshotToPersistedHermesState(snapshot = {}) {
@@ -677,11 +685,16 @@ print(json.dumps({
   return runHermesPythonJson(agent, script, { timeout: 30000 });
 }
 
-async function persistHermesModelConfig(agent, modelConfig = {}) {
+async function persistHermesModelConfig(agent, modelConfig = {}, { profile = "default" } = {}) {
   if (
     typeof containerManager.isKubernetesAgent === "function" &&
     containerManager.isKubernetesAgent(agent)
   ) {
+    if (profile !== "default") {
+      const e = new Error("Hermes profile management is not supported on Kubernetes agents yet");
+      e.statusCode = 409;
+      throw e;
+    }
     await containerManager.updateEnv(agent, buildHermesRuntimeBootstrapEnv({ modelConfig }));
     return { ok: true };
   }
@@ -758,17 +771,21 @@ print(json.dumps({
 }))
 `;
 
-  return runHermesPythonJson(agent, script, { timeout: 30000 });
+  return runHermesPythonJson(agent, script, { timeout: 30000, profile });
 }
 
-async function applyPersistedHermesState(agent, persistedState = null, { restart = true } = {}) {
-  const state = persistedState || (await getPersistedHermesState(agent.id));
+async function applyPersistedHermesState(
+  agent,
+  persistedState = null,
+  { restart = true, profile = "default" } = {},
+) {
+  const state = persistedState || (await getPersistedHermesState(agent.id, { profile }));
   const modelConfig = normalizeHermesModelConfig(state?.modelConfig || {});
   const channels = normalizeHermesChannelStateList(state?.channels || []);
   let mutated = false;
 
   if (modelConfig.defaultModel || modelConfig.provider || modelConfig.baseUrl) {
-    await persistHermesModelConfig(agent, modelConfig);
+    await persistHermesModelConfig(agent, modelConfig, { profile });
     mutated = true;
   }
 
@@ -776,12 +793,12 @@ async function applyPersistedHermesState(agent, persistedState = null, { restart
     const definition = definitionForChannelType(entry.type);
     if (!definition) continue;
     const normalized = normalizeHermesChannelInput(definition, entry.config || {}, {});
-    await persistHermesChannelConfig(agent, definition, normalized);
+    await persistHermesChannelConfig(agent, definition, normalized, { profile });
     mutated = true;
   }
 
   if (mutated && restart) {
-    await restartHermesRuntime(agent);
+    await restartHermesRuntime(agent, { profile });
   }
 
   return {
@@ -935,7 +952,7 @@ function definitionForChannelType(type) {
   );
 }
 
-async function readHermesRuntimeSnapshot(agent) {
+async function readHermesRuntimeSnapshot(agent, { profile = "default" } = {}) {
   const definitions = serializeHermesChannelCatalog().map((entry) => ({
     type: entry.type,
     configFields: entry.configFields.map((field) => ({ key: field.key })),
@@ -996,10 +1013,27 @@ print(json.dumps({
 }))
 `;
 
-  return runHermesPythonJson(agent, script, { timeout: 30000 });
+  return runHermesPythonJson(agent, script, { timeout: 30000, profile });
 }
 
-async function restartHermesRuntime(agent) {
+async function restartHermesRuntime(agent, { profile = "default" } = {}) {
+  if (profile !== "default") {
+    const home = resolveHermesProfileHome(profile);
+    const {
+      buildHermesProfileGatewayStopSnippet,
+      buildHermesProfileGatewayStartSnippet,
+    } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
+    const restartCommand = [
+      "set -eu",
+      `HERMES_BIN="/opt/hermes/.venv/bin/hermes"`,
+      '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes 2>/dev/null || true)"',
+      buildHermesProfileGatewayStopSnippet(home),
+      buildHermesProfileGatewayStartSnippet(home),
+    ].join("\n");
+    await runContainerCommand(agent, restartCommand, { timeout: 30000 });
+    return;
+  }
+
   const lifecycleResult = await containerManager.restart(agent);
   await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
   const readiness = await waitForAgentReadiness(
@@ -1070,8 +1104,13 @@ function isKubernetesHermesAgent(agent) {
   );
 }
 
-async function persistHermesChannelConfig(agent, definition, config) {
+async function persistHermesChannelConfig(agent, definition, config, { profile = "default" } = {}) {
   if (isKubernetesHermesAgent(agent)) {
+    if (profile !== "default") {
+      const e = new Error("Hermes profile management is not supported on Kubernetes agents yet");
+      e.statusCode = 409;
+      throw e;
+    }
     await syncHermesManagedEnvToKubernetes(agent);
     return;
   }
@@ -1092,11 +1131,16 @@ for key, value in payload.items():
 print(json.dumps({"ok": True}))
 `;
 
-  await runHermesPythonJson(agent, script, { timeout: 30000 });
+  await runHermesPythonJson(agent, script, { timeout: 30000, profile });
 }
 
-async function removeHermesChannelConfig(agent, definition) {
+async function removeHermesChannelConfig(agent, definition, { profile = "default" } = {}) {
   if (isKubernetesHermesAgent(agent)) {
+    if (profile !== "default") {
+      const e = new Error("Hermes profile management is not supported on Kubernetes agents yet");
+      e.statusCode = 409;
+      throw e;
+    }
     // DB state was deleted by the caller; rebuilding the managed env from the
     // DB drops the removed channel's keys from the managed block.
     await syncHermesManagedEnvToKubernetes(agent);
@@ -1114,7 +1158,7 @@ for key in keys:
 print(json.dumps({"ok": True}))
 `;
 
-  await runHermesPythonJson(agent, script, { timeout: 30000 });
+  await runHermesPythonJson(agent, script, { timeout: 30000, profile });
 }
 
 function buildHermesGatewaySummary(snapshot) {
@@ -1140,8 +1184,8 @@ function buildHermesGatewaySummary(snapshot) {
   };
 }
 
-async function listHermesChannels(agent) {
-  const snapshot = await readHermesRuntimeSnapshot(agent);
+async function listHermesChannels(agent, { profile = "default" } = {}) {
+  const snapshot = await readHermesRuntimeSnapshot(agent, { profile });
   const knownChannels = HERMES_CHANNEL_TYPES.map((type) =>
     serializeKnownHermesChannel(HERMES_CHANNEL_DEFINITIONS[type], snapshot),
   ).filter(
@@ -1178,7 +1222,12 @@ async function listHermesChannels(agent) {
   };
 }
 
-async function saveHermesChannel(agent, type, inputConfig = {}, { create = false } = {}) {
+async function saveHermesChannel(
+  agent,
+  type,
+  inputConfig = {},
+  { create = false, profile = "default" } = {},
+) {
   const definition = definitionForChannelType(type);
   if (!definition) {
     const error = new Error("Unsupported Hermes channel type");
@@ -1186,7 +1235,7 @@ async function saveHermesChannel(agent, type, inputConfig = {}, { create = false
     throw error;
   }
 
-  const snapshot = await readHermesRuntimeSnapshot(agent);
+  const snapshot = await readHermesRuntimeSnapshot(agent, { profile });
   const platformDetails = snapshot?.platformDetails?.[definition.type] || {};
   const existingEnv = snapshot?.envValues?.[definition.type] || {};
   const alreadyConfigured = isHermesChannelConfigured(definition, existingEnv, platformDetails);
@@ -1199,18 +1248,18 @@ async function saveHermesChannel(agent, type, inputConfig = {}, { create = false
 
   const normalized = normalizeHermesChannelInput(definition, inputConfig, existingEnv);
 
-  await persistHermesChannelState(agent.id, definition.type, normalized);
-  await persistHermesChannelConfig(agent, definition, normalized);
-  await restartHermesRuntime(agent);
+  await persistHermesChannelState(agent.id, definition.type, normalized, { profile });
+  await persistHermesChannelConfig(agent, definition, normalized, { profile });
+  await restartHermesRuntime(agent, { profile });
 
-  const payload = await listHermesChannels(agent);
+  const payload = await listHermesChannels(agent, { profile });
   return {
     payload,
     channel: payload.channels.find((entry) => entry.type === definition.type) || null,
   };
 }
 
-async function deleteHermesChannel(agent, type) {
+async function deleteHermesChannel(agent, type, { profile = "default" } = {}) {
   const definition = definitionForChannelType(type);
   if (!definition) {
     const error = new Error("Unsupported Hermes channel type");
@@ -1218,14 +1267,14 @@ async function deleteHermesChannel(agent, type) {
     throw error;
   }
 
-  await deletePersistedHermesChannelState(agent.id, definition.type);
-  await removeHermesChannelConfig(agent, definition);
-  await restartHermesRuntime(agent);
-  return listHermesChannels(agent);
+  await deletePersistedHermesChannelState(agent.id, definition.type, { profile });
+  await removeHermesChannelConfig(agent, definition, { profile });
+  await restartHermesRuntime(agent, { profile });
+  return listHermesChannels(agent, { profile });
 }
 
-async function testHermesChannel(agent, type) {
-  const payload = await listHermesChannels(agent);
+async function testHermesChannel(agent, type, { profile = "default" } = {}) {
+  const payload = await listHermesChannels(agent, { profile });
   const channel = payload.channels.find((entry) => entry.type === type);
   if (!channel) {
     const error = new Error("Channel not found");
