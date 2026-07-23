@@ -472,6 +472,7 @@ describe("provisioner deployment lifecycle", () => {
         deploy_target: "remote-docker",
         execution_target_id: "remote:old-host",
       }),
+      { preserveState: true },
     );
     expect(queryable.query).toHaveBeenCalledWith(
       expect.stringMatching(/container_id IS NOT DISTINCT FROM \$10/),
@@ -762,6 +763,7 @@ describe("provisioner deployment lifecycle", () => {
         container_id: null,
         container_name: null,
       }),
+      { preserveState: true },
     );
   });
 
@@ -881,6 +883,7 @@ describe("provisioner deployment lifecycle", () => {
 
     expect(mockContainerManager.destroy).toHaveBeenCalledWith(
       expect.objectContaining({ container_id: "old-container" }),
+      { preserveState: true },
     );
     expect(mockWorkerDb.query).toHaveBeenCalledWith(
       "UPDATE agents SET status = 'error' WHERE id = $1",
