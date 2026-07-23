@@ -448,6 +448,14 @@ async function removeFailedDemoActivation(queryable, agentId, userId) {
   }
 }
 
+/**
+ * Resolve the image Nora should deploy for a requested runtime selection,
+ * preferring an explicit override, then the current image when the runtime path
+ * is unchanged, and finally the runtime-family default image.
+ *
+ * @param {Object} [options={}] - Requested and fallback image/runtime inputs.
+ * @returns {string|null} Image Nora should persist for the agent.
+ */
 function resolveRequestedImage({
   requestedImage,
   runtimeFields = null,
@@ -478,6 +486,13 @@ function normalizeRequestedRuntimeFamily(value) {
   return normalizeRuntimeFamilyName(value);
 }
 
+/**
+ * Validate that the requested runtime selection is enabled and fully
+ * configured on this Nora control plane.
+ *
+ * @param {Object} runtimeFields - Requested runtime/backend selection fields.
+ * @returns {Object} Runtime-selection status when the request is allowed.
+ */
 function assertRuntimeSelectionAvailable(runtimeFields) {
   const status = getRuntimeSelectionStatus(runtimeFields);
   if (!status.enabled) {
@@ -502,6 +517,14 @@ function assertRuntimeSelectionAvailable(runtimeFields) {
   return status;
 }
 
+/**
+ * Validate the requested runtime path and ensure any Kubernetes or Remote
+ * Docker execution target is available to the owning user.
+ *
+ * @param {Object} runtimeFields - Requested runtime/backend selection fields.
+ * @param {string} ownerUserId - User id used to validate remote-host-backed execution targets.
+ * @returns {Promise<Object>} Runtime-selection status for the validated target.
+ */
 async function assertRuntimeTargetAvailable(runtimeFields, ownerUserId) {
   const status = assertRuntimeSelectionAvailable(runtimeFields);
   await assertKubernetesExecutionTargetAvailable(runtimeFields);
@@ -534,6 +557,13 @@ function normalizeGatewayHost(value) {
   }
 }
 
+/**
+ * Determine the externally reachable gateway host Nora should publish for an
+ * agent, preferring explicit env configuration before request headers.
+ *
+ * @param {Object} req - Express request used to inspect forwarded host headers.
+ * @returns {string} Hostname Nora should expose in agent gateway URLs.
+ */
 function resolvePublishedGatewayHost(req) {
   const configuredHost = normalizeGatewayHost(process.env.GATEWAY_HOST);
   if (configuredHost) return configuredHost;
@@ -551,6 +581,13 @@ function resolvePublishedGatewayHost(req) {
   return normalizeGatewayHost(req.get("host")) || "localhost";
 }
 
+/**
+ * Determine the externally reachable gateway protocol Nora should publish for
+ * an agent, preferring explicit env configuration before request headers.
+ *
+ * @param {Object} req - Express request used to inspect forwarded protocol headers.
+ * @returns {string} `https` or `http` for published gateway URLs.
+ */
 function resolvePublishedGatewayProtocol(req) {
   const configuredProtocol = String(
     process.env.GATEWAY_PROTOCOL || process.env.GATEWAY_SCHEME || "",
@@ -603,6 +640,13 @@ function normalizeClawhubSkillEntry(entry) {
   };
 }
 
+/**
+ * Normalize and deduplicate the ClawHub-installed-skill metadata Nora stores on
+ * an agent row.
+ *
+ * @param {Array} entries - Raw installed-skill entries from the request or DB.
+ * @returns {Array} Stable list of normalized ClawHub skill descriptors.
+ */
 function normalizeClawhubSkills(entries) {
   if (!Array.isArray(entries)) return [];
 
@@ -834,6 +878,14 @@ function createStatusCodeError(message, statusCode) {
   return error;
 }
 
+/**
+ * Load an agent for Hermes WebUI endpoints and enforce the extra runtime-state
+ * invariants those routes rely on.
+ *
+ * @param {Object} req - Express request carrying the target `:id` and user context.
+ * @param {Object} [options={}] - Access requirements for the lookup.
+ * @returns {Promise<Object>} Accessible Hermes agent ready for downstream WebUI actions.
+ */
 async function loadHermesUiAgent(req, { requiredRole = "viewer" } = {}) {
   const agent = await findAccessibleAgentForRequest(req, req.params.id, requiredRole);
   if (!agent) {
