@@ -1,19 +1,28 @@
-import { useState } from "react";
-import { CalendarClock, MessageSquare, MonitorPlay, Puzzle, Radio } from "lucide-react";
+import { useEffect, useState } from "react";
+import {
+  CalendarClock,
+  LayoutDashboard,
+  MessageSquare,
+  MessagesSquare,
+  Puzzle,
+  Radio,
+} from "lucide-react";
 import StatusPanel from "./openclaw/StatusPanel";
 import ChatPanel from "./openclaw/ChatPanel";
 import IntegrationsTab from "./IntegrationsTab";
 import ClawHubTab from "./openclaw/ClawHubTab";
 import CronPanel from "./openclaw/CronPanel";
+import ChannelsTab from "./ChannelsTab";
 import OpenClawUIPanel from "./openclaw/OpenClawUIPanel";
 
 const subTabs = [
+  { id: "official-dashboard", label: "Official Dashboard", icon: LayoutDashboard },
   { id: "status", label: "Status", icon: Radio },
   { id: "chat", label: "Chat", icon: MessageSquare },
   { id: "integrations", label: "Integrations", icon: Puzzle },
   { id: "clawhub", label: "ClawHub", icon: Puzzle },
   { id: "cron", label: "Cron", icon: CalendarClock },
-  { id: "ui", label: "UI", icon: MonitorPlay },
+  { id: "channels", label: "Channels", icon: MessagesSquare },
 ];
 
 export default function OpenClawTab({
@@ -22,7 +31,11 @@ export default function OpenClawTab({
   agentContainerId,
   onClawhubInstallSuccess,
 }) {
-  const [activeSubTab, setActiveSubTab] = useState("status");
+  const [activeSubTab, setActiveSubTab] = useState("official-dashboard");
+
+  useEffect(() => {
+    setActiveSubTab("official-dashboard");
+  }, [agentId]);
 
   if (agentStatus !== "running" && agentStatus !== "warning") {
     return (
@@ -65,6 +78,7 @@ export default function OpenClawTab({
 
       {/* Sub-panel content */}
       <div>
+        {activeSubTab === "official-dashboard" && <OpenClawUIPanel agentId={agentId} />}
         {activeSubTab === "status" && <StatusPanel agentId={agentId} />}
         {activeSubTab === "chat" && <ChatPanel agentId={agentId} />}
         {activeSubTab === "integrations" && <IntegrationsTab agentId={agentId} />}
@@ -76,7 +90,7 @@ export default function OpenClawTab({
           />
         )}
         {activeSubTab === "cron" && <CronPanel agentId={agentId} />}
-        {activeSubTab === "ui" && <OpenClawUIPanel agentId={agentId} />}
+        {activeSubTab === "channels" && <ChannelsTab agentId={agentId} />}
       </div>
     </div>
   );
