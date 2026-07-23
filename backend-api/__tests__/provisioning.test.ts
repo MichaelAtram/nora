@@ -1236,6 +1236,38 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(result.policyStatus).toBe("supported");
   });
 
+  it("launches Hermes under the image's PID-1 init without re-exec'ing /init", async () => {
+    const K8sBackend = require("../../workers/provisioner/backends/k8s");
+    const backend = new K8sBackend(k8sProfile({ hermesNamespace: "hermes-agents" }));
+
+    await backend.create({
+      id: "hermes-init-guard",
+      name: "Hermes Init Guard",
+      runtimeFamily: "hermes",
+      vcpu: 2,
+      ram_mb: 2048,
+      env: {},
+    });
+
+    // Bug #1 (#297): the pod must launch args-only so the image ENTRYPOINT
+    // (/init, s6-overlay as PID 1) supervises the bootstrap. A nested /init in
+    // the bootstrap script fatals with "s6-overlay-suexec: can only run as
+    // pid 1" and kills the container before the runtime port can bind.
+    const deployment = mockCreateNamespacedDeployment.mock.calls[0][0].body;
+    const container = deployment.spec.template.spec.containers[0];
+    expect(container.command).toBeUndefined();
+    expect(container.args).toEqual(["bash", "-lc", ". /opt/nora-bootstrap/bootstrap.sh"]);
+
+    const bootstrapConfigMap = mockCreateNamespacedConfigMap.mock.calls
+      .map((call) => call[0].body)
+      .find((body) => body?.metadata?.labels?.["nora.bootstrap"] === "true");
+    expect(bootstrapConfigMap).toBeDefined();
+    const script = bootstrapConfigMap.data["bootstrap.sh"];
+    expect(script).not.toContain("/init");
+    expect(script).toContain('nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open');
+    expect(script).toContain('exec "$HERMES_BIN" gateway run');
+  });
+
   it("replaces an existing NetworkPolicy instead of failing on redeploy", async () => {
     mockCreateNamespacedNetworkPolicy
       .mockRejectedValueOnce({
