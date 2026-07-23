@@ -148,6 +148,15 @@ export default function HermesWebUITab({ agentId, agentStatus }) {
 
   return (
     <div className="space-y-4">
+      <div className="flex items-center justify-between gap-2">
+        <ProfileSwitcher
+          agentId={agentId}
+          selectedProfile={selectedProfile}
+          onSelect={setSelectedProfile}
+          disabled={runtimeInfo?.deployTarget === "k8s"}
+        />
+      </div>
+
       <div className="w-full overflow-x-auto rounded-xl border border-slate-200 bg-slate-50 p-1 scrollbar-hide">
         <div className="flex items-center gap-1">
           {subTabs.map((tab) => {
@@ -171,15 +180,6 @@ export default function HermesWebUITab({ agentId, agentStatus }) {
             );
           })}
         </div>
-      </div>
-
-      <div className="flex items-center justify-between gap-2">
-        <ProfileSwitcher
-          agentId={agentId}
-          selectedProfile={selectedProfile}
-          onSelect={setSelectedProfile}
-          disabled={runtimeInfo?.deployTarget === "k8s"}
-        />
       </div>
 
       <div>
