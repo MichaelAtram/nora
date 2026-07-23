@@ -843,6 +843,40 @@ describe("containerManager NemoClaw routing", () => {
     expect(exec).toEqual({ exec: "hermes-exec", stream: "hermes-stream" });
   });
 
+  it("threads preserveState:true to the backend on a redeploy destroy", async () => {
+    const containerManager = require("../containerManager");
+    const agent = {
+      runtime_family: "hermes",
+      deploy_target: "docker",
+      sandbox_profile: "standard",
+      container_id: "hermes-preserve-true",
+    };
+
+    await containerManager.destroy(agent, { preserveState: true });
+
+    expect(mockHermesDestroy).toHaveBeenCalledWith(
+      "hermes-preserve-true",
+      expect.objectContaining({ preserveState: true, runtimeFamily: "hermes" }),
+    );
+  });
+
+  it("defaults preserveState to false for a plain delete destroy", async () => {
+    const containerManager = require("../containerManager");
+    const agent = {
+      runtime_family: "hermes",
+      deploy_target: "docker",
+      sandbox_profile: "standard",
+      container_id: "hermes-preserve-default",
+    };
+
+    await containerManager.destroy(agent);
+
+    expect(mockHermesDestroy).toHaveBeenCalledWith(
+      "hermes-preserve-default",
+      expect.objectContaining({ preserveState: false }),
+    );
+  });
+
   it("keeps Hermes on Kubernetes lifecycle calls on the Kubernetes adapter", async () => {
     const containerManager = require("../containerManager");
     const agent = {
