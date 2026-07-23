@@ -1163,6 +1163,116 @@ describe("Hermes WebUI routes", () => {
     });
   });
 
+  it("uses the routable published HostIp as the connect host, not the browsing host", async () => {
+    mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
+      runtimeStatus: { gateway_state: "running", active_agents: 1, updated_at: "t", platforms: {} },
+      directory: { updated_at: "t", platforms: {} },
+      platformDetails: {},
+      jobsCount: 0,
+      modelConfig: { defaultModel: "gpt-5.5", provider: "custom", baseUrl: "https://x/v1" },
+    });
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-hermes-hostip",
+          user_id: "user-1",
+          status: "running",
+          runtime_family: "hermes",
+          backend_type: "docker",
+          container_id: "hermes-container",
+          runtime_host: "10.0.0.43",
+          runtime_port: 8642,
+          gateway_token: "hermes-token",
+        },
+      ],
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }))
+      .mockResolvedValueOnce(
+        createMockFetchResponse({ body: { object: "list", data: [{ id: "desk-bot", object: "model" }] } }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({ body: { version: "1.0.0", gateway_running: true, gateway_state: "running" } }),
+      );
+    // Ports are bound to a concrete routable interface (Tailscale IP).
+    mockDockerInspect.mockResolvedValueOnce({
+      NetworkSettings: {
+        Ports: {
+          "8642/tcp": [{ HostIp: "100.71.115.105", HostPort: "19500" }],
+          "9119/tcp": [{ HostIp: "100.71.115.105", HostPort: "19044" }],
+        },
+      },
+    });
+
+    // Operator browses Nora on a DIFFERENT host — the connect URLs must reflect
+    // where the ports are actually bound, not the browsing host.
+    const res = await auth(
+      request(app).get("/agents/a-hermes-hostip/hermes-ui").set("X-Forwarded-Host", "nora.internal.example"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.connect).toEqual({
+      runtimeApiUrl: "http://100.71.115.105:19500",
+      dashboardUrl: "http://100.71.115.105:19044",
+      apiKey: "hermes-token",
+    });
+  });
+
+  it("falls back to the browsing host when ports are bound to loopback / 0.0.0.0", async () => {
+    mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
+      runtimeStatus: { gateway_state: "running", active_agents: 1, updated_at: "t", platforms: {} },
+      directory: { updated_at: "t", platforms: {} },
+      platformDetails: {},
+      jobsCount: 0,
+      modelConfig: { defaultModel: "gpt-5.5", provider: "custom", baseUrl: "https://x/v1" },
+    });
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-hermes-loopback",
+          user_id: "user-1",
+          status: "running",
+          runtime_family: "hermes",
+          backend_type: "docker",
+          container_id: "hermes-container",
+          runtime_host: "10.0.0.43",
+          runtime_port: 8642,
+          gateway_token: "hermes-token",
+        },
+      ],
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }))
+      .mockResolvedValueOnce(
+        createMockFetchResponse({ body: { object: "list", data: [{ id: "desk-bot", object: "model" }] } }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({ body: { version: "1.0.0", gateway_running: true, gateway_state: "running" } }),
+      );
+    // Loopback bind (default DOCKER_AGENT_BIND_IP) — no routable HostIp to advertise.
+    mockDockerInspect.mockResolvedValueOnce({
+      NetworkSettings: {
+        Ports: {
+          "8642/tcp": [{ HostIp: "127.0.0.1", HostPort: "19500" }],
+          "9119/tcp": [{ HostIp: "0.0.0.0", HostPort: "19044" }],
+        },
+      },
+    });
+
+    const res = await auth(
+      request(app).get("/agents/a-hermes-loopback/hermes-ui").set("X-Forwarded-Host", "nora.internal.example"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.connect).toEqual({
+      runtimeApiUrl: "http://nora.internal.example:19500",
+      dashboardUrl: "http://nora.internal.example:19044",
+      apiKey: "hermes-token",
+    });
+  });
+
   it("omits the connect block for non-Docker Hermes agents", async () => {
     mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
       runtimeStatus: {

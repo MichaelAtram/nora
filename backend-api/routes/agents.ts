@@ -620,6 +620,24 @@ const HERMES_RUNTIME_PORT = 8642;
 // proxy's resolveHermesDashboardAddress). The host shown to the operator is
 // whatever they browsed Nora on (X-Forwarded-Host / GATEWAY_HOST), matching
 // the OpenClaw ui-info pattern.
+// A published-port HostIp is usable as the advertised connect host only when it
+// is a concrete routable address. Docker's bind-all (0.0.0.0 / ::) and loopback
+// addresses tell us nothing about where an external client should connect, so
+// those fall back to the browsing-host heuristic.
+function isRoutablePublishHostIp(hostIp) {
+  const ip = String(hostIp || "").trim();
+  if (!ip) return false;
+  if (ip === "0.0.0.0" || ip === "::" || ip === "[::]") return false;
+  if (ip === "localhost" || ip === "::1" || ip === "[::1]") return false;
+  if (/^127\./.test(ip)) return false;
+  return true;
+}
+
+function formatHostForUrl(host) {
+  // Bracket IPv6 literals so their colons don't collide with the port separator.
+  return require("net").isIP(host) === 6 ? `[${host}]` : host;
+}
+
 async function resolveHermesConnectInfo(agent, req) {
   const runtimeFields = buildAgentRuntimeFields(agent);
   if (runtimeFields.runtime_family !== "hermes") return null;
@@ -628,6 +646,7 @@ async function resolveHermesConnectInfo(agent, req) {
 
   let runtimeApiHostPort = null;
   let dashboardHostPort = null;
+  let runtimeHostIp = null;
   try {
     const Docker = require("dockerode");
     const docker = new Docker({ socketPath: "/var/run/docker.sock" });
@@ -641,6 +660,8 @@ async function resolveHermesConnectInfo(agent, req) {
     dashboardHostPort = dashboardBinding?.[0]?.HostPort
       ? parseInt(dashboardBinding[0].HostPort, 10)
       : null;
+    // The interface the ports are actually bound to (DOCKER_AGENT_BIND_IP).
+    runtimeHostIp = runtimeBinding?.[0]?.HostIp || null;
   } catch (err) {
     console.warn(
       `[hermes-connect] Could not inspect published ports for agent ${agent.id}: ${err.message}`,
@@ -653,7 +674,12 @@ async function resolveHermesConnectInfo(agent, req) {
   if (!runtimeApiHostPort) return null;
 
   const proto = resolvePublishedGatewayProtocol(req);
-  const host = resolvePublishedGatewayHost(req);
+  // Prefer the actual publish interface (source of truth) when it is routable;
+  // otherwise fall back to the browsing-host heuristic (loopback default / the
+  // remote 0.0.0.0 variant, where the bind IP doesn't identify a reachable host).
+  const host = isRoutablePublishHostIp(runtimeHostIp)
+    ? formatHostForUrl(runtimeHostIp)
+    : resolvePublishedGatewayHost(req);
   const apiKey = await resolveHermesApiToken(agent);
 
   return {
