@@ -190,6 +190,34 @@ function buildHermesRuntimeConfigBootstrapCommand() {
   ].join("\n");
 }
 
+function buildHermesProfileGatewayStartSnippet(home) {
+  const safeHome = String(home);
+  return [
+    `HERMES_HOME="${safeHome}" API_SERVER_ENABLED=false nohup "$HERMES_BIN" gateway run >> "${safeHome}/gateway.log" 2>&1 &`,
+    `echo $! > "${safeHome}/gateway.pid"`,
+  ].join("\n");
+}
+
+function buildHermesProfileGatewayStopSnippet(home) {
+  const safeHome = String(home);
+  return [
+    `if [ -f "${safeHome}/gateway.pid" ]; then`,
+    `  kill "$(cat "${safeHome}/gateway.pid")" 2>/dev/null || true`,
+    `  rm -f "${safeHome}/gateway.pid"`,
+    `fi`,
+  ].join("\n");
+}
+
+function buildAllProfilesGatewayLaunchSnippet() {
+  return [
+    `for prof_dir in "${HERMES_DEFAULT_HOME}/${HERMES_PROFILES_SUBDIR}/"*; do`,
+    `  [ -d "$prof_dir" ] || continue`,
+    `  HERMES_HOME="$prof_dir" API_SERVER_ENABLED=false nohup "$HERMES_BIN" gateway run >> "$prof_dir/gateway.log" 2>&1 &`,
+    `  echo $! > "$prof_dir/gateway.pid"`,
+    `done`,
+  ].join("\n");
+}
+
 module.exports = {
   HERMES_DEFAULT_HOME,
   HERMES_PROFILES_SUBDIR,
@@ -199,6 +227,9 @@ module.exports = {
   buildHermesManagedEnvBlock,
   buildHermesRuntimeBootstrapEnv,
   buildHermesRuntimeConfigBootstrapCommand,
+  buildHermesProfileGatewayStartSnippet,
+  buildHermesProfileGatewayStopSnippet,
+  buildAllProfilesGatewayLaunchSnippet,
   isValidHermesProfileName,
   resolveHermesProfileHome,
 };
