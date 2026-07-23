@@ -89,6 +89,10 @@ Resolved in `agent-runtime/lib/backendCatalog.ts`:
 2. **Deploy target** (`ENABLED_BACKENDS`): `docker`, `k8s`, `proxmox` (`proxmox` is experimental)
 3. **Sandbox profile**: `standard` or `nemoclaw` (`nemoclaw` is experimental)
 
+### Hermes profiles
+
+A single Hermes agent runtime (one container) hosts multiple native Hermes **profiles** — isolated agent identities, each its own `HERMES_HOME` (`config.yaml`, `.env`, `SOUL.md`, channels, cron, gateway). The default profile lives at `/opt/data`; named profiles at `/opt/data/profiles/<name>`. All profile gateways run concurrently in the container: the default profile's gateway is the primary (`exec`'d) process, and each named profile runs a background `hermes gateway run` with `API_SERVER_ENABLED=false`. Nora reads/writes each profile's config via `docker exec` scoped by `HERMES_HOME` (see `resolveHermesProfileHome` in `agent-runtime/lib/hermesRuntimeBootstrap.ts`), storing per-`(agent, profile)` state in `hermes_runtime_state`/`hermes_profiles`. Profile management (`backend-api/hermesProfiles.ts`, routes under `/:id/hermes-ui/profiles`) and the dashboard profile switcher cover **local Docker + remote-hermes**; the switcher scopes the **Channels** panel via `?profile=`. Cron/Chat/Status proxy the runtime API server (which named profiles don't run) and stay default-only; Kubernetes/Proxmox Hermes profile management is not yet supported (rejected with 409). Distinct from the `nemoclaw` **sandbox profile** dimension above — same word, unrelated concept.
+
 ### Shared runtime contracts
 
 `agent-runtime/` is **not deployed alone** — it is mounted read-only at `/agent-runtime` into both backend-api and worker-provisioner. Control-plane and workers import from it rather than embedding backend assumptions. Key files:
