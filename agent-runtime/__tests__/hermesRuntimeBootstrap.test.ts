@@ -31,6 +31,12 @@ describe("hermes profile home", () => {
 
   it("throws on invalid names", () => {
     expect(() => resolveHermesProfileHome("../escape")).toThrow(/Invalid Hermes profile name/);
+    try {
+      resolveHermesProfileHome("../escape");
+      throw new Error("expected resolveHermesProfileHome to throw");
+    } catch (error) {
+      expect(error.statusCode).toBe(400);
+    }
   });
 });
 

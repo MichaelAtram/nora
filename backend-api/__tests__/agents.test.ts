@@ -1019,6 +1019,7 @@ describe("Hermes WebUI routes", () => {
       expect.objectContaining({
         url: "http://10.0.0.40:8642/v1",
         runtime: { host: "10.0.0.40", port: 8642 },
+        deployTarget: "docker",
         health: expect.objectContaining({ ok: true, status: "ok" }),
         dashboard: expect.objectContaining({
           ready: true,
@@ -1076,6 +1077,73 @@ describe("Hermes WebUI routes", () => {
         jobsCount: 0,
       }),
     );
+  });
+
+  it("reports deployTarget: k8s for a k8s-backed Hermes agent so the frontend can hide the profile switcher", async () => {
+    mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
+      runtimeStatus: {
+        gateway_state: "running",
+        active_agents: 1,
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      directory: {
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      platformDetails: {},
+      jobsCount: 0,
+      modelConfig: {
+        defaultModel: "gpt-5.5",
+        provider: "custom",
+        baseUrl: "https://api.openai.com/v1",
+      },
+    });
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-hermes-ui-k8s",
+          user_id: "user-1",
+          status: "running",
+          runtime_family: "hermes",
+          backend_type: "k8s",
+          container_id: "hermes-container",
+          runtime_host: "10.0.0.43",
+          runtime_port: 8642,
+          gateway_token: "hermes-token",
+        },
+      ],
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { status: "ok", platform: "hermes-agent" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: {
+            object: "list",
+            data: [{ id: "desk-bot", object: "model" }],
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: {
+            version: "1.0.0",
+            gateway_running: true,
+            gateway_state: "running",
+            active_sessions: 4,
+          },
+        }),
+      );
+
+    const res = await auth(request(app).get("/agents/a-hermes-ui-k8s/hermes-ui"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.deployTarget).toBe("k8s");
   });
 
   it("surfaces a redeploy message when the running Hermes image does not include the official dashboard", async () => {

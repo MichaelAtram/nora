@@ -1177,6 +1177,12 @@ router.get(
   asyncHandler(async (req, res) => {
     const agent = await loadHermesUiAgent(req);
 
+    // deploy_target values are drawn from KNOWN_DEPLOY_TARGETS in
+    // agent-runtime/lib/backendCatalog.ts ("docker" | "k8s" | "remote-docker" |
+    // "proxmox"), so this maps 1:1 onto the frontend's `=== "k8s"` guard that
+    // hides the ProfileSwitcher for k8s-deployed Hermes agents.
+    const deployTarget = buildAgentRuntimeFields(agent).deploy_target;
+
     const runtimeAddress = resolveRuntimeAddress(agent);
     const dashboardAddress = resolveHermesDashboardAddress(agent);
     if (!runtimeAddress) {
@@ -1365,6 +1371,7 @@ router.get(
     res.json({
       url: runtimeUrlForAgent(agent, "/v1"),
       runtime: runtimeAddress,
+      deployTarget,
       health,
       dashboard,
       models,

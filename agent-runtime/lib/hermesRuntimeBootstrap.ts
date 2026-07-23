@@ -16,7 +16,9 @@ function resolveHermesProfileHome(profileName) {
   const value = String(profileName || "default");
   if (value === "default") return HERMES_DEFAULT_HOME;
   if (!HERMES_PROFILE_NAME_RE.test(value)) {
-    throw new Error(`Invalid Hermes profile name: ${profileName}`);
+    const error = new Error(`Invalid Hermes profile name: ${profileName}`);
+    error.statusCode = 400;
+    throw error;
   }
   return `${HERMES_DEFAULT_HOME}/${HERMES_PROFILES_SUBDIR}/${value}`;
 }

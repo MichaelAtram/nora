@@ -14,6 +14,14 @@ security fixes shipped in integrations.ts / channels/adapters.ts.
   and setup-save coverage with real creds where supplied. Discord runs only
   with `REAL_OPENCLAW_DISCORD_CONFIG_JSON`; webhook URLs belong to the legacy
   adapter and are not accepted by OpenClaw's Discord Bot API schema.
+- `specs/hermes-profiles.spec.ts` — Hermes multi-profile smoke: deploys a
+  local-Docker Hermes agent, creates a named profile via
+  `POST hermes-ui/profiles`, configures a Telegram channel scoped to that
+  profile, confirms the `default` profile does NOT see that channel
+  (isolation), then deletes the profile. Requires `REAL_ENABLE_HERMES_DOCKER=1`,
+  an LLM key (`REAL_LLM_API_KEY` or a provider-specific real key) to deploy the
+  standard-profile Hermes agent, and `REAL_TELEGRAM_BOT_TOKEN` for the scoped
+  channel step.
 - `specs/support/realConfig.ts` — `.env.real` loader and skip gates.
 - `specs/support/agents.ts` — API helpers.
 - `specs/support/app.ts` — session/auth + API request helpers
@@ -70,6 +78,12 @@ BASE_URL=http://localhost:8080 npx playwright test --headed specs/real-deploy-ma
 REAL_ENABLE_HERMES_DOCKER=1 REAL_ENABLE_OPENCLAW_DOCKER=0 \
 BASE_URL=http://localhost:8080 \
 npx playwright test specs/real-deploy-matrix.spec.ts
+
+# Hermes multi-profile smoke — requires REAL_ENABLE_HERMES_DOCKER=1, an LLM
+# key, and REAL_TELEGRAM_BOT_TOKEN (set in .env.real, or overridden inline):
+REAL_ENABLE_HERMES_DOCKER=1 REAL_TELEGRAM_BOT_TOKEN=your-bot-token \
+BASE_URL=http://localhost:8080 \
+npx playwright test specs/hermes-profiles.spec.ts
 ```
 
 Setting `BASE_URL` disables the auto-managed `docker-compose.e2e.yml` stack in
