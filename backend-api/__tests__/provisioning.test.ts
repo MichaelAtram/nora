@@ -1264,7 +1264,7 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(bootstrapConfigMap).toBeDefined();
     const script = bootstrapConfigMap.data["bootstrap.sh"];
     expect(script).not.toContain("/init");
-    expect(script).toContain('nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open');
+    expect(script).toContain('nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open');
     expect(script).toContain('exec "$HERMES_BIN" gateway run');
   });
 
