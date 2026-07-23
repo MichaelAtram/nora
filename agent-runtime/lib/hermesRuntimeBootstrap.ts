@@ -3,6 +3,25 @@
 const HERMES_MODEL_CONFIG_ENV = "NORA_HERMES_MODEL_CONFIG_B64";
 const HERMES_MANAGED_ENV_ENV = "NORA_HERMES_MANAGED_ENV_B64";
 const HERMES_EMPTY_STATE_SENTINEL = "__NORA_EMPTY_STATE_V1__";
+const HERMES_DEFAULT_HOME = "/opt/data";
+const HERMES_PROFILES_SUBDIR = "profiles";
+const HERMES_PROFILE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+function isValidHermesProfileName(name) {
+  const value = String(name || "");
+  return value === "default" || HERMES_PROFILE_NAME_RE.test(value);
+}
+
+function resolveHermesProfileHome(profileName) {
+  const value = String(profileName || "default");
+  if (value === "default") return HERMES_DEFAULT_HOME;
+  if (!HERMES_PROFILE_NAME_RE.test(value)) {
+    const error = new Error(`Invalid Hermes profile name: ${profileName}`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return `${HERMES_DEFAULT_HOME}/${HERMES_PROFILES_SUBDIR}/${value}`;
+}
 
 function normalizeEnvValueMap(envVars = {}) {
   return Object.fromEntries(
@@ -173,11 +192,46 @@ function buildHermesRuntimeConfigBootstrapCommand() {
   ].join("\n");
 }
 
+function buildHermesProfileGatewayStartSnippet(home) {
+  const safeHome = String(home);
+  return [
+    `HERMES_HOME="${safeHome}" API_SERVER_ENABLED=false nohup "$HERMES_BIN" gateway run >> "${safeHome}/gateway.log" 2>&1 &`,
+    `echo $! > "${safeHome}/gateway.pid"`,
+  ].join("\n");
+}
+
+function buildHermesProfileGatewayStopSnippet(home) {
+  const safeHome = String(home);
+  return [
+    `if [ -f "${safeHome}/gateway.pid" ]; then`,
+    `  kill "$(cat "${safeHome}/gateway.pid")" 2>/dev/null || true`,
+    `  rm -f "${safeHome}/gateway.pid"`,
+    `fi`,
+  ].join("\n");
+}
+
+function buildAllProfilesGatewayLaunchSnippet() {
+  return [
+    `for prof_dir in "${HERMES_DEFAULT_HOME}/${HERMES_PROFILES_SUBDIR}/"*; do`,
+    `  [ -d "$prof_dir" ] || continue`,
+    `  HERMES_HOME="$prof_dir" API_SERVER_ENABLED=false nohup "$HERMES_BIN" gateway run >> "$prof_dir/gateway.log" 2>&1 &`,
+    `  echo $! > "$prof_dir/gateway.pid"`,
+    `done`,
+  ].join("\n");
+}
+
 module.exports = {
+  HERMES_DEFAULT_HOME,
+  HERMES_PROFILES_SUBDIR,
   HERMES_EMPTY_STATE_SENTINEL,
   HERMES_MANAGED_ENV_ENV,
   HERMES_MODEL_CONFIG_ENV,
   buildHermesManagedEnvBlock,
   buildHermesRuntimeBootstrapEnv,
   buildHermesRuntimeConfigBootstrapCommand,
+  buildHermesProfileGatewayStartSnippet,
+  buildHermesProfileGatewayStopSnippet,
+  buildAllProfilesGatewayLaunchSnippet,
+  isValidHermesProfileName,
+  resolveHermesProfileHome,
 };

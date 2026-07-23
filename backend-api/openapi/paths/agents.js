@@ -540,6 +540,26 @@ const tail = {
       ["agents:write"],
     ),
   },
+  "/agents/{id}/hermes-ui/profiles": {
+    get: summarize("Hermes", "List Hermes profiles", [agentParam], ["agents:read"]),
+    post: summarize("Hermes", "Create a Hermes profile", [agentParam], ["agents:write"]),
+  },
+  "/agents/{id}/hermes-ui/profiles/{name}": {
+    delete: summarize(
+      "Hermes",
+      "Delete a Hermes profile",
+      [agentParam, { name: "name", in: "path", required: true, schema: { type: "string" } }],
+      ["agents:write"],
+    ),
+  },
+  "/agents/{id}/hermes-ui/profiles/{name}/gateway": {
+    post: summarize(
+      "Hermes",
+      "Start, stop, or restart a Hermes profile's gateway",
+      [agentParam, { name: "name", in: "path", required: true, schema: { type: "string" } }],
+      ["agents:write"],
+    ),
+  },
   "/agents/{id}/hermes-ui/channels": {
     get: summarize("Hermes", "List Hermes channels", [agentParam], ["agents:read"]),
     post: summarize("Hermes", "Create a Hermes channel", [agentParam], ["agents:write"]),

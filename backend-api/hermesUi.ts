@@ -5,7 +5,10 @@ const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
 const { runContainerCommand } = require("./authSync");
 const { waitForAgentReadiness } = require("./healthChecks");
 const { assertRemoteHostAgentUse } = require("./remoteHosts");
-const { buildHermesRuntimeBootstrapEnv } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
+const {
+  buildHermesRuntimeBootstrapEnv,
+  resolveHermesProfileHome,
+} = require("../agent-runtime/lib/hermesRuntimeBootstrap");
 
 const HERMES_CHANNEL_REDACTED = "[REDACTED]";
 
@@ -484,15 +487,17 @@ function normalizeHermesChannelStateList(rawChannels = []) {
  * Password fields are decrypted; a missing row produces an empty state.
  *
  * @param {string} agentId - Agent whose durable Hermes state should be loaded.
+ * @param {Object} [options={}] - Load options.
+ * @param {string} [options.profile="default"] - Hermes profile to scope the load to.
  * @returns {Promise<Object>} Plaintext model and channel configuration.
  */
-async function getPersistedHermesState(agentId) {
+async function getPersistedHermesState(agentId, { profile = "default" } = {}) {
   const result = await db.query(
     `SELECT model_config, channel_configs
        FROM hermes_runtime_state
-      WHERE agent_id = $1
+      WHERE agent_id = $1 AND profile_name = $2
       LIMIT 1`,
-    [agentId],
+    [agentId, profile],
   );
   const row = result.rows[0];
   if (!row) {
@@ -523,9 +528,11 @@ async function getPersistedHermesState(agentId) {
  *
  * @param {string} agentId - Agent whose state should be replaced.
  * @param {Object} [state={}] - Model and channel configuration to persist.
+ * @param {Object} [options={}] - Replace options.
+ * @param {string} [options.profile="default"] - Hermes profile to scope the write to.
  * @returns {Promise<Object>} Normalized plaintext state that was stored.
  */
-async function replacePersistedHermesState(agentId, state = {}) {
+async function replacePersistedHermesState(agentId, state = {}, { profile = "default" } = {}) {
   const normalizedModelConfig = normalizeHermesModelConfig(state.modelConfig || {});
   const normalizedChannels = normalizeHermesChannelStateList(state.channels || []);
 
@@ -547,14 +554,14 @@ async function replacePersistedHermesState(agentId, state = {}) {
   }
 
   await db.query(
-    `INSERT INTO hermes_runtime_state(agent_id, model_config, channel_configs)
-     VALUES($1, $2, $3)
-     ON CONFLICT (agent_id)
+    `INSERT INTO hermes_runtime_state(agent_id, profile_name, model_config, channel_configs)
+     VALUES($1, $2, $3, $4)
+     ON CONFLICT (agent_id, profile_name)
      DO UPDATE SET
        model_config = EXCLUDED.model_config,
        channel_configs = EXCLUDED.channel_configs,
        updated_at = NOW()`,
-    [agentId, JSON.stringify(normalizedModelConfig), JSON.stringify(securedChannels)],
+    [agentId, profile, JSON.stringify(normalizedModelConfig), JSON.stringify(securedChannels)],
   );
 
   return {
@@ -563,25 +570,33 @@ async function replacePersistedHermesState(agentId, state = {}) {
   };
 }
 
-async function persistHermesChannelState(agentId, type, config) {
-  const current = await getPersistedHermesState(agentId);
+async function persistHermesChannelState(agentId, type, config, { profile = "default" } = {}) {
+  const current = await getPersistedHermesState(agentId, { profile });
   const channels = [
     ...current.channels.filter((entry) => entry.type !== type),
     { type, config },
   ].sort((left, right) => left.type.localeCompare(right.type));
 
-  return replacePersistedHermesState(agentId, {
-    modelConfig: current.modelConfig,
-    channels,
-  });
+  return replacePersistedHermesState(
+    agentId,
+    {
+      modelConfig: current.modelConfig,
+      channels,
+    },
+    { profile },
+  );
 }
 
-async function deletePersistedHermesChannelState(agentId, type) {
-  const current = await getPersistedHermesState(agentId);
-  return replacePersistedHermesState(agentId, {
-    modelConfig: current.modelConfig,
-    channels: current.channels.filter((entry) => entry.type !== type),
-  });
+async function deletePersistedHermesChannelState(agentId, type, { profile = "default" } = {}) {
+  const current = await getPersistedHermesState(agentId, { profile });
+  return replacePersistedHermesState(
+    agentId,
+    {
+      modelConfig: current.modelConfig,
+      channels: current.channels.filter((entry) => entry.type !== type),
+    },
+    { profile },
+  );
 }
 
 /**
@@ -616,12 +631,16 @@ function humanizeHermesChannelType(value) {
  * Wrap a Python helper script for execution from Hermes's install root and virtual environment.
  *
  * @param {string} script - Python source to execute inside the runtime.
+ * @param {Object} [options={}] - Execution options.
+ * @param {string} [options.profile="default"] - Hermes profile whose HERMES_HOME the script runs against.
  * @returns {string} Shell command that decodes and executes the script.
  */
-function buildHermesPythonCommand(script) {
+function buildHermesPythonCommand(script, { profile = "default" } = {}) {
   const encoded = Buffer.from(String(script || ""), "utf8").toString("base64");
+  const home = resolveHermesProfileHome(profile);
   return [
     "set -eu",
+    `export HERMES_HOME="${home}"`,
     'HERMES_ROOT="/opt/hermes"',
     'HERMES_PYTHON="$HERMES_ROOT/.venv/bin/python"',
     'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_PYTHON="$HERMES_ROOT/.venv/bin/python3"; fi',
@@ -636,12 +655,12 @@ function buildHermesPythonCommand(script) {
   ].join("\n");
 }
 
-async function runHermesPython(agent, script, { timeout = 30000 } = {}) {
-  return runContainerCommand(agent, buildHermesPythonCommand(script), { timeout });
+async function runHermesPython(agent, script, { timeout = 30000, profile = "default" } = {}) {
+  return runContainerCommand(agent, buildHermesPythonCommand(script, { profile }), { timeout });
 }
 
-async function runHermesPythonJson(agent, script, { timeout = 30000 } = {}) {
-  const result = await runHermesPython(agent, script, { timeout });
+async function runHermesPythonJson(agent, script, { timeout = 30000, profile = "default" } = {}) {
+  const result = await runHermesPython(agent, script, { timeout, profile });
   const raw = String(result?.output || "").trim();
   if (!raw) return {};
   try {
@@ -714,13 +733,20 @@ print(json.dumps({
  *
  * @param {Object} agent - Hermes agent receiving the model configuration.
  * @param {Object} [modelConfig={}] - Provider, model, endpoint, and optional API-key settings.
+ * @param {Object} [options={}] - Persist options.
+ * @param {string} [options.profile="default"] - Hermes profile to scope the model config to.
  * @returns {Promise<Object>} Runtime helper or Kubernetes environment update result.
  */
-async function persistHermesModelConfig(agent, modelConfig = {}) {
+async function persistHermesModelConfig(agent, modelConfig = {}, { profile = "default" } = {}) {
   if (
     typeof containerManager.isKubernetesAgent === "function" &&
     containerManager.isKubernetesAgent(agent)
   ) {
+    if (profile !== "default") {
+      const e = new Error("Hermes profile management is not supported on Kubernetes agents yet");
+      e.statusCode = 409;
+      throw e;
+    }
     await containerManager.updateEnv(agent, buildHermesRuntimeBootstrapEnv({ modelConfig }));
     return { ok: true };
   }
@@ -797,7 +823,7 @@ print(json.dumps({
 }))
 `;
 
-  return runHermesPythonJson(agent, script, { timeout: 30000 });
+  return runHermesPythonJson(agent, script, { timeout: 30000, profile });
 }
 
 /**
@@ -808,16 +834,21 @@ print(json.dumps({
  * @param {Object} agent - Provisioned Hermes agent receiving the persisted state.
  * @param {Object|null} [persistedState=null] - Preloaded state, or `null` to load it from storage.
  * @param {Object} [options={}] - Runtime-application options.
+ * @param {string} [options.profile="default"] - Hermes profile to scope the replay to.
  * @returns {Promise<Object>} Normalized replayed state and whether the runtime was mutated.
  */
-async function applyPersistedHermesState(agent, persistedState = null, { restart = true } = {}) {
-  const state = persistedState || (await getPersistedHermesState(agent.id));
+async function applyPersistedHermesState(
+  agent,
+  persistedState = null,
+  { restart = true, profile = "default" } = {},
+) {
+  const state = persistedState || (await getPersistedHermesState(agent.id, { profile }));
   const modelConfig = normalizeHermesModelConfig(state?.modelConfig || {});
   const channels = normalizeHermesChannelStateList(state?.channels || []);
   let mutated = false;
 
   if (modelConfig.defaultModel || modelConfig.provider || modelConfig.baseUrl) {
-    await persistHermesModelConfig(agent, modelConfig);
+    await persistHermesModelConfig(agent, modelConfig, { profile });
     mutated = true;
   }
 
@@ -825,12 +856,12 @@ async function applyPersistedHermesState(agent, persistedState = null, { restart
     const definition = definitionForChannelType(entry.type);
     if (!definition) continue;
     const normalized = normalizeHermesChannelInput(definition, entry.config || {}, {});
-    await persistHermesChannelConfig(agent, definition, normalized);
+    await persistHermesChannelConfig(agent, definition, normalized, { profile });
     mutated = true;
   }
 
   if (mutated && restart) {
-    await restartHermesRuntime(agent);
+    await restartHermesRuntime(agent, { profile });
   }
 
   return {
@@ -999,9 +1030,11 @@ function definitionForChannelType(type) {
  * The snapshot includes unredacted environment values and is for trusted internal callers.
  *
  * @param {Object} agent - Running Hermes agent to inspect.
+ * @param {Object} [options={}] - Snapshot options.
+ * @param {string} [options.profile="default"] - Hermes profile to inspect.
  * @returns {Promise<Object>} Live runtime snapshot.
  */
-async function readHermesRuntimeSnapshot(agent) {
+async function readHermesRuntimeSnapshot(agent, { profile = "default" } = {}) {
   const definitions = serializeHermesChannelCatalog().map((entry) => ({
     type: entry.type,
     configFields: entry.configFields.map((field) => ({ key: field.key })),
@@ -1062,16 +1095,37 @@ print(json.dumps({
 }))
 `;
 
-  return runHermesPythonJson(agent, script, { timeout: 30000 });
+  return runHermesPythonJson(agent, script, { timeout: 30000, profile });
 }
 
 /**
- * Restart Hermes and require its runtime endpoint to become ready again.
+ * Restart Hermes and require its runtime endpoint to become ready again. For a named
+ * profile, only that profile's background gateway is restarted (pidfile stop + relaunch);
+ * the default profile keeps the full-container restart + readiness probe.
  *
  * @param {Object} agent - Hermes agent to restart and probe.
+ * @param {Object} [options={}] - Restart options.
+ * @param {string} [options.profile="default"] - Hermes profile to restart.
  * @returns {Promise<void>} Resolves when the runtime recovers.
  */
-async function restartHermesRuntime(agent) {
+async function restartHermesRuntime(agent, { profile = "default" } = {}) {
+  if (profile !== "default") {
+    const home = resolveHermesProfileHome(profile);
+    const {
+      buildHermesProfileGatewayStopSnippet,
+      buildHermesProfileGatewayStartSnippet,
+    } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
+    const restartCommand = [
+      "set -eu",
+      `HERMES_BIN="/opt/hermes/.venv/bin/hermes"`,
+      '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes 2>/dev/null || true)"',
+      buildHermesProfileGatewayStopSnippet(home),
+      buildHermesProfileGatewayStartSnippet(home),
+    ].join("\n");
+    await runContainerCommand(agent, restartCommand, { timeout: 30000 });
+    return;
+  }
+
   const lifecycleResult = await containerManager.restart(agent);
   await containerManager.persistLifecycleRuntimeAddress(db, agent, lifecycleResult);
   const readiness = await waitForAgentReadiness(
@@ -1145,8 +1199,25 @@ function isKubernetesHermesAgent(agent) {
   );
 }
 
-async function persistHermesChannelConfig(agent, definition, config) {
+// Named Hermes profiles aren't supported on Kubernetes agents yet. This must
+// run BEFORE any DB mutation (persistHermesChannelState / replacePersistedHermesState)
+// so a rejected save/delete never leaves a phantom hermes_runtime_state row
+// claiming a channel is configured when it was never applied to the runtime.
+function assertHermesProfileSupportedForAgent(agent, profile) {
+  if (profile && profile !== "default" && isKubernetesHermesAgent(agent)) {
+    const e = new Error("Hermes profile management is not supported on Kubernetes agents yet");
+    e.statusCode = 409;
+    throw e;
+  }
+}
+
+async function persistHermesChannelConfig(agent, definition, config, { profile = "default" } = {}) {
   if (isKubernetesHermesAgent(agent)) {
+    if (profile !== "default") {
+      const e = new Error("Hermes profile management is not supported on Kubernetes agents yet");
+      e.statusCode = 409;
+      throw e;
+    }
     await syncHermesManagedEnvToKubernetes(agent);
     return;
   }
@@ -1167,11 +1238,16 @@ for key, value in payload.items():
 print(json.dumps({"ok": True}))
 `;
 
-  await runHermesPythonJson(agent, script, { timeout: 30000 });
+  await runHermesPythonJson(agent, script, { timeout: 30000, profile });
 }
 
-async function removeHermesChannelConfig(agent, definition) {
+async function removeHermesChannelConfig(agent, definition, { profile = "default" } = {}) {
   if (isKubernetesHermesAgent(agent)) {
+    if (profile !== "default") {
+      const e = new Error("Hermes profile management is not supported on Kubernetes agents yet");
+      e.statusCode = 409;
+      throw e;
+    }
     // DB state was deleted by the caller; rebuilding the managed env from the
     // DB drops the removed channel's keys from the managed block.
     await syncHermesManagedEnvToKubernetes(agent);
@@ -1189,7 +1265,7 @@ for key in keys:
 print(json.dumps({"ok": True}))
 `;
 
-  await runHermesPythonJson(agent, script, { timeout: 30000 });
+  await runHermesPythonJson(agent, script, { timeout: 30000, profile });
 }
 
 function buildHermesGatewaySummary(snapshot) {
@@ -1221,10 +1297,12 @@ function buildHermesGatewaySummary(snapshot) {
  * List editable known channels and read-only runtime-discovered channels with secrets redacted.
  *
  * @param {Object} agent - Running Hermes agent to inspect.
+ * @param {Object} [options={}] - Listing options.
+ * @param {string} [options.profile="default"] - Hermes profile to scope the listing to.
  * @returns {Promise<Object>} Channel catalog, runtime status, and gateway summary.
  */
-async function listHermesChannels(agent) {
-  const snapshot = await readHermesRuntimeSnapshot(agent);
+async function listHermesChannels(agent, { profile = "default" } = {}) {
+  const snapshot = await readHermesRuntimeSnapshot(agent, { profile });
   const knownChannels = HERMES_CHANNEL_TYPES.map((type) =>
     serializeKnownHermesChannel(HERMES_CHANNEL_DEFINITIONS[type], snapshot),
   ).filter(
@@ -1270,9 +1348,18 @@ async function listHermesChannels(agent) {
  * @param {string} type - Supported channel type.
  * @param {Object} [inputConfig={}] - Requested channel configuration.
  * @param {Object} [options={}] - Save options, including create-only behavior.
+ * @param {boolean} [options.create=false] - Reject if the channel already exists.
+ * @param {string} [options.profile="default"] - Hermes profile to scope the save to.
  * @returns {Promise<Object>} Refreshed channel listing and saved channel.
  */
-async function saveHermesChannel(agent, type, inputConfig = {}, { create = false } = {}) {
+async function saveHermesChannel(
+  agent,
+  type,
+  inputConfig = {},
+  { create = false, profile = "default" } = {},
+) {
+  assertHermesProfileSupportedForAgent(agent, profile);
+
   const definition = definitionForChannelType(type);
   if (!definition) {
     const error = new Error("Unsupported Hermes channel type");
@@ -1280,7 +1367,7 @@ async function saveHermesChannel(agent, type, inputConfig = {}, { create = false
     throw error;
   }
 
-  const snapshot = await readHermesRuntimeSnapshot(agent);
+  const snapshot = await readHermesRuntimeSnapshot(agent, { profile });
   const platformDetails = snapshot?.platformDetails?.[definition.type] || {};
   const existingEnv = snapshot?.envValues?.[definition.type] || {};
   const alreadyConfigured = isHermesChannelConfigured(definition, existingEnv, platformDetails);
@@ -1293,11 +1380,11 @@ async function saveHermesChannel(agent, type, inputConfig = {}, { create = false
 
   const normalized = normalizeHermesChannelInput(definition, inputConfig, existingEnv);
 
-  await persistHermesChannelState(agent.id, definition.type, normalized);
-  await persistHermesChannelConfig(agent, definition, normalized);
-  await restartHermesRuntime(agent);
+  await persistHermesChannelState(agent.id, definition.type, normalized, { profile });
+  await persistHermesChannelConfig(agent, definition, normalized, { profile });
+  await restartHermesRuntime(agent, { profile });
 
-  const payload = await listHermesChannels(agent);
+  const payload = await listHermesChannels(agent, { profile });
   return {
     payload,
     channel: payload.channels.find((entry) => entry.type === definition.type) || null,
@@ -1310,9 +1397,13 @@ async function saveHermesChannel(agent, type, inputConfig = {}, { create = false
  *
  * @param {Object} agent - Hermes agent whose channel should be removed.
  * @param {string} type - Supported channel type.
+ * @param {Object} [options={}] - Deletion options.
+ * @param {string} [options.profile="default"] - Hermes profile to scope the deletion to.
  * @returns {Promise<Object>} Refreshed channel listing after deletion.
  */
-async function deleteHermesChannel(agent, type) {
+async function deleteHermesChannel(agent, type, { profile = "default" } = {}) {
+  assertHermesProfileSupportedForAgent(agent, profile);
+
   const definition = definitionForChannelType(type);
   if (!definition) {
     const error = new Error("Unsupported Hermes channel type");
@@ -1320,10 +1411,10 @@ async function deleteHermesChannel(agent, type) {
     throw error;
   }
 
-  await deletePersistedHermesChannelState(agent.id, definition.type);
-  await removeHermesChannelConfig(agent, definition);
-  await restartHermesRuntime(agent);
-  return listHermesChannels(agent);
+  await deletePersistedHermesChannelState(agent.id, definition.type, { profile });
+  await removeHermesChannelConfig(agent, definition, { profile });
+  await restartHermesRuntime(agent, { profile });
+  return listHermesChannels(agent, { profile });
 }
 
 /**
@@ -1331,10 +1422,12 @@ async function deleteHermesChannel(agent, type) {
  *
  * @param {Object} agent - Hermes agent whose channel state should be checked.
  * @param {string} type - Channel type to evaluate.
+ * @param {Object} [options={}] - Evaluation options.
+ * @param {string} [options.profile="default"] - Hermes profile to scope the check to.
  * @returns {Promise<Object>} Success or failure derived from runtime status and discovery.
  */
-async function testHermesChannel(agent, type) {
-  const payload = await listHermesChannels(agent);
+async function testHermesChannel(agent, type, { profile = "default" } = {}) {
+  const payload = await listHermesChannels(agent, { profile });
   const channel = payload.channels.find((entry) => entry.type === type);
   if (!channel) {
     const error = new Error("Channel not found");

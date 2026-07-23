@@ -69,7 +69,10 @@ function channelTone(channel) {
   return "bg-slate-100 text-slate-600";
 }
 
-export default function HermesChannelsPanel({ agentId }) {
+const withProfile = (url, profile) =>
+  `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile || "default")}`;
+
+export default function HermesChannelsPanel({ agentId, profile = "default" }) {
   const [payload, setPayload] = useState({
     channels: [],
     availableTypes: [],
@@ -92,7 +95,9 @@ export default function HermesChannelsPanel({ agentId }) {
     setError("");
 
     try {
-      const res = await fetchWithAuth(`/api/agents/${agentId}/hermes-ui/channels`);
+      const res = await fetchWithAuth(
+        withProfile(`/api/agents/${agentId}/hermes-ui/channels`, profile),
+      );
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         throw new Error(data.error || "Failed to load Hermes channels");
@@ -119,7 +124,7 @@ export default function HermesChannelsPanel({ agentId }) {
 
   useEffect(() => {
     loadChannels();
-  }, [agentId]);
+  }, [agentId, profile]);
 
   const channels = payload.channels || [];
   const availableTypes = payload.availableTypes || [];
@@ -173,10 +178,12 @@ export default function HermesChannelsPanel({ agentId }) {
     setSaving(true);
     setError("");
 
-    const endpoint =
+    const endpoint = withProfile(
       editorMode === "create"
         ? `/api/agents/${agentId}/hermes-ui/channels`
-        : `/api/agents/${agentId}/hermes-ui/channels/${selectedType}`;
+        : `/api/agents/${agentId}/hermes-ui/channels/${selectedType}`,
+      profile,
+    );
     const method = editorMode === "create" ? "POST" : "PATCH";
 
     try {
@@ -223,9 +230,10 @@ export default function HermesChannelsPanel({ agentId }) {
     setError("");
 
     try {
-      const res = await fetchWithAuth(`/api/agents/${agentId}/hermes-ui/channels/${channel.type}`, {
-        method: "DELETE",
-      });
+      const res = await fetchWithAuth(
+        withProfile(`/api/agents/${agentId}/hermes-ui/channels/${channel.type}`, profile),
+        { method: "DELETE" },
+      );
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         throw new Error(data.error || "Failed to delete Hermes channel");
@@ -253,7 +261,7 @@ export default function HermesChannelsPanel({ agentId }) {
 
     try {
       const res = await fetchWithAuth(
-        `/api/agents/${agentId}/hermes-ui/channels/${channel.type}/test`,
+        withProfile(`/api/agents/${agentId}/hermes-ui/channels/${channel.type}/test`, profile),
         { method: "POST" },
       );
       const data = await res.json().catch(() => ({}));

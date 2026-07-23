@@ -2355,6 +2355,21 @@ async function migrateDB(database = db, env = process.env) {
     `CREATE TRIGGER trg_agents_remote_host_target
      BEFORE INSERT OR UPDATE OF execution_target_id, status ON agents
      FOR EACH ROW EXECUTE FUNCTION enforce_remote_host_agent_target()`,
+    `ALTER TABLE hermes_runtime_state ADD COLUMN IF NOT EXISTS profile_name TEXT NOT NULL DEFAULT 'default'`,
+    `ALTER TABLE hermes_runtime_state DROP CONSTRAINT IF EXISTS hermes_runtime_state_pkey`,
+    `ALTER TABLE hermes_runtime_state ADD PRIMARY KEY (agent_id, profile_name)`,
+    `CREATE TABLE IF NOT EXISTS hermes_profiles (
+       agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+       name TEXT NOT NULL,
+       display_name TEXT,
+       is_default BOOLEAN NOT NULL DEFAULT FALSE,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       PRIMARY KEY (agent_id, name)
+     )`,
+    `INSERT INTO hermes_profiles (agent_id, name, display_name, is_default)
+       SELECT id, 'default', 'Default', TRUE FROM agents WHERE runtime_family = 'hermes'
+       ON CONFLICT (agent_id, name) DO NOTHING`,
   ];
 
   return runVersionedMigrations(database, migrations, {

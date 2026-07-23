@@ -36,6 +36,8 @@ jest.mock("../remoteHosts", () => ({
 }));
 
 const {
+  buildHermesPythonCommand,
+  deleteHermesChannel,
   getPersistedHermesState,
   persistHermesModelConfig,
   readHermesRuntimeSnapshot,
@@ -277,8 +279,8 @@ describe("Hermes persisted runtime state", () => {
 
     expect(mockDb.query).toHaveBeenCalledTimes(1);
     const replaceParams = mockDb.query.mock.calls[0][1];
-    const storedModelConfig = replaceParams[1];
-    const storedChannelConfigs = replaceParams[2];
+    const storedModelConfig = replaceParams[2];
+    const storedChannelConfigs = replaceParams[3];
     const parsedStoredChannels = JSON.parse(storedChannelConfigs);
 
     expect(parsedStoredChannels.telegram.TELEGRAM_BOT_TOKEN).not.toBe("telegram-secret");
@@ -350,5 +352,86 @@ describe("Hermes persisted runtime state", () => {
         },
       ],
     });
+  });
+});
+
+describe("profile scoping in python command", () => {
+  it("defaults to /opt/data", () => {
+    const cmd = buildHermesPythonCommand("print('x')");
+    expect(cmd).toContain('export HERMES_HOME="/opt/data"');
+  });
+
+  it("scopes to a named profile home", () => {
+    const cmd = buildHermesPythonCommand("print('x')", { profile: "coder" });
+    expect(cmd).toContain('export HERMES_HOME="/opt/data/profiles/coder"');
+  });
+});
+
+describe("per-profile state persistence", () => {
+  beforeEach(() => {
+    mockDb.query.mockReset();
+  });
+
+  it("getPersistedHermesState filters by profile_name", async () => {
+    mockDb.query.mockResolvedValueOnce({ rows: [{ model_config: "{}", channel_configs: "{}" }] });
+    await getPersistedHermesState("agent-1", { profile: "coder" });
+    const [sql, params] = mockDb.query.mock.calls[0];
+    expect(sql).toContain("profile_name = $2");
+    expect(params).toEqual(["agent-1", "coder"]);
+  });
+
+  it("replacePersistedHermesState writes the profile_name", async () => {
+    mockDb.query.mockResolvedValue({ rows: [] });
+    await replacePersistedHermesState("agent-1", { modelConfig: {}, channels: [] }, { profile: "coder" });
+    const call = mockDb.query.mock.calls.find(([sql]) => sql.includes("INSERT INTO hermes_runtime_state"));
+    expect(call[0]).toContain("profile_name");
+    expect(call[1]).toContain("coder");
+  });
+});
+
+describe("k8s named-profile guard fires before any DB write", () => {
+  const k8sAgent = {
+    id: "agent-hermes-k8s",
+    user_id: "user-1",
+    container_id: "nora-hermes-qa-1",
+    backend_type: "k8s",
+    host: "runtime.internal",
+    runtime_host: "runtime.internal",
+    runtime_port: 8642,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDb.query.mockReset().mockResolvedValue({ rows: [] });
+    mockIsKubernetesAgent.mockReset().mockReturnValue(true);
+  });
+
+  it("rejects saveHermesChannel for a k8s agent with a named profile before touching the DB", async () => {
+    await expect(
+      saveHermesChannel(
+        k8sAgent,
+        "telegram",
+        { TELEGRAM_BOT_TOKEN: "tok-123" },
+        { profile: "coder" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(mockDb.query).not.toHaveBeenCalled();
+    const insertCalls = mockDb.query.mock.calls.filter(([sql]) =>
+      String(sql || "").includes("INSERT INTO hermes_runtime_state"),
+    );
+    expect(insertCalls).toHaveLength(0);
+  });
+
+  it("rejects deleteHermesChannel for a k8s agent with a named profile before touching the DB", async () => {
+    await expect(
+      deleteHermesChannel(k8sAgent, "telegram", { profile: "coder" }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(mockDb.query).not.toHaveBeenCalled();
+    const insertCalls = mockDb.query.mock.calls.filter(([sql]) =>
+      String(sql || "").includes("INSERT INTO hermes_runtime_state"),
+    );
+    expect(insertCalls).toHaveLength(0);
   });
 });
