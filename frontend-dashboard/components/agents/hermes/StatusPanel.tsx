@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   Bot,
   CheckCircle2,
+  Eye,
+  EyeOff,
   Key,
   Loader2,
   RefreshCw,
@@ -10,6 +12,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { fetchWithAuth } from "../../../lib/api";
+import { connectFieldDisplay, isSecretRevealed } from "../../../lib/connectField";
 import { useToast } from "../../Toast";
 import { formatModelLabel, getProviderMeta, ProviderLogo } from "../providerLogos";
 
@@ -132,6 +135,75 @@ function resolveDefaultChoiceKey(savedProviders, options) {
   return providerMatch?.key || options[0]?.key || "";
 }
 
+// A single "Connect Hermes Desktop" field: selectable readonly value + Copy.
+// Secret fields (API key, dashboard password) are masked by default behind a
+// reveal toggle; each owns its reveal state (revealing one never reveals another)
+// and Copy always copies the REAL value, even while masked.
+function ConnectField({ label, value, Icon, mono = false, secret = false, onCopy, toast }) {
+  // Track the exact value the field was revealed for (not a bare boolean), so a
+  // rotated credential re-masks automatically — see isSecretRevealed.
+  const [revealedFor, setRevealedFor] = useState(null);
+  const revealed = secret ? isSecretRevealed(revealedFor, value) : true;
+  const displayValue = connectFieldDisplay(value, { secret, revealed });
+
+  const handleCopy = async () => {
+    // onCopy copies the REAL value regardless of masking, and reports success.
+    const copied = await onCopy(value);
+    if (copied) {
+      toast.success(`${label} copied`);
+      return;
+    }
+    if (secret && !revealed) {
+      // Programmatic copy failed and the value is masked — selecting the field
+      // would copy the mask, so reveal it and let the user copy it manually.
+      setRevealedFor(value);
+      toast.error(`Couldn't copy ${label} automatically — revealed it so you can select and copy it.`);
+    } else {
+      toast.error(`Couldn't copy ${label} — select the text to copy it manually.`);
+    }
+  };
+
+  return (
+    <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+      <Icon size={16} className="mt-0.5 shrink-0 text-slate-500" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">{label}</p>
+          <div className="flex shrink-0 items-center gap-3">
+            {secret ? (
+              <button
+                type="button"
+                onClick={() => setRevealedFor(revealed ? null : value)}
+                aria-label={revealed ? `Hide ${label}` : `Reveal ${label}`}
+                className="text-slate-400 hover:text-slate-600"
+              >
+                {revealed ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={handleCopy}
+              className="text-xs font-bold text-blue-600 hover:text-blue-700"
+            >
+              Copy
+            </button>
+          </div>
+        </div>
+        <input
+          type="text"
+          readOnly
+          value={displayValue}
+          onFocus={(e) => e.currentTarget.select()}
+          onClick={(e) => e.currentTarget.select()}
+          className={`mt-1 block w-full select-all break-all rounded-md border border-slate-200 bg-white px-2 py-1 text-sm font-medium text-slate-800 ${
+            mono ? "font-mono" : ""
+          }`}
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error, onRefresh }) {
   const [providers, setProviders] = useState(null);
   const [availableProviders, setAvailableProviders] = useState([]);
@@ -229,53 +301,25 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
       return false;
     }
   };
-  const copyValue = async (label, value) => {
-    if (!value) return;
+  // Copy `value` to the clipboard, returning whether it succeeded. Uses the
+  // async Clipboard API in a secure context and falls back to the legacy
+  // execCommand path on plain-HTTP non-localhost origins. Success/failure
+  // messaging (and the "reveal a masked secret so you can copy it" fallback) is
+  // left to the caller, which knows whether the value is a masked secret.
+  const copyValue = async (value) => {
+    if (!value) return false;
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(value);
-      } else if (!legacyCopy(value)) {
-        throw new Error("clipboard unavailable");
+        return true;
       }
-      toast.success(`${label} copied`);
+      return legacyCopy(value);
     } catch {
-      // Native path failed (unavailable or permission) — try the legacy path.
-      if (legacyCopy(value)) {
-        toast.success(`${label} copied`);
-      } else {
-        toast.error(`Could not copy ${label} — select the text to copy it manually`);
-      }
+      return legacyCopy(value);
     }
   };
-  // Render a connect field as SELECTABLE text (readonly input) plus a Copy button,
-  // so the operator can always copy manually even if programmatic copy is blocked.
-  const renderConnectField = (label, value, Icon, { mono = false } = {}) => (
-    <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-      <Icon size={16} className="mt-0.5 shrink-0 text-slate-500" />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">{label}</p>
-          <button
-            type="button"
-            onClick={() => copyValue(label, value)}
-            className="shrink-0 text-xs font-bold text-blue-600 hover:text-blue-700"
-          >
-            Copy
-          </button>
-        </div>
-        <input
-          type="text"
-          readOnly
-          value={value}
-          onFocus={(e) => e.currentTarget.select()}
-          onClick={(e) => e.currentTarget.select()}
-          className={`mt-1 block w-full select-all break-all rounded-md border border-slate-200 bg-white px-2 py-1 text-sm font-medium text-slate-800 ${
-            mono ? "font-mono" : ""
-          }`}
-        />
-      </div>
-    </div>
-  );
+  // Connect fields render via the module-level <ConnectField> component (below),
+  // which owns its own reveal state for secret values. copyValue is passed in.
   const models = Array.isArray(runtimeInfo?.models) ? runtimeInfo.models : [];
   const gateway: any = runtimeInfo?.gateway || {};
   const platformStates =
@@ -750,13 +794,57 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
               </p>
             </div>
             <div className="space-y-3 p-4">
-              {renderConnectField("Runtime API", connect.runtimeApiUrl, Server)}
-              {connect.dashboardUrl
-                ? renderConnectField("Dashboard", connect.dashboardUrl, Workflow)
-                : null}
-              {connect.apiKey
-                ? renderConnectField("API Key", connect.apiKey, Key, { mono: true })
-                : null}
+              <ConnectField
+                label="Runtime API"
+                value={connect.runtimeApiUrl}
+                Icon={Server}
+                onCopy={copyValue}
+                toast={toast}
+              />
+              {connect.dashboardUrl ? (
+                <ConnectField
+                  label="Dashboard"
+                  value={connect.dashboardUrl}
+                  Icon={Workflow}
+                  onCopy={copyValue}
+                  toast={toast}
+                />
+              ) : null}
+              {connect.dashboardUsername || connect.dashboardPassword ? (
+                <ConnectField
+                  label="Dashboard Username"
+                  value={connect.dashboardUsername || "nora"}
+                  Icon={Bot}
+                  onCopy={copyValue}
+                  toast={toast}
+                />
+              ) : null}
+              {connect.dashboardPassword ? (
+                <ConnectField
+                  label="Desktop Password"
+                  value={connect.dashboardPassword}
+                  Icon={Key}
+                  onCopy={copyValue}
+                  toast={toast}
+                  mono
+                  secret
+                />
+              ) : null}
+              {connect.apiKey ? (
+                <ConnectField
+                  label="API Key"
+                  value={connect.apiKey}
+                  Icon={Key}
+                  onCopy={copyValue}
+                  toast={toast}
+                  mono
+                  secret
+                />
+              ) : null}
+              <p className="text-xs text-slate-500">
+                These credentials rotate when the agent is redeployed — the API key and dashboard
+                password are regenerated on each deploy.
+              </p>
             </div>
           </section>
         ) : null}

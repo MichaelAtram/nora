@@ -687,11 +687,18 @@ async function resolveHermesConnectInfo(agent, req) {
     ? formatHostForUrl(runtimeHostIp)
     : resolvePublishedGatewayHost(req);
   const apiKey = await resolveHermesApiToken(agent);
+  // The dashboard's basic-auth password is derived from the API key (the same
+  // seed the worker injects into the container), so we can surface it without
+  // storing it. Username is always "nora". The derived `secret` is not needed
+  // by the client and is deliberately not returned.
+  const dashboardAuth = apiKey ? deriveHermesDashboardBasicAuth(apiKey) : null;
 
   return {
     runtimeApiUrl: `${proto}://${host}:${runtimeApiHostPort}`,
     dashboardUrl: dashboardHostPort ? `${proto}://${host}:${dashboardHostPort}` : null,
     apiKey: apiKey || null,
+    dashboardUsername: dashboardAuth?.username ?? null,
+    dashboardPassword: dashboardAuth?.password ?? null,
   };
 }
 
