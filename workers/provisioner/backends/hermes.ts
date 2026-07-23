@@ -15,6 +15,7 @@ const {
 } = require("../../../agent-runtime/lib/containerCommand");
 const {
   buildHermesRuntimeConfigBootstrapCommand,
+  buildAllProfilesGatewayLaunchSnippet,
 } = require("../../../agent-runtime/lib/hermesRuntimeBootstrap");
 
 const HERMES_RUNTIME_PORT = 8642;
@@ -55,6 +56,8 @@ function buildHermesStartCommand() {
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
     `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
+    // Launch every named profile's gateway in the background (default gateway is exec'd below).
+    buildAllProfilesGatewayLaunchSnippet(),
     'exec "$HERMES_BIN" gateway run',
   ].join("\n");
 
@@ -346,3 +349,4 @@ class HermesBackend extends DockerBackend {
 }
 
 module.exports = HermesBackend;
+module.exports.__buildHermesStartCommandForTest = buildHermesStartCommand;
