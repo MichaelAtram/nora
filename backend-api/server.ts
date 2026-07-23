@@ -55,6 +55,11 @@ const { assertRemoteHostAgentUse, toPublicRemoteHostAuthorizationError } = requi
 const { repairHermesAgentConfig } = require("./hermesUi");
 const { HERMES_EMBED_AGENT_COLUMNS, GATEWAY_EMBED_AGENT_COLUMNS } = require("./embedAgentColumns");
 const {
+  establishHermesDashboardSession,
+  needsHermesLogin,
+} = require("./hermesDashboardSession");
+const { decrypt: decryptSecret } = require("./crypto");
+const {
   joinHttpUrl,
   hasGatewayEndpoint,
   hasHermesDashboardEndpoint,
@@ -149,7 +154,6 @@ const EMBED_SESSION_TTL_MS = 15 * 60 * 1000;
 const EMBED_SESSION_COOKIE_PREFIX = "__nora_gateway_embed_";
 const HERMES_EMBED_SESSION_COOKIE_PREFIX = "__nora_hermes_embed_";
 const HERMES_DASHBOARD_TOKEN_COOKIE_PREFIX = "__nora_hermes_dashboard_token_";
-const HERMES_DASHBOARD_SESSION_HEADER = "X-Hermes-Session-Token";
 const EMBED_CONTENT_SECURITY_POLICY = [
   "default-src 'self' data: blob: https:",
   "base-uri 'self'",
@@ -226,6 +230,13 @@ function buildForwardedSearch(req) {
   return str ? `?${str}` : "";
 }
 
+/**
+ * Build the browser bootstrap that redirects gateway WebSockets through Nora
+ * and performs gateway-password login without placing the user JWT in URLs.
+ *
+ * @param {Object} context - Agent id, public request origin, and gateway token.
+ * @returns {string} JavaScript injected into the embedded gateway UI.
+ */
 function buildEmbedBootstrapScript({ agentId, requestHost, requestScheme, gatewayToken }) {
   const wsProto = requestScheme === "https" ? "wss" : "ws";
   // Intentionally no `?token=` — the WebSocket upgrade is authenticated via
@@ -385,11 +396,6 @@ function rewriteHermesEmbedHtml(html, agentId) {
     .replace(/(["'])\/favicon\.ico(["'])/g, `$1${embedBase}/favicon.ico$2`);
 }
 
-function extractHermesDashboardSessionToken(html) {
-  const match = String(html || "").match(/window\.__HERMES_SESSION_TOKEN__\s*=\s*(["'])([^"']+)\1/);
-  return match?.[2] || "";
-}
-
 function rewriteHermesEmbedCss(css, agentId) {
   const embedBase = hermesEmbedBasePath(agentId);
   return css.replace(/url\((['"]?)\/fonts\//g, `url($1${embedBase}/fonts/`);
@@ -485,6 +491,16 @@ async function fetchAgentForHermesRepair(agentId) {
   return row;
 }
 
+/**
+ * Authenticate an embedded UI through a verified JWT or agent-scoped HttpOnly
+ * session, verify direct ownership/runtime availability, and mint the scoped
+ * cookie when needed.
+ *
+ * @param {Object} req - Express embed request.
+ * @param {Object} res - Express response used for auth failures and cookies.
+ * @param {Object} [options={}] - Scope, cookie, lookup, and query-token policy.
+ * @returns {Promise<Object|null>} Authorized embed context, or `null` after responding.
+ */
 async function resolveEmbedAccess(
   req,
   res,
@@ -522,10 +538,9 @@ async function resolveEmbedAccess(
       res.status(401).send("invalid token");
       return null;
     }
-    // Only full user bearer JWTs (no `scope`) may be used here to mint a new
-    // embed session. Embed-scoped JWTs must flow through the cookie path,
-    // where scope + agentId are validated; accepting them here would let a
-    // leaked embed-scoped token mint fresh sessions for sibling agents.
+    // Full user JWTs may mint a session for an owned agent. Scoped JWTs are
+    // accepted here only when both their scope and agent id match this embed,
+    // preventing reuse for a sibling agent.
     if (payload.scope && (payload.scope !== scope || payload.agentId !== agentId)) {
       res.status(401).send("invalid token for this embed");
       return null;
@@ -905,6 +920,14 @@ gatewayUIAssetProxy.get("/agents/:agentId/gateway/embed/bootstrap.js", async (re
   }
 });
 
+/**
+ * Proxy an authenticated OpenClaw embed request through Nora's SSRF-checked
+ * gateway target, rewriting HTML to keep assets and WebSockets same-origin.
+ *
+ * @param {Object} req - Express gateway embed request.
+ * @param {Object} res - Express response receiving proxied content.
+ * @returns {Promise<void>} Resolves after proxying or sending an error.
+ */
 async function proxyEmbeddedGateway(req, res) {
   try {
     const access = await resolveEmbedAccess(req, res);
@@ -976,6 +999,14 @@ gatewayUIAssetProxy.use("/agents/:agentId/gateway", (req, res, next) => {
   return next();
 });
 
+/**
+ * Proxy an authenticated Hermes dashboard request through its SSRF-checked
+ * target and rewrite dashboard assets/API paths for the embedded base path.
+ *
+ * @param {Object} req - Express Hermes embed request.
+ * @param {Object} res - Express response receiving proxied content.
+ * @returns {Promise<void>} Resolves after proxying or sending an error.
+ */
 async function proxyEmbeddedHermes(req, res) {
   try {
     const access = await resolveEmbedAccess(req, res, {
@@ -995,19 +1026,18 @@ async function proxyEmbeddedHermes(req, res) {
       access.agentId,
       HERMES_DASHBOARD_TOKEN_COOKIE_PREFIX,
     );
-    const dashboardSessionToken = cookies[dashboardTokenCookieName];
     const headers = {
       Accept: req.headers.accept || "*/*",
       "Accept-Encoding": "identity",
     };
-    if (dashboardSessionToken) {
-      headers[HERMES_DASHBOARD_SESSION_HEADER] = dashboardSessionToken;
-    }
-    // Intentionally do NOT forward the client's Authorization header to the
-    // tenant-owned Hermes container. The embed session cookie already
-    // authenticates this request at the proxy boundary; forwarding the
-    // platform JWT upstream would expose it to a process whose image may be
-    // operator-supplied and should be treated as untrusted.
+    // Relay the stored Hermes dashboard session (established via server-side
+    // login below) as the upstream Cookie. We intentionally do NOT forward the
+    // client's Authorization header to the tenant-owned Hermes container: the
+    // embed session cookie already authenticates this request at the proxy
+    // boundary, and forwarding the platform JWT would expose it to a process
+    // whose image may be operator-supplied and should be treated as untrusted.
+    let dashboardSession = cookies[dashboardTokenCookieName];
+    if (dashboardSession) headers.Cookie = dashboardSession;
 
     const method = req.method.toUpperCase();
     let body;
@@ -1027,10 +1057,49 @@ async function proxyEmbeddedHermes(req, res) {
         method,
         headers,
         body,
+        redirect: "manual",
         signal: AbortSignal.timeout(15000),
       });
 
     let resp = await fetchUpstream();
+
+    // If the dashboard says we're unauthenticated, log in once with the
+    // per-agent derived basic-auth credential, persist the Hermes session in
+    // the Nora-managed HttpOnly cookie, and retry with the new session.
+    if (needsHermesLogin(resp)) {
+      const seed = decryptSecret(access.agent.gateway_token);
+      if (seed) {
+        const session = await establishHermesDashboardSession(safeTarget, seed);
+        if (session) {
+          headers.Cookie = session;
+          res.cookie(dashboardTokenCookieName, session, {
+            httpOnly: true,
+            sameSite: "lax",
+            secure: cookieSecureFlag(req),
+            maxAge: EMBED_SESSION_TTL_MS,
+            path: "/",
+          });
+          resp = await fetchUpstream();
+        }
+      }
+    }
+
+    // Relay any remaining redirect (login failed, or a non-login 3xx) instead of
+    // dropping it: fetch is in manual-redirect mode, so setProxyResponseHeaders /
+    // setEmbedHtmlHeaders would otherwise send a bare 3xx with no Location and
+    // strand the iframe. Rewrite same-origin targets onto the embed base path so
+    // the iframe stays within the proxied dashboard.
+    if (resp.status >= 300 && resp.status < 400) {
+      const location = resp.headers.get("location");
+      if (location) {
+        const rewritten = location.startsWith("/")
+          ? `${hermesEmbedBasePath(access.agentId)}${location}`
+          : location;
+        res.setHeader("Location", rewritten);
+      }
+      res.status(resp.status).end();
+      return;
+    }
 
     const isApiRequest = hermesPath.startsWith("api/");
     // Self-heal: Hermes's response serializer (UTF-8) crashes on lone UTF-16
@@ -1061,16 +1130,6 @@ async function proxyEmbeddedHermes(req, res) {
 
     if (/text\/html/i.test(contentType)) {
       const rawHtml = await resp.text();
-      const hermesSessionToken = extractHermesDashboardSessionToken(rawHtml);
-      if (hermesSessionToken) {
-        res.cookie(dashboardTokenCookieName, hermesSessionToken, {
-          httpOnly: true,
-          sameSite: "lax",
-          secure: cookieSecureFlag(req),
-          maxAge: EMBED_SESSION_TTL_MS,
-          path: "/",
-        });
-      }
       const html = rewriteHermesEmbedHtml(rawHtml, access.agentId);
       setEmbedHtmlHeaders(res);
       res.send(html);
@@ -1114,6 +1173,14 @@ gatewayUIAssetProxy.use("/agents/:agentId/hermes-ui", (req, res, next) => {
   return next();
 });
 
+/**
+ * Proxy only allowlisted gateway UI asset paths for an authorized embed,
+ * rejecting HTML/internal API paths and retaining SSRF-safe resolution.
+ *
+ * @param {Object} req - Express asset request.
+ * @param {Object} res - Express response receiving the asset.
+ * @returns {Promise<void>} Resolves after proxying or sending an error.
+ */
 async function proxyGatewayAsset(req, res) {
   try {
     const access = await resolveEmbedAccess(req, res);
@@ -1324,6 +1391,14 @@ const LEGACY_COMPATIBILITY_REPAIRS = [
   },
 ];
 
+/**
+ * Apply compatibility repairs and append-only schema migrations under one
+ * transactional advisory lock; any failure rolls back and blocks startup.
+ *
+ * @param {Object} [database=db] - PostgreSQL pool or client used for migration work.
+ * @param {Object} [env=process.env] - Migration timeout configuration.
+ * @returns {Promise<Object>} Total and newly applied migration counts after commit.
+ */
 async function migrateDB(database = db, env = process.env) {
   const migrations = [
     `DO $$ BEGIN
@@ -2302,6 +2377,12 @@ function stableStringify(value) {
   return JSON.stringify(value);
 }
 
+/**
+ * Reconcile on-disk starter templates into built-in snapshots and Agent Hub
+ * listings without replacing unchanged snapshot content.
+ *
+ * @returns {Promise<void>} Resolves after starter listings are synchronized.
+ */
 async function seedStarterAgentHub() {
   for (const template of STARTER_TEMPLATES) {
     const existingListing = await agentHubStore.getPlatformListingByTemplateKey(
@@ -2357,6 +2438,14 @@ async function seedStarterAgentHub() {
   console.log(`Agent Hub seeded with ${STARTER_TEMPLATES.length} built-in starter templates`);
 }
 
+/**
+ * Seed the first admin account on boot when the user table is empty. Hosted
+ * PaaS refuses to start without explicit, valid `DEFAULT_ADMIN_EMAIL` and
+ * `DEFAULT_ADMIN_PASSWORD`; selfhosted installs may instead leave the account
+ * to be claimed through first-run signup.
+ *
+ * @returns {Promise<void>}
+ */
 async function seedBootstrapAdminAccount() {
   const { rows } = await db.query("SELECT id FROM users LIMIT 1");
   if (rows.length > 0) return;

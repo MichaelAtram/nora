@@ -20,12 +20,13 @@
     "postcss": "8.5.12",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.3",
     "tailwind-merge": "^3.5.0",
     "tailwindcss": "^4.2.2"
   },
   "overrides": {
-    "postcss": "8.5.12"
+    "postcss": "8.5.12",
+    "sharp": "$sharp"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

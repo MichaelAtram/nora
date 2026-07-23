@@ -1907,7 +1907,7 @@ function buildProvisionerCommandExitError(exitCode, output = "", timeout = null)
  *
  * This is the lowest-level provisioner exec helper used by ClawHub flows and
  * other runtime repair paths. Callers must shell-escape any interpolated
- * user-controlled values because `command` is executed via `/bin/sh -lc ...`,
+ * user-controlled values because `command` is executed via `/bin/sh -c ...`,
  * not as a direct argv array.
  *
  * @param {object} provisioner Backend-specific provisioner client with `exec`.
@@ -1918,6 +1918,8 @@ function buildProvisionerCommandExitError(exitCode, output = "", timeout = null)
  * @param {number} [options.maxOutputBytes=65536] Max output bytes to retain.
  * @param {boolean} [options.tty=false] Whether to allocate a TTY for exec.
  * @param {string[]} [options.env=[]] Extra env vars for the exec call.
+ * @param {string|null} [options.agentId=null] Agent id used for authorization
+ * and cleanup tracking.
  * @returns {Promise<{exitCode: number, output: string}>} Sanitized output and
  * the final container exit code. Rejects on timeout, exec transport failures,
  * or non-zero exit status.
@@ -2130,7 +2132,10 @@ function wrapCommandWithContainerTimeout(command, timeoutMs) {
  * @param {number|string} params.gatewayHostPort Gateway port exposed on the host.
  * @param {string} params.gatewayHost Gateway host used for readiness checks.
  * @param {number|string} params.gatewayPort Gateway port used for readiness checks.
+ * @param {string} params.gatewayToken Gateway auth token used to authorize runtime commands.
  * @param {string} params.bootstrappedProviderFingerprint Canonical effective provider state injected before runtime creation.
+ * @param {string[]} [params.preservedEnvNames=[]] Managed env var names to exclude from
+ * this write so they are not overwritten or reported as caller-managed.
  * @returns {Promise<{status: "skipped" | "synced", reason?: string}>} `skipped` when there is
  * nothing to apply, otherwise `synced` after config write, restart, and
  * readiness verification succeed.
@@ -2515,10 +2520,9 @@ function throwIfRemoteAuthorizationFailure(error) {
 }
 
 /**
- * Wrap a credential-bearing Remote Docker adapter so every worker operation
- * revalidates the current owner/workspace grant. `destroy` remains deliberately
- * unguarded: failure cleanup must be able to remove a runtime created just
- * before the grant was revoked.
+ * Wrap a credential-bearing Remote Docker adapter so normal worker operations
+ * revalidate the current owner/workspace grant. Runtime destruction and tracked
+ * command cleanup deliberately bypass the grant so revoked work can be removed.
  */
 function guardRemoteProvisioner(provisioner, runtimeFields = {}, ownerUserId = null) {
   if (!provisioner || !isRemoteDockerRuntime(runtimeFields)) return provisioner;
@@ -2553,6 +2557,14 @@ async function assertProvisionerAuthorized(provisioner) {
   }
 }
 
+/**
+ * Resolve the provisioner backend for a runtime path, refreshing profile-backed
+ * adapters and enforcing current owner/workspace grants for Remote Docker.
+ *
+ * @param {Object} [runtimeFields={}] - Runtime-selection fields identifying the backend.
+ * @param {Object} [options={}] - Optional owner context used for remote-host authorization.
+ * @returns {Promise<Object>} Authorized backend adapter used for lifecycle work.
+ */
 async function loadBackend(runtimeFields = {}, { ownerUserId = null } = {}) {
   const key = backendInstanceKey(runtimeFields);
   // Profile-backed targets can change at runtime. Rebuild from the latest
@@ -2801,6 +2813,13 @@ function loadQueuedPreviousRuntimeTuple(agentId, jobData, agentRow) {
   return queued;
 }
 
+/**
+ * Validate a queued replacement against durable runtime identity, destroy that
+ * exact prior runtime, then compare-and-swap the desired placement into storage.
+ *
+ * @param {Object} [params={}] - Queued job, durable row, and resolved replacement fields.
+ * @returns {Promise<Object>} Replacement status and the updated mutable agent row.
+ */
 async function prepareReplacementRuntime({
   queryable = db,
   agentId,
@@ -2853,7 +2872,7 @@ async function prepareReplacementRuntime({
     console.log(
       `[provisioner] Destroying previous ${previousRuntimeFields.deploy_target} runtime ${previousAgent.container_id || previousAgent.container_name || previousAgent.name} before redeploying agent ${agentId}`,
     );
-    await containerManager.destroy(previousAgent);
+    await containerManager.destroy(previousAgent, { preserveState: true });
     previousRuntimeDestroyed = true;
   }
 
@@ -3040,12 +3059,12 @@ function normalizeInstalledSkillsLockfile(parsed = {}) {
  * list of installed skills.
  *
  * The helper uses a TTY plus base64 transport because raw Docker exec streams
- * can prepend framing bytes that corrupt JSON reads. It retries a few times so
- * short lockfile propagation delays after install/delete do not look like hard
- * failures.
+ * can prepend framing bytes that corrupt JSON reads. JSON decode or parse
+ * failures are retried; a valid missing-file result is returned immediately.
  *
  * @param {object} provisioner Backend-specific provisioner client with `exec`.
  * @param {string} containerId Runtime container identifier.
+ * @param {string} agentId Agent identifier used to authorize and track exec commands.
  * @returns {Promise<Array<{slug: string, version: string}>>} The installed
  * ClawHub skills currently represented in the runtime lockfile.
  */
@@ -3083,6 +3102,15 @@ async function readInstalledClawhubSkills(provisioner, containerId, agentId) {
   throw new Error(`Failed to parse ClawHub lockfile: ${lastError?.message || "unknown error"}`);
 }
 
+/**
+ * Ensure the `clawhub` CLI is available inside a running OpenClaw container
+ * before Nora attempts install/delete operations.
+ *
+ * @param {Object} provisioner - Backend-specific provisioner client with `exec`.
+ * @param {string} containerId - Runtime container identifier.
+ * @param {string} agentId - Agent identifier used to authorize and track the exec command.
+ * @returns {Promise<void>} Resolves when the CLI is already present or installs successfully.
+ */
 async function ensureClawhubCli(provisioner, containerId, agentId) {
   try {
     await runProvisionerExecCommand(
@@ -3320,6 +3348,12 @@ async function reconcileClawhubSkills({
   }
 }
 
+/**
+ * Load and validate the agent targeted by a queued ClawHub job.
+ *
+ * @param {string} agentId - Agent whose runtime will be mutated.
+ * @returns {Promise<Object>} Running OpenClaw agent with a usable container id.
+ */
 async function loadClawhubJobAgent(agentId) {
   const result = await db.query(
     `SELECT id, user_id, name, status, container_id, backend_type, runtime_family, deploy_target,

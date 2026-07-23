@@ -9,19 +9,18 @@ const {
 } = require("./telemetry");
 const { getHermesDockerAgentImage } = require("../../../agent-runtime/lib/agentImages");
 const { HERMES_DASHBOARD_PORT } = require("../../../agent-runtime/lib/contracts");
-const {
-  buildContainerBootstrap,
-  shellSingleQuote,
-} = require("../../../agent-runtime/lib/containerCommand");
+const { buildContainerBootstrap } = require("../../../agent-runtime/lib/containerCommand");
 const {
   buildHermesRuntimeConfigBootstrapCommand,
 } = require("../../../agent-runtime/lib/hermesRuntimeBootstrap");
+const {
+  deriveHermesDashboardBasicAuth,
+} = require("../../../agent-runtime/lib/hermesDashboardAuth");
 
 const HERMES_RUNTIME_PORT = 8642;
 const HERMES_HOME = "/opt/data";
 const HERMES_WORKSPACE = `${HERMES_HOME}/workspace`;
 const HERMES_DASHBOARD_LOG = `${HERMES_HOME}/hermes-dashboard.log`;
-const HERMES_ENTRYPOINT = "/init";
 const HERMES_BIN = "/opt/hermes/.venv/bin/hermes";
 const DEFAULT_AGENT_PIDS_LIMIT = 512;
 // The official Hermes image starts s6 as root, repairs mounted-state
@@ -48,21 +47,20 @@ function isMutableImageReference(imgName) {
 }
 
 function buildHermesStartCommand() {
-  const hermesRuntimeCommand = [
+  // This runs as the container CMD, supervised directly by the image's PID-1
+  // /init (s6-overlay). Do NOT re-exec /init here: a second s6 init launched as
+  // a non-PID-1 child fatals with "s6-overlay-suexec: can only run as pid 1"
+  // and exits the container within seconds, before the gateway can bind
+  // port 8642 for the readiness probe (#297). Returning the runtime command
+  // directly lets the image's PID-1 /init supervise it naturally.
+  return [
     "set -eu",
     "if [ -r /opt/nora-managed-env/apply.sh ]; then . /opt/nora-managed-env/apply.sh; fi",
     buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
-    `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
+    `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
     'exec "$HERMES_BIN" gateway run',
-  ].join("\n");
-
-  return [
-    "set -eu",
-    // Bootstrap the mounted Hermes home once, then fork dashboard and gateway
-    // from that initialized session so first-run file seeding cannot race.
-    `exec ${HERMES_ENTRYPOINT} bash -lc ${shellSingleQuote(hermesRuntimeCommand)}`,
   ].join("\n");
 }
 
@@ -220,13 +218,39 @@ class HermesBackend extends DockerBackend {
       // No existing container.
     }
 
+    // Persist the Hermes home (/opt/data: workspace, sessions, config, and the
+    // conversation-history store) on a named volume so it survives a
+    // recreate/redeploy/image-update. The volume is created idempotently and
+    // reused across recreates; it's removed only on a true delete (see destroy()).
+    const homeVolumeName = `nora_hermes_home_${id}`;
+    try {
+      await this.docker.createVolume({ Name: homeVolumeName });
+    } catch (error) {
+      // Volume already exists — reuse it (idempotent), preserving prior data.
+    }
+
     const apiServerKey = crypto.randomBytes(32).toString("hex");
+    const dashboardAuth = deriveHermesDashboardBasicAuth(apiServerKey);
     const envArray = Object.entries({
       HERMES_HOME,
       HOME: `${HERMES_HOME}/home`,
       API_SERVER_ENABLED: "true",
       API_SERVER_HOST: "0.0.0.0",
       API_SERVER_PORT: String(HERMES_RUNTIME_PORT),
+      // Bake the gateway API key into the container environment so the
+      // s6-supervised gateway service — which reads /run/s6/container_environment,
+      // not the sourced managed-env file — inherits it on every boot, including
+      // auth-reconcile restarts. Without this the gateway refuses to start with
+      // "Refusing to start: API_SERVER_KEY is required" (#297).
+      API_SERVER_KEY: apiServerKey,
+      // Hermes fail-closed dashboard auth (basic-auth provider). Baked into the
+      // container env so the s6-supervised dashboard reads it from
+      // /run/s6/container_environment on every boot. The backend-api embed proxy
+      // re-derives the identical credential from API_SERVER_KEY to log in on the
+      // operator's behalf.
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: dashboardAuth.username,
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: dashboardAuth.password,
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: dashboardAuth.secret,
       GATEWAY_HEALTH_URL: `http://127.0.0.1:${HERMES_RUNTIME_PORT}`,
       MESSAGING_CWD: HERMES_WORKSPACE,
       TERMINAL_CWD: HERMES_WORKSPACE,
@@ -260,6 +284,7 @@ class HermesBackend extends DockerBackend {
           SecurityOpt: ["no-new-privileges:true"],
           PidsLimit: DEFAULT_AGENT_PIDS_LIMIT,
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
+          Binds: [`${homeVolumeName}:${HERMES_HOME}`],
           // Local Hermes publishes the runtime + dashboard ports to
           // DOCKER_AGENT_BIND_IP (see _hermesPortBindings above) in addition to
           // being reachable via the container IP on the shared compose network.
@@ -356,6 +381,25 @@ class HermesBackend extends DockerBackend {
         capabilities: DOCKER_CAPABILITIES,
       });
     }
+  }
+
+  async destroy(containerId, opts = {}) {
+    // Let the base backend remove the container (its OpenClaw-named volume
+    // cleanup is a harmless no-op for Hermes).
+    const result = await super.destroy(containerId, opts);
+    const { agentId, preserveState } = opts;
+    // Keep the home volume on a redeploy (preserveState) so data survives the
+    // destroy→create replacement; remove it only on a true delete.
+    if (agentId && !preserveState) {
+      const homeVolumeName = `nora_hermes_home_${agentId}`;
+      try {
+        await this.docker.getVolume(homeVolumeName).remove({ force: true });
+        console.log(`[hermes] Volume ${homeVolumeName} removed`);
+      } catch (error) {
+        console.warn(`[hermes] Could not remove volume ${homeVolumeName}: ${error.message}`);
+      }
+    }
+    return result;
   }
 }
 
