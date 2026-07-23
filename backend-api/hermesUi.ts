@@ -5,7 +5,10 @@ const { decrypt, encrypt, ensureEncryptionConfigured } = require("./crypto");
 const { runContainerCommand } = require("./authSync");
 const { waitForAgentReadiness } = require("./healthChecks");
 const { assertRemoteHostAgentUse } = require("./remoteHosts");
-const { buildHermesRuntimeBootstrapEnv } = require("../agent-runtime/lib/hermesRuntimeBootstrap");
+const {
+  buildHermesRuntimeBootstrapEnv,
+  resolveHermesProfileHome,
+} = require("../agent-runtime/lib/hermesRuntimeBootstrap");
 
 const HERMES_CHANNEL_REDACTED = "[REDACTED]";
 
@@ -588,10 +591,12 @@ function humanizeHermesChannelType(value) {
     .join(" ");
 }
 
-function buildHermesPythonCommand(script) {
+function buildHermesPythonCommand(script, { profile = "default" } = {}) {
   const encoded = Buffer.from(String(script || ""), "utf8").toString("base64");
+  const home = resolveHermesProfileHome(profile);
   return [
     "set -eu",
+    `export HERMES_HOME="${home}"`,
     'HERMES_ROOT="/opt/hermes"',
     'HERMES_PYTHON="$HERMES_ROOT/.venv/bin/python"',
     'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_PYTHON="$HERMES_ROOT/.venv/bin/python3"; fi',
@@ -606,12 +611,12 @@ function buildHermesPythonCommand(script) {
   ].join("\n");
 }
 
-async function runHermesPython(agent, script, { timeout = 30000 } = {}) {
-  return runContainerCommand(agent, buildHermesPythonCommand(script), { timeout });
+async function runHermesPython(agent, script, { timeout = 30000, profile = "default" } = {}) {
+  return runContainerCommand(agent, buildHermesPythonCommand(script, { profile }), { timeout });
 }
 
-async function runHermesPythonJson(agent, script, { timeout = 30000 } = {}) {
-  const result = await runHermesPython(agent, script, { timeout });
+async function runHermesPythonJson(agent, script, { timeout = 30000, profile = "default" } = {}) {
+  const result = await runHermesPython(agent, script, { timeout, profile });
   const raw = String(result?.output || "").trim();
   if (!raw) return {};
   try {

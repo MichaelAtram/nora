@@ -36,6 +36,7 @@ jest.mock("../remoteHosts", () => ({
 }));
 
 const {
+  buildHermesPythonCommand,
   getPersistedHermesState,
   persistHermesModelConfig,
   readHermesRuntimeSnapshot,
@@ -350,5 +351,17 @@ describe("Hermes persisted runtime state", () => {
         },
       ],
     });
+  });
+});
+
+describe("profile scoping in python command", () => {
+  it("defaults to /opt/data", () => {
+    const cmd = buildHermesPythonCommand("print('x')");
+    expect(cmd).toContain('export HERMES_HOME="/opt/data"');
+  });
+
+  it("scopes to a named profile home", () => {
+    const cmd = buildHermesPythonCommand("print('x')", { profile: "coder" });
+    expect(cmd).toContain('export HERMES_HOME="/opt/data/profiles/coder"');
   });
 });
