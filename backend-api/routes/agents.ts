@@ -79,6 +79,13 @@ const {
   testHermesChannel,
 } = require("../hermesUi");
 const {
+  listHermesProfiles,
+  createHermesProfile,
+  deleteHermesProfile,
+  setProfileGatewayState,
+  assertProfileExists,
+} = require("../hermesProfiles");
+const {
   isProviderAuthStatusHoldReason,
   runContainerCommand,
   resumeAgentWithProviderAuth,
@@ -1013,6 +1020,13 @@ function resolveHermesChannelConfig(body = {}) {
   return rest;
 }
 
+async function resolveHermesProfileParam(agent, req) {
+  const raw = typeof req.query?.profile === "string" ? req.query.profile.trim() : "";
+  const profile = raw || "default";
+  await assertProfileExists(agent, profile);
+  return profile;
+}
+
 async function resolveHermesApiToken(agent) {
   // gateway_token is encrypted at rest; decrypt() is transparent to legacy
   // plaintext. A rotated/corrupted key would throw — fall through to the
@@ -1613,12 +1627,65 @@ router.delete(
 );
 
 router.get(
+  "/:id/hermes-ui/profiles",
+  asyncHandler(async (req, res) => {
+    const agent = await loadHermesUiAgent(req);
+    try {
+      res.json(await listHermesProfiles(agent));
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message || "Failed to list Hermes profiles" });
+    }
+  }),
+);
+
+router.post(
+  "/:id/hermes-ui/profiles",
+  asyncHandler(async (req, res) => {
+    const agent = await loadHermesUiAgent(req, { requiredRole: "editor" });
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    const cloneFrom = typeof req.body?.cloneFrom === "string" && req.body.cloneFrom.trim()
+      ? req.body.cloneFrom.trim() : undefined;
+    try {
+      res.json(await createHermesProfile(agent, name, { cloneFrom }));
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message || "Failed to create Hermes profile" });
+    }
+  }),
+);
+
+router.delete(
+  "/:id/hermes-ui/profiles/:name",
+  asyncHandler(async (req, res) => {
+    const agent = await loadHermesUiAgent(req, { requiredRole: "editor" });
+    try {
+      res.json(await deleteHermesProfile(agent, req.params.name));
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message || "Failed to delete Hermes profile" });
+    }
+  }),
+);
+
+router.post(
+  "/:id/hermes-ui/profiles/:name/gateway",
+  asyncHandler(async (req, res) => {
+    const agent = await loadHermesUiAgent(req, { requiredRole: "editor" });
+    const action = typeof req.body?.action === "string" ? req.body.action.trim() : "";
+    try {
+      res.json(await setProfileGatewayState(agent, req.params.name, action));
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message || "Failed to change gateway state" });
+    }
+  }),
+);
+
+router.get(
   "/:id/hermes-ui/channels",
   asyncHandler(async (req, res) => {
     const agent = await loadHermesUiAgent(req);
+    const profile = await resolveHermesProfileParam(agent, req);
 
     try {
-      res.json(await listHermesChannels(agent));
+      res.json(await listHermesChannels(agent, { profile }));
     } catch (error) {
       res.status(error.statusCode || 500).json({
         error: error.message || "Failed to load Hermes channels",
@@ -1631,6 +1698,7 @@ router.post(
   "/:id/hermes-ui/channels",
   asyncHandler(async (req, res) => {
     const agent = await loadHermesUiAgent(req, { requiredRole: "editor" });
+    const profile = await resolveHermesProfileParam(agent, req);
     const type = typeof req.body?.type === "string" ? req.body.type.trim().toLowerCase() : "";
 
     if (!type) {
@@ -1641,6 +1709,7 @@ router.post(
       res.json(
         await saveHermesChannel(agent, type, resolveHermesChannelConfig(req.body), {
           create: true,
+          profile,
         }),
       );
     } catch (error) {
@@ -1655,10 +1724,13 @@ router.patch(
   "/:id/hermes-ui/channels/:channelId",
   asyncHandler(async (req, res) => {
     const agent = await loadHermesUiAgent(req, { requiredRole: "editor" });
+    const profile = await resolveHermesProfileParam(agent, req);
 
     try {
       res.json(
-        await saveHermesChannel(agent, req.params.channelId, resolveHermesChannelConfig(req.body)),
+        await saveHermesChannel(agent, req.params.channelId, resolveHermesChannelConfig(req.body), {
+          profile,
+        }),
       );
     } catch (error) {
       res.status(error.statusCode || 500).json({
@@ -1672,9 +1744,10 @@ router.delete(
   "/:id/hermes-ui/channels/:channelId",
   asyncHandler(async (req, res) => {
     const agent = await loadHermesUiAgent(req, { requiredRole: "editor" });
+    const profile = await resolveHermesProfileParam(agent, req);
 
     try {
-      res.json(await deleteHermesChannel(agent, req.params.channelId));
+      res.json(await deleteHermesChannel(agent, req.params.channelId, { profile }));
     } catch (error) {
       res.status(error.statusCode || 500).json({
         error: error.message || "Failed to delete Hermes channel",
@@ -1687,9 +1760,10 @@ router.post(
   "/:id/hermes-ui/channels/:channelId/test",
   asyncHandler(async (req, res) => {
     const agent = await loadHermesUiAgent(req, { requiredRole: "editor" });
+    const profile = await resolveHermesProfileParam(agent, req);
 
     try {
-      res.json(await testHermesChannel(agent, req.params.channelId));
+      res.json(await testHermesChannel(agent, req.params.channelId, { profile }));
     } catch (error) {
       res.status(error.statusCode || 500).json({
         error: error.message || "Failed to test Hermes channel",

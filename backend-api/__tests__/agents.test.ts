@@ -1559,6 +1559,7 @@ describe("Hermes WebUI routes", () => {
     expect(res.body.channels).toEqual([{ type: "telegram", name: "Telegram" }]);
     expect(mockListHermesChannels).toHaveBeenCalledWith(
       expect.objectContaining({ id: "a-hermes-channel-list" }),
+      { profile: "default" },
     );
   });
 
@@ -1604,13 +1605,14 @@ describe("Hermes WebUI routes", () => {
       expect.objectContaining({ id: "a-hermes-channel-save" }),
       "telegram",
       { TELEGRAM_BOT_TOKEN: "secret-token" },
-      { create: true },
+      { create: true, profile: "default" },
     );
     expect(mockSaveHermesChannel).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({ id: "a-hermes-channel-save" }),
       "telegram",
       { TELEGRAM_BOT_TOKEN: "[REDACTED]" },
+      { profile: "default" },
     );
   });
 
@@ -1647,10 +1649,12 @@ describe("Hermes WebUI routes", () => {
     expect(mockDeleteHermesChannel).toHaveBeenCalledWith(
       expect.objectContaining({ id: "a-hermes-channel-actions" }),
       "telegram",
+      { profile: "default" },
     );
     expect(mockTestHermesChannel).toHaveBeenCalledWith(
       expect.objectContaining({ id: "a-hermes-channel-actions" }),
       "telegram",
+      { profile: "default" },
     );
   });
 });
