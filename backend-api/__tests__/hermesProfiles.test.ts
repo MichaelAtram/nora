@@ -11,6 +11,7 @@ const {
   listHermesProfiles,
   createHermesProfile,
   deleteHermesProfile,
+  setProfileGatewayState,
 } = require("../hermesProfiles");
 
 const agent = { id: "agent-1", container_id: "c1" };
@@ -64,5 +65,79 @@ describe("listHermesProfiles", () => {
     expect(names).toContain("default");
     expect(names).toContain("coder");
     expect(profiles.find((p) => p.name === "default").isDefault).toBe(true);
+  });
+
+  it("still lists a registry-only profile that is not present on disk", async () => {
+    mockRunContainerCommand.mockResolvedValue({ output: JSON.stringify({ profiles: [] }) });
+    mockDb.query.mockResolvedValue({
+      rows: [{ name: "ghost", display_name: "Ghost", is_default: false }],
+    });
+    const { profiles } = await listHermesProfiles(agent);
+    expect(profiles.map((p) => p.name)).toContain("ghost");
+  });
+
+  it("auto-registers an on-disk profile that is not yet in the registry", async () => {
+    mockRunContainerCommand.mockResolvedValue({
+      output: JSON.stringify({ profiles: [{ name: "shadow", running: true }] }),
+    });
+    mockDb.query.mockResolvedValue({ rows: [] });
+    await listHermesProfiles(agent);
+    const insertCall = mockDb.query.mock.calls.find(
+      ([sql, params]) => sql.includes("INSERT INTO hermes_profiles") && params.includes("shadow"),
+    );
+    expect(insertCall).toBeTruthy();
+  });
+
+  it("does not auto-register an on-disk directory named 'default'", async () => {
+    mockRunContainerCommand.mockResolvedValue({
+      output: JSON.stringify({ profiles: [{ name: "default", running: true }] }),
+    });
+    mockDb.query.mockResolvedValue({ rows: [] });
+    await listHermesProfiles(agent);
+    const insertForDefault = mockDb.query.mock.calls.find(
+      ([sql, params]) => sql.includes("INSERT INTO hermes_profiles") && params && params.includes("default"),
+    );
+    expect(insertForDefault).toBeUndefined();
+  });
+
+  it("still reports default as isDefault:true even if the registry says otherwise", async () => {
+    mockRunContainerCommand.mockResolvedValue({ output: JSON.stringify({ profiles: [] }) });
+    mockDb.query.mockResolvedValue({
+      rows: [{ name: "default", display_name: "Default", is_default: false }],
+    });
+    const { profiles } = await listHermesProfiles(agent);
+    const def = profiles.find((p) => p.name === "default");
+    expect(def.isDefault).toBe(true);
+  });
+
+  it("degrades to registry-only when the on-disk probe throws", async () => {
+    mockRunContainerCommand.mockRejectedValue(new Error("exec failed"));
+    mockDb.query.mockResolvedValue({
+      rows: [{ name: "coder", display_name: "Coder", is_default: false }],
+    });
+    const { profiles } = await listHermesProfiles(agent);
+    const names = profiles.map((p) => p.name).sort();
+    expect(names).toEqual(["coder", "default"]);
+  });
+});
+
+describe("Kubernetes guard", () => {
+  beforeEach(() => {
+    mockIsKubernetesAgent.mockReturnValue(true);
+  });
+
+  it("createHermesProfile rejects with 409 and never runs the CLI", async () => {
+    await expect(createHermesProfile(agent, "coder")).rejects.toMatchObject({ statusCode: 409 });
+    expect(mockRunContainerCommand).not.toHaveBeenCalled();
+  });
+
+  it("deleteHermesProfile rejects with 409 and never runs the CLI", async () => {
+    await expect(deleteHermesProfile(agent, "coder")).rejects.toMatchObject({ statusCode: 409 });
+    expect(mockRunContainerCommand).not.toHaveBeenCalled();
+  });
+
+  it("setProfileGatewayState rejects with 409 and never runs the CLI", async () => {
+    await expect(setProfileGatewayState(agent, "coder", "start")).rejects.toMatchObject({ statusCode: 409 });
+    expect(mockRunContainerCommand).not.toHaveBeenCalled();
   });
 });

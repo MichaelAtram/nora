@@ -46,7 +46,12 @@ async function readOnDiskProfiles(agent) {
     "fi",
     'printf "]}"',
   ].join("\n");
-  const result = await runContainerCommand(agent, command, { timeout: 15000 });
+  let result;
+  try {
+    result = await runContainerCommand(agent, command, { timeout: 15000 });
+  } catch {
+    return { profiles: [] };
+  }
   try {
     return JSON.parse(String(result?.output || "").trim() || '{"profiles":[]}');
   } catch {
@@ -77,8 +82,9 @@ async function listHermesProfiles(agent) {
   for (const p of onDisk.profiles || []) {
     const existing = byName.get(p.name) || { name: p.name, displayName: p.name, isDefault: false };
     byName.set(p.name, { ...existing, running: Boolean(p.running) });
-    // Auto-register out-of-band profiles Nora didn't create.
-    if (!(registry.rows || []).some((r) => r.name === p.name)) {
+    // Auto-register out-of-band profiles Nora didn't create. Never auto-register "default" —
+    // it's a seeded synthetic entry, not a real registry row.
+    if (p.name !== "default" && !(registry.rows || []).some((r) => r.name === p.name)) {
       await db.query(
         `INSERT INTO hermes_profiles(agent_id, name, display_name, is_default)
          VALUES($1, $2, $2, FALSE) ON CONFLICT (agent_id, name) DO NOTHING`,
@@ -86,6 +92,10 @@ async function listHermesProfiles(agent) {
       );
     }
   }
+
+  // The default profile always exists and is always the default, regardless of what the
+  // registry or on-disk probe reported (a stray "default" row/dir must not override this).
+  byName.set("default", { name: "default", displayName: "Default", isDefault: true, running: true });
 
   return { profiles: [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)) };
 }
