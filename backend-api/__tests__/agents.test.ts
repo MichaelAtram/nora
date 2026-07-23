@@ -5,6 +5,10 @@
 const request = require("supertest");
 const jwt = require("jsonwebtoken");
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
+const { deriveHermesDashboardBasicAuth } = require("../../agent-runtime/lib/hermesDashboardAuth");
+// The connect block derives dashboard basic-auth from the API key (seed).
+const HERMES_CONNECT_TOKEN = "hermes-token";
+const HERMES_CONNECT_DASHBOARD = deriveHermesDashboardBasicAuth(HERMES_CONNECT_TOKEN);
 
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
 process.env.JWT_SECRET = JWT_SECRET;
@@ -1160,6 +1164,8 @@ describe("Hermes WebUI routes", () => {
       runtimeApiUrl: "http://100.71.115.105:19500",
       dashboardUrl: "http://100.71.115.105:19044",
       apiKey: "hermes-token",
+      dashboardUsername: "nora",
+      dashboardPassword: HERMES_CONNECT_DASHBOARD.password,
     });
   });
 
@@ -1216,6 +1222,8 @@ describe("Hermes WebUI routes", () => {
       runtimeApiUrl: "http://100.71.115.105:19500",
       dashboardUrl: "http://100.71.115.105:19044",
       apiKey: "hermes-token",
+      dashboardUsername: "nora",
+      dashboardPassword: HERMES_CONNECT_DASHBOARD.password,
     });
   });
 
@@ -1270,6 +1278,8 @@ describe("Hermes WebUI routes", () => {
       runtimeApiUrl: "http://nora.internal.example:19500",
       dashboardUrl: "http://nora.internal.example:19044",
       apiKey: "hermes-token",
+      dashboardUsername: "nora",
+      dashboardPassword: HERMES_CONNECT_DASHBOARD.password,
     });
   });
 
