@@ -1104,6 +1104,18 @@ function isKubernetesHermesAgent(agent) {
   );
 }
 
+// Named Hermes profiles aren't supported on Kubernetes agents yet. This must
+// run BEFORE any DB mutation (persistHermesChannelState / replacePersistedHermesState)
+// so a rejected save/delete never leaves a phantom hermes_runtime_state row
+// claiming a channel is configured when it was never applied to the runtime.
+function assertHermesProfileSupportedForAgent(agent, profile) {
+  if (profile && profile !== "default" && isKubernetesHermesAgent(agent)) {
+    const e = new Error("Hermes profile management is not supported on Kubernetes agents yet");
+    e.statusCode = 409;
+    throw e;
+  }
+}
+
 async function persistHermesChannelConfig(agent, definition, config, { profile = "default" } = {}) {
   if (isKubernetesHermesAgent(agent)) {
     if (profile !== "default") {
@@ -1228,6 +1240,8 @@ async function saveHermesChannel(
   inputConfig = {},
   { create = false, profile = "default" } = {},
 ) {
+  assertHermesProfileSupportedForAgent(agent, profile);
+
   const definition = definitionForChannelType(type);
   if (!definition) {
     const error = new Error("Unsupported Hermes channel type");
@@ -1260,6 +1274,8 @@ async function saveHermesChannel(
 }
 
 async function deleteHermesChannel(agent, type, { profile = "default" } = {}) {
+  assertHermesProfileSupportedForAgent(agent, profile);
+
   const definition = definitionForChannelType(type);
   if (!definition) {
     const error = new Error("Unsupported Hermes channel type");

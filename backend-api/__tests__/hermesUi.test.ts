@@ -37,6 +37,7 @@ jest.mock("../remoteHosts", () => ({
 
 const {
   buildHermesPythonCommand,
+  deleteHermesChannel,
   getPersistedHermesState,
   persistHermesModelConfig,
   readHermesRuntimeSnapshot,
@@ -385,5 +386,52 @@ describe("per-profile state persistence", () => {
     const call = mockDb.query.mock.calls.find(([sql]) => sql.includes("INSERT INTO hermes_runtime_state"));
     expect(call[0]).toContain("profile_name");
     expect(call[1]).toContain("coder");
+  });
+});
+
+describe("k8s named-profile guard fires before any DB write", () => {
+  const k8sAgent = {
+    id: "agent-hermes-k8s",
+    user_id: "user-1",
+    container_id: "nora-hermes-qa-1",
+    backend_type: "k8s",
+    host: "runtime.internal",
+    runtime_host: "runtime.internal",
+    runtime_port: 8642,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDb.query.mockReset().mockResolvedValue({ rows: [] });
+    mockIsKubernetesAgent.mockReset().mockReturnValue(true);
+  });
+
+  it("rejects saveHermesChannel for a k8s agent with a named profile before touching the DB", async () => {
+    await expect(
+      saveHermesChannel(
+        k8sAgent,
+        "telegram",
+        { TELEGRAM_BOT_TOKEN: "tok-123" },
+        { profile: "coder" },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(mockDb.query).not.toHaveBeenCalled();
+    const insertCalls = mockDb.query.mock.calls.filter(([sql]) =>
+      String(sql || "").includes("INSERT INTO hermes_runtime_state"),
+    );
+    expect(insertCalls).toHaveLength(0);
+  });
+
+  it("rejects deleteHermesChannel for a k8s agent with a named profile before touching the DB", async () => {
+    await expect(
+      deleteHermesChannel(k8sAgent, "telegram", { profile: "coder" }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(mockDb.query).not.toHaveBeenCalled();
+    const insertCalls = mockDb.query.mock.calls.filter(([sql]) =>
+      String(sql || "").includes("INSERT INTO hermes_runtime_state"),
+    );
+    expect(insertCalls).toHaveLength(0);
   });
 });
