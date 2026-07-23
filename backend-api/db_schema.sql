@@ -284,11 +284,23 @@ CREATE INDEX IF NOT EXISTS idx_agent_secret_overrides_agent
   ON agent_secret_overrides(agent_id, env_key);
 
 CREATE TABLE IF NOT EXISTS hermes_runtime_state (
-  agent_id UUID PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  profile_name TEXT NOT NULL DEFAULT 'default',
   model_config JSONB DEFAULT '{}',
   channel_configs JSONB DEFAULT '{}',
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (agent_id, profile_name)
+);
+
+CREATE TABLE IF NOT EXISTS hermes_profiles (
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  display_name TEXT,
+  is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (agent_id, name)
 );
 
 -- Durable copy of OpenClaw channel config: the runtime's openclaw.json is the
