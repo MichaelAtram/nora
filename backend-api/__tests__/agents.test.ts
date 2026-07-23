@@ -1078,6 +1078,160 @@ describe("Hermes WebUI routes", () => {
     );
   });
 
+  it("returns an external connect block for a running local Docker Hermes agent", async () => {
+    mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
+      runtimeStatus: {
+        gateway_state: "running",
+        active_agents: 1,
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      directory: {
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      platformDetails: {},
+      jobsCount: 0,
+      modelConfig: {
+        defaultModel: "gpt-5.5",
+        provider: "custom",
+        baseUrl: "https://api.openai.com/v1",
+      },
+    });
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-hermes-connect",
+          user_id: "user-1",
+          status: "running",
+          runtime_family: "hermes",
+          backend_type: "docker",
+          container_id: "hermes-container",
+          runtime_host: "10.0.0.43",
+          runtime_port: 8642,
+          gateway_token: "hermes-token",
+        },
+      ],
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { status: "ok", platform: "hermes-agent" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: {
+            object: "list",
+            data: [{ id: "desk-bot", object: "model" }],
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: {
+            version: "1.0.0",
+            gateway_running: true,
+            gateway_state: "running",
+            active_sessions: 4,
+          },
+        }),
+      );
+    // Live container bindings for the published runtime API (8642) and
+    // dashboard (9119) ports — read on demand, never persisted.
+    mockDockerInspect.mockResolvedValueOnce({
+      NetworkSettings: {
+        Ports: {
+          "8642/tcp": [{ HostIp: "100.71.115.105", HostPort: "19500" }],
+          "9119/tcp": [{ HostIp: "100.71.115.105", HostPort: "19044" }],
+        },
+      },
+    });
+
+    const res = await auth(
+      request(app)
+        .get("/agents/a-hermes-connect/hermes-ui")
+        .set("X-Forwarded-Host", "100.71.115.105"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.connect).toEqual({
+      runtimeApiUrl: "http://100.71.115.105:19500",
+      dashboardUrl: "http://100.71.115.105:19044",
+      apiKey: "hermes-token",
+    });
+  });
+
+  it("omits the connect block for non-Docker Hermes agents", async () => {
+    mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
+      runtimeStatus: {
+        gateway_state: "running",
+        active_agents: 1,
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      directory: {
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      platformDetails: {},
+      jobsCount: 0,
+      modelConfig: {
+        defaultModel: "gpt-5.5",
+        provider: "custom",
+        baseUrl: "https://api.openai.com/v1",
+      },
+    });
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-hermes-connect-k8s",
+          user_id: "user-1",
+          status: "running",
+          runtime_family: "hermes",
+          backend_type: "k8s",
+          container_id: "hermes-k8s-container",
+          runtime_host: "10.42.0.5",
+          runtime_port: 8642,
+          gateway_token: "hermes-token",
+        },
+      ],
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { status: "ok", platform: "hermes-agent" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: {
+            object: "list",
+            data: [{ id: "desk-bot", object: "model" }],
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: {
+            version: "1.0.0",
+            gateway_running: true,
+            gateway_state: "running",
+            active_sessions: 4,
+          },
+        }),
+      );
+
+    const res = await auth(request(app).get("/agents/a-hermes-connect-k8s/hermes-ui"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.connect).toBeUndefined();
+    // Non-Docker gate must short-circuit before touching the container at all.
+    expect(mockDockerInspect).not.toHaveBeenCalled();
+  });
+
   it("surfaces a redeploy message when the running Hermes image does not include the official dashboard", async () => {
     mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
       runtimeStatus: {
