@@ -208,15 +208,74 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
 
   const runtimeReady = Boolean(runtimeInfo?.health?.ok);
   const connect = runtimeInfo?.connect || null;
+  // Legacy execCommand copy for non-secure contexts. navigator.clipboard is only
+  // defined in a secure context (HTTPS, http://localhost / 127.0.0.1); over a
+  // plain-HTTP non-localhost origin (e.g. http://<tailscale-ip>:8080) it is
+  // undefined, so the native path throws.
+  const legacyCopy = (text) => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  };
   const copyValue = async (label, value) => {
     if (!value) return;
     try {
-      await navigator.clipboard.writeText(value);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else if (!legacyCopy(value)) {
+        throw new Error("clipboard unavailable");
+      }
       toast.success(`${label} copied`);
     } catch {
-      toast.error(`Could not copy ${label}`);
+      // Native path failed (unavailable or permission) — try the legacy path.
+      if (legacyCopy(value)) {
+        toast.success(`${label} copied`);
+      } else {
+        toast.error(`Could not copy ${label} — select the text to copy it manually`);
+      }
     }
   };
+  // Render a connect field as SELECTABLE text (readonly input) plus a Copy button,
+  // so the operator can always copy manually even if programmatic copy is blocked.
+  const renderConnectField = (label, value, Icon, { mono = false } = {}) => (
+    <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+      <Icon size={16} className="mt-0.5 shrink-0 text-slate-500" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">{label}</p>
+          <button
+            type="button"
+            onClick={() => copyValue(label, value)}
+            className="shrink-0 text-xs font-bold text-blue-600 hover:text-blue-700"
+          >
+            Copy
+          </button>
+        </div>
+        <input
+          type="text"
+          readOnly
+          value={value}
+          onFocus={(e) => e.currentTarget.select()}
+          onClick={(e) => e.currentTarget.select()}
+          className={`mt-1 block w-full select-all break-all rounded-md border border-slate-200 bg-white px-2 py-1 text-sm font-medium text-slate-800 ${
+            mono ? "font-mono" : ""
+          }`}
+        />
+      </div>
+    </div>
+  );
   const models = Array.isArray(runtimeInfo?.models) ? runtimeInfo.models : [];
   const gateway: any = runtimeInfo?.gateway || {};
   const platformStates =
@@ -691,57 +750,13 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
               </p>
             </div>
             <div className="space-y-3 p-4">
-              <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-                <Server size={16} className="mt-0.5 shrink-0 text-slate-500" />
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">
-                    Runtime API
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => copyValue("Runtime API URL", connect.runtimeApiUrl)}
-                    className="mt-1 block w-full break-all text-left text-sm font-medium text-slate-800 hover:text-slate-950"
-                  >
-                    {connect.runtimeApiUrl}
-                  </button>
-                </div>
-              </div>
-
-              {connect.dashboardUrl ? (
-                <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-                  <Workflow size={16} className="mt-0.5 shrink-0 text-slate-500" />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">
-                      Dashboard
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => copyValue("Dashboard URL", connect.dashboardUrl)}
-                      className="mt-1 block w-full break-all text-left text-sm font-medium text-slate-800 hover:text-slate-950"
-                    >
-                      {connect.dashboardUrl}
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-
-              {connect.apiKey ? (
-                <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-                  <Key size={16} className="mt-0.5 shrink-0 text-slate-500" />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">
-                      API Key
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => copyValue("API key", connect.apiKey)}
-                      className="mt-1 block w-full break-all text-left font-mono text-sm font-medium text-slate-800 hover:text-slate-950"
-                    >
-                      Click to copy API key
-                    </button>
-                  </div>
-                </div>
-              ) : null}
+              {renderConnectField("Runtime API", connect.runtimeApiUrl, Server)}
+              {connect.dashboardUrl
+                ? renderConnectField("Dashboard", connect.dashboardUrl, Workflow)
+                : null}
+              {connect.apiKey
+                ? renderConnectField("API Key", connect.apiKey, Key, { mono: true })
+                : null}
             </div>
           </section>
         ) : null}
