@@ -14,6 +14,7 @@ import HermesChannelsPanel from "./hermes/ChannelsPanel";
 import HermesChatPanel from "./hermes/ChatPanel";
 import HermesCronPanel from "./hermes/CronPanel";
 import OfficialDashboardPanel from "./hermes/OfficialDashboardPanel";
+import ProfileSwitcher from "./hermes/ProfileSwitcher";
 import HermesStatusPanel from "./hermes/StatusPanel";
 
 const STATUS_POLL_MS = 5000;
@@ -50,6 +51,7 @@ function HermesIntegrationsPanel({ agentId }) {
 
 export default function HermesWebUITab({ agentId, agentStatus }) {
   const [activeSubTab, setActiveSubTab] = useState("official-dashboard");
+  const [selectedProfile, setSelectedProfile] = useState("default");
   const [loading, setLoading] = useState(true);
   const [runtimeInfo, setRuntimeInfo] = useState(null);
   const [error, setError] = useState("");
@@ -108,6 +110,7 @@ export default function HermesWebUITab({ agentId, agentStatus }) {
 
   useEffect(() => {
     setActiveSubTab("official-dashboard");
+    setSelectedProfile("default");
   }, [agentId]);
 
   useEffect(() => {
@@ -170,6 +173,15 @@ export default function HermesWebUITab({ agentId, agentStatus }) {
         </div>
       </div>
 
+      <div className="flex items-center justify-between gap-2">
+        <ProfileSwitcher
+          agentId={agentId}
+          selectedProfile={selectedProfile}
+          onSelect={setSelectedProfile}
+          disabled={runtimeInfo?.deployTarget === "k8s"}
+        />
+      </div>
+
       <div>
         {activeSubTab === "official-dashboard" && (
           <OfficialDashboardPanel
@@ -179,6 +191,13 @@ export default function HermesWebUITab({ agentId, agentStatus }) {
             runtimeError={error}
             onRefreshRuntime={() => loadRuntimeInfo({ showSpinner: false })}
           />
+        )}
+        {selectedProfile !== "default" && ["status", "chat", "cron"].includes(activeSubTab) && (
+          <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-800">
+            Cron, Chat, and Status are managed on the <strong>default</strong> profile. For the
+            &ldquo;{selectedProfile}&rdquo; profile, use the Official Dashboard&apos;s built-in
+            profile switcher.
+          </div>
         )}
         {activeSubTab === "status" && (
           <HermesStatusPanel
@@ -200,7 +219,9 @@ export default function HermesWebUITab({ agentId, agentStatus }) {
         )}
         {activeSubTab === "integrations" && <HermesIntegrationsPanel agentId={agentId} />}
         {activeSubTab === "cron" && <HermesCronPanel agentId={agentId} />}
-        {activeSubTab === "channels" && <HermesChannelsPanel agentId={agentId} />}
+        {activeSubTab === "channels" && (
+          <HermesChannelsPanel agentId={agentId} profile={selectedProfile} />
+        )}
       </div>
     </div>
   );
