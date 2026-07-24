@@ -13,6 +13,9 @@ const { buildContainerBootstrap } = require("../../../agent-runtime/lib/containe
 const {
   buildHermesRuntimeConfigBootstrapCommand,
 } = require("../../../agent-runtime/lib/hermesRuntimeBootstrap");
+const {
+  deriveHermesDashboardBasicAuth,
+} = require("../../../agent-runtime/lib/hermesDashboardAuth");
 
 const HERMES_RUNTIME_PORT = 8642;
 const HERMES_HOME = "/opt/data";
@@ -56,7 +59,7 @@ function buildHermesStartCommand() {
     buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
-    `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
+    `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
     'exec "$HERMES_BIN" gateway run',
   ].join("\n");
 }
@@ -202,6 +205,7 @@ class HermesBackend extends DockerBackend {
     }
 
     const apiServerKey = crypto.randomBytes(32).toString("hex");
+    const dashboardAuth = deriveHermesDashboardBasicAuth(apiServerKey);
     const envArray = Object.entries({
       HERMES_HOME,
       HOME: `${HERMES_HOME}/home`,
@@ -214,6 +218,14 @@ class HermesBackend extends DockerBackend {
       // auth-reconcile restarts. Without this the gateway refuses to start with
       // "Refusing to start: API_SERVER_KEY is required" (#297).
       API_SERVER_KEY: apiServerKey,
+      // Hermes fail-closed dashboard auth (basic-auth provider). Baked into the
+      // container env so the s6-supervised dashboard reads it from
+      // /run/s6/container_environment on every boot. The backend-api embed proxy
+      // re-derives the identical credential from API_SERVER_KEY to log in on the
+      // operator's behalf.
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: dashboardAuth.username,
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: dashboardAuth.password,
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: dashboardAuth.secret,
       GATEWAY_HEALTH_URL: `http://127.0.0.1:${HERMES_RUNTIME_PORT}`,
       MESSAGING_CWD: HERMES_WORKSPACE,
       TERMINAL_CWD: HERMES_WORKSPACE,

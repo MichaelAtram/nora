@@ -51,6 +51,7 @@ const {
   runtimeUrlForAgent,
 } = require("../../agent-runtime/lib/agentEndpoints");
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
+const { deriveHermesDashboardBasicAuth } = require("../../agent-runtime/lib/hermesDashboardAuth");
 const {
   DEFAULT_RUNTIME_FAMILY,
   KNOWN_RUNTIME_FAMILIES,
@@ -972,27 +973,51 @@ function buildHermesDashboardUnsupportedMessage(versionLine = "") {
   );
 }
 
-function buildHermesDashboardEnsureCommand() {
-  return [
+function buildHermesDashboardEnsureCommand(dashboardAuth = null) {
+  const lines = [
     'HERMES_BIN="/opt/hermes/.venv/bin/hermes"',
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes 2>/dev/null || true)"',
     'if [ -z "$HERMES_BIN" ]; then echo "STATUS=missing-cli"; exit 0; fi',
     'VERSION="$("$HERMES_BIN" version 2>/dev/null | head -n 1 || true)"',
     'if ! "$HERMES_BIN" --help 2>/dev/null | grep -q "dashboard"; then echo "STATUS=missing-dashboard"; printf "VERSION=%s\\n" "$VERSION"; exit 0; fi',
     `if python3 -c 'import socket,sys;s=socket.socket();s.settimeout(1);rc=s.connect_ex(("127.0.0.1",${HERMES_DASHBOARD_PORT}));s.close();sys.exit(0 if rc==0 else 1)'; then echo "STATUS=already-running"; printf "VERSION=%s\\n" "$VERSION"; exit 0; fi`,
-    'if [ "$(id -u)" = "0" ] && command -v gosu >/dev/null 2>&1; then setsid gosu hermes "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open < /dev/null & else setsid "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open < /dev/null & fi',
+    'if [ "$(id -u)" = "0" ] && command -v gosu >/dev/null 2>&1; then setsid gosu hermes "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open < /dev/null & else setsid "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open < /dev/null & fi',
     "started=0",
     `for _attempt in 1 2 3 4 5; do if python3 -c 'import socket,sys;s=socket.socket();s.settimeout(1);rc=s.connect_ex(("127.0.0.1",${HERMES_DASHBOARD_PORT}));s.close();sys.exit(0 if rc==0 else 1)'; then started=1; break; fi; sleep 1; done`,
     'if [ "$started" = "1" ]; then echo "STATUS=started"; else echo "STATUS=start-failed"; fi',
     'printf "VERSION=%s\\n" "$VERSION"',
-  ].join("; ");
+  ];
+  if (dashboardAuth) {
+    // Existing containers created before dashboard-auth support lack the
+    // HERMES_DASHBOARD_BASIC_AUTH_* vars in their baked env. Derive them from the
+    // agent's gateway_token (control-plane side) and export them here so the
+    // relaunched dashboard starts with Hermes's basic-auth provider — letting an
+    // existing agent's Web UI work again without a data-losing container recreate.
+    lines.unshift(
+      `export HERMES_DASHBOARD_BASIC_AUTH_USERNAME='${dashboardAuth.username}'`,
+      `export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD='${dashboardAuth.password}'`,
+      `export HERMES_DASHBOARD_BASIC_AUTH_SECRET='${dashboardAuth.secret}'`,
+    );
+  }
+  return lines.join("; ");
 }
 
 async function ensureHermesDashboardProcess(agent) {
   try {
-    const { output } = await runContainerCommand(agent, buildHermesDashboardEnsureCommand(), {
-      timeout: 15000,
-    });
+    let dashboardAuth = null;
+    try {
+      const token = await resolveHermesApiToken(agent);
+      if (token) dashboardAuth = deriveHermesDashboardBasicAuth(token);
+    } catch (err) {
+      console.warn(
+        `[hermes-dashboard] could not derive dashboard auth for agent ${agent.id}: ${err.message}`,
+      );
+    }
+    const { output } = await runContainerCommand(
+      agent,
+      buildHermesDashboardEnsureCommand(dashboardAuth),
+      { timeout: 15000 },
+    );
     const lines = String(output || "")
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -3032,3 +3057,4 @@ router.post(
 );
 
 module.exports = router;
+module.exports.buildHermesDashboardEnsureCommand = buildHermesDashboardEnsureCommand;

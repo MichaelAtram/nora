@@ -30,6 +30,9 @@ const {
   buildHermesRuntimeConfigBootstrapCommand,
 } = require("../../../agent-runtime/lib/hermesRuntimeBootstrap");
 const {
+  deriveHermesDashboardBasicAuth,
+} = require("../../../agent-runtime/lib/hermesDashboardAuth");
+const {
   buildTelemetry,
   buildUnavailableTelemetry,
   bytesToMegabytes,
@@ -320,7 +323,7 @@ function buildHermesStartCommand() {
     buildHermesRuntimeConfigBootstrapCommand(),
     `HERMES_BIN="${HERMES_BIN}"`,
     '[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"',
-    `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
+    `nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open >> ${HERMES_DASHBOARD_LOG} 2>&1 &`,
     'exec "$HERMES_BIN" gateway run',
   ].join("\n");
 }
@@ -1912,6 +1915,7 @@ class K8sBackend extends ProvisionerBackend {
     const namespace = this._namespaceForRuntimeFamily("hermes");
     const imgName = image || getHermesDockerAgentImage();
     const apiServerKey = config.gatewayToken || crypto.randomBytes(32).toString("hex");
+    const dashboardAuth = deriveHermesDashboardBasicAuth(apiServerKey);
 
     await this._ensureNamespace(namespace);
     const policyStatus = await this._reconcileNetworkPolicies({
@@ -1946,6 +1950,11 @@ class K8sBackend extends ProvisionerBackend {
       API_SERVER_HOST: "0.0.0.0",
       API_SERVER_PORT: String(HERMES_RUNTIME_PORT),
       API_SERVER_KEY: apiServerKey,
+      // Hermes fail-closed dashboard auth (basic-auth provider); the embed proxy
+      // re-derives the same credential from API_SERVER_KEY to log in.
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: dashboardAuth.username,
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: dashboardAuth.password,
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: dashboardAuth.secret,
       GATEWAY_HEALTH_URL: `http://127.0.0.1:${HERMES_RUNTIME_PORT}`,
       MESSAGING_CWD: HERMES_WORKSPACE,
       TERMINAL_CWD: HERMES_WORKSPACE,
