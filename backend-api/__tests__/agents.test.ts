@@ -1163,6 +1163,98 @@ describe("Hermes WebUI routes", () => {
     });
   });
 
+  it.each(["viewer", "editor", "admin"])(
+    "omits Hermes connect credentials for workspace %s members",
+    async (role) => {
+      mockDb.query
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              id: "a-hermes-viewer",
+              user_id: "agent-owner",
+              status: "running",
+              runtime_family: "hermes",
+              backend_type: "docker",
+              container_id: "hermes-container",
+              runtime_host: "10.0.0.43",
+              runtime_port: 8642,
+              gateway_token: "hermes-token",
+            },
+          ],
+        })
+        .mockResolvedValueOnce({ rows: [{ role }] });
+      global.fetch = jest
+        .fn()
+        .mockResolvedValueOnce(
+          createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }),
+        )
+        .mockResolvedValueOnce(
+          createMockFetchResponse({
+            body: { object: "list", data: [{ id: "desk-bot", object: "model" }] },
+          }),
+        )
+        .mockResolvedValueOnce(
+          createMockFetchResponse({
+            body: { version: "1.0.0", gateway_running: true, gateway_state: "running" },
+          }),
+        );
+
+      const res = await auth(request(app).get("/agents/a-hermes-viewer/hermes-ui"));
+
+      expect(res.status).toBe(200);
+      expect(res.body.connect).toBeUndefined();
+      expect(mockDockerInspect).not.toHaveBeenCalled();
+    },
+  );
+
+  it("omits Hermes connect credentials for read-scoped workspace API keys", async () => {
+    authorizeWorkspaceApiKey({ scopes: ["agents:read"] });
+    const agent = {
+      id: "a-hermes-api-key",
+      user_id: "agent-owner",
+      status: "running",
+      runtime_family: "hermes",
+      backend_type: "docker",
+      container_id: "hermes-container",
+      runtime_host: "10.0.0.43",
+      runtime_port: 8642,
+      gateway_token: "hermes-token",
+    };
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: agent.id,
+            backend_type: agent.backend_type,
+            deploy_target: agent.deploy_target,
+            execution_target_id: agent.execution_target_id,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [agent] });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(
+        createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { object: "list", data: [{ id: "desk-bot", object: "model" }] },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { version: "1.0.0", gateway_running: true, gateway_state: "running" },
+        }),
+      );
+
+    const res = await workspaceApiKeyAuth(request(app).get("/agents/a-hermes-api-key/hermes-ui"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.connect).toBeUndefined();
+    expect(mockDockerInspect).not.toHaveBeenCalled();
+  });
+
   it("uses the routable published HostIp as the connect host, not the browsing host", async () => {
     mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
       runtimeStatus: { gateway_state: "running", active_agents: 1, updated_at: "t", platforms: {} },
@@ -1188,12 +1280,18 @@ describe("Hermes WebUI routes", () => {
     });
     global.fetch = jest
       .fn()
-      .mockResolvedValueOnce(createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }))
       .mockResolvedValueOnce(
-        createMockFetchResponse({ body: { object: "list", data: [{ id: "desk-bot", object: "model" }] } }),
+        createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }),
       )
       .mockResolvedValueOnce(
-        createMockFetchResponse({ body: { version: "1.0.0", gateway_running: true, gateway_state: "running" } }),
+        createMockFetchResponse({
+          body: { object: "list", data: [{ id: "desk-bot", object: "model" }] },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { version: "1.0.0", gateway_running: true, gateway_state: "running" },
+        }),
       );
     // Ports are bound to a concrete routable interface (Tailscale IP).
     mockDockerInspect.mockResolvedValueOnce({
@@ -1208,7 +1306,9 @@ describe("Hermes WebUI routes", () => {
     // Operator browses Nora on a DIFFERENT host — the connect URLs must reflect
     // where the ports are actually bound, not the browsing host.
     const res = await auth(
-      request(app).get("/agents/a-hermes-hostip/hermes-ui").set("X-Forwarded-Host", "nora.internal.example"),
+      request(app)
+        .get("/agents/a-hermes-hostip/hermes-ui")
+        .set("X-Forwarded-Host", "nora.internal.example"),
     );
 
     expect(res.status).toBe(200);
@@ -1244,12 +1344,18 @@ describe("Hermes WebUI routes", () => {
     });
     global.fetch = jest
       .fn()
-      .mockResolvedValueOnce(createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }))
       .mockResolvedValueOnce(
-        createMockFetchResponse({ body: { object: "list", data: [{ id: "desk-bot", object: "model" }] } }),
+        createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }),
       )
       .mockResolvedValueOnce(
-        createMockFetchResponse({ body: { version: "1.0.0", gateway_running: true, gateway_state: "running" } }),
+        createMockFetchResponse({
+          body: { object: "list", data: [{ id: "desk-bot", object: "model" }] },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { version: "1.0.0", gateway_running: true, gateway_state: "running" },
+        }),
       );
     // Loopback bind (default DOCKER_AGENT_BIND_IP) — no routable HostIp to advertise.
     mockDockerInspect.mockResolvedValueOnce({
@@ -1262,7 +1368,9 @@ describe("Hermes WebUI routes", () => {
     });
 
     const res = await auth(
-      request(app).get("/agents/a-hermes-loopback/hermes-ui").set("X-Forwarded-Host", "nora.internal.example"),
+      request(app)
+        .get("/agents/a-hermes-loopback/hermes-ui")
+        .set("X-Forwarded-Host", "nora.internal.example"),
     );
 
     expect(res.status).toBe(200);

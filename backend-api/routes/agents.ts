@@ -638,6 +638,12 @@ function formatHostForUrl(host) {
 }
 
 async function resolveHermesConnectInfo(agent, req) {
+  // The connect block carries the decrypted runtime API key, so it is a
+  // management capability rather than ordinary status metadata. Keep the
+  // shared Hermes status route intact while omitting durable credentials for
+  // non-owner workspace members and control-plane API keys.
+  if (req?.apiKey || agent?.effective_role !== "owner") return null;
+
   const runtimeFields = buildAgentRuntimeFields(agent);
   if (runtimeFields.runtime_family !== "hermes") return null;
   if (runtimeFields.deploy_target !== "docker") return null;
