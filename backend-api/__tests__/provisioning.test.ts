@@ -1264,7 +1264,8 @@ describe("provisioning runtime/gateway contracts", () => {
     expect(bootstrapConfigMap).toBeDefined();
     const script = bootstrapConfigMap.data["bootstrap.sh"];
     expect(script).not.toContain("/init");
-    expect(script).toContain('nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --insecure --no-open');
+    expect(script).toContain('nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open');
+    expect(script).not.toContain("--insecure");
     expect(script).toContain('exec "$HERMES_BIN" gateway run');
   });
 
@@ -1867,8 +1868,10 @@ describe("Hermes dashboard provisioning", () => {
     expect(apiServerKeyEnv).toBe(`API_SERVER_KEY=${result.gatewayToken}`);
     // Dashboard basic-auth credential is baked into the container env and must
     // match what the proxy re-derives from the returned gateway token.
-    const derivedDash = require("../../agent-runtime/lib/hermesDashboardAuth")
-      .deriveHermesDashboardBasicAuth(result.gatewayToken);
+    const derivedDash =
+      require("../../agent-runtime/lib/hermesDashboardAuth").deriveHermesDashboardBasicAuth(
+        result.gatewayToken,
+      );
     expect(config.Env).toEqual(
       expect.arrayContaining([
         `HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${derivedDash.username}`,
@@ -1886,9 +1889,7 @@ describe("Hermes dashboard provisioning", () => {
     // (s6-overlay) supervises this command directly; a nested /init fatals with
     // "s6-overlay-suexec: can only run as pid 1" and exits before port 8642 binds.
     expect(config.Cmd[2]).not.toContain("/init");
-    expect(config.Cmd[2]).toContain(
-      'nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open',
-    );
+    expect(config.Cmd[2]).toContain('nohup "$HERMES_BIN" dashboard --host 0.0.0.0 --no-open');
     expect(config.Cmd[2]).not.toContain("--insecure");
     expect(config.Cmd[2]).toContain(">> /opt/data/hermes-dashboard.log 2>&1");
     expect(config.Cmd[2]).not.toContain("/proc/1/fd");

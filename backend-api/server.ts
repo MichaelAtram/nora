@@ -54,10 +54,7 @@ const { isGatewayAvailableStatus } = require("./agentStatus");
 const { assertRemoteHostAgentUse, toPublicRemoteHostAuthorizationError } = require("./remoteHosts");
 const { repairHermesAgentConfig } = require("./hermesUi");
 const { HERMES_EMBED_AGENT_COLUMNS, GATEWAY_EMBED_AGENT_COLUMNS } = require("./embedAgentColumns");
-const {
-  establishHermesDashboardSession,
-  needsHermesLogin,
-} = require("./hermesDashboardSession");
+const { establishHermesDashboardSession, needsHermesLogin } = require("./hermesDashboardSession");
 const { decrypt: decryptSecret } = require("./crypto");
 const {
   joinHttpUrl,
