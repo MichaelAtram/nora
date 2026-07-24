@@ -9,9 +9,7 @@ const {
 } = require("./telemetry");
 const { getHermesDockerAgentImage } = require("../../../agent-runtime/lib/agentImages");
 const { HERMES_DASHBOARD_PORT } = require("../../../agent-runtime/lib/contracts");
-const {
-  buildContainerBootstrap,
-} = require("../../../agent-runtime/lib/containerCommand");
+const { buildContainerBootstrap } = require("../../../agent-runtime/lib/containerCommand");
 const {
   buildHermesRuntimeConfigBootstrapCommand,
 } = require("../../../agent-runtime/lib/hermesRuntimeBootstrap");
