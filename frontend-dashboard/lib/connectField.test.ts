@@ -4,15 +4,24 @@ import test from "node:test";
 import { CONNECT_FIELD_MASK, connectFieldDisplay, isSecretRevealed } from "./connectField";
 
 test("secret fields are masked by default (not revealed)", () => {
-  assert.equal(connectFieldDisplay("s3cret-password", { secret: true, revealed: false }), CONNECT_FIELD_MASK);
+  assert.equal(
+    connectFieldDisplay("s3cret-password", { secret: true, revealed: false }),
+    CONNECT_FIELD_MASK,
+  );
 });
 
 test("revealing a secret shows its real value", () => {
-  assert.equal(connectFieldDisplay("s3cret-password", { secret: true, revealed: true }), "s3cret-password");
+  assert.equal(
+    connectFieldDisplay("s3cret-password", { secret: true, revealed: true }),
+    "s3cret-password",
+  );
 });
 
 test("non-secret fields always show the real value", () => {
-  assert.equal(connectFieldDisplay("http://100.71.115.105:19500", { secret: false }), "http://100.71.115.105:19500");
+  assert.equal(
+    connectFieldDisplay("http://100.71.115.105:19500", { secret: false }),
+    "http://100.71.115.105:19500",
+  );
   assert.equal(connectFieldDisplay("nora", {}), "nora");
 });
 

@@ -157,7 +157,9 @@ function ConnectField({ label, value, Icon, mono = false, secret = false, onCopy
       // Programmatic copy failed and the value is masked — selecting the field
       // would copy the mask, so reveal it and let the user copy it manually.
       setRevealedFor(value);
-      toast.error(`Couldn't copy ${label} automatically — revealed it so you can select and copy it.`);
+      toast.error(
+        `Couldn't copy ${label} automatically — revealed it so you can select and copy it.`,
+      );
     } else {
       toast.error(`Couldn't copy ${label} — select the text to copy it manually.`);
     }
@@ -821,7 +823,7 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
               ) : null}
               {connect.dashboardPassword ? (
                 <ConnectField
-                  label="Desktop Password"
+                  label="Dashboard Password"
                   value={connect.dashboardPassword}
                   Icon={Key}
                   onCopy={copyValue}
