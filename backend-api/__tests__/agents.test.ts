@@ -1169,6 +1169,75 @@ describe("Hermes WebUI routes", () => {
     });
   });
 
+  it("returns null connect credentials when the runtime token is unresolvable", async () => {
+    // No stored gateway_token and a container env without API_SERVER_KEY: the
+    // connect block must degrade to null credentials — the `apiKey ? derive :
+    // null` guard is load-bearing because deriveHermesDashboardBasicAuth
+    // throws on an empty seed, which would 500 the whole hermes-ui route.
+    mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
+      runtimeStatus: {
+        gateway_state: "running",
+        active_agents: 1,
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      directory: {
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      platformDetails: {},
+      jobsCount: 0,
+      modelConfig: {
+        defaultModel: "gpt-5.5",
+        provider: "custom",
+        baseUrl: "https://api.openai.com/v1",
+      },
+    });
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-hermes-tokenless",
+          user_id: "user-1",
+          status: "running",
+          runtime_family: "hermes",
+          backend_type: "docker",
+          container_id: "hermes-container",
+          runtime_host: "10.0.0.43",
+          runtime_port: 8642,
+          gateway_token: null,
+        },
+      ],
+    });
+    global.fetch = jest.fn().mockResolvedValue(createMockFetchResponse({ body: {} }));
+    // Every inspect (the token fallback re-inspects per resolution attempt plus
+    // the published-port lookup) sees the same container: ports published, no
+    // API_SERVER_KEY in the environment.
+    mockDockerInspect.mockResolvedValue({
+      Config: { Env: ["HERMES_HOME=/opt/hermes"] },
+      NetworkSettings: {
+        Ports: {
+          "8642/tcp": [{ HostIp: "100.71.115.105", HostPort: "19500" }],
+          "9119/tcp": [{ HostIp: "100.71.115.105", HostPort: "19044" }],
+        },
+      },
+    });
+
+    const res = await auth(
+      request(app)
+        .get("/agents/a-hermes-tokenless/hermes-ui")
+        .set("X-Forwarded-Host", "100.71.115.105"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.connect).toEqual({
+      runtimeApiUrl: "http://100.71.115.105:19500",
+      dashboardUrl: "http://100.71.115.105:19044",
+      apiKey: null,
+      dashboardUsername: null,
+      dashboardPassword: null,
+    });
+  });
+
   it.each(["viewer", "editor", "admin"])(
     "omits Hermes connect credentials for workspace %s members",
     async (role) => {
