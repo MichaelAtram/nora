@@ -171,6 +171,62 @@ describe("Agent Hub template deploy targets", () => {
   });
 });
 
+describe("Agent Hub template runtime family", () => {
+  it("defaults runtimeFamily to openclaw for snapshots captured before the field existed", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            deploy_target: "docker",
+          },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ runtimeFamily: "openclaw" }));
+  });
+
+  it("defaults runtimeFamily to openclaw when the snapshot has no defaults at all", () => {
+    expect(extractTemplateDefaultsFromSnapshot({ config: {} })).toEqual(
+      expect.objectContaining({ runtimeFamily: "openclaw" }),
+    );
+  });
+
+  it("surfaces a stored runtime_family from snapshot defaults", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            runtime_family: "hermes",
+          },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ runtimeFamily: "hermes" }));
+  });
+
+  it("accepts the camelCase runtimeFamily alias", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            runtimeFamily: "hermes",
+          },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ runtimeFamily: "hermes" }));
+  });
+
+  it("collapses unknown runtime families to openclaw", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            runtime_family: "quantumclaw",
+          },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ runtimeFamily: "openclaw" }));
+  });
+});
+
 describe("buildTemplatePayloadFromAgent capture authorization", () => {
   it.each([
     "REMOTE_HOST_ACCESS_REVOKED",

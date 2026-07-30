@@ -255,6 +255,7 @@ function buildSnapshotConfigFromAgent(agent, templatePayload) {
   return {
     kind: "community-template",
     defaults: {
+      runtime_family: agent.runtime_family || "openclaw",
       backend,
       sandbox: runtimeFields.sandbox_profile,
       vcpu: agent.vcpu || 2,
@@ -599,6 +600,7 @@ router.post(
       category: listingCategory,
       builtIn: false,
       sourceType: agentHubStore.LISTING_SOURCE_COMMUNITY,
+      runtimeFamily: agent.runtime_family || "openclaw",
       status: agentHubStore.LISTING_STATUS_PUBLISHED,
       visibility: agentHubStore.LISTING_VISIBILITY_PUBLIC,
       shareTarget,

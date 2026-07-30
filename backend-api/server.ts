@@ -2378,6 +2378,8 @@ async function migrateDB(database = db, env = process.env) {
        added_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
        created_at TIMESTAMPTZ DEFAULT NOW()
      )`,
+    `DO $$ BEGIN ALTER TABLE agent_hub_listings ADD COLUMN runtime_family TEXT NOT NULL DEFAULT 'openclaw'; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+    `UPDATE agent_hub_listings SET runtime_family = 'openclaw' WHERE runtime_family IS NULL`,
   ];
 
   return runVersionedMigrations(database, migrations, {
