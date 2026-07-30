@@ -21,6 +21,10 @@ const CLAWHUB_INSTALL_JOB_TIMEOUT_MS = parseTimeoutMs(
   process.env.CLAWHUB_INSTALL_TIMEOUT_MS,
   300000,
 );
+const HERMES_SKILLS_JOB_TIMEOUT_MS = parseTimeoutMs(
+  process.env.HERMES_SKILLS_INSTALL_TIMEOUT_MS,
+  300000,
+);
 const BACKUP_JOB_TIMEOUT_MS = parseTimeoutMs(process.env.NORA_BACKUP_JOB_TIMEOUT_MS, 1800000);
 
 const ALERT_DELIVERY_ATTEMPTS = (() => {
@@ -61,6 +65,21 @@ const clawhubJobsQueue = new Queue("clawhub-jobs", {
     attempts: 1,
     backoff: { type: "exponential", delay: 3000 },
     timeout: CLAWHUB_INSTALL_JOB_TIMEOUT_MS,
+    removeOnComplete: { count: 200 },
+    removeOnFail: false,
+  },
+});
+
+// Separate queue per runtime family: sharing clawhub-jobs would couple both
+// families' concurrency-1 serialization (a slow Hermes registry install would
+// block OpenClaw installs) and renaming a live queue orphans in-flight jobs
+// across self-hosted upgrades.
+const hermesSkillsQueue = new Queue("hermes-skills-jobs", {
+  connection,
+  defaultJobOptions: {
+    attempts: 1,
+    backoff: { type: "exponential", delay: 3000 },
+    timeout: HERMES_SKILLS_JOB_TIMEOUT_MS,
     removeOnComplete: { count: 200 },
     removeOnFail: false,
   },
@@ -227,9 +246,7 @@ async function addAlertDeliveryJob(payload) {
  * @returns {Promise<Object>} BullMQ job.
  */
 async function addClawhubJob(payload) {
-  const jobId = payload?.jobId || randomUUID();
-  const operation = String(payload?.operation || "").trim() || "install";
-  return clawhubJobsQueue.add(`${operation}-skill`, { ...payload, operation, jobId }, { jobId });
+  return clawhubJobsApi.addJob(payload);
 }
 
 async function addBackupJob(payload) {
@@ -278,46 +295,9 @@ async function addKubernetesPolicyReconcileJob(payload) {
   );
 }
 
-// ── ClawHub job inspection and compatibility helpers ────────────
+// ── Skill job queues: shared inspection API ─────────────────────
 
-/**
- * Find an in-flight ClawHub job for the same agent, skill, and optional operation.
- *
- * @param {string} agentId - Agent receiving the operation.
- * @param {string} slug - ClawHub skill slug.
- * @param {string} operation - Optional operation filter.
- * @returns {Promise<Object|null>} Matching BullMQ job, if any.
- */
-async function findInFlightClawhubJob(agentId, slug, operation) {
-  if (!agentId || !slug) return null;
-
-  const jobs = await clawhubJobsQueue.getJobs([
-    "active",
-    "waiting",
-    "waiting-children",
-    "delayed",
-    "prioritized",
-  ]);
-
-  const normalizedAgentId = String(agentId);
-  const normalizedSlug = String(slug).trim();
-
-  for (const job of jobs) {
-    if (!job) continue;
-    const matchesAgent = String(job.data?.agentId || "") === normalizedAgentId;
-    const matchesSlug = String(job.data?.slug || "").trim() === normalizedSlug;
-    const matchesOperation = operation
-      ? String(job.data?.operation || "").trim() === String(operation).trim()
-      : true;
-    if (matchesAgent && matchesSlug && matchesOperation) {
-      return job;
-    }
-  }
-
-  return null;
-}
-
-function mapClawhubJobState(state) {
+function mapSkillJobState(state) {
   switch (state) {
     case "active":
       return "running";
@@ -334,30 +314,112 @@ function mapClawhubJobState(state) {
   }
 }
 
+/**
+ * Per-agent skill job queue API shared by the ClawHub (OpenClaw) and Hermes
+ * skill queues. The queues stay separate (independent serialization, stable
+ * queue names across upgrades); only the add/find/status plumbing is shared.
+ * `identityField` names the job-data key that identifies the skill: `slug`
+ * for ClawHub, `name` (the Hermes hub lockfile key) for Hermes.
+ *
+ * @param {Object} queue - BullMQ queue instance.
+ * @param {Object} options - `identityField` selecting the skill key.
+ * @returns {Object} `{ addJob, findInFlightJob, getJob, getJobStatus }`.
+ */
+function createSkillJobQueueApi(queue, { identityField = "slug" } = {}) {
+  async function addJob(payload) {
+    const jobId = payload?.jobId || randomUUID();
+    const operation = String(payload?.operation || "").trim() || "install";
+    return queue.add(`${operation}-skill`, { ...payload, operation, jobId }, { jobId });
+  }
+
+  async function findInFlightJob(agentId, identity, operation) {
+    if (!agentId || !identity) return null;
+
+    const jobs = await queue.getJobs([
+      "active",
+      "waiting",
+      "waiting-children",
+      "delayed",
+      "prioritized",
+    ]);
+
+    const normalizedAgentId = String(agentId);
+    const normalizedIdentity = String(identity).trim();
+
+    for (const job of jobs) {
+      if (!job) continue;
+      const matchesAgent = String(job.data?.agentId || "") === normalizedAgentId;
+      const matchesIdentity =
+        String(job.data?.[identityField] || "").trim() === normalizedIdentity;
+      const matchesOperation = operation
+        ? String(job.data?.operation || "").trim() === String(operation).trim()
+        : true;
+      if (matchesAgent && matchesIdentity && matchesOperation) {
+        return job;
+      }
+    }
+
+    return null;
+  }
+
+  async function getJob(jobId) {
+    if (!jobId) return null;
+    return queue.getJob(jobId);
+  }
+
+  async function getJobStatus(jobId) {
+    const job = await getJob(jobId);
+    if (!job) return null;
+
+    const state = await job.getState();
+    const failedReason =
+      typeof job.failedReason === "string" && job.failedReason.trim()
+        ? job.failedReason.trim()
+        : null;
+
+    return {
+      jobId: String(job.id),
+      agentId: job.data?.agentId || null,
+      [identityField]: job.data?.[identityField] || null,
+      operation: job.data?.operation || "install",
+      status: mapSkillJobState(state),
+      error: failedReason,
+      completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+    };
+  }
+
+  return { addJob, findInFlightJob, getJob, getJobStatus };
+}
+
+const clawhubJobsApi = createSkillJobQueueApi(clawhubJobsQueue, { identityField: "slug" });
+const hermesSkillsJobsApi = createSkillJobQueueApi(hermesSkillsQueue, { identityField: "name" });
+
+// ── ClawHub job inspection and compatibility helpers ────────────
+
+async function findInFlightClawhubJob(agentId, slug, operation) {
+  return clawhubJobsApi.findInFlightJob(agentId, slug, operation);
+}
+
 async function getClawhubJob(jobId) {
-  if (!jobId) return null;
-  return clawhubJobsQueue.getJob(jobId);
+  return clawhubJobsApi.getJob(jobId);
 }
 
 async function getClawhubJobStatus(jobId) {
-  const job = await getClawhubJob(jobId);
-  if (!job) return null;
+  return clawhubJobsApi.getJobStatus(jobId);
+}
 
-  const state = await job.getState();
-  const failedReason =
-    typeof job.failedReason === "string" && job.failedReason.trim()
-      ? job.failedReason.trim()
-      : null;
+// ── Hermes skill job helpers ────────────────────────────────────
 
-  return {
-    jobId: String(job.id),
-    agentId: job.data?.agentId || null,
-    slug: job.data?.slug || null,
-    operation: job.data?.operation || "install",
-    status: mapClawhubJobState(state),
-    error: failedReason,
-    completedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
-  };
+async function addHermesSkillJob(payload) {
+  return hermesSkillsJobsApi.addJob(payload);
+}
+
+async function findInFlightHermesSkillJob(agentId, name, operation) {
+  return hermesSkillsJobsApi.findInFlightJob(agentId, name, operation);
+}
+
+async function getHermesSkillJobStatus(jobId) {
+  return hermesSkillsJobsApi.getJobStatus(jobId);
 }
 
 async function addClawhubInstallJob(payload) {
@@ -396,6 +458,7 @@ async function retryDLQJob(jobId) {
 module.exports = {
   deployQueue,
   clawhubJobsQueue,
+  hermesSkillsQueue,
   policySettingsQueue,
   backupsQueue,
   alertDeliveryQueue,
@@ -414,6 +477,9 @@ module.exports = {
   getClawhubJobStatus,
   getClawhubInstallJob,
   getClawhubInstallJobStatus,
+  addHermesSkillJob,
+  findInFlightHermesSkillJob,
+  getHermesSkillJobStatus,
   getDLQJobs,
   retryDLQJob,
   connection,
