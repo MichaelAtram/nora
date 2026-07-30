@@ -3564,7 +3564,7 @@ async function runClawhubDeleteJob({
 
 // ── Hermes skills: job + reconciliation helpers ─────────────────
 // Mirrors the ClawHub block above with the Hermes hub CLI (`hermes skills`)
-// and its lockfile (~/.hermes/skills/.hub/lock.json, keyed by skill name).
+// and its lockfile ($HERMES_HOME/skills/.hub/lock.json, keyed by skill name).
 
 const HERMES_CLI_BIN = "/opt/hermes/.venv/bin/hermes";
 const HERMES_CONTAINER_HOME = "/opt/data/home";
@@ -3702,7 +3702,10 @@ async function uninstallHermesSkill(provisioner, containerId, name, agentId) {
   await runProvisionerExecCommand(
     provisioner,
     containerId,
-    buildHermesSkillsCliPrefix() + `"$HERMES_BIN" skills uninstall ${shellSingleQuote(name)}`,
+    // `skills uninstall` has no --yes flag and prompts; pipe the confirmation
+    // (verified: non-interactive runs otherwise cancel and leave the skill).
+    buildHermesSkillsCliPrefix() +
+      `printf 'y\\n' | "$HERMES_BIN" skills uninstall ${shellSingleQuote(name)}`,
     {
       timeout: HERMES_SKILLS_INSTALL_TIMEOUT_MS + 10000,
       maxOutputBytes: 32768,

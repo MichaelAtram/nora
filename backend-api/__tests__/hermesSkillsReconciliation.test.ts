@@ -99,7 +99,7 @@ describe("lockfile parsing", () => {
   });
 
   it("exports the lockfile path under the skills dir", () => {
-    expect(HERMES_SKILLS_LOCK_FILE).toBe("/opt/data/home/.hermes/skills/.hub/lock.json");
+    expect(HERMES_SKILLS_LOCK_FILE).toBe("/opt/data/skills/.hub/lock.json");
   });
 });
 
