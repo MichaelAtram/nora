@@ -16,6 +16,11 @@ const mockUpsertListing = jest.fn();
 const mockGetListing = jest.fn();
 const mockGetAgentHubSettings = jest.fn();
 const mockLogEvent = jest.fn();
+const mockAddDeploymentJob = jest.fn();
+const mockEnforceLimits = jest.fn();
+const mockFetchListing = jest.fn();
+const mockRecordInstall = jest.fn();
+const mockSelectNode = jest.fn();
 
 jest.mock("../db", () => mockDb);
 jest.mock("../authSync", () => ({
@@ -46,12 +51,12 @@ jest.mock("../hermesTemplateExport", () => ({
   buildHermesBundleMetadata: mockBuildHermesBundleMetadata,
 }));
 jest.mock("../redisQueue", () => ({
-  addDeploymentJob: jest.fn(),
+  addDeploymentJob: (...args) => mockAddDeploymentJob(...args),
 }));
 jest.mock("../billing", () => ({
   IS_PAAS: false,
   SELFHOSTED_LIMITS: { max_vcpu: 8, max_ram_mb: 16384, max_disk_gb: 200 },
-  enforceLimits: jest.fn(),
+  enforceLimits: (...args) => mockEnforceLimits(...args),
 }));
 jest.mock("../agentHubStore", () => ({
   LISTING_SOURCE_PLATFORM: "platform",
@@ -73,7 +78,7 @@ jest.mock("../agentHubStore", () => ({
   listAgentHubLocalListings: jest.fn(),
   listUserListings: jest.fn(),
   listCommunityCatalog: jest.fn(),
-  recordInstall: jest.fn(),
+  recordInstall: (...args) => mockRecordInstall(...args),
   recordDownload: jest.fn(),
   createReport: jest.fn(),
 }));
@@ -84,7 +89,7 @@ jest.mock("../agentHubApiKeys", () => ({
 }));
 jest.mock("../agentHubRemote", () => ({
   fetchCatalog: jest.fn(),
-  fetchListing: jest.fn(),
+  fetchListing: (...args) => mockFetchListing(...args),
   submitListing: jest.fn(),
 }));
 jest.mock("../platformSettings", () => ({
@@ -97,7 +102,7 @@ jest.mock("../snapshots", () => ({
   updateSnapshot: jest.fn(),
 }));
 jest.mock("../scheduler", () => ({
-  selectNode: jest.fn(),
+  selectNode: (...args) => mockSelectNode(...args),
 }));
 jest.mock("../monitoring", () => ({
   logEvent: (...args) => mockLogEvent(...args),
@@ -271,6 +276,10 @@ beforeEach(() => {
     central_share_status: "not_shared",
   });
   mockLogEvent.mockResolvedValue(undefined);
+  mockEnforceLimits.mockResolvedValue({ allowed: true, subscription: { plan: "selfhosted" } });
+  mockAddDeploymentJob.mockResolvedValue(undefined);
+  mockRecordInstall.mockResolvedValue(undefined);
+  mockSelectNode.mockResolvedValue(null);
 });
 
 afterAll(() => {
@@ -595,5 +604,366 @@ describe("hermesTemplateExport bundle metadata", () => {
 
     expect(metadata.hermesModelConfig).toEqual({ provider: "", defaultModel: "", baseUrl: "" });
     expect(metadata.hermesSkills).toEqual([]);
+  });
+});
+
+// ── /install ────────────────────────────────────────────────────
+
+function hermesBundlePayload({ files = null, metadata = {} } = {}) {
+  return {
+    version: 1,
+    files: files || [{ path: "notes.md", contentBase64: encode("# Notes"), mode: 0o644 }],
+    memoryFiles: [],
+    wiring: { channels: [], integrations: [] },
+    metadata: { runtimeFamily: "hermes", ...metadata },
+  };
+}
+
+function hermesListingRow(overrides = {}) {
+  return {
+    id: "listing-h1",
+    name: "Hermes Bundle",
+    snapshot_id: "snapshot-h1",
+    status: "published",
+    source_type: "community",
+    local_visibility: "internal",
+    owner_user_id: "user-2",
+    runtime_family: "hermes",
+    ...overrides,
+  };
+}
+
+function snapshotRow({ defaults = {}, templatePayload = {} } = {}) {
+  return {
+    id: "snapshot-h1",
+    name: "Hermes Bundle",
+    kind: "community-template",
+    template_key: null,
+    config: {
+      kind: "community-template",
+      defaults: {
+        backend: "docker",
+        sandbox: "standard",
+        vcpu: 2,
+        ram_mb: 2048,
+        disk_gb: 20,
+        image: null,
+        ...defaults,
+      },
+      templatePayload,
+    },
+  };
+}
+
+function primeInstallQueries() {
+  const insertedAgent = {
+    id: "agent-new-1",
+    user_id: "user-1",
+    status: "queued",
+  };
+  mockDb.query.mockImplementation(async (sql, params) => {
+    const text = String(sql);
+    if (text.includes("INSERT INTO agents")) {
+      return {
+        rows: [
+          {
+            ...insertedAgent,
+            name: params[1],
+            runtime_family: params[12],
+            deploy_target: params[13],
+            execution_target_id: params[14],
+            sandbox_profile: params[15],
+          },
+        ],
+      };
+    }
+    return { rows: [] };
+  });
+}
+
+function findQueryCall(matcher) {
+  return mockDb.query.mock.calls.find(([sql]) => String(sql).includes(matcher)) || null;
+}
+
+describe("POST /install runtime-family resolution", () => {
+  it("resolves the family from the listing column and persists a hermes agent", async () => {
+    primeInstallQueries();
+    mockGetListing.mockResolvedValue(hermesListingRow());
+    mockGetSnapshot.mockResolvedValue(
+      snapshotRow({
+        defaults: { runtime_family: "hermes" },
+        templatePayload: hermesBundlePayload(),
+      }),
+    );
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "listing-h1", name: "My Hermes Agent" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.runtime_family).toBe("hermes");
+    const [, params] = findQueryCall("INSERT INTO agents");
+    expect(params[12]).toBe("hermes");
+    expect(mockRecordInstall).toHaveBeenCalledWith("listing-h1");
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "agent-new-1", backend: "docker", sandbox: "standard" }),
+    );
+  });
+
+  it("resolves the family from snapshot defaults when the listing column is absent", async () => {
+    primeInstallQueries();
+    mockGetListing.mockResolvedValue(hermesListingRow({ runtime_family: null }));
+    mockGetSnapshot.mockResolvedValue(
+      snapshotRow({
+        defaults: { runtime_family: "hermes" },
+        templatePayload: hermesBundlePayload({ metadata: { runtimeFamily: undefined } }),
+      }),
+    );
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "listing-h1", name: "Defaults Hermes" });
+
+    expect(res.status).toBe(200);
+    const [, params] = findQueryCall("INSERT INTO agents");
+    expect(params[12]).toBe("hermes");
+  });
+
+  it("resolves a remote listing's family from the payload metadata carrier alone", async () => {
+    primeInstallQueries();
+    mockFetchListing.mockResolvedValue({
+      id: "hub:remote-1",
+      remote_id: "remote-1",
+      name: "Remote Hermes",
+      templatePayload: hermesBundlePayload(),
+      defaults: {},
+    });
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "hub:remote-1", name: "Metadata Hermes" });
+
+    expect(res.status).toBe(200);
+    const [, params] = findQueryCall("INSERT INTO agents");
+    expect(params[12]).toBe("hermes");
+    expect(mockRecordInstall).not.toHaveBeenCalled();
+  });
+
+  it("defaults a remote listing with no family carriers to openclaw", async () => {
+    primeInstallQueries();
+    mockFetchListing.mockResolvedValue({
+      id: "hub:remote-2",
+      remote_id: "remote-2",
+      name: "Legacy Remote",
+      templatePayload: {
+        version: 1,
+        files: [{ path: "CUSTOM.md", contentBase64: encode("stored") }],
+        memoryFiles: [],
+        wiring: { channels: [], integrations: [] },
+        metadata: {},
+      },
+      defaults: {},
+    });
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "hub:remote-2", name: "Legacy Agent" });
+
+    expect(res.status).toBe(200);
+    const [, params] = findQueryCall("INSERT INTO agents");
+    expect(params[12]).toBe("openclaw");
+  });
+
+  it.each([
+    ["a mismatched family", "openclaw"],
+    ["an unknown family", "quantumclaw"],
+  ])("rejects a request carrying %s with 400", async (_label, requestedFamily) => {
+    primeInstallQueries();
+    mockGetListing.mockResolvedValue(hermesListingRow());
+    mockGetSnapshot.mockResolvedValue(
+      snapshotRow({
+        defaults: { runtime_family: "hermes" },
+        templatePayload: hermesBundlePayload(),
+      }),
+    );
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "listing-h1", name: "Mismatch", runtime_family: requestedFamily });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/targets the "hermes" runtime family/i);
+    expect(findQueryCall("INSERT INTO agents")).toBeNull();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+
+  it("rejects installing a listing whose family is not enabled on this instance", async () => {
+    process.env.ENABLED_RUNTIME_FAMILIES = "openclaw";
+    primeInstallQueries();
+    mockGetListing.mockResolvedValue(hermesListingRow());
+    mockGetSnapshot.mockResolvedValue(
+      snapshotRow({
+        defaults: { runtime_family: "hermes" },
+        templatePayload: hermesBundlePayload(),
+      }),
+    );
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "listing-h1", name: "Disabled Hermes" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/not enabled/i);
+    expect(findQueryCall("INSERT INTO agents")).toBeNull();
+    expect(mockAddDeploymentJob).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /install hermes bundle persistence", () => {
+  it("persists normalized bundle skills and seeds hermes_runtime_state.model_config", async () => {
+    primeInstallQueries();
+    mockGetListing.mockResolvedValue(hermesListingRow());
+    mockGetSnapshot.mockResolvedValue(
+      snapshotRow({
+        defaults: { runtime_family: "hermes" },
+        templatePayload: hermesBundlePayload({
+          metadata: {
+            hermesSkills: [
+              {
+                source: "hermes-bundle",
+                ref: "official/security/1password",
+                name: "1password",
+                installMode: "cli",
+                installedAt: "2026-07-01T00:00:00.000Z",
+              },
+              {
+                source: "hermes-bundle",
+                ref: "",
+                name: "pdf-tools",
+                installMode: "files",
+                installedAt: "2026-07-01T00:00:00.000Z",
+              },
+              { source: "hermes-hub", ref: "", name: "refless-cli", installMode: "cli" },
+              { source: "hermes-hub", ref: "internal", name: "nora-integrations" },
+            ],
+            hermesModelConfig: {
+              provider: "nous",
+              defaultModel: "hermes-4-405b",
+              baseUrl: "",
+            },
+          },
+        }),
+      }),
+    );
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "listing-h1", name: "Bundle Agent", runtime_family: "hermes" });
+
+    expect(res.status).toBe(200);
+
+    const [, agentParams] = findQueryCall("INSERT INTO agents");
+    const persistedSkills = JSON.parse(agentParams[11]);
+    expect(persistedSkills.map((entry) => entry.name)).toEqual(["1password", "pdf-tools"]);
+    expect(persistedSkills[1].installMode).toBe("files");
+
+    const stateCall = findQueryCall("hermes_runtime_state");
+    expect(stateCall).not.toBeNull();
+    expect(stateCall[1][0]).toBe("agent-new-1");
+    expect(JSON.parse(stateCall[1][1])).toEqual({
+      provider: "nous",
+      defaultModel: "hermes-4-405b",
+      baseUrl: "",
+    });
+
+    expect(findQueryCall("INSERT INTO deployments")).not.toBeNull();
+    expect(mockAddDeploymentJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps persisted bundle skills at 20 entries", async () => {
+    primeInstallQueries();
+    mockGetListing.mockResolvedValue(hermesListingRow());
+    mockGetSnapshot.mockResolvedValue(
+      snapshotRow({
+        defaults: { runtime_family: "hermes" },
+        templatePayload: hermesBundlePayload({
+          metadata: {
+            hermesSkills: Array.from({ length: 25 }, (_, index) => ({
+              source: "hermes-bundle",
+              ref: `official/tools/skill-${index}`,
+              name: `skill-${index}`,
+              installMode: "cli",
+              installedAt: "2026-07-01T00:00:00.000Z",
+            })),
+          },
+        }),
+      }),
+    );
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "listing-h1", name: "Capped Agent" });
+
+    expect(res.status).toBe(200);
+    const [, agentParams] = findQueryCall("INSERT INTO agents");
+    expect(JSON.parse(agentParams[11])).toHaveLength(20);
+  });
+
+  it("skips the runtime-state seed when the bundle has no meaningful model config", async () => {
+    primeInstallQueries();
+    mockGetListing.mockResolvedValue(hermesListingRow());
+    mockGetSnapshot.mockResolvedValue(
+      snapshotRow({
+        defaults: { runtime_family: "hermes" },
+        templatePayload: hermesBundlePayload({
+          metadata: { hermesModelConfig: { provider: "", defaultModel: "", baseUrl: "" } },
+        }),
+      }),
+    );
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "listing-h1", name: "No Model Agent" });
+
+    expect(res.status).toBe(200);
+    expect(findQueryCall("hermes_runtime_state")).toBeNull();
+  });
+});
+
+describe("POST /install openclaw flow (unchanged)", () => {
+  it("still installs openclaw listings with synthesized core files and no hermes state", async () => {
+    primeInstallQueries();
+    mockGetListing.mockResolvedValue(
+      hermesListingRow({
+        id: "listing-o1",
+        name: "OpenClaw Template",
+        runtime_family: "openclaw",
+      }),
+    );
+    mockGetSnapshot.mockResolvedValue(
+      snapshotRow({
+        defaults: { runtime_family: "openclaw" },
+        templatePayload: {
+          version: 1,
+          files: [{ path: "CUSTOM.md", contentBase64: encode("stored template") }],
+          memoryFiles: [],
+          wiring: { channels: [], integrations: [] },
+          metadata: {},
+        },
+      }),
+    );
+
+    const res = await request(buildApp())
+      .post("/install")
+      .send({ listingId: "listing-o1", name: "OpenClaw Install", runtime_family: "openclaw" });
+
+    expect(res.status).toBe(200);
+    const [, params] = findQueryCall("INSERT INTO agents");
+    expect(params[12]).toBe("openclaw");
+    expect(JSON.parse(params[11])).toEqual([]);
+    const payloadPaths = JSON.parse(params[10]).files.map((entry) => entry.path);
+    expect(payloadPaths).toEqual(expect.arrayContaining(["CUSTOM.md", "AGENTS.md", "SOUL.md"]));
+    expect(findQueryCall("hermes_runtime_state")).toBeNull();
+    expect(mockAddDeploymentJob).toHaveBeenCalledTimes(1);
   });
 });

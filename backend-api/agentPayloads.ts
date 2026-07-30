@@ -1057,6 +1057,7 @@ module.exports = {
   materializeTemplateWiring,
   normalizeTemplatePayload,
   resolveContainerName,
+  resolveTemplatePayloadRuntimeFamily,
   sanitizeAgentName,
   serializeAgent,
   stripInternalTemplateMetadata,

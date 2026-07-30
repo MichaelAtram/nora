@@ -19,7 +19,9 @@ const {
   extractTemplateDefaultsFromSnapshot,
   extractTemplatePayloadFromSnapshot,
   materializeTemplateWiring,
+  normalizeTemplatePayload,
   resolveContainerName,
+  resolveTemplatePayloadRuntimeFamily,
   sanitizeAgentName,
   serializeAgent,
   stripInternalTemplateMetadata,
@@ -34,11 +36,16 @@ const {
   isKnownBackend,
   isKnownRuntimeFamily,
   normalizeBackendName,
+  normalizeRuntimeFamilyName,
 } = require("../../agent-runtime/lib/backendCatalog");
 const {
   buildHermesBundleMetadata,
   buildHermesTemplatePayloadFromAgent,
 } = require("../hermesTemplateExport");
+const {
+  normalizeSavedHermesSkillEntries,
+} = require("../../agent-runtime/lib/hermesSkillsReconciliation");
+const { replacePersistedHermesState } = require("../hermesUi");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { requireSession } = require("../middleware/auth");
 const {
@@ -159,12 +166,60 @@ function resolveRequestedDeployTarget({
   return getDefaultBackend(process.env);
 }
 
-function normalizeRequestedRuntimeFamily(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-  if (!normalized) return null;
-  return normalized === DEFAULT_RUNTIME_FAMILY ? DEFAULT_RUNTIME_FAMILY : null;
+// Keep in sync with MAX_HERMES_SKILLS_PER_DEPLOY in routes/agents.ts: an
+// installed bundle must not seed more saved skills than a deploy may request.
+const MAX_HERMES_SKILLS_PER_INSTALL = 20;
+
+/**
+ * Resolve the runtime family of a listing being installed, in the redundant
+ * carrier order the bundle format defines: the listing's own `runtime_family`
+ * field (authoritative, always present on local rows), then the snapshot or
+ * remote `defaults` block, then the template payload's `metadata.runtimeFamily`
+ * carrier (survives federation through hubs that predate runtime_family),
+ * defaulting to OpenClaw.
+ *
+ * @param {Object} listing - Local or remote listing row/detail.
+ * @param {Object} defaults - Raw defaults block attached to the listing.
+ * @param {Object} templatePayload - Template payload being installed.
+ * @returns {string} Known runtime family name.
+ */
+function resolveListingRuntimeFamily(listing, defaults, templatePayload) {
+  const carriers = [
+    listing?.runtime_family ?? listing?.runtimeFamily,
+    defaults?.runtime_family ?? defaults?.runtimeFamily,
+  ];
+  for (const carrier of carriers) {
+    const candidate = String(carrier ?? "").trim();
+    if (candidate) return normalizeRuntimeFamilyName(candidate);
+  }
+  return resolveTemplatePayloadRuntimeFamily(normalizeTemplatePayload(templatePayload));
+}
+
+/**
+ * Extract the saved-skill entries a Hermes bundle should seed onto the
+ * installed agent. Entries are re-normalized through the shared reconciliation
+ * module (reserved and malformed names dropped, `installMode` preserved) and
+ * only entries the runtime can actually restore are kept: CLI installs need a
+ * ref, files-mode skills rematerialize from the template payload.
+ *
+ * @param {Object} templatePayload - Normalized bundle payload.
+ * @returns {Array<Object>} Saved-skill entries for `agents.hermes_skills`.
+ */
+function extractHermesBundleSkills(templatePayload) {
+  return normalizeSavedHermesSkillEntries(templatePayload?.metadata?.hermesSkills)
+    .filter((entry) => entry.ref || entry.installMode === "files")
+    .slice(0, MAX_HERMES_SKILLS_PER_INSTALL);
+}
+
+function extractHermesBundleModelConfig(templatePayload) {
+  const rawConfig = templatePayload?.metadata?.hermesModelConfig;
+  if (!rawConfig || typeof rawConfig !== "object") return null;
+  const modelConfig = {
+    provider: String(rawConfig.provider || "").trim(),
+    defaultModel: String(rawConfig.defaultModel || "").trim(),
+    baseUrl: String(rawConfig.baseUrl || "").trim(),
+  };
+  return Object.values(modelConfig).some(Boolean) ? modelConfig : null;
 }
 
 function assertRuntimeSelectionAvailable(runtimeFields) {
@@ -351,17 +406,18 @@ function buildRemoteTemplateDetail(remoteDetail, options = {}) {
   const templatePayload = stripInternalTemplateMetadata(
     remoteDetail.templatePayload || remoteDetail.template_payload || {},
   );
+  // Family resolution order for federated listings: listing field first, then
+  // remote defaults, then the payload metadata carrier for hubs that predate
+  // runtime_family. The resolved value is surfaced as `runtime_family` so the
+  // install route and the UI treat remote details like local listing rows.
+  const runtimeFamily = resolveListingRuntimeFamily(
+    remoteDetail,
+    remoteDetail.defaults,
+    templatePayload,
+  );
   const template = summarizeTemplatePayload(templatePayload, {
     includeContent: options.includeContent === true,
-    // Family resolution order for federated listings: listing field first,
-    // then remote defaults, then the payload metadata carrier (handled inside
-    // the summarizer) for hubs that predate runtime_family.
-    runtimeFamily:
-      remoteDetail.runtime_family ??
-      remoteDetail.runtimeFamily ??
-      remoteDetail.defaults?.runtime_family ??
-      remoteDetail.defaults?.runtimeFamily ??
-      null,
+    runtimeFamily,
   });
   return {
     ...remoteDetail,
@@ -371,6 +427,7 @@ function buildRemoteTemplateDetail(remoteDetail, options = {}) {
     remote: true,
     source_type: "community",
     status: "published",
+    runtime_family: runtimeFamily,
     defaults: remoteDetail.defaults || {},
     snapshot: remoteDetail.snapshot || null,
     template:
@@ -411,6 +468,7 @@ function buildCentralSubmissionPayload(listing, snapshot, templatePayload) {
       sourceType: listing.source_type,
       ownerName: listing.owner_name || listing.owner_email || "Nora user",
       version: listing.current_version || 1,
+      runtimeFamily: listing.runtime_family || DEFAULT_RUNTIME_FAMILY,
     },
     snapshot: {
       id: snapshot.id,
@@ -756,22 +814,39 @@ router.post(
     }
     res.locals.auditContext = buildListingContext(listing);
 
-    const name = sanitizeAgentName(requestedName, snap.name || listing.name || "OpenClaw-Agent");
+    // Decision-6 family resolution: listing column -> snapshot/remote defaults
+    // -> payload metadata carrier -> OpenClaw. The remote branch already
+    // resolved this into `listing.runtime_family` via buildRemoteTemplateDetail;
+    // the local branch reads the listing row column directly.
+    const listingFamily = resolveListingRuntimeFamily(listing, defaults, templatePayload);
+    const requestBody = req.body || {};
+    const requestedFamilyRaw = requestBody.runtime_family ?? requestBody.runtimeFamily;
+    if (requestedFamilyRaw != null && String(requestedFamilyRaw).trim()) {
+      const requestedFamily = String(requestedFamilyRaw).trim().toLowerCase();
+      if (!isKnownRuntimeFamily(requestedFamily) || requestedFamily !== listingFamily) {
+        return res.status(400).json({
+          error: `This template targets the "${listingFamily}" runtime family and cannot be installed with runtime_family "${requestedFamily}".`,
+        });
+      }
+    }
+    if (!getEnabledRuntimeFamilies(process.env).includes(listingFamily)) {
+      return res.status(400).json({
+        error: `Runtime family "${listingFamily}" is not enabled on this Nora control plane. Enable it via ENABLED_RUNTIME_FAMILIES before installing this template.`,
+      });
+    }
+
+    const name = sanitizeAgentName(
+      requestedName,
+      snap.name || listing.name || (listingFamily === "hermes" ? "Hermes-Agent" : "OpenClaw-Agent"),
+    );
     if (name.length > 100) {
       return res.status(400).json({ error: "Agent name must be 100 characters or less" });
     }
 
-    const requestBody = req.body || {};
-    const runtimeFamily = normalizeRequestedRuntimeFamily(requestBody.runtime_family);
-    if (requestBody.runtime_family != null && runtimeFamily == null) {
-      return res.status(400).json({
-        error: `Unsupported runtime_family. Nora currently supports only "${DEFAULT_RUNTIME_FAMILY}".`,
-      });
-    }
     const runtimeFields = resolveRequestedRuntimeFields({
       request: {
         ...requestBody,
-        runtime_family: runtimeFamily || DEFAULT_RUNTIME_FAMILY,
+        runtime_family: listingFamily,
       },
       fallback: {
         backend_type: defaults.backend || null,
@@ -802,12 +877,17 @@ router.post(
       runtimeSelection: runtimeFields,
     });
 
+    // Hermes bundles seed the agent's saved skills at install time; the deploy
+    // worker's reconcile/rematerialize pass then restores them on first boot.
+    const hermesSkills =
+      listingFamily === "hermes" ? extractHermesBundleSkills(templatePayload) : [];
+
     const result = await db.query(
       `INSERT INTO agents(
          user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
-         container_name, image, template_payload, runtime_family, deploy_target,
+         container_name, image, template_payload, hermes_skills, runtime_family, deploy_target,
          execution_target_id, sandbox_profile
-       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16)
        RETURNING *`,
       [
         req.user.id,
@@ -821,6 +901,7 @@ router.post(
         containerName,
         image,
         JSON.stringify(templatePayload),
+        JSON.stringify(hermesSkills),
         runtimeFields.runtime_family,
         runtimeFields.deploy_target,
         runtimeFields.execution_target_id,
@@ -828,6 +909,17 @@ router.post(
       ],
     );
     const agent = result.rows[0];
+
+    // Seed the bundle's model selection (never keys) as durable Hermes state so
+    // the deploy worker's persisted-state replay applies it on first boot.
+    const hermesModelConfig =
+      listingFamily === "hermes" ? extractHermesBundleModelConfig(templatePayload) : null;
+    if (hermesModelConfig) {
+      await replacePersistedHermesState(agent.id, {
+        modelConfig: hermesModelConfig,
+        channels: [],
+      });
+    }
 
     await materializeTemplateWiring(agent.id, templatePayload);
     await db.query("INSERT INTO deployments(agent_id, status) VALUES($1, 'queued')", [agent.id]);

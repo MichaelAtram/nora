@@ -117,6 +117,7 @@ const {
   computeOrphanedInstalledHermesSkills,
   installedEntriesFromHermesLockData,
   isReservedHermesSkillName,
+  isValidHermesSkillName,
   normalizeSavedHermesSkillEntry,
   removeSavedHermesSkillEntry,
 } = require("../../agent-runtime/lib/hermesSkillsReconciliation");
@@ -1155,6 +1156,211 @@ async function seedHermesArchiveForDeployment({
   // enters the normal provisioning cleanup path instead of finalizing runtime.
   await authorize(provisioner);
   return { seeded: true, reason: null };
+}
+
+// ── Hermes template-bundle materialization ──────────────────────
+// Agent Hub Hermes bundles ship workspace files (and files-mode skill
+// directories under the reserved `.hermes-skills/<name>/` prefix) in the
+// agent's stored template payload. They are written into the runtime after
+// creation via exec — NOT the Docker-only seed-archive path above, so the
+// same materializer works on k8s and remote targets. A marker file skips
+// re-materialization on redeploys whose /opt/data survived (k8s PVCs,
+// post-#301 named volumes), so agent-edited files are never clobbered.
+const HERMES_TEMPLATE_WORKSPACE_DIR = "/opt/data/workspace";
+const HERMES_TEMPLATE_MARKER_DIR = "/opt/data/.nora";
+const HERMES_TEMPLATE_APPLIED_MARKER = `${HERMES_TEMPLATE_MARKER_DIR}/template-applied`;
+const HERMES_TEMPLATE_SKILLS_PREFIX = ".hermes-skills/";
+const HERMES_TEMPLATE_MARKER_PRESENT_TOKEN = "NORA_TEMPLATE_APPLIED";
+const HERMES_TEMPLATE_MARKER_ABSENT_TOKEN = "NORA_TEMPLATE_ABSENT";
+// Base64 payload budget per exec batch; each write command carries its file
+// inline, so this bounds individual command sizes across exec transports.
+const HERMES_TEMPLATE_WRITE_BATCH_BYTES = 512 * 1024;
+
+// Local variant of hermesManifest.writeBase64FileCommand (same
+// mkdir/base64/chmod idiom). Deliberately replicated rather than imported:
+// the manifest helper is not exported and takes UTF-8 text it re-encodes,
+// while bundle entries already carry base64 that must survive byte-for-byte
+// for binary workspace files.
+function buildHermesTemplateFileWriteCommand(filePath, contentBase64, mode = "0644") {
+  const quotedPath = shellSingleQuote(filePath);
+  const quotedDir = shellSingleQuote(filePath.split("/").slice(0, -1).join("/") || "/");
+  return [
+    `mkdir -p ${quotedDir}`,
+    `printf '%s' ${shellSingleQuote(String(contentBase64 || ""))} | base64 -d > ${quotedPath}`,
+    `chmod ${mode} ${quotedPath}`,
+  ].join(" && ");
+}
+
+// Single validation + mapping choke point for bundle file paths — they are
+// interpolated into shell commands, so this mirrors the containment rules in
+// runtimeBootstrap/agentPayloads (relative only, no dot/dot-dot segments,
+// conservative charset). `.hermes-skills/<name>/<rest>` maps into the hub
+// skills tree with the skill-name charset + reserved-name rules enforced;
+// everything else lands under the workspace root. Returns null on rejection.
+function resolveHermesTemplateFilePath(rawPath) {
+  const normalized = String(rawPath || "")
+    .trim()
+    .replace(/\\/g, "/");
+  if (!normalized || normalized.startsWith("/") || !/^[A-Za-z0-9._/-]+$/.test(normalized)) {
+    return null;
+  }
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length === 0 || segments.some((segment) => segment === "." || segment === "..")) {
+    return null;
+  }
+  if (normalized.startsWith(HERMES_TEMPLATE_SKILLS_PREFIX)) {
+    const [skillName, ...rest] = segments.slice(1);
+    if (
+      !skillName ||
+      rest.length === 0 ||
+      !isValidHermesSkillName(skillName) ||
+      isReservedHermesSkillName(skillName)
+    ) {
+      return null;
+    }
+    return `${HERMES_SKILLS_DIR}/${[skillName, ...rest].join("/")}`;
+  }
+  return `${HERMES_TEMPLATE_WORKSPACE_DIR}/${segments.join("/")}`;
+}
+
+function formatHermesTemplateFileMode(mode) {
+  if (!Number.isInteger(mode) || mode <= 0 || mode > 0o7777) return "0644";
+  return mode.toString(8).padStart(4, "0");
+}
+
+/**
+ * Write an installed Agent Hub bundle's files into a freshly created Hermes
+ * runtime. Skipped when a migration seed already restored the workspace
+ * (migration wins over the bundle), when the payload has no files, or when the
+ * marker file reports a previous materialization (surviving /opt/data). Files
+ * are written in size-bounded exec batches, ownership is repaired for the
+ * runtime user on every root that was touched, and the marker is written last
+ * so a failed partial write is retried on the next deploy instead of sealed.
+ *
+ * @param {object} options.templatePayload Stored agent template payload.
+ * @param {boolean} [options.migrationSeeded] Whether the migration seed archive
+ *   restored this runtime's workspace during the same deployment.
+ * @param {Function} [options.execute] Exec runner override for tests.
+ * @returns {Promise<{applied: boolean, reason: string|null, fileCount?: number}>}
+ */
+async function materializeHermesTemplatePayload({
+  agentId,
+  provisioner,
+  containerId,
+  templatePayload,
+  migrationSeeded = false,
+  logPrefix = "[hermes-template]",
+  execute = runProvisionerExecCommand,
+} = {}) {
+  if (migrationSeeded) {
+    console.log(
+      `${logPrefix} agent=${agentId} Skipping template bundle; migration seed was applied`,
+    );
+    return { applied: false, reason: "migration-seed" };
+  }
+
+  const files = Array.isArray(templatePayload?.files) ? templatePayload.files : [];
+  if (files.length === 0) {
+    return { applied: false, reason: "no-files" };
+  }
+
+  const markerProbe =
+    `if [ -f ${JSON.stringify(HERMES_TEMPLATE_APPLIED_MARKER)} ]; ` +
+    `then printf '${HERMES_TEMPLATE_MARKER_PRESENT_TOKEN}'; ` +
+    `else printf '${HERMES_TEMPLATE_MARKER_ABSENT_TOKEN}'; fi`;
+  const { output } = await execute(provisioner, containerId, markerProbe, {
+    tty: true,
+    timeout: 30000,
+    agentId,
+  });
+  if (String(output || "").includes(HERMES_TEMPLATE_MARKER_PRESENT_TOKEN)) {
+    console.log(
+      `${logPrefix} agent=${agentId} Template bundle already materialized (marker present); skipping`,
+    );
+    return { applied: false, reason: "marker-present" };
+  }
+
+  // Validate and map every path before writing anything: a bundle with one
+  // unsafe path must fail whole rather than apply partially.
+  const writes = [];
+  let touchedWorkspace = false;
+  let touchedSkills = false;
+  for (const entry of files) {
+    const targetPath = resolveHermesTemplateFilePath(entry?.path);
+    if (!targetPath) {
+      throw new Error(
+        `Hermes template bundle contains an unsafe file path: ${String(entry?.path || "(empty)").slice(0, 200)}`,
+      );
+    }
+    if (targetPath.startsWith(`${HERMES_SKILLS_DIR}/`)) {
+      touchedSkills = true;
+    } else {
+      touchedWorkspace = true;
+    }
+    writes.push({
+      contentBase64: String(entry?.contentBase64 || ""),
+      command: buildHermesTemplateFileWriteCommand(
+        targetPath,
+        entry?.contentBase64,
+        formatHermesTemplateFileMode(entry?.mode),
+      ),
+    });
+  }
+
+  const batches = [];
+  let currentBatch = [];
+  let currentBatchBytes = 0;
+  for (const write of writes) {
+    if (
+      currentBatch.length > 0 &&
+      currentBatchBytes + write.contentBase64.length > HERMES_TEMPLATE_WRITE_BATCH_BYTES
+    ) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBatchBytes = 0;
+    }
+    currentBatch.push(write.command);
+    currentBatchBytes += write.contentBase64.length;
+  }
+  if (currentBatch.length > 0) batches.push(currentBatch);
+
+  for (const batch of batches) {
+    await execute(provisioner, containerId, ["set -eu", ...batch].join("\n"), {
+      timeout: 120000,
+      agentId,
+    });
+  }
+
+  const ownershipRoots = [
+    ...(touchedWorkspace ? [HERMES_TEMPLATE_WORKSPACE_DIR] : []),
+    ...(touchedSkills ? [HERMES_SKILLS_DIR] : []),
+  ];
+  await execute(
+    provisioner,
+    containerId,
+    ownershipRoots
+      .map((root) => `chown -R hermes:hermes ${shellSingleQuote(root)} 2>/dev/null || true`)
+      .join("\n"),
+    { timeout: 60000, agentId },
+  );
+
+  // Marker written last: a failure anywhere above leaves the marker absent so
+  // the next deploy retries the full materialization.
+  await execute(
+    provisioner,
+    containerId,
+    [
+      "set -eu",
+      `mkdir -p ${shellSingleQuote(HERMES_TEMPLATE_MARKER_DIR)}`,
+      `date -u +%Y-%m-%dT%H:%M:%SZ > ${shellSingleQuote(HERMES_TEMPLATE_APPLIED_MARKER)}`,
+    ].join("\n"),
+    { timeout: 30000, agentId },
+  );
+
+  console.log(
+    `${logPrefix} agent=${agentId} Materialized ${writes.length} template bundle file(s)`,
+  );
+  return { applied: true, reason: null, fileCount: writes.length };
 }
 
 function buildHermesPythonCommand(script) {
@@ -4555,11 +4761,31 @@ const worker = new Worker(
             channels: [],
           }));
 
-          await seedHermesArchiveForDeployment({
+          const hermesSeed = await seedHermesArchiveForDeployment({
             agentId: id,
             provisioner,
             containerId,
           });
+
+          // A migration seed wins over an Agent Hub bundle: when the attached
+          // manifest restored a workspace, the bundle's files must not clobber
+          // it. Bundle failures are non-fatal — the marker stays absent and the
+          // next deploy retries; skills replay separately via reconciliation.
+          try {
+            await materializeHermesTemplatePayload({
+              agentId: id,
+              provisioner,
+              containerId,
+              templatePayload,
+              migrationSeeded: hermesSeed?.seeded === true,
+            });
+          } catch (e) {
+            throwIfRemoteAuthorizationFailure(e);
+            console.warn(
+              `[provisioner] Failed to materialize Hermes template bundle for agent ${id}:`,
+              e.message,
+            );
+          }
 
           if (
             hasMeaningfulHermesModelConfig(persistedHermesState?.modelConfig) ||
@@ -5287,6 +5513,7 @@ module.exports = {
   runRuntimeCommand,
   runProvisionerExecCommand,
   seedHermesArchiveForDeployment,
+  materializeHermesTemplatePayload,
   toUnrecoverableRuntimeSelectionError,
   readInstalledHermesSkills,
   installHermesSkill,

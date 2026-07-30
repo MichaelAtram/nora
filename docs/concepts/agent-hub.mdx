@@ -25,10 +25,14 @@ Every listing records the `runtimeFamily` of the agent it was captured from (`op
 
 Publishing runs the same secret scan for every family — listings with detected credentials are rejected before a snapshot is created.
 
-<Note>
-  Hermes listings can currently be published and browsed; one-click install of Hermes bundles ships
-  with the Hermes Agent Hub install path.
-</Note>
+## Installing by runtime family
+
+The catalog shows each listing's family as a badge, and a family filter appears whenever the catalog contains both OpenClaw and Hermes listings. Installing resolves the listing's family server-side — listing field first, then the snapshot's stored defaults, then the template payload's `metadata.runtimeFamily` carrier (which survives federation through hubs that predate the family field), defaulting to `openclaw`. A request that names a different family is rejected, as is installing a listing whose family is not enabled on the instance. The install dialog constrains the deploy target and sandbox pickers to the targets enabled for the listing's family.
+
+- **OpenClaw** — the template files (including the guaranteed core markdown set) are stored on the new agent and written into the workspace by the normal deploy bootstrap.
+- **Hermes** — after the runtime is created, the deploy worker writes the bundle's files into the new agent over container exec: workspace files land under `/opt/data/workspace`, and files-mode skill directories captured under the reserved `.hermes-skills/<name>/` prefix land under `/opt/data/skills`. A marker file (`/opt/data/.nora/template-applied`) records the materialization, so redeploys whose `/opt/data` survived (Kubernetes PVCs, named volumes) never clobber files the agent has since edited; on Docker targets where `/opt/data` is rebuilt, the marker disappears with it and the bundle is re-materialized. The bundle's saved skills are seeded into the agent and reinstalled by the skills reconciler on boot, and its model selection (`provider`, `defaultModel`, `baseUrl` — keys are never bundled) is applied as the new agent's Hermes model config. Connect an LLM provider and any integrations after install, exactly as for a manually deployed Hermes agent.
+
+If an installed agent was created from a migration draft, the migration's restored workspace wins and the bundle files are skipped for that deployment.
 
 ## Sharing model
 
