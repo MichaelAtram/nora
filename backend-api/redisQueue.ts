@@ -349,8 +349,7 @@ function createSkillJobQueueApi(queue, { identityField = "slug" } = {}) {
     for (const job of jobs) {
       if (!job) continue;
       const matchesAgent = String(job.data?.agentId || "") === normalizedAgentId;
-      const matchesIdentity =
-        String(job.data?.[identityField] || "").trim() === normalizedIdentity;
+      const matchesIdentity = String(job.data?.[identityField] || "").trim() === normalizedIdentity;
       const matchesOperation = operation
         ? String(job.data?.operation || "").trim() === String(operation).trim()
         : true;
@@ -482,6 +481,7 @@ module.exports = {
   getHermesSkillJobStatus,
   getDLQJobs,
   retryDLQJob,
+  createSkillJobQueueApi,
   connection,
   BACKUP_JOB_TIMEOUT_MS,
   ALERT_DELIVERY_ATTEMPTS,
