@@ -1867,6 +1867,8 @@ async function migrateDB(database = db, env = process.env) {
     `UPDATE agents SET template_payload = '{}'::jsonb WHERE template_payload IS NULL`,
     `DO $$ BEGIN ALTER TABLE agents ADD COLUMN clawhub_skills JSONB DEFAULT '[]'; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
     `UPDATE agents SET clawhub_skills = '[]'::jsonb WHERE clawhub_skills IS NULL`,
+    `DO $$ BEGIN ALTER TABLE agents ADD COLUMN hermes_skills JSONB DEFAULT '[]'; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+    `UPDATE agents SET hermes_skills = '[]'::jsonb WHERE hermes_skills IS NULL`,
     `CREATE TABLE IF NOT EXISTS agent_migrations (
        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
