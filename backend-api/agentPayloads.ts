@@ -11,6 +11,7 @@ const { NORA_INTEGRATIONS_SKILL_FILE } = require("../agent-runtime/lib/integrati
 const {
   normalizeBackendName,
   normalizeExecutionTargetId,
+  normalizeRuntimeFamilyName,
 } = require("../agent-runtime/lib/backendCatalog");
 const { buildAgentRuntimeFields, parseSandboxProfile } = require("./agentRuntimeFields");
 
@@ -972,8 +973,14 @@ function extractTemplateDefaultsFromSnapshot(snapshot) {
     normalizedExecutionTargetId || normalizeExecutionTargetId(requestedBackend) || backend;
   const requestedSandbox = defaults.sandbox_profile ?? defaults.sandboxProfile ?? defaults.sandbox;
   const sandbox = parseSandboxProfile(requestedSandbox) || "standard";
+  // Unknown or absent families collapse to the platform default ("openclaw")
+  // so templates captured before runtime_family existed keep installing.
+  const runtimeFamily = normalizeRuntimeFamilyName(
+    defaults.runtime_family ?? defaults.runtimeFamily,
+  );
 
   return {
+    runtimeFamily,
     backend,
     executionTargetId,
     sandbox,

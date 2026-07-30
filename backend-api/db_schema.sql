@@ -398,6 +398,7 @@ CREATE TABLE IF NOT EXISTS agent_hub_listings (
   downloads INTEGER DEFAULT 0,
   built_in BOOLEAN DEFAULT false,
   source_type TEXT DEFAULT 'platform',
+  runtime_family TEXT NOT NULL DEFAULT 'openclaw',
   status TEXT DEFAULT 'published',
   visibility TEXT DEFAULT 'public',
   share_target TEXT DEFAULT 'internal',
