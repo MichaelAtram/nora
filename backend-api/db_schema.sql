@@ -292,6 +292,18 @@ CREATE TABLE IF NOT EXISTS hermes_runtime_state (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Instance-curated Hermes Skills Library: registry refs pinned by operators
+-- for quick reuse in skill pickers. Purely a UX curation layer — agents and
+-- hub bundles store full skill entries, never library references.
+CREATE TABLE IF NOT EXISTS hermes_skills_library (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ref TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  added_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Durable copy of OpenClaw channel config: the runtime's openclaw.json is the
 -- live source, but it dies with the container on redeploy, so each saved
 -- channel's config patch is persisted (encrypted) and reseeded on provision.
