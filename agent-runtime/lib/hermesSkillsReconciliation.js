@@ -4,14 +4,18 @@
 // shared engine: both live in the mounted agent-runtime blast-radius zone, and
 // the two families differ in identity (ClawHub keys on author+slug from its
 // own lockfile; Hermes keys on the skill NAME from the Hermes hub lockfile at
-// ~/.hermes/skills/.hub/lock.json, whose entries may nest under category
+// $HERMES_HOME/skills/.hub/lock.json, whose entries may nest under category
 // folders via install_path). The status vocabulary and row shape are kept
 // IDENTICAL to the ClawHub module so the dashboard's shared skill components
 // render both families: healthy / missing_runtime / orphaned_runtime /
 // pending_install / pending_delete.
 
-// Container-absolute paths for the Hermes skills tree (HOME=/opt/data/home).
-const HERMES_SKILLS_DIR = "/opt/data/home/.hermes/skills";
+// Container-absolute paths for the Hermes hub skills tree. get_hermes_home()
+// honors HERMES_HOME (=/opt/data in Nora containers and the stock image), so
+// hub skills live at /opt/data/skills — NOT under $HOME/.hermes (that is the
+// separate "local" tier where Nora's generated nora-integrations skill lives).
+// Verified against nousresearch/hermes-agent:latest (2026-07-30 smoke).
+const HERMES_SKILLS_DIR = "/opt/data/skills";
 const HERMES_SKILLS_LOCK_FILE = `${HERMES_SKILLS_DIR}/.hub/lock.json`;
 
 // Skill directories Nora itself manages. These are written by the integrations

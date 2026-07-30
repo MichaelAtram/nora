@@ -450,7 +450,7 @@ describe("hermes skills routes", () => {
     expect(res.statusCode).toBe(200);
     expect(runContainerCommand).toHaveBeenCalledWith(
       expect.objectContaining({ id: "agent-1" }),
-      expect.stringContaining(".hermes/skills/.hub/lock.json"),
+      expect.stringContaining("/opt/data/skills/.hub/lock.json"),
     );
     expect(res.body).toEqual({
       skills: [
