@@ -40,18 +40,18 @@ flowchart LR
 
 ## Major components
 
-| Component                | Repo surface                                | Role                                                                                                                                                                              |
-| ------------------------ | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Public and auth UI       | `frontend-marketing/`                       | Landing pages, signup, login, and public entrypoint routes.                                                                                                                       |
-| Operator workspace       | `frontend-dashboard/`                       | Deployments, migration/import, fleet operations, filesystem access, logs, settings, Agent Hub, alert rules, backups, and runtime interaction surfaces.                            |
-| Admin workspace          | `admin-dashboard/`                          | Fleet-wide administration, moderation, audit, platform settings, release upgrades.                                                                                                |
-| Reverse proxy            | `nginx.conf`, `nginx.public.conf`, `infra/` | Routes browser traffic to the correct UI or API surface and carries WebSocket / SSE traffic.                                                                                      |
-| Control-plane API        | `backend-api/`                              | Auth, persistence, workspace RBAC, API keys, queue orchestration, monitoring, alert rules, Agent Hub logic, runtime coordination, and runtime proxy endpoints.                    |
-| Durable state            | PostgreSQL 15                               | Accounts, agents, workspaces, members, remote hosts and grants, API keys, deployments, migration drafts, snapshots, Agent Hub content, integrations, channels, metrics, events.   |
-| Queue and worker handoff | Redis 7 + BullMQ                            | Carries deployment, ClawHub-install, backup, and alert-delivery jobs between the API and workers.                                                                                 |
-| Provisioning worker      | `workers/provisioner/`                      | Resolves backend choice, injects bootstrap state, applies imported managed state, waits for readiness, persists status. Also runs the ClawHub-install and alert-delivery workers. |
-| Backup worker            | `workers/backup/`                           | Captures encrypted backup archives, runs scheduled backups, prunes expired backups.                                                                                               |
-| Runtime contract package | `agent-runtime/`                            | Shared runtime-side files, ports, endpoint conventions, bootstrap helpers, and backend metadata used by the API and worker.                                                       |
+| Component                | Repo surface                                | Role                                                                                                                                                                                             |
+| ------------------------ | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Public and auth UI       | `frontend-marketing/`                       | Landing pages, signup, login, and public entrypoint routes.                                                                                                                                      |
+| Operator workspace       | `frontend-dashboard/`                       | Deployments, migration/import, fleet operations, filesystem access, logs, settings, Agent Hub, alert rules, backups, and runtime interaction surfaces.                                           |
+| Admin workspace          | `admin-dashboard/`                          | Fleet-wide administration, moderation, audit, platform settings, release upgrades.                                                                                                               |
+| Reverse proxy            | `nginx.conf`, `nginx.public.conf`, `infra/` | Routes browser traffic to the correct UI or API surface and carries WebSocket / SSE traffic.                                                                                                     |
+| Control-plane API        | `backend-api/`                              | Auth, persistence, workspace RBAC, API keys, queue orchestration, monitoring, alert rules, Agent Hub logic, runtime coordination, and runtime proxy endpoints.                                   |
+| Durable state            | PostgreSQL 15                               | Accounts, agents, workspaces, members, remote hosts and grants, API keys, deployments, migration drafts, snapshots, Agent Hub content, integrations, channels, metrics, events.                  |
+| Queue and worker handoff | Redis 7 + BullMQ                            | Carries deployment, ClawHub-install, Hermes-skill, backup, and alert-delivery jobs between the API and workers.                                                                                  |
+| Provisioning worker      | `workers/provisioner/`                      | Resolves backend choice, injects bootstrap state, applies imported managed state, waits for readiness, persists status. Also runs the ClawHub-install, Hermes-skill, and alert-delivery workers. |
+| Backup worker            | `workers/backup/`                           | Captures encrypted backup archives, runs scheduled backups, prunes expired backups.                                                                                                              |
+| Runtime contract package | `agent-runtime/`                            | Shared runtime-side files, ports, endpoint conventions, bootstrap helpers, and backend metadata used by the API and worker.                                                                      |
 
 ## Control plane
 
@@ -83,6 +83,7 @@ WebSocket upgrades are handled at the nginx layer; the Express app attaches WS h
 - Security middleware: helmet, CORS, rate limiting, correlation IDs, prototype-pollution-safe input validation
 - Auth middleware (session JWT + workspace-scoped API key bearer auth)
 - Workspace-scoped route families for agents, alert rules, API keys, channels, integrations, LLM providers, monitoring, Agent Hub, and workspace members
+- Skill catalogs for both runtime families: ClawHub browse and install for OpenClaw agents, Hermes skills browse/search/install served from a disk-cached copy of the aggregated Hermes skills index, and the instance-curated Hermes Skills Library of pinned registry refs surfaced first in skill pickers
 - Session-only Remote Docker registration for personal hosts plus workspace-based host grants
 - Admin-only routes for platform Remote Docker hosts, fleet operations, audit, moderation, release upgrades, and platform settings
 - Gateway proxy with SSRF guards (`gatewayProxy.ts` — exposes `createGatewayRouter` + `attachGatewayWS`)
@@ -93,7 +94,7 @@ WebSocket upgrades are handled at the nginx layer; the Express app attaches WS h
 | Service        | What it stores or carries                                                                                                                                                                                                                         |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | PostgreSQL     | Users, user groups, workspaces, workspace members, personal/platform Remote Docker hosts and grants, API keys (HMAC-hashed), agents, deployments, migration drafts, snapshots, Agent Hub records, alert rules, backups, integrations, and events. |
-| Redis + BullMQ | Four queues: `deployments`, `clawhub-jobs`, `backups`, `alert-deliveries`. Each has its own retry, backoff, and DLQ retention configured in `backend-api/redisQueue.ts`.                                                                          |
+| Redis + BullMQ | Five queues: `deployments`, `clawhub-jobs`, `hermes-skills-jobs`, `backups`, `alert-deliveries`. Each has its own retry, backoff, and DLQ retention configured in `backend-api/redisQueue.ts`.                                                    |
 
 The API persists desired state first, then hands long-running work to a queue-backed worker. That keeps provisioning failures, retries, and delayed readiness out of the synchronous browser request path.
 
@@ -235,12 +236,13 @@ Compose mounts `./workers/provisioner/backends` into `backend-api` at `/app/back
 
 ## Background work
 
-| Queue              | Job type          | Concurrency                             | Retry                                               | Worker                          | What it does                                                                            |
-| ------------------ | ----------------- | --------------------------------------- | --------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------- |
-| `deployments`      | `deploy-agent`    | `DEPLOYMENT_WORKER_CONCURRENCY` (6)     | 5 attempts, exponential 3 s base                    | `workers/provisioner/worker.ts` | Provisions or redeploys an agent runtime through the chosen backend adapter.            |
-| `clawhub-jobs`     | `install-skill`   | 1                                       | 1 attempt (operator drives retries)                 | `workers/provisioner/worker.ts` | Runs `clawhub install` inside an OpenClaw agent and persists the installed-skill state. |
-| `backups`          | `run-backup`      | `BACKUP_WORKER_CONCURRENCY` (2)         | 2 attempts, exponential 5 s base                    | `workers/backup/worker.ts`      | Captures, encrypts, and uploads an agent backup archive, then prunes expired backups.   |
-| `alert-deliveries` | `deliver-webhook` | `ALERT_DELIVERY_WORKER_CONCURRENCY` (5) | `ALERT_DELIVERY_ATTEMPTS` (5), exponential 1 s base | `workers/provisioner/worker.ts` | Posts a webhook delivery for an alert rule. Each job is one (rule, channel) pair.       |
+| Queue                | Job type                         | Concurrency                             | Retry                                               | Worker                          | What it does                                                                                           |
+| -------------------- | -------------------------------- | --------------------------------------- | --------------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `deployments`        | `deploy-agent`                   | `DEPLOYMENT_WORKER_CONCURRENCY` (6)     | 5 attempts, exponential 3 s base                    | `workers/provisioner/worker.ts` | Provisions or redeploys an agent runtime through the chosen backend adapter.                           |
+| `clawhub-jobs`       | `install-skill`                  | 1                                       | 1 attempt (operator drives retries)                 | `workers/provisioner/worker.ts` | Runs `clawhub install` inside an OpenClaw agent and persists the installed-skill state.                |
+| `hermes-skills-jobs` | `install-skill` / `delete-skill` | 1                                       | 1 attempt (operator drives retries)                 | `workers/provisioner/worker.ts` | Runs `hermes skills install`/`uninstall` inside a Hermes agent and persists the installed-skill state. |
+| `backups`            | `run-backup`                     | `BACKUP_WORKER_CONCURRENCY` (2)         | 2 attempts, exponential 5 s base                    | `workers/backup/worker.ts`      | Captures, encrypts, and uploads an agent backup archive, then prunes expired backups.                  |
+| `alert-deliveries`   | `deliver-webhook`                | `ALERT_DELIVERY_WORKER_CONCURRENCY` (5) | `ALERT_DELIVERY_ATTEMPTS` (5), exponential 1 s base | `workers/provisioner/worker.ts` | Posts a webhook delivery for an alert rule. Each job is one (rule, channel) pair.                      |
 
 Failed jobs are retained on each queue for inspection. The DLQ surface for deployments is exposed via `getDLQJobs` / `retryDLQJob` in `backend-api/redisQueue.ts`.
 
