@@ -517,6 +517,7 @@ async function buildAdminListingDetail(listing, reports = [], options = {}) {
   const template = templatePayload
     ? summarizeTemplatePayload(templatePayload, {
         includeContent: options.includeContent === true,
+        runtimeFamily: listing?.runtime_family || null,
       })
     : null;
 

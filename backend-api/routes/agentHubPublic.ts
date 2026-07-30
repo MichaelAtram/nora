@@ -51,7 +51,10 @@ function buildPublisher(listing = {}, sourceHubUrl = "") {
 
 function buildCatalogListing(listing, snapshot = null, templatePayload = null, options = {}) {
   const template = templatePayload
-    ? summarizeTemplatePayload(templatePayload, { includeContent: false })
+    ? summarizeTemplatePayload(templatePayload, {
+        includeContent: false,
+        runtimeFamily: listing?.runtime_family || null,
+      })
     : null;
   const publisher = buildPublisher(listing, options.sourceHubUrl || "");
 
@@ -122,7 +125,10 @@ async function buildCatalogDetail(listing, { includeContent = false, sourceHubUr
     ...summary,
     defaults: snapshot ? extractTemplateDefaultsFromSnapshot(snapshot) : {},
     templatePayload,
-    template: summarizeTemplatePayload(templatePayload, { includeContent: true }),
+    template: summarizeTemplatePayload(templatePayload, {
+      includeContent: true,
+      runtimeFamily: listing?.runtime_family || null,
+    }),
   };
 }
 

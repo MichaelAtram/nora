@@ -66,7 +66,8 @@ The fastest way to see the full flow is to install a built-in template and confi
     ![Install dialog — workspace + agent-name confirmation before materializing the listing](/images/guides/agent-hub/install-dialog.png)
 
     <Note>
-      Installing requires the `editor` role on the destination workspace.
+      Any signed-in user can install a listing today; workspace-scoped install roles are on the
+      roadmap. See [Permissions](#permissions).
     </Note>
 
   </Step>
@@ -135,12 +136,19 @@ The Agent Hub source-catalog API key authenticates Nora to the upstream hub. Man
 
 ## Permissions
 
-| Capability                       | Required role |
-| -------------------------------- | ------------- |
-| Browse listings                  | viewer        |
-| Install a listing                | editor        |
-| Publish, edit, unpublish listing | admin         |
-| Manage source-catalog API keys   | admin         |
+Agent Hub authorization is platform-level today, not workspace-role-based:
+
+| Capability                       | Who can do it                               |
+| -------------------------------- | ------------------------------------------- |
+| Browse listings                  | Any signed-in user                          |
+| Install a listing                | Any signed-in user (subject to plan limits) |
+| Publish, edit, unpublish listing | The owner of the source agent               |
+| Moderation and hub settings      | Platform admin                              |
+
+<Note>
+  Workspace-scoped RBAC for Agent Hub actions is on the roadmap; until it lands the roles above are
+  the actual enforcement.
+</Note>
 
 ## Troubleshooting
 

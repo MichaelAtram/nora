@@ -29,10 +29,16 @@ const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
 const {
   DEFAULT_RUNTIME_FAMILY,
   getDefaultBackend,
+  getEnabledRuntimeFamilies,
   getRuntimeSelectionStatus,
   isKnownBackend,
+  isKnownRuntimeFamily,
   normalizeBackendName,
 } = require("../../agent-runtime/lib/backendCatalog");
+const {
+  buildHermesBundleMetadata,
+  buildHermesTemplatePayloadFromAgent,
+} = require("../hermesTemplateExport");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { requireSession } = require("../middleware/auth");
 const {
@@ -295,6 +301,7 @@ async function buildListingTemplateDetail(listing, options = {}) {
   const template = templatePayload
     ? summarizeTemplatePayload(templatePayload, {
         includeContent: options.includeContent === true,
+        runtimeFamily: listing?.runtime_family || null,
       })
     : null;
 
@@ -346,6 +353,15 @@ function buildRemoteTemplateDetail(remoteDetail, options = {}) {
   );
   const template = summarizeTemplatePayload(templatePayload, {
     includeContent: options.includeContent === true,
+    // Family resolution order for federated listings: listing field first,
+    // then remote defaults, then the payload metadata carrier (handled inside
+    // the summarizer) for hubs that predate runtime_family.
+    runtimeFamily:
+      remoteDetail.runtime_family ??
+      remoteDetail.runtimeFamily ??
+      remoteDetail.defaults?.runtime_family ??
+      remoteDetail.defaults?.runtimeFamily ??
+      null,
   });
   return {
     ...remoteDetail,
@@ -544,11 +560,49 @@ router.post(
       }
     }
 
+    // Server-side family guard. Publishing is a family-specific capture path,
+    // so an unknown or disabled family must fail closed instead of silently
+    // producing a broken bundle (the pre-runtime_family behavior for Hermes).
+    const runtimeFamily = String(agent.runtime_family || DEFAULT_RUNTIME_FAMILY)
+      .trim()
+      .toLowerCase();
+    if (!isKnownRuntimeFamily(runtimeFamily)) {
+      return res.status(400).json({
+        error: `Agents with runtime family "${runtimeFamily}" cannot be published to the Agent Hub.`,
+      });
+    }
+    if (!getEnabledRuntimeFamilies(process.env).includes(runtimeFamily)) {
+      return res.status(400).json({
+        error: `Runtime family "${runtimeFamily}" is not enabled on this Nora control plane. Enable it via ENABLED_RUNTIME_FAMILIES before publishing this agent.`,
+      });
+    }
+
     let templatePayload;
-    try {
-      templatePayload = await buildTemplatePayloadFromAgent(agent, "files_only");
-    } catch (error) {
-      return res.status(409).json({ error: error.message });
+    if (runtimeFamily === "hermes") {
+      // Hermes bundles are captured from the live /opt/data/workspace tree
+      // over container exec — there is no stored-template fallback, so the
+      // runtime must be up before a bundle can be built.
+      const capturable =
+        (agent.status === "running" || agent.status === "warning") && agent.container_id;
+      if (!capturable) {
+        return res.status(409).json({
+          error:
+            "Hermes templates are captured from the live agent workspace. Start the agent and retry once it is running.",
+        });
+      }
+      try {
+        templatePayload = await buildHermesTemplatePayloadFromAgent(agent);
+        const bundleMetadata = await buildHermesBundleMetadata(agent);
+        templatePayload.metadata = { ...templatePayload.metadata, ...bundleMetadata };
+      } catch (error) {
+        return res.status(409).json({ error: error.message });
+      }
+    } else {
+      try {
+        templatePayload = await buildTemplatePayloadFromAgent(agent, "files_only");
+      } catch (error) {
+        return res.status(409).json({ error: error.message });
+      }
     }
 
     const issues = scanTemplatePayloadForSecrets(templatePayload);
@@ -600,7 +654,7 @@ router.post(
       category: listingCategory,
       builtIn: false,
       sourceType: agentHubStore.LISTING_SOURCE_COMMUNITY,
-      runtimeFamily: agent.runtime_family || "openclaw",
+      runtimeFamily,
       status: agentHubStore.LISTING_STATUS_PUBLISHED,
       visibility: agentHubStore.LISTING_VISIBILITY_PUBLIC,
       shareTarget,
