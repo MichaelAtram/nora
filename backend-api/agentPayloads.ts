@@ -9,6 +9,7 @@ const remoteHosts = require("./remoteHosts");
 const { NORA_INTEGRATIONS_CONTEXT_FILE } = require("../agent-runtime/lib/runtimeBootstrap");
 const { NORA_INTEGRATIONS_SKILL_FILE } = require("../agent-runtime/lib/integrationTools");
 const {
+  DEFAULT_RUNTIME_FAMILY,
   normalizeBackendName,
   normalizeExecutionTargetId,
   normalizeRuntimeFamilyName,
@@ -167,6 +168,19 @@ function createEmptyTemplatePayload(metadata = {}) {
 
 // Core template files
 
+// Runtime-family resolution for core-file handling. An explicit caller-supplied
+// family wins, then the payload's own `metadata.runtimeFamily` carrier (which
+// survives federation through hubs that predate the runtime_family column),
+// then the platform default. Unknown values collapse to the default so payloads
+// captured before runtime families existed keep their OpenClaw behavior.
+function resolveTemplatePayloadRuntimeFamily(payload, explicitFamily = null) {
+  const requested = String(explicitFamily ?? "").trim();
+  if (requested) return normalizeRuntimeFamilyName(requested);
+  const carried = String(payload?.metadata?.runtimeFamily ?? "").trim();
+  if (carried) return normalizeRuntimeFamilyName(carried);
+  return DEFAULT_RUNTIME_FAMILY;
+}
+
 function buildCoreFileDefaultContent(filePath, context = {}) {
   const name = String(context.name || "OpenClaw Agent").trim() || "OpenClaw Agent";
   const description =
@@ -257,12 +271,21 @@ Track durable facts, preferences, operating constraints, and open loops here.`.t
  * Ensure a template payload contains Nora's required core OpenClaw files,
  * backfilling missing entries from aliases or generated defaults.
  *
+ * Core-file synthesis is an OpenClaw-only contract: payloads that resolve to a
+ * different runtime family (explicit `context.runtimeFamily`, or the payload's
+ * own `metadata.runtimeFamily` carrier) are normalized and returned unchanged
+ * so a Hermes workspace capture never gains fabricated OpenClaw markdown.
+ *
  * @param {Object} [rawPayload={}] - Template payload to validate and repair.
- * @param {Object} [context={}] - Template metadata used when generating default file content.
+ * @param {Object} [context={}] - Template metadata used when generating default
+ *   file content, plus an optional `runtimeFamily` override.
  * @returns {Object} Normalized payload that includes the required core files.
  */
 function ensureCoreTemplateFiles(rawPayload = {}, context = {}) {
   const payload = normalizeTemplatePayload(rawPayload);
+  if (resolveTemplatePayloadRuntimeFamily(payload, context.runtimeFamily) !== "openclaw") {
+    return payload;
+  }
   const fileByPath = new Map(payload.files.map((entry) => [entry.path, entry]));
   const includeBootstrap = context.includeBootstrap === true || fileByPath.has("BOOTSTRAP.md");
   const nextFiles = [...payload.files];
@@ -309,16 +332,31 @@ function ensureCoreTemplateFiles(rawPayload = {}, context = {}) {
  * Build a UI-friendly summary of a template payload, including core-file
  * presence, previews, and file counts.
  *
+ * The core-file sections are family-aware: an explicit `options.runtimeFamily`
+ * wins, then the payload's `metadata.runtimeFamily` carrier, defaulting to
+ * OpenClaw. Non-OpenClaw payloads report `requiredCoreCount: 0`, an empty
+ * `coreFiles` list, and never fabricate the OpenClaw markdown set.
+ *
  * @param {Object} [rawPayload={}] - Template payload to summarize.
- * @param {Object} [options={}] - Summary options such as whether to include full decoded content.
+ * @param {Object} [options={}] - Summary options such as whether to include
+ *   full decoded content and an optional `runtimeFamily` override.
  * @returns {Object} Summary object describing the payload and its files.
  */
 function summarizeTemplatePayload(rawPayload = {}, options = {}) {
   const includeContent = options.includeContent === true;
-  const payload = ensureCoreTemplateFiles(rawPayload, options.context || {});
+  const runtimeFamily = resolveTemplatePayloadRuntimeFamily(
+    decodeMaybeString(rawPayload),
+    options.runtimeFamily,
+  );
+  const payload = ensureCoreTemplateFiles(rawPayload, {
+    ...(options.context || {}),
+    runtimeFamily,
+  });
+  const coreFileSpecs = runtimeFamily === "openclaw" ? OPENCLAW_CORE_FILE_SPECS : [];
+  const requiredCorePaths = runtimeFamily === "openclaw" ? OPENCLAW_REQUIRED_CORE_PATHS : [];
   const fileByPath = new Map(payload.files.map((entry) => [entry.path, entry]));
   const files = payload.files.map((entry) => {
-    const spec = OPENCLAW_CORE_FILE_SPECS.find((candidate) => candidate.path === entry.path);
+    const spec = coreFileSpecs.find((candidate) => candidate.path === entry.path);
     const content = decodeContentBase64(entry.contentBase64);
     return {
       path: entry.path,
@@ -332,7 +370,7 @@ function summarizeTemplatePayload(rawPayload = {}, options = {}) {
     };
   });
 
-  const coreFiles = OPENCLAW_CORE_FILE_SPECS.map((spec) => {
+  const coreFiles = coreFileSpecs.map((spec) => {
     const entry = fileByPath.get(spec.path) || null;
     const content = entry ? decodeContentBase64(entry.contentBase64) : "";
     return {
@@ -347,22 +385,23 @@ function summarizeTemplatePayload(rawPayload = {}, options = {}) {
     };
   });
 
-  const missingRequiredCoreFiles = OPENCLAW_REQUIRED_CORE_PATHS.filter(
+  const missingRequiredCoreFiles = requiredCorePaths.filter(
     (filePath) => !fileByPath.has(filePath),
   );
 
   return {
     payload,
+    runtimeFamily,
     fileCount: payload.files.length,
     memoryFileCount: payload.memoryFiles.length,
     integrationCount: payload.wiring.integrations.length,
     channelCount: payload.wiring.channels.length,
-    requiredCoreCount: OPENCLAW_REQUIRED_CORE_PATHS.length,
-    presentRequiredCoreCount: OPENCLAW_REQUIRED_CORE_PATHS.length - missingRequiredCoreFiles.length,
+    requiredCoreCount: requiredCorePaths.length,
+    presentRequiredCoreCount: requiredCorePaths.length - missingRequiredCoreFiles.length,
     missingRequiredCoreFiles,
     hasBootstrap: fileByPath.has("BOOTSTRAP.md"),
     extraFilesCount: payload.files.filter(
-      (entry) => !OPENCLAW_CORE_FILE_SPECS.some((spec) => spec.path === entry.path),
+      (entry) => !coreFileSpecs.some((spec) => spec.path === entry.path),
     ).length,
     coreFiles,
     files,
@@ -930,11 +969,19 @@ async function materializeTemplateWiring(agentId, rawPayload = {}) {
 function extractTemplatePayloadFromSnapshot(snapshot, options = {}) {
   const config = decodeMaybeString(snapshot?.config);
   const builtIn = config?.builtIn === true || snapshot?.built_in === true;
+  const defaults = config?.defaults && typeof config.defaults === "object" ? config.defaults : {};
+  // Family resolution order for snapshots: stored snapshot defaults first, then
+  // the payload's own metadata.runtimeFamily carrier (inside
+  // ensureCoreTemplateFiles), then the OpenClaw default.
+  const defaultsRuntimeFamily = String(
+    defaults.runtime_family ?? defaults.runtimeFamily ?? "",
+  ).trim();
   return ensureCoreTemplateFiles(stripInternalTemplateMetadata(config.templatePayload || {}), {
     name: snapshot?.name || "OpenClaw Agent",
     description: snapshot?.description || "",
     templateKey: snapshot?.template_key || config?.templateKey || null,
     sourceType: builtIn ? "platform" : "community",
+    ...(defaultsRuntimeFamily ? { runtimeFamily: defaultsRuntimeFamily } : {}),
     includeBootstrap:
       options.includeBootstrap === true ||
       snapshot?.kind === "starter-template" ||
