@@ -4545,6 +4545,180 @@ describe("POST /agents/deploy", () => {
     );
   });
 
+  it("persists normalized hermes skills for Hermes deploys and drops invalid entries", async () => {
+    process.env.ENABLED_RUNTIME_FAMILIES = "openclaw,hermes";
+    process.env.ENABLED_BACKENDS = "docker";
+
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-hermes-skills",
+            name: "Hermes Skills Agent",
+            status: "queued",
+            user_id: "user-1",
+            runtime_family: "hermes",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(
+      request(app)
+        .post("/agents/deploy")
+        .send({
+          name: "Hermes Skills Agent",
+          runtime_family: "hermes",
+          hermes_skills: [
+            {
+              source: "hermes-hub",
+              ref: "official/security/1password",
+              name: "1password",
+              installMode: "cli",
+              installedAt: "2026-07-30T00:00:00.000Z",
+              description: "Should not persist",
+            },
+            {
+              // Duplicate name (the reconciliation identity) — first wins.
+              source: "hermes-hub",
+              ref: "clawhub/other/1password",
+              name: "1password",
+              installMode: "cli",
+              installedAt: "2026-07-30T00:05:00.000Z",
+            },
+            {
+              // Missing ref — deploy-time saves are CLI installs from a ref.
+              source: "hermes-hub",
+              name: "no-ref",
+              installMode: "cli",
+              installedAt: "2026-07-30T00:00:00.000Z",
+            },
+            {
+              // Invalid charset in the shell-reaching name.
+              source: "hermes-hub",
+              ref: "x/y",
+              name: "../escape",
+              installedAt: "2026-07-30T00:00:00.000Z",
+            },
+            {
+              // Nora-managed reserved skill.
+              source: "hermes-hub",
+              ref: "x/z",
+              name: "nora-integrations",
+              installedAt: "2026-07-30T00:00:00.000Z",
+            },
+          ],
+        }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockDb.query.mock.calls[0][0]).toEqual(expect.stringContaining("hermes_skills"));
+    const insertParams = mockDb.query.mock.calls[0][1];
+    expect(JSON.parse(insertParams[12])).toEqual([
+      {
+        source: "hermes-hub",
+        ref: "official/security/1password",
+        name: "1password",
+        installMode: "cli",
+        installedAt: "2026-07-30T00:00:00.000Z",
+      },
+    ]);
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "a-hermes-skills",
+        hermes_skills: [
+          expect.objectContaining({
+            name: "1password",
+            ref: "official/security/1password",
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("stores an empty hermes skill list when the resolved runtime family is not hermes", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-openclaw-hermes-skills",
+            name: "OpenClaw Agent",
+            status: "queued",
+            user_id: "user-1",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(
+      request(app)
+        .post("/agents/deploy")
+        .send({
+          name: "OpenClaw Agent",
+          hermes_skills: [
+            {
+              source: "hermes-hub",
+              ref: "official/security/1password",
+              name: "1password",
+              installMode: "cli",
+              installedAt: "2026-07-30T00:00:00.000Z",
+            },
+          ],
+        }),
+    );
+
+    expect(res.status).toBe(200);
+    const insertParams = mockDb.query.mock.calls[0][1];
+    expect(JSON.parse(insertParams[12])).toEqual([]);
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "a-openclaw-hermes-skills",
+        hermes_skills: [],
+      }),
+    );
+  });
+
+  it("truncates hermes skill pre-selection to twenty entries", async () => {
+    process.env.ENABLED_RUNTIME_FAMILIES = "openclaw,hermes";
+    process.env.ENABLED_BACKENDS = "docker";
+
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-hermes-cap",
+            name: "Capped Hermes Agent",
+            status: "queued",
+            user_id: "user-1",
+            runtime_family: "hermes",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(
+      request(app)
+        .post("/agents/deploy")
+        .send({
+          name: "Capped Hermes Agent",
+          runtime_family: "hermes",
+          hermes_skills: Array.from({ length: 25 }, (_, index) => ({
+            source: "hermes-hub",
+            ref: `official/tools/skill-${index}`,
+            name: `skill-${index}`,
+            installMode: "cli",
+            installedAt: "2026-07-30T00:00:00.000Z",
+          })),
+        }),
+    );
+
+    expect(res.status).toBe(200);
+    const persisted = JSON.parse(mockDb.query.mock.calls[0][1][12]);
+    expect(persisted).toHaveLength(20);
+    expect(persisted[0].name).toBe("skill-0");
+    expect(persisted[19].name).toBe("skill-19");
+  });
+
   it("uses operator-managed deployment defaults in PaaS mode", async () => {
     const billing = require("../billing");
     billing.IS_PAAS = true;

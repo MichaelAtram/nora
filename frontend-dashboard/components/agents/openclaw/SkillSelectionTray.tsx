@@ -8,6 +8,7 @@ type SkillSelectionTrayProps = {
   installLabel?: string;
   installDisabled?: boolean;
   installError?: string | null;
+  emptyMessage?: string;
   onBack?: () => void;
   onDeploy?: () => void;
   onInstall?: () => void;
@@ -22,6 +23,7 @@ export default function SkillSelectionTray({
   installLabel,
   installDisabled = false,
   installError = null,
+  emptyMessage,
   onBack,
   onDeploy,
   onInstall,
@@ -95,11 +97,12 @@ export default function SkillSelectionTray({
             </div>
           ) : (
             <p className="text-sm text-slate-500">
-              {isDeployMode
-                ? "No ClawHub skills selected. You can still continue and deploy the agent without any."
-                : isDeleteMode
-                  ? "No ClawHub skills selected for delete yet. Pick one or more installed skills above."
-                  : "No ClawHub skills selected yet. Pick one or more cards to queue installs."}
+              {emptyMessage ||
+                (isDeployMode
+                  ? "No ClawHub skills selected. You can still continue and deploy the agent without any."
+                  : isDeleteMode
+                    ? "No ClawHub skills selected for delete yet. Pick one or more installed skills above."
+                    : "No ClawHub skills selected yet. Pick one or more cards to queue installs.")}
             </p>
           )}
           {installError ? <p className="text-sm font-medium text-red-600">{installError}</p> : null}
