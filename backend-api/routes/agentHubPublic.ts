@@ -7,9 +7,15 @@ const { scanTemplatePayloadForSecrets } = require("../agentHubSafety");
 const {
   extractTemplateDefaultsFromSnapshot,
   extractTemplatePayloadFromSnapshot,
+  normalizeTemplatePayload,
+  resolveTemplatePayloadRuntimeFamily,
   stripInternalTemplateMetadata,
   summarizeTemplatePayload,
 } = require("../agentPayloads");
+const {
+  DEFAULT_RUNTIME_FAMILY,
+  normalizeRuntimeFamilyName,
+} = require("../../agent-runtime/lib/backendCatalog");
 
 const router = express.Router();
 
@@ -25,6 +31,22 @@ function normalizeDescription(value, fallback = "", maxLength = 1200) {
 
 function normalizeCategory(value) {
   return normalizeText(value, "General", 60) || "General";
+}
+
+// Decision-6 family resolution for inbound submissions: explicit listing field
+// first, then the submission's defaults block, then the template payload's
+// metadata carrier (how bundles survive federation through hubs that predate
+// runtime_family), defaulting to OpenClaw.
+function resolveSubmittedRuntimeFamily(listingPayload, defaults, templatePayload) {
+  const carriers = [
+    listingPayload?.runtimeFamily ?? listingPayload?.runtime_family,
+    defaults?.runtime_family ?? defaults?.runtimeFamily,
+  ];
+  for (const carrier of carriers) {
+    const candidate = String(carrier ?? "").trim();
+    if (candidate) return normalizeRuntimeFamilyName(candidate);
+  }
+  return resolveTemplatePayloadRuntimeFamily(normalizeTemplatePayload(templatePayload));
 }
 
 function requestBaseUrl(req) {
@@ -67,6 +89,7 @@ function buildCatalogListing(listing, snapshot = null, templatePayload = null, o
     price: listing.price || "Free",
     source_type: "community",
     status: listing.status,
+    runtime_family: listing.runtime_family || DEFAULT_RUNTIME_FAMILY,
     ownerName: publisher.displayName,
     publisher,
     current_version: listing.current_version || 1,
@@ -192,6 +215,11 @@ router.post("/submissions", requireAgentHubApiKey, async (req, res, next) => {
     const name = normalizeText(listingPayload.name, "Community Template", 100);
     const description = normalizeDescription(listingPayload.description);
     const category = normalizeCategory(listingPayload.category);
+    const runtimeFamily = resolveSubmittedRuntimeFamily(
+      listingPayload,
+      payload.defaults,
+      templatePayload,
+    );
     const snapshot = await snapshots.createSnapshot(
       null,
       name,
@@ -216,6 +244,7 @@ router.post("/submissions", requireAgentHubApiKey, async (req, res, next) => {
       category,
       builtIn: false,
       sourceType: agentHubStore.LISTING_SOURCE_COMMUNITY,
+      runtimeFamily,
       status: agentHubStore.LISTING_STATUS_PENDING_REVIEW,
       visibility: agentHubStore.LISTING_VISIBILITY_PUBLIC,
       shareTarget: agentHubStore.LISTING_SHARE_TARGET_COMMUNITY,

@@ -26,9 +26,10 @@ import { useToast } from "../../components/Toast";
 import {
   activeExecutionTargetFromConfig,
   activeSandboxOptionFromTarget,
+  formatRuntimeFamilyLabel,
+  listingRuntimeFamily,
   resolveAgentExecutionTarget,
   resolveAgentSandboxProfile,
-  runtimeFamilyFromConfig,
 } from "../../lib/runtime";
 
 const REPORT_REASONS = [
@@ -221,7 +222,9 @@ export default function AgentHubTemplateDetail() {
         body: JSON.stringify({
           listingId: detail.id,
           name: trimmedName,
-          runtime_family: runtimeFamilyFromConfig(backendConfig)?.id || "openclaw",
+          // The listing's own family, not the instance default — the backend
+          // rejects a mismatch between the request and the listing.
+          runtime_family: listingRuntimeFamily(detail),
           deploy_target: installExecutionTarget,
           execution_target_id: installExecutionTarget,
           sandbox_profile: installSandboxProfile || "standard",
@@ -386,8 +389,12 @@ export default function AgentHubTemplateDetail() {
   const isPreset = detail?.source_type === "platform";
   const statusClass =
     STATUS_STYLES[detail?.status] || "bg-slate-100 text-slate-700 border-slate-200";
+  const listingFamily = listingRuntimeFamily(detail);
+  const isHermesListing = listingFamily === "hermes";
+  const listingFamilyLabel = formatRuntimeFamilyLabel(listingFamily);
   const installActiveExecutionTarget = activeExecutionTargetFromConfig(
     backendConfig,
+    listingFamily,
     installExecutionTarget,
   );
   const installActiveSandboxOption = activeSandboxOptionFromTarget(
@@ -455,6 +462,9 @@ export default function AgentHubTemplateDetail() {
                     >
                       {String(detail.status || "unknown").replace(/_/g, " ")}
                     </span>
+                    <span className="inline-flex rounded-full border border-blue-500/30 bg-blue-500/10 px-3 py-1 text-[10px] font-black uppercase tracking-[0.18em] text-blue-300">
+                      {listingFamilyLabel}
+                    </span>
                   </div>
 
                   <h1 className="mt-5 text-4xl font-black tracking-tight text-white sm:text-5xl">
@@ -488,8 +498,12 @@ export default function AgentHubTemplateDetail() {
                   />
                   <HeroMetric
                     icon={Layers3}
-                    label="Core Files"
-                    value={`${detail.template?.presentRequiredCoreCount || 0}/${detail.template?.requiredCoreCount || 7}`}
+                    label={isHermesListing ? "Runtime" : "Core Files"}
+                    value={
+                      isHermesListing
+                        ? listingFamilyLabel
+                        : `${detail.template?.presentRequiredCoreCount || 0}/${detail.template?.requiredCoreCount || 7}`
+                    }
                   />
                   <HeroMetric
                     icon={FileText}
@@ -509,10 +523,14 @@ export default function AgentHubTemplateDetail() {
                         Template Summary
                       </p>
                       <h2 className="mt-2 text-2xl font-black tracking-tight text-slate-950">
-                        OpenClaw core files included
+                        {isHermesListing
+                          ? "Workspace files included"
+                          : "OpenClaw core files included"}
                       </h2>
                       <p className="mt-2 text-sm font-medium leading-relaxed text-slate-500">
-                        Inspect the markdown files that will be installed into the agent template.
+                        {isHermesListing
+                          ? "Inspect the workspace files captured from the published Hermes agent. They are written into the new agent's workspace on first deploy."
+                          : "Inspect the markdown files that will be installed into the agent template."}{" "}
                         This view does not change download counts.
                       </p>
                     </div>
@@ -538,7 +556,7 @@ export default function AgentHubTemplateDetail() {
                   <div className="flex flex-col gap-6 lg:grid lg:grid-cols-[260px_minmax(0,1fr)]">
                     <div className="space-y-2">
                       <p className="text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">
-                        Core Files
+                        {isHermesListing ? "Workspace Files" : "Core Files"}
                       </p>
                       {coreFiles.map((file) => (
                         <button
@@ -558,9 +576,11 @@ export default function AgentHubTemplateDetail() {
 
                       {extraFiles.length > 0 ? (
                         <>
-                          <p className="pt-3 text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">
-                            Additional Files
-                          </p>
+                          {!isHermesListing && (
+                            <p className="pt-3 text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">
+                              Additional Files
+                            </p>
+                          )}
                           {extraFiles.map((file) => (
                             <button
                               key={file.path}
@@ -618,8 +638,10 @@ export default function AgentHubTemplateDetail() {
                         </h2>
                         <p className="mt-2 max-w-3xl text-sm font-medium leading-relaxed text-slate-500">
                           Editing a shared listing updates the internal template immediately and
-                          refreshes community sync when that target is enabled. Core files stay
-                          pinned to the OpenClaw filenames, and extra files can be added or removed.
+                          refreshes community sync when that target is enabled.{" "}
+                          {isHermesListing
+                            ? "Workspace files can be edited, added, or removed."
+                            : "Core files stay pinned to the OpenClaw filenames, and extra files can be added or removed."}
                         </p>
                       </div>
 
@@ -860,6 +882,7 @@ export default function AgentHubTemplateDetail() {
                       label="Status"
                       value={String(detail.status || "unknown").replace(/_/g, " ")}
                     />
+                    <MetadataRow label="Runtime Family" value={listingFamilyLabel} />
                     <MetadataRow label="Category" value={detail.category || "General"} />
                     <MetadataRow label="Price" value={detail.price || "Free"} />
                     <MetadataRow label="Owner" value={publisherName(detail)} />
@@ -893,6 +916,7 @@ export default function AgentHubTemplateDetail() {
           loading={installing}
           backendConfig={backendConfig}
           viewerRole={currentUser?.role || "user"}
+          runtimeFamily={listingFamily}
           executionTarget={installExecutionTarget}
           sandboxProfile={installSandboxProfile}
           onExecutionTargetChange={setInstallExecutionTarget}
@@ -1023,6 +1047,7 @@ function InstallTemplateDialog({
   loading,
   backendConfig,
   viewerRole,
+  runtimeFamily,
   executionTarget,
   sandboxProfile,
   onExecutionTargetChange,
@@ -1034,6 +1059,7 @@ function InstallTemplateDialog({
   open,
 }) {
   if (!open || !item) return null;
+  const isHermesTemplate = runtimeFamily === "hermes";
 
   return (
     <div
@@ -1053,8 +1079,11 @@ function InstallTemplateDialog({
               Install Template
             </h3>
             <p className="mt-1 text-sm leading-relaxed text-slate-500">
-              {item.name} will be turned into a new queued agent in your fleet, including the
-              OpenClaw core markdown files shown on this page.
+              {item.name} will be turned into a new queued agent in your fleet, including the{" "}
+              {isHermesTemplate
+                ? "Hermes workspace files, bundled skills, and model selection shown on this page"
+                : "OpenClaw core markdown files shown on this page"}
+              .
             </p>
           </div>
           <button
@@ -1092,6 +1121,7 @@ function InstallTemplateDialog({
           <RuntimePathFields
             backendConfig={backendConfig}
             viewerRole={viewerRole}
+            runtimeFamily={runtimeFamily}
             executionTarget={executionTarget}
             sandboxProfile={sandboxProfile}
             onExecutionTargetChange={onExecutionTargetChange}

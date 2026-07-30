@@ -139,6 +139,7 @@ const {
   resolveCanonicalDeploymentOwnerUserId,
   runProvisionerExecCommand,
   seedHermesArchiveForDeployment,
+  materializeHermesTemplatePayload,
 } = require("../../workers/provisioner/worker");
 const { DASHBOARD_PORT_PURPOSE, GATEWAY_PORT_PURPOSE } = require("../portAllocations");
 
@@ -414,6 +415,188 @@ describe("provisioner Hermes restore seeding", () => {
     ).resolves.toEqual({ seeded: false, reason: "archive-empty" });
 
     expect(buildSeedArchive).not.toHaveBeenCalled();
+  });
+});
+
+describe("provisioner Hermes template-bundle materialization", () => {
+  function encodeContent(content) {
+    return Buffer.from(content, "utf8").toString("base64");
+  }
+
+  function bundlePayload(files) {
+    return {
+      version: 1,
+      files,
+      memoryFiles: [],
+      wiring: { channels: [], integrations: [] },
+      metadata: { runtimeFamily: "hermes" },
+    };
+  }
+
+  function buildExecuteMock({ markerPresent = false } = {}) {
+    return jest.fn(async (_provisioner, _containerId, command) => {
+      if (String(command).startsWith("if [ -f ")) {
+        return { output: markerPresent ? "NORA_TEMPLATE_APPLIED" : "NORA_TEMPLATE_ABSENT" };
+      }
+      return { output: "" };
+    });
+  }
+
+  it("skips entirely when the migration seed already restored the workspace", async () => {
+    const execute = buildExecuteMock();
+
+    await expect(
+      materializeHermesTemplatePayload({
+        agentId: "agent-h1",
+        provisioner: {},
+        containerId: "hermes-container",
+        templatePayload: bundlePayload([{ path: "notes.md", contentBase64: encodeContent("n") }]),
+        migrationSeeded: true,
+        execute,
+      }),
+    ).resolves.toEqual({ applied: false, reason: "migration-seed" });
+
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("skips without exec calls when the payload carries no files", async () => {
+    const execute = buildExecuteMock();
+
+    await expect(
+      materializeHermesTemplatePayload({
+        agentId: "agent-h1",
+        provisioner: {},
+        containerId: "hermes-container",
+        templatePayload: bundlePayload([]),
+        execute,
+      }),
+    ).resolves.toEqual({ applied: false, reason: "no-files" });
+
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("skips after the marker probe when a previous materialization is recorded", async () => {
+    const execute = buildExecuteMock({ markerPresent: true });
+
+    await expect(
+      materializeHermesTemplatePayload({
+        agentId: "agent-h1",
+        provisioner: {},
+        containerId: "hermes-container",
+        templatePayload: bundlePayload([{ path: "notes.md", contentBase64: encodeContent("n") }]),
+        execute,
+      }),
+    ).resolves.toEqual({ applied: false, reason: "marker-present" });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(String(execute.mock.calls[0][2])).toContain("/opt/data/.nora/template-applied");
+  });
+
+  it("maps workspace and .hermes-skills paths, repairs ownership, and writes the marker last", async () => {
+    const execute = buildExecuteMock();
+
+    const result = await materializeHermesTemplatePayload({
+      agentId: "agent-h1",
+      provisioner: {},
+      containerId: "hermes-container",
+      templatePayload: bundlePayload([
+        { path: "notes.md", contentBase64: encodeContent("# Notes"), mode: 0o644 },
+        { path: "scripts/run.sh", contentBase64: encodeContent("echo hi"), mode: 0o755 },
+        {
+          path: ".hermes-skills/pdf-tools/SKILL.md",
+          contentBase64: encodeContent("---\nname: pdf-tools\n---"),
+          mode: 0o644,
+        },
+      ]),
+      execute,
+    });
+
+    expect(result).toEqual({ applied: true, reason: null, fileCount: 3 });
+
+    const commands = execute.mock.calls.map((call) => String(call[2]));
+    // probe, one write batch, ownership repair, marker write
+    expect(commands).toHaveLength(4);
+    expect(commands[1]).toContain("'/opt/data/workspace/notes.md'");
+    expect(commands[1]).toContain("'/opt/data/workspace/scripts/run.sh'");
+    expect(commands[1]).toContain("chmod 0755 '/opt/data/workspace/scripts/run.sh'");
+    expect(commands[1]).toContain("'/opt/data/skills/pdf-tools/SKILL.md'");
+    expect(commands[1]).not.toContain(".hermes-skills");
+    expect(commands[2]).toContain("chown -R hermes:hermes '/opt/data/workspace'");
+    expect(commands[2]).toContain("chown -R hermes:hermes '/opt/data/skills'");
+    expect(commands[3]).toContain("mkdir -p '/opt/data/.nora'");
+    expect(commands[3]).toContain("'/opt/data/.nora/template-applied'");
+    // The marker write must come after every file write and the chown.
+    expect(commands[3]).not.toContain("base64 -d");
+  });
+
+  it("only repairs ownership on roots that were actually written", async () => {
+    const execute = buildExecuteMock();
+
+    await materializeHermesTemplatePayload({
+      agentId: "agent-h1",
+      provisioner: {},
+      containerId: "hermes-container",
+      templatePayload: bundlePayload([
+        { path: "notes.md", contentBase64: encodeContent("# Notes") },
+      ]),
+      execute,
+    });
+
+    const chownCommand = String(execute.mock.calls[2][2]);
+    expect(chownCommand).toContain("'/opt/data/workspace'");
+    expect(chownCommand).not.toContain("'/opt/data/skills'");
+  });
+
+  it.each([
+    ["an absolute path", "/etc/passwd"],
+    ["a dot-dot traversal", "../escape.md"],
+    ["a nested dot-dot traversal", "docs/../../escape.md"],
+    ["an empty path", ""],
+    ["an unsafe character", "notes;rm.md"],
+    ["a reserved skill directory", ".hermes-skills/nora-integrations/SKILL.md"],
+    ["a skills prefix without a file", ".hermes-skills/pdf-tools"],
+  ])("rejects %s without writing anything", async (_label, unsafePath) => {
+    const execute = buildExecuteMock();
+
+    await expect(
+      materializeHermesTemplatePayload({
+        agentId: "agent-h1",
+        provisioner: {},
+        containerId: "hermes-container",
+        templatePayload: bundlePayload([
+          { path: "notes.md", contentBase64: encodeContent("safe") },
+          { path: unsafePath, contentBase64: encodeContent("unsafe") },
+        ]),
+        execute,
+      }),
+    ).rejects.toThrow(/unsafe file path/i);
+
+    // Only the marker probe ran — no partial writes, no marker.
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("splits large payloads into multiple size-bounded write batches", async () => {
+    const execute = buildExecuteMock();
+    const bigContent = encodeContent("x".repeat(400 * 1024));
+
+    await materializeHermesTemplatePayload({
+      agentId: "agent-h1",
+      provisioner: {},
+      containerId: "hermes-container",
+      templatePayload: bundlePayload([
+        { path: "one.bin", contentBase64: bigContent },
+        { path: "two.bin", contentBase64: bigContent },
+        { path: "three.bin", contentBase64: bigContent },
+      ]),
+      execute,
+    });
+
+    const commands = execute.mock.calls.map((call) => String(call[2]));
+    // probe + 3 single-file batches (each exceeds the batch budget) + chown + marker
+    expect(commands).toHaveLength(6);
+    expect(commands[1]).toContain("'/opt/data/workspace/one.bin'");
+    expect(commands[2]).toContain("'/opt/data/workspace/two.bin'");
+    expect(commands[3]).toContain("'/opt/data/workspace/three.bin'");
   });
 });
 

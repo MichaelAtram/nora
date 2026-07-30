@@ -52,16 +52,19 @@ The fastest way to see the full flow is to install a built-in template and confi
 
 <Steps>
   <Step title="Open Agent Hub">
-    From the dashboard, open **Agent Hub** in the workspace navigation. The catalog shows three filters: **Internal** (your workspace's listings), **Community** (synced from the upstream hub), and **Built-in** (platform-seeded templates).
+    From the dashboard, open **Agent Hub** in the workspace navigation. The catalog shows three filters: **Internal** (your workspace's listings), **Community** (synced from the upstream hub), and **Built-in** (platform-seeded templates). Every card carries a runtime-family badge (**OpenClaw** or **Hermes**), and a family filter row appears whenever the catalog contains both families.
   </Step>
 
 <Step title="Select a listing">
   Click any listing to open its detail page. You'll see the runtime family, deploy target, sandbox
-  profile, default image, and any bootstrap files or integrations the template wires up.
+  profile, default image, and any bootstrap files or integrations the template wires up. OpenClaw
+  listings show their core markdown set; Hermes listings show the captured workspace files instead.
 </Step>
 
   <Step title="Click Install">
-    Choose the workspace (defaults to the current one) and an agent name. Nora materializes the latest version of the listing into a new agent in `queued` status. The deployment job runs the same path as a manual deploy.
+    Choose the workspace (defaults to the current one) and an agent name. The deploy target and sandbox pickers only offer targets enabled for the listing's runtime family. Nora materializes the latest version of the listing into a new agent in `queued` status. The deployment job runs the same path as a manual deploy.
+
+    For a Hermes listing, the deploy worker writes the bundle into the new runtime after it is created: workspace files under `/opt/data/workspace`, bundled skill directories under `/opt/data/skills`, guarded by a `/opt/data/.nora/template-applied` marker so redeploys with surviving storage never overwrite files the agent has edited. The bundle's saved skills are reinstalled by the skills reconciler on boot, and its captured model selection (provider, model, base URL — never API keys) becomes the new agent's model config.
 
     ![Install dialog — workspace + agent-name confirmation before materializing the listing](/images/guides/agent-hub/install-dialog.png)
 
