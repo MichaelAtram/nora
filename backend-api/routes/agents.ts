@@ -53,6 +53,9 @@ const {
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
 const { deriveHermesDashboardBasicAuth } = require("../../agent-runtime/lib/hermesDashboardAuth");
 const {
+  normalizeSavedHermesSkillEntries,
+} = require("../../agent-runtime/lib/hermesSkillsReconciliation");
+const {
   DEFAULT_RUNTIME_FAMILY,
   KNOWN_RUNTIME_FAMILIES,
   getRuntimeSelectionStatus,
@@ -249,6 +252,7 @@ function buildDemoDeploymentJob(agent, userId, demoProviderId, plan = "selfhoste
     model: null,
     migration_draft_id: null,
     clawhub_skills: [],
+    hermes_skills: [],
     llm_provider_id: demoProviderId,
   };
 }
@@ -761,6 +765,26 @@ function normalizeClawhubSkills(entries) {
   }
 
   return normalized;
+}
+
+// Deploy requests may pre-select at most this many Hermes skills; extra
+// entries are silently truncated after validation/dedup.
+const MAX_HERMES_SKILLS_PER_DEPLOY = 20;
+
+/**
+ * Normalize the Hermes skill entries a deploy request may save on an agent
+ * row. Validation, dedup-by-name, and reserved-name filtering are delegated
+ * to the shared agent-runtime normalizer; deploy-time saves are always CLI
+ * installs resolved from a registry ref, so ref-less entries are dropped, and
+ * the list is capped at MAX_HERMES_SKILLS_PER_DEPLOY.
+ *
+ * @param {Array} entries - Raw skill entries from the request body.
+ * @returns {Array} Stable list of normalized Hermes skill descriptors.
+ */
+function normalizeHermesSkills(entries) {
+  return normalizeSavedHermesSkillEntries(Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry.ref)
+    .slice(0, MAX_HERMES_SKILLS_PER_DEPLOY);
 }
 
 router.get(
@@ -1972,9 +1996,9 @@ router.post("/activate-demo", requireSession, async (req, res) => {
     const result = await client.query(
       `INSERT INTO agents(
          user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
-         container_name, image, template_payload, clawhub_skills, runtime_family, deploy_target,
-         execution_target_id, sandbox_profile
-       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, '[]'::jsonb, $12, $13, $14, $15)
+         container_name, image, template_payload, clawhub_skills, hermes_skills, runtime_family,
+         deploy_target, execution_target_id, sandbox_profile
+       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, '[]'::jsonb, '[]'::jsonb, $12, $13, $14, $15)
        RETURNING *`,
       [
         userId,
@@ -2072,6 +2096,7 @@ router.post("/deploy", async (req, res) => {
   try {
     const requestBody = req.body || {};
     const clawhubSkills = normalizeClawhubSkills(requestBody.clawhub_skills);
+    const requestedHermesSkills = normalizeHermesSkills(requestBody.hermes_skills);
     let migrationDraft = null;
     if (requestBody.migration_draft_id) {
       if (req.apiKey) {
@@ -2109,6 +2134,10 @@ router.post("/deploy", async (req, res) => {
         runtime_family: runtimeFamily || DEFAULT_RUNTIME_FAMILY,
       },
     });
+    // Hermes skill pre-selection only applies to Hermes runtimes; the gate
+    // uses the RESOLVED family (unlike clawhub_skills, which is normalized
+    // before the family is known) so non-Hermes agents always store [].
+    const hermesSkills = runtimeFields.runtime_family === "hermes" ? requestedHermesSkills : [];
     if (!requireSessionForRemoteDockerPlacement(req, res, runtimeFields)) return;
     // Enforce billing only after authorization has rejected session-only
     // Remote Docker placement for workspace API keys.
@@ -2187,9 +2216,9 @@ router.post("/deploy", async (req, res) => {
       req,
       `INSERT INTO agents(
          user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
-         container_name, image, template_payload, clawhub_skills, runtime_family, deploy_target,
-         execution_target_id, sandbox_profile
-       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16) RETURNING *`,
+         container_name, image, template_payload, clawhub_skills, hermes_skills, runtime_family,
+         deploy_target, execution_target_id, sandbox_profile
+       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16, $17) RETURNING *`,
       [
         req.user.id,
         name,
@@ -2203,6 +2232,7 @@ router.post("/deploy", async (req, res) => {
         image,
         JSON.stringify(templatePayload),
         JSON.stringify(clawhubSkills),
+        JSON.stringify(hermesSkills),
         runtimeFields.runtime_family,
         runtimeFields.deploy_target,
         runtimeFields.execution_target_id,
@@ -2253,6 +2283,7 @@ router.post("/deploy", async (req, res) => {
       model: runtimeFields.sandbox_profile === "nemoclaw" ? req.body.model || null : null,
       migration_draft_id: migrationDraft?.id || null,
       clawhub_skills: clawhubSkills,
+      hermes_skills: hermesSkills,
     });
 
     const deployType = `${runtimeSelectionStatus.runtimeFamily}/${runtimeSelectionStatus.deployTarget}/${runtimeSelectionStatus.sandboxProfile}`;

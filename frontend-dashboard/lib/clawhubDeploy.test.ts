@@ -7,6 +7,7 @@ import {
   loadDeployDraft,
   saveDeployDraft,
   type DeployDraft,
+  type DeployHermesSkill,
 } from "./clawhubDeploy";
 
 function createDraft(overrides: Partial<DeployDraft> = {}): DeployDraft {
@@ -355,6 +356,107 @@ test("deploy draft storage keeps only the versioned schema and whitelisted skill
       },
     ]);
     assert.doesNotMatch(JSON.stringify(stored), /TOP-LEVEL-LEAK|NESTED-LEAK|SKILL-LEAK/);
+  } finally {
+    storage.restore();
+  }
+});
+
+test("hermes deploy skills round-trip only the whitelisted entry fields", () => {
+  const storage = installSessionStorage();
+
+  try {
+    saveDeployDraft({
+      ...createDraft({ runtimeFamily: "hermes" }),
+      hermesSkills: [
+        {
+          source: "hermes-hub",
+          ref: "official/security/1password",
+          name: "1password",
+          installMode: "cli",
+          installedAt: "2026-07-30T00:00:00.000Z",
+          description: "Secrets tooling",
+          accessToken: "HERMES-SKILL-LEAK",
+        },
+      ],
+    } as unknown as DeployDraft);
+
+    const stored = storage.readDraft();
+    assert.deepEqual(stored.hermesSkills, [
+      {
+        source: "hermes-hub",
+        ref: "official/security/1password",
+        name: "1password",
+        installMode: "cli",
+        installedAt: "2026-07-30T00:00:00.000Z",
+        description: "Secrets tooling",
+      },
+    ]);
+    assert.doesNotMatch(JSON.stringify(stored), /HERMES-SKILL-LEAK/);
+
+    const loaded = loadDeployDraft();
+    assert.deepEqual(loaded?.hermesSkills, stored.hermesSkills);
+  } finally {
+    storage.restore();
+  }
+});
+
+test("hermes skill sanitizer drops invalid, ref-less, reserved, and duplicate entries", () => {
+  const storage = installSessionStorage();
+
+  try {
+    saveDeployDraft(
+      createDraft({
+        runtimeFamily: "hermes",
+        hermesSkills: [
+          {
+            source: "hermes-hub",
+            ref: "official/tools/k8s",
+            name: "k8s",
+            installMode: "cli",
+            installedAt: "2026-07-30T00:00:00.000Z",
+          },
+          {
+            // Duplicate name (the reconciliation identity) — first entry wins.
+            source: "hermes-hub",
+            ref: "clawhub/other/k8s",
+            name: "k8s",
+            installMode: "cli",
+            installedAt: "2026-07-30T00:05:00.000Z",
+          },
+          {
+            // Missing ref — deploy-time saves are CLI installs resolved from a ref.
+            source: "hermes-hub",
+            ref: "",
+            name: "no-ref",
+            installMode: "cli",
+            installedAt: "2026-07-30T00:00:00.000Z",
+          },
+          {
+            // Invalid charset (path traversal) in the shell-reaching name.
+            source: "hermes-hub",
+            ref: "x/y",
+            name: "../escape",
+            installMode: "cli",
+            installedAt: "2026-07-30T00:00:00.000Z",
+          },
+          {
+            // Nora-managed reserved skill.
+            source: "hermes-hub",
+            ref: "x/z",
+            name: "nora-integrations",
+            installMode: "cli",
+            installedAt: "2026-07-30T00:00:00.000Z",
+          },
+        ],
+      }),
+    );
+
+    const stored = storage.readDraft();
+    assert.deepEqual(
+      stored.hermesSkills.map((skill: DeployHermesSkill) => skill.name),
+      ["k8s"],
+    );
+    assert.equal(stored.hermesSkills[0].ref, "official/tools/k8s");
   } finally {
     storage.restore();
   }
