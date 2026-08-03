@@ -1169,6 +1169,167 @@ describe("Hermes WebUI routes", () => {
     });
   });
 
+  it("returns null connect credentials when the runtime token is unresolvable", async () => {
+    // No stored gateway_token and a container env without API_SERVER_KEY: the
+    // connect block must degrade to null credentials — the `apiKey ? derive :
+    // null` guard is load-bearing because deriveHermesDashboardBasicAuth
+    // throws on an empty seed, which would 500 the whole hermes-ui route.
+    mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
+      runtimeStatus: {
+        gateway_state: "running",
+        active_agents: 1,
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      directory: {
+        updated_at: "2026-04-12T12:00:00.000Z",
+        platforms: {},
+      },
+      platformDetails: {},
+      jobsCount: 0,
+      modelConfig: {
+        defaultModel: "gpt-5.5",
+        provider: "custom",
+        baseUrl: "https://api.openai.com/v1",
+      },
+    });
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          id: "a-hermes-tokenless",
+          user_id: "user-1",
+          status: "running",
+          runtime_family: "hermes",
+          backend_type: "docker",
+          container_id: "hermes-container",
+          runtime_host: "10.0.0.43",
+          runtime_port: 8642,
+          gateway_token: null,
+        },
+      ],
+    });
+    global.fetch = jest.fn().mockResolvedValue(createMockFetchResponse({ body: {} }));
+    // Every inspect (the token fallback re-inspects per resolution attempt plus
+    // the published-port lookup) sees the same container: ports published, no
+    // API_SERVER_KEY in the environment.
+    mockDockerInspect.mockResolvedValue({
+      Config: { Env: ["HERMES_HOME=/opt/hermes"] },
+      NetworkSettings: {
+        Ports: {
+          "8642/tcp": [{ HostIp: "100.71.115.105", HostPort: "19500" }],
+          "9119/tcp": [{ HostIp: "100.71.115.105", HostPort: "19044" }],
+        },
+      },
+    });
+
+    const res = await auth(
+      request(app)
+        .get("/agents/a-hermes-tokenless/hermes-ui")
+        .set("X-Forwarded-Host", "100.71.115.105"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.connect).toEqual({
+      runtimeApiUrl: "http://100.71.115.105:19500",
+      dashboardUrl: "http://100.71.115.105:19044",
+      apiKey: null,
+      dashboardUsername: null,
+      dashboardPassword: null,
+    });
+  });
+
+  it.each(["viewer", "editor", "admin"])(
+    "omits Hermes connect credentials for workspace %s members",
+    async (role) => {
+      mockDb.query
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              id: "a-hermes-viewer",
+              user_id: "agent-owner",
+              status: "running",
+              runtime_family: "hermes",
+              backend_type: "docker",
+              container_id: "hermes-container",
+              runtime_host: "10.0.0.43",
+              runtime_port: 8642,
+              gateway_token: "hermes-token",
+            },
+          ],
+        })
+        .mockResolvedValueOnce({ rows: [{ role }] });
+      global.fetch = jest
+        .fn()
+        .mockResolvedValueOnce(
+          createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }),
+        )
+        .mockResolvedValueOnce(
+          createMockFetchResponse({
+            body: { object: "list", data: [{ id: "desk-bot", object: "model" }] },
+          }),
+        )
+        .mockResolvedValueOnce(
+          createMockFetchResponse({
+            body: { version: "1.0.0", gateway_running: true, gateway_state: "running" },
+          }),
+        );
+
+      const res = await auth(request(app).get("/agents/a-hermes-viewer/hermes-ui"));
+
+      expect(res.status).toBe(200);
+      expect(res.body.connect).toBeUndefined();
+      expect(mockDockerInspect).not.toHaveBeenCalled();
+    },
+  );
+
+  it("omits Hermes connect credentials for read-scoped workspace API keys", async () => {
+    authorizeWorkspaceApiKey({ scopes: ["agents:read"] });
+    const agent = {
+      id: "a-hermes-api-key",
+      user_id: "agent-owner",
+      status: "running",
+      runtime_family: "hermes",
+      backend_type: "docker",
+      container_id: "hermes-container",
+      runtime_host: "10.0.0.43",
+      runtime_port: 8642,
+      gateway_token: "hermes-token",
+    };
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: agent.id,
+            backend_type: agent.backend_type,
+            deploy_target: agent.deploy_target,
+            execution_target_id: agent.execution_target_id,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [agent] });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(
+        createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { object: "list", data: [{ id: "desk-bot", object: "model" }] },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { version: "1.0.0", gateway_running: true, gateway_state: "running" },
+        }),
+      );
+
+    const res = await workspaceApiKeyAuth(request(app).get("/agents/a-hermes-api-key/hermes-ui"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.connect).toBeUndefined();
+    expect(mockDockerInspect).not.toHaveBeenCalled();
+  });
+
   it("uses the routable published HostIp as the connect host, not the browsing host", async () => {
     mockReadHermesRuntimeSnapshot.mockResolvedValueOnce({
       runtimeStatus: { gateway_state: "running", active_agents: 1, updated_at: "t", platforms: {} },
@@ -1194,12 +1355,18 @@ describe("Hermes WebUI routes", () => {
     });
     global.fetch = jest
       .fn()
-      .mockResolvedValueOnce(createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }))
       .mockResolvedValueOnce(
-        createMockFetchResponse({ body: { object: "list", data: [{ id: "desk-bot", object: "model" }] } }),
+        createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }),
       )
       .mockResolvedValueOnce(
-        createMockFetchResponse({ body: { version: "1.0.0", gateway_running: true, gateway_state: "running" } }),
+        createMockFetchResponse({
+          body: { object: "list", data: [{ id: "desk-bot", object: "model" }] },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { version: "1.0.0", gateway_running: true, gateway_state: "running" },
+        }),
       );
     // Ports are bound to a concrete routable interface (Tailscale IP).
     mockDockerInspect.mockResolvedValueOnce({
@@ -1214,7 +1381,9 @@ describe("Hermes WebUI routes", () => {
     // Operator browses Nora on a DIFFERENT host — the connect URLs must reflect
     // where the ports are actually bound, not the browsing host.
     const res = await auth(
-      request(app).get("/agents/a-hermes-hostip/hermes-ui").set("X-Forwarded-Host", "nora.internal.example"),
+      request(app)
+        .get("/agents/a-hermes-hostip/hermes-ui")
+        .set("X-Forwarded-Host", "nora.internal.example"),
     );
 
     expect(res.status).toBe(200);
@@ -1252,12 +1421,18 @@ describe("Hermes WebUI routes", () => {
     });
     global.fetch = jest
       .fn()
-      .mockResolvedValueOnce(createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }))
       .mockResolvedValueOnce(
-        createMockFetchResponse({ body: { object: "list", data: [{ id: "desk-bot", object: "model" }] } }),
+        createMockFetchResponse({ body: { status: "ok", platform: "hermes-agent" } }),
       )
       .mockResolvedValueOnce(
-        createMockFetchResponse({ body: { version: "1.0.0", gateway_running: true, gateway_state: "running" } }),
+        createMockFetchResponse({
+          body: { object: "list", data: [{ id: "desk-bot", object: "model" }] },
+        }),
+      )
+      .mockResolvedValueOnce(
+        createMockFetchResponse({
+          body: { version: "1.0.0", gateway_running: true, gateway_state: "running" },
+        }),
       );
     // Loopback bind (default DOCKER_AGENT_BIND_IP) — no routable HostIp to advertise.
     mockDockerInspect.mockResolvedValueOnce({
@@ -1270,7 +1445,9 @@ describe("Hermes WebUI routes", () => {
     });
 
     const res = await auth(
-      request(app).get("/agents/a-hermes-loopback/hermes-ui").set("X-Forwarded-Host", "nora.internal.example"),
+      request(app)
+        .get("/agents/a-hermes-loopback/hermes-ui")
+        .set("X-Forwarded-Host", "nora.internal.example"),
     );
 
     expect(res.status).toBe(200);
@@ -4366,6 +4543,180 @@ describe("POST /agents/deploy", () => {
         ],
       }),
     );
+  });
+
+  it("persists normalized hermes skills for Hermes deploys and drops invalid entries", async () => {
+    process.env.ENABLED_RUNTIME_FAMILIES = "openclaw,hermes";
+    process.env.ENABLED_BACKENDS = "docker";
+
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-hermes-skills",
+            name: "Hermes Skills Agent",
+            status: "queued",
+            user_id: "user-1",
+            runtime_family: "hermes",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(
+      request(app)
+        .post("/agents/deploy")
+        .send({
+          name: "Hermes Skills Agent",
+          runtime_family: "hermes",
+          hermes_skills: [
+            {
+              source: "hermes-hub",
+              ref: "official/security/1password",
+              name: "1password",
+              installMode: "cli",
+              installedAt: "2026-07-30T00:00:00.000Z",
+              description: "Should not persist",
+            },
+            {
+              // Duplicate name (the reconciliation identity) — first wins.
+              source: "hermes-hub",
+              ref: "clawhub/other/1password",
+              name: "1password",
+              installMode: "cli",
+              installedAt: "2026-07-30T00:05:00.000Z",
+            },
+            {
+              // Missing ref — deploy-time saves are CLI installs from a ref.
+              source: "hermes-hub",
+              name: "no-ref",
+              installMode: "cli",
+              installedAt: "2026-07-30T00:00:00.000Z",
+            },
+            {
+              // Invalid charset in the shell-reaching name.
+              source: "hermes-hub",
+              ref: "x/y",
+              name: "../escape",
+              installedAt: "2026-07-30T00:00:00.000Z",
+            },
+            {
+              // Nora-managed reserved skill.
+              source: "hermes-hub",
+              ref: "x/z",
+              name: "nora-integrations",
+              installedAt: "2026-07-30T00:00:00.000Z",
+            },
+          ],
+        }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockDb.query.mock.calls[0][0]).toEqual(expect.stringContaining("hermes_skills"));
+    const insertParams = mockDb.query.mock.calls[0][1];
+    expect(JSON.parse(insertParams[12])).toEqual([
+      {
+        source: "hermes-hub",
+        ref: "official/security/1password",
+        name: "1password",
+        installMode: "cli",
+        installedAt: "2026-07-30T00:00:00.000Z",
+      },
+    ]);
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "a-hermes-skills",
+        hermes_skills: [
+          expect.objectContaining({
+            name: "1password",
+            ref: "official/security/1password",
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("stores an empty hermes skill list when the resolved runtime family is not hermes", async () => {
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-openclaw-hermes-skills",
+            name: "OpenClaw Agent",
+            status: "queued",
+            user_id: "user-1",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(
+      request(app)
+        .post("/agents/deploy")
+        .send({
+          name: "OpenClaw Agent",
+          hermes_skills: [
+            {
+              source: "hermes-hub",
+              ref: "official/security/1password",
+              name: "1password",
+              installMode: "cli",
+              installedAt: "2026-07-30T00:00:00.000Z",
+            },
+          ],
+        }),
+    );
+
+    expect(res.status).toBe(200);
+    const insertParams = mockDb.query.mock.calls[0][1];
+    expect(JSON.parse(insertParams[12])).toEqual([]);
+    expect(mockAddDeploymentJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "a-openclaw-hermes-skills",
+        hermes_skills: [],
+      }),
+    );
+  });
+
+  it("truncates hermes skill pre-selection to twenty entries", async () => {
+    process.env.ENABLED_RUNTIME_FAMILIES = "openclaw,hermes";
+    process.env.ENABLED_BACKENDS = "docker";
+
+    mockDb.query
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "a-hermes-cap",
+            name: "Capped Hermes Agent",
+            status: "queued",
+            user_id: "user-1",
+            runtime_family: "hermes",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await auth(
+      request(app)
+        .post("/agents/deploy")
+        .send({
+          name: "Capped Hermes Agent",
+          runtime_family: "hermes",
+          hermes_skills: Array.from({ length: 25 }, (_, index) => ({
+            source: "hermes-hub",
+            ref: `official/tools/skill-${index}`,
+            name: `skill-${index}`,
+            installMode: "cli",
+            installedAt: "2026-07-30T00:00:00.000Z",
+          })),
+        }),
+    );
+
+    expect(res.status).toBe(200);
+    const persisted = JSON.parse(mockDb.query.mock.calls[0][1][12]);
+    expect(persisted).toHaveLength(20);
+    expect(persisted[0].name).toBe("skill-0");
+    expect(persisted[19].name).toBe("skill-19");
   });
 
   it("uses operator-managed deployment defaults in PaaS mode", async () => {

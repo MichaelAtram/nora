@@ -68,8 +68,20 @@ Make sure you have at least one LLM provider key saved in **Settings** before de
   before deploying.
 </Step>
 
+  <Step title="Choose deploy-time skills">
+    Blank deploys include a per-family skills step: the primary button reads **Next: Choose
+    Skills** and opens the skills picker for the selected runtime family. OpenClaw agents pick
+    from **ClawHub**. Hermes agents pick from the **Hermes Skills Hub**, with your instance's
+    curated **Skills Library** shown first for one-click selection — any operator can pin a skill
+    to the shared library from the picker's detail panel or from a running Hermes agent's Skills
+    tab. Selected skills are saved on the agent record and installed automatically once the
+    runtime is ready. Adopting an external runtime skips this step, and you can always continue
+    without selecting any skills.
+
+  </Step>
+
   <Step title="Confirm and deploy">
-    Click **Confirm & Deploy Agent**. Nora creates the agent record with a `queued` status and adds a deployment job to the queue.
+    Click **Deploy Agent & Open Validation** on the skills page. Nora creates the agent record with a `queued` status and adds a deployment job to the queue.
 
     ![Deploy wizard — final confirm step before submission](/images/guides/deploy/wizard-confirm.png)
 
@@ -97,7 +109,7 @@ invented silently.
 
 ## What happens during deployment
 
-After you click **Confirm & Deploy Agent**, the deployment moves through three stages:
+After you submit the deploy, the deployment moves through three stages:
 
 1. **Queued** — The agent record is created and a deployment job is queued. The status is set to `queued` immediately so you can track progress.
 2. **Deploying** — A provisioner worker is creating the workload on the execution target and waiting for readiness.

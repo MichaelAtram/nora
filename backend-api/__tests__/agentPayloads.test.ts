@@ -16,8 +16,11 @@ jest.mock("../remoteHosts", () => ({
 
 const {
   buildTemplatePayloadFromAgent,
+  ensureCoreTemplateFiles,
   extractTemplateDefaultsFromSnapshot,
+  extractTemplatePayloadFromSnapshot,
   serializeAgent,
+  summarizeTemplatePayload,
 } = require("../agentPayloads");
 const { buildAgentHubTemplateUpdate } = require("../agentHubTemplateEdits");
 
@@ -168,6 +171,199 @@ describe("Agent Hub template deploy targets", () => {
         { sandbox: "nemoclaw-typo" },
       ),
     ).toThrow(expect.objectContaining({ code: "UNKNOWN_SANDBOX_PROFILE", statusCode: 400 }));
+  });
+});
+
+describe("Agent Hub template runtime family", () => {
+  it("defaults runtimeFamily to openclaw for snapshots captured before the field existed", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            deploy_target: "docker",
+          },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ runtimeFamily: "openclaw" }));
+  });
+
+  it("defaults runtimeFamily to openclaw when the snapshot has no defaults at all", () => {
+    expect(extractTemplateDefaultsFromSnapshot({ config: {} })).toEqual(
+      expect.objectContaining({ runtimeFamily: "openclaw" }),
+    );
+  });
+
+  it("surfaces a stored runtime_family from snapshot defaults", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            runtime_family: "hermes",
+          },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ runtimeFamily: "hermes" }));
+  });
+
+  it("accepts the camelCase runtimeFamily alias", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            runtimeFamily: "hermes",
+          },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ runtimeFamily: "hermes" }));
+  });
+
+  it("collapses unknown runtime families to openclaw", () => {
+    expect(
+      extractTemplateDefaultsFromSnapshot({
+        config: {
+          defaults: {
+            runtime_family: "quantumclaw",
+          },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ runtimeFamily: "openclaw" }));
+  });
+});
+
+const OPENCLAW_REQUIRED_PATHS = [
+  "AGENTS.md",
+  "SOUL.md",
+  "TOOLS.md",
+  "IDENTITY.md",
+  "USER.md",
+  "HEARTBEAT.md",
+  "MEMORY.md",
+];
+
+describe("ensureCoreTemplateFiles family awareness", () => {
+  const hermesFiles = [
+    { path: "notes/plan.md", content: "# Plan" },
+    { path: "scripts/run.sh", content: "echo hi" },
+  ];
+
+  it("keeps synthesizing the seven required OpenClaw files by default", () => {
+    const payload = ensureCoreTemplateFiles({ files: [] }, { name: "Pinned Behavior" });
+
+    const paths = payload.files.map((entry) => entry.path);
+    expect(paths).toEqual(expect.arrayContaining(OPENCLAW_REQUIRED_PATHS));
+    expect(paths).not.toContain("BOOTSTRAP.md");
+  });
+
+  it("skips synthesis for an explicit non-OpenClaw runtime family", () => {
+    const payload = ensureCoreTemplateFiles({ files: hermesFiles }, { runtimeFamily: "hermes" });
+
+    expect(payload.files.map((entry) => entry.path)).toEqual(["notes/plan.md", "scripts/run.sh"]);
+  });
+
+  it("skips synthesis when the payload metadata carries runtimeFamily hermes", () => {
+    const payload = ensureCoreTemplateFiles({
+      files: hermesFiles,
+      metadata: { runtimeFamily: "hermes" },
+    });
+
+    expect(payload.files.map((entry) => entry.path)).toEqual(["notes/plan.md", "scripts/run.sh"]);
+    expect(payload.metadata).toEqual({ runtimeFamily: "hermes" });
+  });
+
+  it("collapses unknown carried families to OpenClaw synthesis", () => {
+    const payload = ensureCoreTemplateFiles({
+      files: [],
+      metadata: { runtimeFamily: "quantumclaw" },
+    });
+
+    expect(payload.files.map((entry) => entry.path)).toEqual(
+      expect.arrayContaining(OPENCLAW_REQUIRED_PATHS),
+    );
+  });
+
+  it("lets an explicit openclaw override beat a hermes metadata carrier", () => {
+    const payload = ensureCoreTemplateFiles(
+      { files: [], metadata: { runtimeFamily: "hermes" } },
+      { runtimeFamily: "openclaw" },
+    );
+
+    expect(payload.files.map((entry) => entry.path)).toEqual(
+      expect.arrayContaining(OPENCLAW_REQUIRED_PATHS),
+    );
+  });
+});
+
+describe("summarizeTemplatePayload family awareness", () => {
+  it("pins the OpenClaw summary contract: requiredCoreCount 7 and synthesized core files", () => {
+    const summary = summarizeTemplatePayload({ files: [] }, { context: { name: "Pinned" } });
+
+    expect(summary.runtimeFamily).toBe("openclaw");
+    expect(summary.requiredCoreCount).toBe(7);
+    expect(summary.presentRequiredCoreCount).toBe(7);
+    expect(summary.missingRequiredCoreFiles).toEqual([]);
+    expect(summary.coreFiles).toHaveLength(8);
+    expect(summary.fileCount).toBe(7);
+    expect(summary.extraFilesCount).toBe(0);
+    expect(summary.hasBootstrap).toBe(false);
+  });
+
+  it("reports zero core-file requirements for hermes payloads without fabricating files", () => {
+    const summary = summarizeTemplatePayload({
+      files: [{ path: "notes.md", content: "hello" }],
+      metadata: { runtimeFamily: "hermes" },
+    });
+
+    expect(summary.runtimeFamily).toBe("hermes");
+    expect(summary.requiredCoreCount).toBe(0);
+    expect(summary.presentRequiredCoreCount).toBe(0);
+    expect(summary.missingRequiredCoreFiles).toEqual([]);
+    expect(summary.coreFiles).toEqual([]);
+    expect(summary.fileCount).toBe(1);
+    expect(summary.extraFilesCount).toBe(1);
+    expect(summary.files.map((file) => file.path)).toEqual(["notes.md"]);
+    expect(summary.files[0].isCore).toBe(false);
+    expect(summary.files[0].requiredCore).toBe(false);
+  });
+
+  it("prefers the explicit runtimeFamily option over the metadata carrier", () => {
+    const summary = summarizeTemplatePayload(
+      { files: [], metadata: { runtimeFamily: "openclaw" } },
+      { runtimeFamily: "hermes" },
+    );
+
+    expect(summary.runtimeFamily).toBe("hermes");
+    expect(summary.requiredCoreCount).toBe(0);
+    expect(summary.fileCount).toBe(0);
+  });
+});
+
+describe("extractTemplatePayloadFromSnapshot family awareness", () => {
+  it("does not fabricate OpenClaw core files for hermes snapshots", () => {
+    const payload = extractTemplatePayloadFromSnapshot({
+      name: "Hermes Listing",
+      kind: "community-template",
+      config: {
+        defaults: { runtime_family: "hermes" },
+        templatePayload: { files: [{ path: "notes.md", content: "hi" }] },
+      },
+    });
+
+    expect(payload.files.map((entry) => entry.path)).toEqual(["notes.md"]);
+  });
+
+  it("keeps synthesizing core files for openclaw snapshots", () => {
+    const payload = extractTemplatePayloadFromSnapshot({
+      name: "OpenClaw Listing",
+      kind: "community-template",
+      config: {
+        defaults: { runtime_family: "openclaw" },
+        templatePayload: { files: [] },
+      },
+    });
+
+    expect(payload.files.map((entry) => entry.path)).toEqual(
+      expect.arrayContaining([...OPENCLAW_REQUIRED_PATHS, "BOOTSTRAP.md"]),
+    );
   });
 });
 

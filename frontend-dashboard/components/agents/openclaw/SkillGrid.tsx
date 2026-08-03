@@ -14,6 +14,7 @@ type SkillGridProps = {
   onToggleSelection?: (skill: SkillSummary) => void;
   emptyTitle?: string;
   emptyMessage?: string;
+  loadingLabel?: string;
 };
 
 function LoadingSkeleton() {
@@ -41,13 +42,14 @@ export default function SkillGrid({
   onToggleSelection,
   emptyTitle = "No skills found.",
   emptyMessage,
+  loadingLabel = "Loading ClawHub skills...",
 }: SkillGridProps) {
   if (loading) {
     return (
       <div className="space-y-4">
         <div className="flex items-center gap-2 text-sm font-semibold text-slate-500">
           <Loader2 size={16} className="animate-spin text-blue-500" />
-          Loading ClawHub skills...
+          {loadingLabel}
         </div>
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
           {Array.from({ length: 6 }).map((_, index) => (

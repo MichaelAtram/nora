@@ -10,6 +10,15 @@ export type DeployClawHubSkill = {
   description?: string;
 };
 
+export type DeployHermesSkill = {
+  source: "hermes-hub";
+  ref: string;
+  name: string;
+  installMode: "cli";
+  installedAt: string;
+  description?: string;
+};
+
 export type DeployDraft = {
   name: string;
   containerName: string;
@@ -25,6 +34,7 @@ export type DeployDraft = {
   ramMb: number;
   diskGb: number;
   clawhubSkills: DeployClawHubSkill[];
+  hermesSkills?: DeployHermesSkill[];
 };
 
 type DraftResourceOptions = {
@@ -169,6 +179,43 @@ function sanitizeClawHubSkills(value: unknown): DeployClawHubSkill[] {
   });
 }
 
+// Mirrors the agent-runtime hermesSkillsReconciliation validation: the skill
+// name is the Hermes reconciliation identity (and later reaches shell commands
+// in the worker), so the same charset and reserved-name rules apply at this
+// choke point. "nora-integrations" is written by Nora's integrations
+// reconciler and must never ride in as an operator-selected skill.
+const HERMES_SKILL_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+const RESERVED_HERMES_SKILL_NAMES = ["nora-integrations"];
+
+function sanitizeHermesSkills(value: unknown): DeployHermesSkill[] {
+  if (!Array.isArray(value)) return [];
+
+  const seenNames = new Set<string>();
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const candidate = entry as Record<string, unknown>;
+    const ref = stringValue(candidate.ref).trim();
+    const name = stringValue(candidate.name).trim();
+    if (!ref || !HERMES_SKILL_NAME_RE.test(name)) return [];
+    if (RESERVED_HERMES_SKILL_NAMES.includes(name.toLowerCase())) return [];
+    if (seenNames.has(name)) return [];
+    seenNames.add(name);
+
+    return [
+      {
+        source: "hermes-hub" as const,
+        ref,
+        name,
+        installMode: "cli" as const,
+        installedAt: stringValue(candidate.installedAt),
+        ...(stringValue(candidate.description)
+          ? { description: stringValue(candidate.description) }
+          : {}),
+      },
+    ];
+  });
+}
+
 function sanitizeDeployDraft(draft: unknown): DeployDraft | null {
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) return null;
 
@@ -214,6 +261,7 @@ function sanitizeDeployDraft(draft: unknown): DeployDraft | null {
     ramMb: numberValue(candidate.ramMb),
     diskGb: numberValue(candidate.diskGb),
     clawhubSkills: sanitizeClawHubSkills(candidate.clawhubSkills),
+    hermesSkills: sanitizeHermesSkills(candidate.hermesSkills),
   };
 }
 

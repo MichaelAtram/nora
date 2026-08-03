@@ -50,10 +50,7 @@ describe("resolveBackendPath — worker-provisioner prod image layout", () => {
   });
 
   it("resolves a shimmed backend (nemoclaw) to the real /app/backends adapter", () => {
-    const resolve = fakeResolver([
-      "/app/backends/nemoclaw",
-      "/backend-api/backends/nemoclaw",
-    ]);
+    const resolve = fakeResolver(["/app/backends/nemoclaw", "/backend-api/backends/nemoclaw"]);
     expect(resolveBackendPath("nemoclaw", { resolve, dirname, appBackendsDir })).toBe(
       "/app/backends/nemoclaw",
     );

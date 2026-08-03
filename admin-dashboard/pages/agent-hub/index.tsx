@@ -173,6 +173,9 @@ export default function AgentHubAdmin() {
                       Source
                     </th>
                     <th className="px-2 py-3 text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">
+                      Family
+                    </th>
+                    <th className="px-2 py-3 text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">
                       Status
                     </th>
                     <th className="px-2 py-3 text-[11px] font-black uppercase tracking-[0.18em] text-slate-400">
@@ -225,6 +228,11 @@ export default function AgentHubAdmin() {
                               </>
                             )}
                           </div>
+                        </td>
+                        <td className="px-2 py-4">
+                          <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[10px] font-black uppercase tracking-widest text-slate-700">
+                            {item.runtime_family === "hermes" ? "Hermes" : "OpenClaw"}
+                          </span>
                         </td>
                         <td className="px-2 py-4">
                           <span

@@ -410,7 +410,7 @@ export default function Deploy() {
   const canDeployExecutionTarget = Boolean(activeSandboxOption?.available);
   // Adopt mode registers an already-running external runtime by URL + token — it
   // skips provisioning, so the execution-target / sandbox / resource selectors and
-  // the ClawHub step don't apply.
+  // the per-family skills step don't apply.
   const isAdopt = deploymentMode === "adopt";
   const canAdopt = Boolean(name.trim() && adoptUrl.trim() && adoptGatewayToken.trim());
   const isNemoClaw = activeSandboxOption?.id === "nemoclaw";
@@ -421,6 +421,7 @@ export default function Deploy() {
     defaultRuntimeFamily?.id ||
     "openclaw";
   const usesClawHubStep = effectiveRuntimeFamily === "openclaw";
+  const usesHermesSkillsStep = effectiveRuntimeFamily === "hermes";
   const isHermes = effectiveRuntimeFamily === "hermes";
   const showSandboxSelection = visibleSandboxOptions.length > 1;
   const showRuntimeFamilySelection = visibleRuntimeFamilies.length > 1;
@@ -557,6 +558,7 @@ export default function Deploy() {
       ramMb: isSelfHosted ? normalizedResources.ramMb : 0,
       diskGb: isSelfHosted ? normalizedResources.diskGb : 0,
       clawhubSkills: usesClawHubStep ? loadDeployDraft()?.clawhubSkills || [] : [],
+      hermesSkills: usesHermesSkillsStep ? loadDeployDraft()?.hermesSkills || [] : [],
     };
 
     deployDraftRef.current = nextDraft;
@@ -595,6 +597,14 @@ export default function Deploy() {
           ...(nextDraft.ramMb ? { ram_mb: normalizedResources.ramMb } : {}),
           ...(nextDraft.diskGb ? { disk_gb: normalizedResources.diskGb } : {}),
           clawhub_skills: [],
+          hermes_skills:
+            nextDraft.hermesSkills?.map((skill) => ({
+              source: "hermes-hub",
+              ref: skill.ref,
+              name: skill.name,
+              installMode: "cli",
+              installedAt: skill.installedAt,
+            })) || [],
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -670,6 +680,11 @@ export default function Deploy() {
 
     if (usesClawHubStep) {
       router.push("/clawhub");
+      return;
+    }
+
+    if (usesHermesSkillsStep) {
+      router.push("/hermes-skills-select");
       return;
     }
 
@@ -1725,7 +1740,7 @@ export default function Deploy() {
                     ? "Prepare Migration Draft First"
                     : !canDeployExecutionTarget
                       ? "Selected Runtime Path Unavailable"
-                      : usesClawHubStep
+                      : usesClawHubStep || usesHermesSkillsStep
                         ? "Next: Choose Skills"
                         : "Deploy Agent"}
             </button>

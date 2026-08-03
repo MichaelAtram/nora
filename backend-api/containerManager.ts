@@ -203,7 +203,10 @@ const APP_BACKENDS_DIR = "/app/backends";
  * /workers/provisioner/backends path. Trying /app/backends first loads the real
  * adapter directly and never touches the shims.
  */
-function backendPathCandidates(name, { appBackendsDir = APP_BACKENDS_DIR, dirname = __dirname } = {}) {
+function backendPathCandidates(
+  name,
+  { appBackendsDir = APP_BACKENDS_DIR, dirname = __dirname } = {},
+) {
   return [
     path.join(appBackendsDir, name),
     path.resolve(dirname, "backends", name),
