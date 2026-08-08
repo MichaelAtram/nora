@@ -408,7 +408,10 @@ describe("containerManager NemoClaw routing", () => {
       { OPENAI_API_KEY: "rotated" },
       lifecycleOptions,
     );
-    expect(mockProxmoxDestroy).toHaveBeenCalledWith("108", lifecycleOptions);
+    expect(mockProxmoxDestroy).toHaveBeenCalledWith("108", {
+      ...lifecycleOptions,
+      preserveState: false,
+    });
     expect(mockProxmoxStatus).toHaveBeenCalledWith("108", lifecycleOptions);
     expect(mockProxmoxStats).toHaveBeenCalledWith("108", lifecycleOptions);
     expect(mockProxmoxLogs).toHaveBeenCalledWith("108", {
@@ -838,6 +841,40 @@ describe("containerManager NemoClaw routing", () => {
     expect(telemetry).toEqual(expect.objectContaining({ backend_type: "docker" }));
     expect(logs).toBe("hermes-log-stream");
     expect(exec).toEqual({ exec: "hermes-exec", stream: "hermes-stream" });
+  });
+
+  it("threads preserveState:true to the backend on a redeploy destroy", async () => {
+    const containerManager = require("../containerManager");
+    const agent = {
+      runtime_family: "hermes",
+      deploy_target: "docker",
+      sandbox_profile: "standard",
+      container_id: "hermes-preserve-true",
+    };
+
+    await containerManager.destroy(agent, { preserveState: true });
+
+    expect(mockHermesDestroy).toHaveBeenCalledWith(
+      "hermes-preserve-true",
+      expect.objectContaining({ preserveState: true, runtimeFamily: "hermes" }),
+    );
+  });
+
+  it("defaults preserveState to false for a plain delete destroy", async () => {
+    const containerManager = require("../containerManager");
+    const agent = {
+      runtime_family: "hermes",
+      deploy_target: "docker",
+      sandbox_profile: "standard",
+      container_id: "hermes-preserve-default",
+    };
+
+    await containerManager.destroy(agent);
+
+    expect(mockHermesDestroy).toHaveBeenCalledWith(
+      "hermes-preserve-default",
+      expect.objectContaining({ preserveState: false }),
+    );
   });
 
   it("keeps Hermes on Kubernetes lifecycle calls on the Kubernetes adapter", async () => {

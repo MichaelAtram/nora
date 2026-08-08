@@ -218,6 +218,17 @@ class HermesBackend extends DockerBackend {
       // No existing container.
     }
 
+    // Persist the Hermes home (/opt/data: workspace, sessions, config, and the
+    // conversation-history store) on a named volume so it survives a
+    // recreate/redeploy/image-update. The volume is created idempotently and
+    // reused across recreates; it's removed only on a true delete (see destroy()).
+    const homeVolumeName = `nora_hermes_home_${id}`;
+    try {
+      await this.docker.createVolume({ Name: homeVolumeName });
+    } catch (error) {
+      // Volume already exists — reuse it (idempotent), preserving prior data.
+    }
+
     const apiServerKey = crypto.randomBytes(32).toString("hex");
     const dashboardAuth = deriveHermesDashboardBasicAuth(apiServerKey);
     const envArray = Object.entries({
@@ -273,6 +284,7 @@ class HermesBackend extends DockerBackend {
           SecurityOpt: ["no-new-privileges:true"],
           PidsLimit: DEFAULT_AGENT_PIDS_LIMIT,
           Dns: ["8.8.8.8", "8.8.4.4", "1.1.1.1"],
+          Binds: [`${homeVolumeName}:${HERMES_HOME}`],
           // Local Hermes publishes the runtime + dashboard ports to
           // DOCKER_AGENT_BIND_IP (see _hermesPortBindings above) in addition to
           // being reachable via the container IP on the shared compose network.
@@ -369,6 +381,25 @@ class HermesBackend extends DockerBackend {
         capabilities: DOCKER_CAPABILITIES,
       });
     }
+  }
+
+  async destroy(containerId, opts = {}) {
+    // Let the base backend remove the container (its OpenClaw-named volume
+    // cleanup is a harmless no-op for Hermes).
+    const result = await super.destroy(containerId, opts);
+    const { agentId, preserveState } = opts;
+    // Keep the home volume on a redeploy (preserveState) so data survives the
+    // destroy→create replacement; remove it only on a true delete.
+    if (agentId && !preserveState) {
+      const homeVolumeName = `nora_hermes_home_${agentId}`;
+      try {
+        await this.docker.getVolume(homeVolumeName).remove({ force: true });
+        console.log(`[hermes] Volume ${homeVolumeName} removed`);
+      } catch (error) {
+        console.warn(`[hermes] Could not remove volume ${homeVolumeName}: ${error.message}`);
+      }
+    }
+    return result;
   }
 }
 

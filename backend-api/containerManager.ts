@@ -504,9 +504,14 @@ module.exports = {
    * revoked-access guard that blocks normal start/restart/read/exec operations.
    *
    * @param {Object} agent - Agent whose runtime should be destroyed.
+   * @param {Object} [options]
+   * @param {boolean} [options.preserveState=false] - Keep the agent's persistent
+   * state volume across the destroy (used by the redeploy path, which recreates
+   * the runtime and must not lose /opt/data). A plain delete leaves this false so
+   * the backend removes the volume.
    * @returns {Promise<void>} Resolves once the backend reports the runtime destroyed.
    */
-  async destroy(agent) {
+  async destroy(agent, { preserveState = false } = {}) {
     const id = resolveDestroyContainerId(agent);
     // Destroy is the final cleanup escape hatch for direct owners/admins. The
     // route layer constrains who may delete; do not expose this bypass to
@@ -515,6 +520,7 @@ module.exports = {
       agentId: agent.id,
       host: agent.host || null,
       runtimeFamily: resolveAgentRuntimeFamily(agent),
+      preserveState,
     });
   },
 

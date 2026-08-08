@@ -3097,7 +3097,7 @@ async function prepareReplacementRuntime({
     console.log(
       `[provisioner] Destroying previous ${previousRuntimeFields.deploy_target} runtime ${previousAgent.container_id || previousAgent.container_name || previousAgent.name} before redeploying agent ${agentId}`,
     );
-    await containerManager.destroy(previousAgent);
+    await containerManager.destroy(previousAgent, { preserveState: true });
     previousRuntimeDestroyed = true;
   }
 
