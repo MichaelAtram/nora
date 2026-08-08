@@ -54,10 +54,7 @@ const { isGatewayAvailableStatus } = require("./agentStatus");
 const { assertRemoteHostAgentUse, toPublicRemoteHostAuthorizationError } = require("./remoteHosts");
 const { repairHermesAgentConfig } = require("./hermesUi");
 const { HERMES_EMBED_AGENT_COLUMNS, GATEWAY_EMBED_AGENT_COLUMNS } = require("./embedAgentColumns");
-const {
-  establishHermesDashboardSession,
-  needsHermesLogin,
-} = require("./hermesDashboardSession");
+const { establishHermesDashboardSession, needsHermesLogin } = require("./hermesDashboardSession");
 const { decrypt: decryptSecret } = require("./crypto");
 const {
   joinHttpUrl,
@@ -626,9 +623,20 @@ const corsOrigins = (
   .filter(Boolean);
 app.use(cors({ origin: corsOrigins }));
 
+// Rate-limit caps are env-overridable so CI/E2E — where the whole Playwright
+// suite hits the API from a single localhost IP — can raise them without
+// disabling abuse protection. Production keeps the defaults below. Mirrors the
+// helper in routes/auth.ts (which already exposes AUTH_/SIGNUP_ overrides).
+function parsePositiveIntegerEnv(name, fallback) {
+  const raw = String(process.env[name] || "").trim();
+  if (!/^[1-9]\d*$/.test(raw)) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : fallback;
+}
+
 const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 1000,
+  windowMs: parsePositiveIntegerEnv("GLOBAL_RATE_LIMIT_WINDOW_MS", 15 * 60 * 1000),
+  max: parsePositiveIntegerEnv("GLOBAL_RATE_LIMIT_MAX", 1000),
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -642,8 +650,8 @@ app.use(globalLimiter);
 // at more than 60 per minute from a single IP. Safe methods are skipped so
 // normal browsing is unaffected.
 const mutationLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
+  windowMs: parsePositiveIntegerEnv("MUTATION_RATE_LIMIT_WINDOW_MS", 60 * 1000),
+  max: parsePositiveIntegerEnv("MUTATION_RATE_LIMIT_MAX", 60),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests, please slow down" },
@@ -1238,6 +1246,7 @@ app.use("/", require("./routes/integrations")); // handles /agents/:id/integrati
 app.use("/", require("./routes/monitoring")); // handles /monitoring/* + /agents/:id/metrics
 app.use("/llm-providers", require("./routes/llmProviders"));
 app.use("/clawhub", require("./routes/clawhub"));
+app.use("/hermes-skills", require("./routes/hermesSkills"));
 app.use("/agent-hub", require("./routes/agentHub"));
 app.use("/workspaces", require("./routes/workspaces"));
 app.use("/remote-hosts", require("./routes/remoteHosts"));
@@ -2355,6 +2364,22 @@ async function migrateDB(database = db, env = process.env) {
     `CREATE TRIGGER trg_agents_remote_host_target
      BEFORE INSERT OR UPDATE OF execution_target_id, status ON agents
      FOR EACH ROW EXECUTE FUNCTION enforce_remote_host_agent_target()`,
+    // Versioned migrations are positional: the runner records version+checksum
+    // per index, so NEW statements must be appended HERE, at the end — never
+    // inserted mid-array (that shifts every later version and fails boot with
+    // "modified after being applied" on existing installations).
+    `DO $$ BEGIN ALTER TABLE agents ADD COLUMN hermes_skills JSONB DEFAULT '[]'; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+    `UPDATE agents SET hermes_skills = '[]'::jsonb WHERE hermes_skills IS NULL`,
+    `CREATE TABLE IF NOT EXISTS hermes_skills_library (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       ref TEXT UNIQUE NOT NULL,
+       name TEXT NOT NULL,
+       description TEXT DEFAULT '',
+       added_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+       created_at TIMESTAMPTZ DEFAULT NOW()
+     )`,
+    `DO $$ BEGIN ALTER TABLE agent_hub_listings ADD COLUMN runtime_family TEXT NOT NULL DEFAULT 'openclaw'; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+    `UPDATE agent_hub_listings SET runtime_family = 'openclaw' WHERE runtime_family IS NULL`,
   ];
 
   return runVersionedMigrations(database, migrations, {

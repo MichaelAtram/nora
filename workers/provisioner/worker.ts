@@ -110,6 +110,17 @@ const {
   removeSavedSkillEntry,
   normalizeSavedSkillEntry: normalizeSavedClawhubSkillEntry,
 } = require("../../agent-runtime/lib/clawhubReconciliation");
+const {
+  HERMES_SKILLS_DIR,
+  HERMES_SKILLS_LOCK_FILE,
+  computeMissingSavedHermesSkills,
+  computeOrphanedInstalledHermesSkills,
+  installedEntriesFromHermesLockData,
+  isReservedHermesSkillName,
+  isValidHermesSkillName,
+  normalizeSavedHermesSkillEntry,
+  removeSavedHermesSkillEntry,
+} = require("../../agent-runtime/lib/hermesSkillsReconciliation");
 
 const REMOTE_PROVISIONER_AUTHORIZATION = Symbol("remoteProvisionerAuthorization");
 const REMOTE_PROVISIONER_CLEANUP_EXEC = Symbol("remoteProvisionerCleanupExec");
@@ -666,6 +677,15 @@ const CLAWHUB_INSTALL_LOCK_RENEW_MS = Math.max(
   Math.min(Math.floor(CLAWHUB_INSTALL_LOCK_DURATION_MS / 2), 120000),
   30000,
 );
+const HERMES_SKILLS_INSTALL_TIMEOUT_MS = parseTimeoutMs(
+  process.env.HERMES_SKILLS_INSTALL_TIMEOUT_MS,
+  300000,
+);
+const HERMES_SKILLS_LOCK_DURATION_MS = Math.max(HERMES_SKILLS_INSTALL_TIMEOUT_MS + 120000, 420000);
+const HERMES_SKILLS_LOCK_RENEW_MS = Math.max(
+  Math.min(Math.floor(HERMES_SKILLS_LOCK_DURATION_MS / 2), 120000),
+  30000,
+);
 const K8S_POLICY_RECONCILE_CONCURRENCY = parsePositiveInteger(
   process.env.K8S_POLICY_RECONCILE_WORKER_CONCURRENCY,
   1,
@@ -1136,6 +1156,211 @@ async function seedHermesArchiveForDeployment({
   // enters the normal provisioning cleanup path instead of finalizing runtime.
   await authorize(provisioner);
   return { seeded: true, reason: null };
+}
+
+// ── Hermes template-bundle materialization ──────────────────────
+// Agent Hub Hermes bundles ship workspace files (and files-mode skill
+// directories under the reserved `.hermes-skills/<name>/` prefix) in the
+// agent's stored template payload. They are written into the runtime after
+// creation via exec — NOT the Docker-only seed-archive path above, so the
+// same materializer works on k8s and remote targets. A marker file skips
+// re-materialization on redeploys whose /opt/data survived (k8s PVCs,
+// post-#301 named volumes), so agent-edited files are never clobbered.
+const HERMES_TEMPLATE_WORKSPACE_DIR = "/opt/data/workspace";
+const HERMES_TEMPLATE_MARKER_DIR = "/opt/data/.nora";
+const HERMES_TEMPLATE_APPLIED_MARKER = `${HERMES_TEMPLATE_MARKER_DIR}/template-applied`;
+const HERMES_TEMPLATE_SKILLS_PREFIX = ".hermes-skills/";
+const HERMES_TEMPLATE_MARKER_PRESENT_TOKEN = "NORA_TEMPLATE_APPLIED";
+const HERMES_TEMPLATE_MARKER_ABSENT_TOKEN = "NORA_TEMPLATE_ABSENT";
+// Base64 payload budget per exec batch; each write command carries its file
+// inline, so this bounds individual command sizes across exec transports.
+const HERMES_TEMPLATE_WRITE_BATCH_BYTES = 512 * 1024;
+
+// Local variant of hermesManifest.writeBase64FileCommand (same
+// mkdir/base64/chmod idiom). Deliberately replicated rather than imported:
+// the manifest helper is not exported and takes UTF-8 text it re-encodes,
+// while bundle entries already carry base64 that must survive byte-for-byte
+// for binary workspace files.
+function buildHermesTemplateFileWriteCommand(filePath, contentBase64, mode = "0644") {
+  const quotedPath = shellSingleQuote(filePath);
+  const quotedDir = shellSingleQuote(filePath.split("/").slice(0, -1).join("/") || "/");
+  return [
+    `mkdir -p ${quotedDir}`,
+    `printf '%s' ${shellSingleQuote(String(contentBase64 || ""))} | base64 -d > ${quotedPath}`,
+    `chmod ${mode} ${quotedPath}`,
+  ].join(" && ");
+}
+
+// Single validation + mapping choke point for bundle file paths — they are
+// interpolated into shell commands, so this mirrors the containment rules in
+// runtimeBootstrap/agentPayloads (relative only, no dot/dot-dot segments,
+// conservative charset). `.hermes-skills/<name>/<rest>` maps into the hub
+// skills tree with the skill-name charset + reserved-name rules enforced;
+// everything else lands under the workspace root. Returns null on rejection.
+function resolveHermesTemplateFilePath(rawPath) {
+  const normalized = String(rawPath || "")
+    .trim()
+    .replace(/\\/g, "/");
+  if (!normalized || normalized.startsWith("/") || !/^[A-Za-z0-9._/-]+$/.test(normalized)) {
+    return null;
+  }
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length === 0 || segments.some((segment) => segment === "." || segment === "..")) {
+    return null;
+  }
+  if (normalized.startsWith(HERMES_TEMPLATE_SKILLS_PREFIX)) {
+    const [skillName, ...rest] = segments.slice(1);
+    if (
+      !skillName ||
+      rest.length === 0 ||
+      !isValidHermesSkillName(skillName) ||
+      isReservedHermesSkillName(skillName)
+    ) {
+      return null;
+    }
+    return `${HERMES_SKILLS_DIR}/${[skillName, ...rest].join("/")}`;
+  }
+  return `${HERMES_TEMPLATE_WORKSPACE_DIR}/${segments.join("/")}`;
+}
+
+function formatHermesTemplateFileMode(mode) {
+  if (!Number.isInteger(mode) || mode <= 0 || mode > 0o7777) return "0644";
+  return mode.toString(8).padStart(4, "0");
+}
+
+/**
+ * Write an installed Agent Hub bundle's files into a freshly created Hermes
+ * runtime. Skipped when a migration seed already restored the workspace
+ * (migration wins over the bundle), when the payload has no files, or when the
+ * marker file reports a previous materialization (surviving /opt/data). Files
+ * are written in size-bounded exec batches, ownership is repaired for the
+ * runtime user on every root that was touched, and the marker is written last
+ * so a failed partial write is retried on the next deploy instead of sealed.
+ *
+ * @param {object} options.templatePayload Stored agent template payload.
+ * @param {boolean} [options.migrationSeeded] Whether the migration seed archive
+ *   restored this runtime's workspace during the same deployment.
+ * @param {Function} [options.execute] Exec runner override for tests.
+ * @returns {Promise<{applied: boolean, reason: string|null, fileCount?: number}>}
+ */
+async function materializeHermesTemplatePayload({
+  agentId,
+  provisioner,
+  containerId,
+  templatePayload,
+  migrationSeeded = false,
+  logPrefix = "[hermes-template]",
+  execute = runProvisionerExecCommand,
+} = {}) {
+  if (migrationSeeded) {
+    console.log(
+      `${logPrefix} agent=${agentId} Skipping template bundle; migration seed was applied`,
+    );
+    return { applied: false, reason: "migration-seed" };
+  }
+
+  const files = Array.isArray(templatePayload?.files) ? templatePayload.files : [];
+  if (files.length === 0) {
+    return { applied: false, reason: "no-files" };
+  }
+
+  const markerProbe =
+    `if [ -f ${JSON.stringify(HERMES_TEMPLATE_APPLIED_MARKER)} ]; ` +
+    `then printf '${HERMES_TEMPLATE_MARKER_PRESENT_TOKEN}'; ` +
+    `else printf '${HERMES_TEMPLATE_MARKER_ABSENT_TOKEN}'; fi`;
+  const { output } = await execute(provisioner, containerId, markerProbe, {
+    tty: true,
+    timeout: 30000,
+    agentId,
+  });
+  if (String(output || "").includes(HERMES_TEMPLATE_MARKER_PRESENT_TOKEN)) {
+    console.log(
+      `${logPrefix} agent=${agentId} Template bundle already materialized (marker present); skipping`,
+    );
+    return { applied: false, reason: "marker-present" };
+  }
+
+  // Validate and map every path before writing anything: a bundle with one
+  // unsafe path must fail whole rather than apply partially.
+  const writes = [];
+  let touchedWorkspace = false;
+  let touchedSkills = false;
+  for (const entry of files) {
+    const targetPath = resolveHermesTemplateFilePath(entry?.path);
+    if (!targetPath) {
+      throw new Error(
+        `Hermes template bundle contains an unsafe file path: ${String(entry?.path || "(empty)").slice(0, 200)}`,
+      );
+    }
+    if (targetPath.startsWith(`${HERMES_SKILLS_DIR}/`)) {
+      touchedSkills = true;
+    } else {
+      touchedWorkspace = true;
+    }
+    writes.push({
+      contentBase64: String(entry?.contentBase64 || ""),
+      command: buildHermesTemplateFileWriteCommand(
+        targetPath,
+        entry?.contentBase64,
+        formatHermesTemplateFileMode(entry?.mode),
+      ),
+    });
+  }
+
+  const batches = [];
+  let currentBatch = [];
+  let currentBatchBytes = 0;
+  for (const write of writes) {
+    if (
+      currentBatch.length > 0 &&
+      currentBatchBytes + write.contentBase64.length > HERMES_TEMPLATE_WRITE_BATCH_BYTES
+    ) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBatchBytes = 0;
+    }
+    currentBatch.push(write.command);
+    currentBatchBytes += write.contentBase64.length;
+  }
+  if (currentBatch.length > 0) batches.push(currentBatch);
+
+  for (const batch of batches) {
+    await execute(provisioner, containerId, ["set -eu", ...batch].join("\n"), {
+      timeout: 120000,
+      agentId,
+    });
+  }
+
+  const ownershipRoots = [
+    ...(touchedWorkspace ? [HERMES_TEMPLATE_WORKSPACE_DIR] : []),
+    ...(touchedSkills ? [HERMES_SKILLS_DIR] : []),
+  ];
+  await execute(
+    provisioner,
+    containerId,
+    ownershipRoots
+      .map((root) => `chown -R hermes:hermes ${shellSingleQuote(root)} 2>/dev/null || true`)
+      .join("\n"),
+    { timeout: 60000, agentId },
+  );
+
+  // Marker written last: a failure anywhere above leaves the marker absent so
+  // the next deploy retries the full materialization.
+  await execute(
+    provisioner,
+    containerId,
+    [
+      "set -eu",
+      `mkdir -p ${shellSingleQuote(HERMES_TEMPLATE_MARKER_DIR)}`,
+      `date -u +%Y-%m-%dT%H:%M:%SZ > ${shellSingleQuote(HERMES_TEMPLATE_APPLIED_MARKER)}`,
+    ].join("\n"),
+    { timeout: 30000, agentId },
+  );
+
+  console.log(
+    `${logPrefix} agent=${agentId} Materialized ${writes.length} template bundle file(s)`,
+  );
+  return { applied: true, reason: null, fileCount: writes.length };
 }
 
 function buildHermesPythonCommand(script) {
@@ -3543,6 +3768,439 @@ async function runClawhubDeleteJob({
   };
 }
 
+// ── Hermes skills: job + reconciliation helpers ─────────────────
+// Mirrors the ClawHub block above with the Hermes hub CLI (`hermes skills`)
+// and its lockfile ($HERMES_HOME/skills/.hub/lock.json, keyed by skill name).
+
+const HERMES_CLI_BIN = "/opt/hermes/.venv/bin/hermes";
+const HERMES_CONTAINER_HOME = "/opt/data/home";
+const HERMES_SKILLS_EMPTY_LOCK_B64 = Buffer.from('{"version":1,"installed":{}}').toString("base64");
+const HERMES_SKILLS_EXEC_ENV = [
+  "TERM=dumb",
+  "CI=1",
+  "NO_COLOR=1",
+  "CLICOLOR=0",
+  // The hermes CLI resolves ~/.hermes from $HOME; exec sessions default to
+  // root's HOME, not the runtime user's.
+  `HOME=${HERMES_CONTAINER_HOME}`,
+];
+
+function createHermesSkillJobLogger({ jobId, agentId, name, operation }) {
+  const startedAt = Date.now();
+
+  return (step, message, extra = null) => {
+    const elapsedMs = Date.now() - startedAt;
+    const suffix = extra ? ` ${JSON.stringify(extra)}` : "";
+    console.log(
+      `[hermes-skills-jobs] operation=${operation} job=${jobId} agent=${agentId} name=${name} step=${step} elapsedMs=${elapsedMs} ${message}${suffix}`,
+    );
+  };
+}
+
+// Resolve the hermes CLI path at exec time: the venv path is the image
+// contract, `command -v` is the fallback for custom images.
+function buildHermesSkillsCliPrefix() {
+  return (
+    `HERMES_BIN=${JSON.stringify(HERMES_CLI_BIN)}; ` +
+    `[ -x "$HERMES_BIN" ] || HERMES_BIN="$(command -v hermes)"; `
+  );
+}
+
+/**
+ * Read the Hermes hub lockfile from the runtime container and normalize it
+ * into installed-skill entries. Same TTY + base64 transport as the ClawHub
+ * reader: raw Docker exec streams can prepend framing bytes.
+ *
+ * @param {object} provisioner Backend-specific provisioner client with `exec`.
+ * @param {string} containerId Runtime container identifier.
+ * @param {string} agentId Agent identifier used to authorize and track exec commands.
+ * @returns {Promise<Array<{name: string, version: string, installPath: string}>>}
+ */
+async function readInstalledHermesSkills(provisioner, containerId, agentId) {
+  const readCommand =
+    `if [ -f ${JSON.stringify(HERMES_SKILLS_LOCK_FILE)} ]; then ` +
+    `base64 < ${JSON.stringify(HERMES_SKILLS_LOCK_FILE)} | tr -d '\\n'; ` +
+    `else printf '${HERMES_SKILLS_EMPTY_LOCK_B64}'; fi`;
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const { output } = await runProvisionerExecCommand(provisioner, containerId, readCommand, {
+      tty: true,
+      env: HERMES_SKILLS_EXEC_ENV,
+      agentId,
+    });
+
+    try {
+      const decoded = Buffer.from(
+        String(output || HERMES_SKILLS_EMPTY_LOCK_B64).trim(),
+        "base64",
+      ).toString("utf8");
+      return installedEntriesFromHermesLockData(
+        JSON.parse(decoded || '{"version":1,"installed":{}}'),
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt < 5) {
+        await sleep(250 * attempt);
+      }
+    }
+  }
+
+  throw new Error(
+    `Failed to parse Hermes skills lockfile: ${lastError?.message || "unknown error"}`,
+  );
+}
+
+async function appendSavedHermesSkill(agentId, skillEntry) {
+  const normalizedEntry = normalizeSavedHermesSkillEntry(skillEntry?.name, skillEntry);
+  if (!normalizedEntry) return;
+
+  const result = await db.query("SELECT hermes_skills FROM agents WHERE id = $1 LIMIT 1", [
+    agentId,
+  ]);
+  const current = Array.isArray(result.rows[0]?.hermes_skills) ? result.rows[0].hermes_skills : [];
+  const exists = current.some((entry) => String(entry?.name || "").trim() === normalizedEntry.name);
+  if (exists) return;
+
+  await db.query("UPDATE agents SET hermes_skills = $2::jsonb WHERE id = $1", [
+    agentId,
+    JSON.stringify([...current, normalizedEntry]),
+  ]);
+}
+
+async function removeSavedHermesSkill(agentId, name) {
+  const result = await db.query("SELECT hermes_skills FROM agents WHERE id = $1 LIMIT 1", [
+    agentId,
+  ]);
+  const current = Array.isArray(result.rows[0]?.hermes_skills) ? result.rows[0].hermes_skills : [];
+  await db.query("UPDATE agents SET hermes_skills = $2::jsonb WHERE id = $1", [
+    agentId,
+    JSON.stringify(removeSavedHermesSkillEntry(current, name)),
+  ]);
+}
+
+async function installHermesSkill(provisioner, containerId, ref, agentId) {
+  // The install runs as root (exec default), so repair skills-tree ownership
+  // for the runtime user afterwards while preserving the install's exit code.
+  // `ref` is shell-quoted (single quotes) so it cannot inject into the shell.
+  // Never pass --force: it would bypass the CLI's built-in security scanner.
+  await runProvisionerExecCommand(
+    provisioner,
+    containerId,
+    buildHermesSkillsCliPrefix() +
+      `"$HERMES_BIN" skills install ${shellSingleQuote(ref)} --yes; rc=$?; ` +
+      `chown -R hermes:hermes ${JSON.stringify(HERMES_SKILLS_DIR)} 2>/dev/null || true; ` +
+      `exit $rc`,
+    {
+      timeout: HERMES_SKILLS_INSTALL_TIMEOUT_MS + 10000,
+      maxOutputBytes: 32768,
+      env: HERMES_SKILLS_EXEC_ENV,
+      agentId,
+    },
+  );
+}
+
+async function uninstallHermesSkill(provisioner, containerId, name, agentId) {
+  if (isReservedHermesSkillName(name)) {
+    throw new Error(`Skill "${name}" is managed by Nora and cannot be removed.`);
+  }
+  // `name` is validated by the reconciliation module and shell-quoted here.
+  await runProvisionerExecCommand(
+    provisioner,
+    containerId,
+    // `skills uninstall` has no --yes flag and prompts; pipe the confirmation
+    // (verified: non-interactive runs otherwise cancel and leave the skill).
+    buildHermesSkillsCliPrefix() +
+      `printf 'y\\n' | "$HERMES_BIN" skills uninstall ${shellSingleQuote(name)}`,
+    {
+      timeout: HERMES_SKILLS_INSTALL_TIMEOUT_MS + 10000,
+      maxOutputBytes: 32768,
+      env: HERMES_SKILLS_EXEC_ENV,
+      agentId,
+    },
+  );
+}
+
+/**
+ * Perform one queued Hermes skill install and persist DB state only after the
+ * hub lockfile confirms the skill. Identity is the lockfile skill name; when
+ * the expected name does not appear (e.g. a raw-URL install whose SKILL.md
+ * frontmatter differs), a single new lock entry is adopted as the resolved
+ * name — otherwise the job fails and nothing is persisted.
+ */
+async function runHermesSkillInstallJob({
+  agentId,
+  name,
+  ref,
+  skillEntry,
+  persistOnSuccess = true,
+  provisioner,
+  containerId,
+  logJob,
+}) {
+  const expectedName = String(name || "").trim();
+  const installRef = String(ref || skillEntry?.ref || "").trim();
+  if (!installRef) {
+    throw new Error("Hermes skill install requires a registry identifier or SKILL.md URL.");
+  }
+  if (expectedName && isReservedHermesSkillName(expectedName)) {
+    throw new Error(`Skill "${expectedName}" is managed by Nora and cannot be installed.`);
+  }
+
+  logJob("precheck", "Reading installed skills before install");
+  const installedBefore = await readInstalledHermesSkills(provisioner, containerId, agentId);
+  logJob("precheck", "Read installed skills before install", {
+    installedCount: installedBefore.length,
+  });
+  if (expectedName && installedBefore.some((entry) => entry.name === expectedName)) {
+    logJob("precheck", "Skill already installed before command");
+    if (persistOnSuccess) {
+      logJob("persist", "Persisting already-installed skill to agents table");
+      await appendSavedHermesSkill(agentId, { ...skillEntry, name: expectedName, ref: installRef });
+      logJob("persist", "Persisted already-installed skill");
+    }
+    return { agentId, name: expectedName, operation: "install", installedSkills: installedBefore };
+  }
+
+  logJob("install", "Running hermes skills install command", {
+    timeoutMs: HERMES_SKILLS_INSTALL_TIMEOUT_MS,
+  });
+  await installHermesSkill(provisioner, containerId, installRef, agentId);
+  logJob("install", "Hermes skills install command finished");
+
+  logJob("verify", "Reading installed skills after install");
+  const installedSkills = await readInstalledHermesSkills(provisioner, containerId, agentId);
+  logJob("verify", "Read installed skills after install", {
+    installedCount: installedSkills.length,
+  });
+
+  let resolvedName =
+    expectedName && installedSkills.some((entry) => entry.name === expectedName)
+      ? expectedName
+      : null;
+  if (!resolvedName) {
+    const beforeNames = new Set(installedBefore.map((entry) => entry.name));
+    const added = installedSkills.filter((entry) => !beforeNames.has(entry.name));
+    if (added.length === 1) {
+      resolvedName = added[0].name;
+      logJob("verify", "Resolved installed skill name from lockfile diff", {
+        resolvedName,
+      });
+    }
+  }
+  if (!resolvedName) {
+    logJob("verify", "Lockfile missing expected skill after install");
+    throw new Error(
+      `Hermes skill install completed but ${expectedName || installRef} was not found in the hub lockfile`,
+    );
+  }
+
+  if (persistOnSuccess) {
+    logJob("persist", "Persisting successful install to agents table");
+    await appendSavedHermesSkill(agentId, { ...skillEntry, name: resolvedName, ref: installRef });
+    logJob("persist", "Persisted successful install");
+  }
+
+  return { agentId, name: resolvedName, operation: "install", installedSkills };
+}
+
+/**
+ * Perform one queued Hermes skill delete and remove the DB entry only after
+ * the hub lockfile confirms the skill is gone. Idempotent like the ClawHub
+ * variant: already-absent is success.
+ */
+async function runHermesSkillDeleteJob({
+  agentId,
+  name,
+  removeSavedEntryOnSuccess = true,
+  provisioner,
+  containerId,
+  logJob,
+}) {
+  const skillName = String(name || "").trim();
+  if (!skillName) {
+    throw new Error("Hermes skill delete requires a skill name.");
+  }
+  if (isReservedHermesSkillName(skillName)) {
+    throw new Error(`Skill "${skillName}" is managed by Nora and cannot be removed.`);
+  }
+
+  logJob("precheck", "Reading installed skills before delete");
+  const installedBefore = await readInstalledHermesSkills(provisioner, containerId, agentId);
+  logJob("precheck", "Read installed skills before delete", {
+    installedCount: installedBefore.length,
+  });
+
+  if (installedBefore.some((entry) => entry.name === skillName)) {
+    logJob("delete", "Running hermes skills uninstall command", {
+      timeoutMs: HERMES_SKILLS_INSTALL_TIMEOUT_MS,
+    });
+    await uninstallHermesSkill(provisioner, containerId, skillName, agentId);
+    logJob("delete", "Hermes skills uninstall command finished");
+  } else {
+    logJob("precheck", "Skill already absent before delete");
+  }
+
+  logJob("verify", "Reading installed skills after delete");
+  const installedSkills = await readInstalledHermesSkills(provisioner, containerId, agentId);
+  logJob("verify", "Read installed skills after delete", {
+    installedCount: installedSkills.length,
+  });
+  if (installedSkills.some((entry) => entry.name === skillName)) {
+    logJob("verify", "Lockfile still contains skill after delete");
+    throw new Error(
+      `Hermes skill uninstall completed but ${skillName} is still present in the hub lockfile`,
+    );
+  }
+
+  if (removeSavedEntryOnSuccess) {
+    logJob("persist", "Removing saved Hermes skill from agents table if present");
+    await removeSavedHermesSkill(agentId, skillName);
+    logJob("persist", "Removed saved Hermes skill from agents table if present");
+  }
+
+  return { agentId, name: skillName, operation: "delete", installedSkills };
+}
+
+/**
+ * Reconcile the Hermes runtime's hub-installed skills against Nora's saved
+ * desired state in `agents.hermes_skills`. Missing CLI-installable skills are
+ * reinstalled (this is what makes saved skills survive Docker redeploys, where
+ * /opt/data is rebuilt); files-mode skills are rematerialized by the template
+ * payload path, not the CLI. Runtime-only skills are drift: surfaced, and only
+ * pruned when HERMES_PRUNE_ORPHANED_SKILLS=true.
+ */
+async function reconcileHermesSkills({
+  agentId,
+  containerId,
+  provisioner,
+  logPrefix = "[hermes-skills-reconcile]",
+}) {
+  const result = await db.query(
+    "SELECT hermes_skills, backend_type, runtime_family FROM agents WHERE id = $1 LIMIT 1",
+    [agentId],
+  );
+  const agent = result.rows[0];
+  if (!agent) {
+    console.warn(`${logPrefix} agent=${agentId} Agent row not found; skipping reconciliation`);
+    return;
+  }
+
+  if (agent.runtime_family !== "hermes") {
+    return;
+  }
+
+  const savedSkills = Array.isArray(agent.hermes_skills) ? agent.hermes_skills : [];
+
+  let installedSkills = [];
+  try {
+    installedSkills = await readInstalledHermesSkills(provisioner, containerId, agentId);
+  } catch (error) {
+    throwIfRemoteAuthorizationFailure(error);
+    console.warn(
+      `${logPrefix} agent=${agentId} Failed to read installed skills before reconciliation: ${error.message}`,
+    );
+    installedSkills = [];
+  }
+
+  const missingSkills = computeMissingSavedHermesSkills(savedSkills, installedSkills);
+  const orphanedSkills = computeOrphanedInstalledHermesSkills(savedSkills, installedSkills);
+
+  if (!missingSkills.length && !orphanedSkills.length) {
+    console.log(`${logPrefix} agent=${agentId} Hermes skills runtime already matches saved state`);
+    return;
+  }
+
+  for (const skill of missingSkills) {
+    if (skill.installMode === "files") {
+      console.log(
+        `${logPrefix} agent=${agentId} name=${skill.name} files-mode skill is rematerialized from the agent template payload; skipping CLI reinstall`,
+      );
+      continue;
+    }
+    if (!skill.ref) {
+      console.warn(
+        `${logPrefix} agent=${agentId} name=${skill.name} Saved entry has no install ref; cannot reinstall`,
+      );
+      continue;
+    }
+    try {
+      console.log(
+        `${logPrefix} agent=${agentId} name=${skill.name} Installing missing saved skill`,
+      );
+      await installHermesSkill(provisioner, containerId, skill.ref, agentId);
+      console.log(
+        `${logPrefix} agent=${agentId} name=${skill.name} Reconciliation install completed`,
+      );
+    } catch (error) {
+      throwIfRemoteAuthorizationFailure(error);
+      console.warn(
+        `${logPrefix} agent=${agentId} name=${skill.name} Reconciliation install failed: ${String(error?.message || "")}`,
+      );
+    }
+  }
+
+  // Pruning orphaned runtime skills is destructive and OFF by default — it
+  // would silently delete skills installed via the agent's own TUI. Drift is
+  // surfaced in the merged skill view and removable via the delete route.
+  const pruneOrphans = process.env.HERMES_PRUNE_ORPHANED_SKILLS === "true";
+
+  if (orphanedSkills.length && !pruneOrphans) {
+    console.warn(
+      `${logPrefix} agent=${agentId} Detected ${orphanedSkills.length} orphaned Hermes skill(s) not in saved state; ` +
+        `automatic pruning is disabled (set HERMES_PRUNE_ORPHANED_SKILLS=true to enable). ` +
+        `Leaving runtime skills in place: ${orphanedSkills.map((skill) => skill.name).join(", ")}`,
+    );
+  }
+
+  if (orphanedSkills.length && pruneOrphans) {
+    console.warn(
+      `${logPrefix} agent=${agentId} Pruning ${orphanedSkills.length} orphaned Hermes skill(s) (HERMES_PRUNE_ORPHANED_SKILLS=true)`,
+    );
+    for (const skill of orphanedSkills) {
+      try {
+        console.warn(
+          `${logPrefix} agent=${agentId} name=${skill.name} Removing orphaned runtime skill`,
+        );
+        await uninstallHermesSkill(provisioner, containerId, skill.name, agentId);
+        console.warn(
+          `${logPrefix} agent=${agentId} name=${skill.name} Reconciliation uninstall completed`,
+        );
+      } catch (error) {
+        throwIfRemoteAuthorizationFailure(error);
+        console.warn(
+          `${logPrefix} agent=${agentId} name=${skill.name} Reconciliation uninstall failed: ${String(error?.message || "")}`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Load and validate the agent targeted by a queued Hermes skill job.
+ */
+async function loadHermesSkillJobAgent(agentId) {
+  const result = await db.query(
+    `SELECT id, user_id, name, status, container_id, backend_type, runtime_family, deploy_target,
+            execution_target_id, sandbox_profile, hermes_skills
+       FROM agents
+      WHERE id = $1
+      LIMIT 1`,
+    [agentId],
+  );
+  const agent = result.rows[0];
+  if (!agent) {
+    throw new Error(`Agent not found: ${agentId}`);
+  }
+  if (agent.runtime_family !== "hermes") {
+    throw new Error("Hermes skill mutations are only available for Hermes agents.");
+  }
+  if (!agent.container_id || (agent.status !== "running" && agent.status !== "warning")) {
+    throw new Error("Start the agent before managing Hermes skills.");
+  }
+  return agent;
+}
+
 const enabledBackends = getEnabledBackends();
 const DEPLOYMENT_WORKER_CONCURRENCY = parsePositiveInteger(
   process.env.DEPLOYMENT_WORKER_CONCURRENCY,
@@ -3835,8 +4493,7 @@ const worker = new Worker(
             : deployTarget === "docker"
               ? LOCAL_HOST_KEY
               : null;
-        const usesLocalDockerPublishedPort =
-          deployTarget === "docker" && resolvedRuntimeFields.runtime_family === "openclaw";
+        const usesLocalDockerPublishedPort = deployTarget === "docker";
         if (allocationHostKey) {
           const unavailableGatewayPorts = usesLocalDockerPublishedPort
             ? await getOccupiedDockerPublishedPorts(provisioner, { agentId: id })
@@ -3846,13 +4503,13 @@ const worker = new Worker(
             agentId: id,
             unavailablePorts: unavailableGatewayPorts,
           });
-          // Remote Hermes needs a SECOND published host port for its dashboard
-          // UI (9119), distinct from the runtime API port (8642 = the 'gateway'
-          // slot used for the readiness probe). Local Hermes reaches the
-          // dashboard on the compose network (no host publish), and OpenClaw has
-          // no separate dashboard, so neither allocates this slot.
+          // Hermes needs a SECOND published host port for its dashboard UI
+          // (9119), distinct from the runtime API port (8642 = the 'gateway'
+          // slot used for the readiness probe). Remote publishes it on the
+          // remote host; local Docker publishes it on DOCKER_AGENT_BIND_IP so
+          // the embedded WebUI is reachable by external clients too.
           if (
-            deployTarget === "remote-docker" &&
+            (deployTarget === "remote-docker" || deployTarget === "docker") &&
             resolvedRuntimeFields.runtime_family === "hermes"
           ) {
             allocatedDashboardPort = await allocateGatewayPort({
@@ -3860,6 +4517,26 @@ const worker = new Worker(
               agentId: id,
               purpose: DASHBOARD_PORT_PURPOSE,
             });
+            // Local Docker (unlike remote) shares the host with the control
+            // plane, so also exclude already-bound host ports outside Nora's
+            // allocation table before handing the port to create().
+            if (
+              deployTarget === "docker" &&
+              typeof provisioner?.isHostPortBound === "function" &&
+              (await provisioner.isHostPortBound(allocatedDashboardPort, {
+                ignoreContainerName: container_name,
+              }))
+            ) {
+              console.warn(
+                `[provisioner] Dashboard host port ${allocatedDashboardPort} already bound; reallocating for agent ${id}`,
+              );
+              allocatedDashboardPort = await reallocateGatewayPort({
+                hostKey: allocationHostKey,
+                agentId: id,
+                previousPort: allocatedDashboardPort,
+                purpose: DASHBOARD_PORT_PURPOSE,
+              });
+            }
           }
           if (
             deployTarget === "remote-docker" &&
@@ -4084,11 +4761,31 @@ const worker = new Worker(
             channels: [],
           }));
 
-          await seedHermesArchiveForDeployment({
+          const hermesSeed = await seedHermesArchiveForDeployment({
             agentId: id,
             provisioner,
             containerId,
           });
+
+          // A migration seed wins over an Agent Hub bundle: when the attached
+          // manifest restored a workspace, the bundle's files must not clobber
+          // it. Bundle failures are non-fatal — the marker stays absent and the
+          // next deploy retries; skills replay separately via reconciliation.
+          try {
+            await materializeHermesTemplatePayload({
+              agentId: id,
+              provisioner,
+              containerId,
+              templatePayload,
+              migrationSeeded: hermesSeed?.seeded === true,
+            });
+          } catch (e) {
+            throwIfRemoteAuthorizationFailure(e);
+            console.warn(
+              `[provisioner] Failed to materialize Hermes template bundle for agent ${id}:`,
+              e.message,
+            );
+          }
 
           if (
             hasMeaningfulHermesModelConfig(persistedHermesState?.modelConfig) ||
@@ -4391,6 +5088,26 @@ const worker = new Worker(
             );
           }
         }
+
+        if (
+          !builtInDemoActivation &&
+          resolvedRuntimeFields.runtime_family === "hermes" &&
+          containerId
+        ) {
+          try {
+            await reconcileHermesSkills({
+              agentId: id,
+              containerId,
+              provisioner,
+            });
+          } catch (e) {
+            throwIfRemoteAuthorizationFailure(e);
+            console.warn(
+              `[provisioner] Failed to reconcile saved Hermes skills for agent ${id}:`,
+              e.message,
+            );
+          }
+        }
       } catch (err) {
         if (isCanceledRuntimeCleanupFailure(err)) throw err;
         console.error("Failed to finalize provisioned runtime:", err.message);
@@ -4562,6 +5279,86 @@ clawhubJobsWorker.on("completed", (job) => {
   );
 });
 
+const hermesSkillsJobsWorker = new Worker(
+  "hermes-skills-jobs",
+  async (job) => {
+    const {
+      agentId,
+      name,
+      ref,
+      operation = "install",
+      skillEntry,
+      persistOnSuccess = true,
+      removeSavedEntryOnSuccess = true,
+    } = job.data || {};
+    const normalizedName = String(name || "").trim();
+    const normalizedOperation = String(operation || "").trim() || "install";
+    if (!agentId || (!normalizedName && normalizedOperation === "delete")) {
+      throw new Error("Hermes skill job is missing agentId or name");
+    }
+    if (!["install", "delete"].includes(normalizedOperation)) {
+      throw new Error(`Unsupported Hermes skill operation: ${normalizedOperation}`);
+    }
+
+    const logJob = createHermesSkillJobLogger({
+      jobId: job.id,
+      agentId,
+      name: normalizedName || String(ref || "").trim(),
+      operation: normalizedOperation,
+    });
+    const agent = await loadHermesSkillJobAgent(agentId);
+    const provisioner = await loadBackend(buildAgentRuntimeFields(agent), {
+      ownerUserId: agent.user_id,
+    });
+
+    logJob("start", `Starting ${normalizedOperation} job`);
+
+    const result =
+      normalizedOperation === "install"
+        ? await runHermesSkillInstallJob({
+            agentId,
+            name: normalizedName,
+            ref,
+            skillEntry,
+            persistOnSuccess,
+            provisioner,
+            containerId: agent.container_id,
+            logJob,
+          })
+        : await runHermesSkillDeleteJob({
+            agentId,
+            name: normalizedName,
+            removeSavedEntryOnSuccess,
+            provisioner,
+            containerId: agent.container_id,
+            logJob,
+          });
+
+    logJob("done", `${normalizedOperation} job completed successfully`);
+    return result;
+  },
+  {
+    connection,
+    concurrency: 1,
+    lockDuration: HERMES_SKILLS_LOCK_DURATION_MS,
+    lockRenewTime: HERMES_SKILLS_LOCK_RENEW_MS,
+    stalledInterval: 30000,
+    maxStalledCount: 1,
+  },
+);
+
+hermesSkillsJobsWorker.on("failed", (job, err) => {
+  console.error(
+    `[hermes-skills-jobs] operation=${job?.data?.operation || "unknown"} job=${job?.id} failed: ${err.message}`,
+  );
+});
+
+hermesSkillsJobsWorker.on("completed", (job) => {
+  console.log(
+    `[hermes-skills-jobs] operation=${job?.data?.operation || "unknown"} job=${job.id} completed successfully`,
+  );
+});
+
 const k8sPolicySettingsWorker = new Worker(
   "k8s-policy-settings",
   async (job) => {
@@ -4716,5 +5513,13 @@ module.exports = {
   runRuntimeCommand,
   runProvisionerExecCommand,
   seedHermesArchiveForDeployment,
+  materializeHermesTemplatePayload,
   toUnrecoverableRuntimeSelectionError,
+  readInstalledHermesSkills,
+  installHermesSkill,
+  uninstallHermesSkill,
+  runHermesSkillInstallJob,
+  runHermesSkillDeleteJob,
+  reconcileHermesSkills,
+  loadHermesSkillJobAgent,
 };

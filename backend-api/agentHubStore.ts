@@ -2,6 +2,10 @@
 // Agent Hub registry backed by PostgreSQL.
 
 const db = require("./db");
+const {
+  DEFAULT_RUNTIME_FAMILY,
+  normalizeRuntimeFamilyName,
+} = require("../agent-runtime/lib/backendCatalog");
 
 const LISTING_SOURCE_PLATFORM = "platform";
 const LISTING_SOURCE_COMMUNITY = "community";
@@ -43,6 +47,7 @@ const LISTING_SELECT = `
     ml.downloads,
     ml.built_in,
     ml.source_type,
+    ml.runtime_family,
     ml.status,
     ml.visibility,
     ml.share_target,
@@ -121,6 +126,19 @@ function normalizeLocalVisibility(value, fallback = LISTING_LOCAL_VISIBILITY_OWN
   if (value === LISTING_LOCAL_VISIBILITY_INTERNAL) return LISTING_LOCAL_VISIBILITY_INTERNAL;
   if (value === LISTING_LOCAL_VISIBILITY_OWNER) return LISTING_LOCAL_VISIBILITY_OWNER;
   return fallback;
+}
+
+/**
+ * Normalize a listing runtime family: lower/trim, absent values fall back to
+ * the provided fallback, and unknown families collapse to the platform default
+ * (`openclaw`) via the shared runtime catalog rather than persisting free text.
+ */
+function normalizeRuntimeFamily(value, fallback = DEFAULT_RUNTIME_FAMILY) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return normalizeRuntimeFamilyName(fallback);
+  return normalizeRuntimeFamilyName(normalized);
 }
 
 function normalizeCentralShareStatus(value, fallback = CENTRAL_SHARE_STATUS_NOT_SHARED) {
@@ -214,6 +232,7 @@ async function upsertListing({
   category = "General",
   builtIn = false,
   sourceType = builtIn ? LISTING_SOURCE_PLATFORM : LISTING_SOURCE_COMMUNITY,
+  runtimeFamily = null,
   ownerUserId = null,
   status = null,
   visibility = LISTING_VISIBILITY_PUBLIC,
@@ -276,6 +295,10 @@ async function upsertListing({
       ? CENTRAL_SHARE_STATUS_QUEUED
       : CENTRAL_SHARE_STATUS_NOT_SHARED,
   );
+  const normalizedRuntimeFamily = normalizeRuntimeFamily(
+    runtimeFamily,
+    existing?.runtime_family || DEFAULT_RUNTIME_FAMILY,
+  );
   const normalizedName = normalizeText(name, existing?.name || "Untitled Listing").slice(0, 100);
   const normalizedDescription = normalizeDescription(description || existing?.description || "");
   const normalizedCategory = normalizeCategory(category || existing?.category || "General");
@@ -313,13 +336,14 @@ async function upsertListing({
               slug = $17,
               current_version = $18,
               review_notes = $19,
+              runtime_family = $20,
               reviewed_at = CASE WHEN $9 IN ('published', 'rejected', 'removed') THEN NOW() ELSE reviewed_at END,
               published_at = CASE
                 WHEN $9 = 'published' THEN COALESCE(published_at, NOW())
                 ELSE published_at
               END,
               updated_at = NOW()
-        WHERE id = $20
+        WHERE id = $21
       RETURNING *`,
       [
         snapshotId || null,
@@ -343,6 +367,7 @@ async function upsertListing({
         resolvedSlug,
         nextVersion,
         reviewNotes,
+        normalizedRuntimeFamily,
         existing.id,
       ],
     );
@@ -378,9 +403,10 @@ async function upsertListing({
        central_error,
        slug,
        current_version,
+       runtime_family,
        published_at
      )
-     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
        CASE WHEN $9 = 'published' THEN NOW() ELSE NULL END
      )
      RETURNING *`,
@@ -403,6 +429,7 @@ async function upsertListing({
       centralError !== undefined ? normalizeDescription(centralError) : null,
       resolvedSlug,
       initialVersion,
+      normalizedRuntimeFamily,
     ],
   );
 

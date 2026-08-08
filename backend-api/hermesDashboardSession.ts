@@ -1,8 +1,6 @@
 // @ts-nocheck
 const { joinHttpUrl } = require("../agent-runtime/lib/agentEndpoints");
-const {
-  deriveHermesDashboardBasicAuth,
-} = require("../agent-runtime/lib/hermesDashboardAuth");
+const { deriveHermesDashboardBasicAuth } = require("../agent-runtime/lib/hermesDashboardAuth");
 
 // VERIFIED against nousresearch/hermes-agent:latest: the basic-auth provider
 // logs in via a JSON POST to /auth/password-login; the `provider` field is
@@ -43,7 +41,8 @@ async function establishHermesDashboardSession(target, seed, { fetchImpl = fetch
     signal: AbortSignal.timeout(15000),
   });
   if (!resp.ok) return null;
-  const setCookies = typeof resp.headers.getSetCookie === "function" ? resp.headers.getSetCookie() : [];
+  const setCookies =
+    typeof resp.headers.getSetCookie === "function" ? resp.headers.getSetCookie() : [];
   const pairs = setCookies.map((c) => c.split(";")[0].trim()).filter(Boolean);
   return pairs.length ? pairs.join("; ") : null;
 }

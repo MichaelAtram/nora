@@ -26,6 +26,12 @@ const mockRemoteProvisioner = {
   restart: jest.fn(),
   updateEnv: jest.fn(),
 };
+const mockHermesProvisioner = {
+  create: jest.fn(),
+  destroy: jest.fn(),
+  restart: jest.fn(),
+  updateEnv: jest.fn(),
+};
 const mockContainerManager = {
   canDestroy: jest.fn(),
   destroy: jest.fn(),
@@ -98,6 +104,9 @@ jest.mock("../portAllocations", () => ({
 jest.mock("../../workers/provisioner/backends/remote-docker", () =>
   jest.fn().mockImplementation(() => mockRemoteProvisioner),
 );
+jest.mock("../../workers/provisioner/backends/hermes", () =>
+  jest.fn().mockImplementation(() => mockHermesProvisioner),
+);
 jest.mock("../../workers/provisioner/healthChecks", () => ({
   waitForAgentReadiness: (...args) => mockWaitForAgentReadiness(...args),
 }));
@@ -130,7 +139,9 @@ const {
   resolveCanonicalDeploymentOwnerUserId,
   runProvisionerExecCommand,
   seedHermesArchiveForDeployment,
+  materializeHermesTemplatePayload,
 } = require("../../workers/provisioner/worker");
+const { DASHBOARD_PORT_PURPOSE, GATEWAY_PORT_PURPOSE } = require("../portAllocations");
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -166,6 +177,11 @@ beforeEach(() => {
   mockRemoteProvisioner.destroy.mockReset().mockResolvedValue(undefined);
   mockRemoteProvisioner.restart.mockReset().mockResolvedValue(undefined);
   mockRemoteProvisioner.updateEnv.mockReset().mockResolvedValue(undefined);
+  mockHermesProvisioner.create.mockReset();
+  mockHermesProvisioner.destroy.mockReset().mockResolvedValue(undefined);
+  mockHermesProvisioner.restart.mockReset().mockResolvedValue(undefined);
+  mockHermesProvisioner.updateEnv.mockReset().mockResolvedValue(undefined);
+  delete mockHermesProvisioner.isHostPortBound;
   mockContainerManager.canDestroy
     .mockReset()
     .mockImplementation((agent) => Boolean(agent?.container_id || agent?.container_name));
@@ -399,6 +415,188 @@ describe("provisioner Hermes restore seeding", () => {
     ).resolves.toEqual({ seeded: false, reason: "archive-empty" });
 
     expect(buildSeedArchive).not.toHaveBeenCalled();
+  });
+});
+
+describe("provisioner Hermes template-bundle materialization", () => {
+  function encodeContent(content) {
+    return Buffer.from(content, "utf8").toString("base64");
+  }
+
+  function bundlePayload(files) {
+    return {
+      version: 1,
+      files,
+      memoryFiles: [],
+      wiring: { channels: [], integrations: [] },
+      metadata: { runtimeFamily: "hermes" },
+    };
+  }
+
+  function buildExecuteMock({ markerPresent = false } = {}) {
+    return jest.fn(async (_provisioner, _containerId, command) => {
+      if (String(command).startsWith("if [ -f ")) {
+        return { output: markerPresent ? "NORA_TEMPLATE_APPLIED" : "NORA_TEMPLATE_ABSENT" };
+      }
+      return { output: "" };
+    });
+  }
+
+  it("skips entirely when the migration seed already restored the workspace", async () => {
+    const execute = buildExecuteMock();
+
+    await expect(
+      materializeHermesTemplatePayload({
+        agentId: "agent-h1",
+        provisioner: {},
+        containerId: "hermes-container",
+        templatePayload: bundlePayload([{ path: "notes.md", contentBase64: encodeContent("n") }]),
+        migrationSeeded: true,
+        execute,
+      }),
+    ).resolves.toEqual({ applied: false, reason: "migration-seed" });
+
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("skips without exec calls when the payload carries no files", async () => {
+    const execute = buildExecuteMock();
+
+    await expect(
+      materializeHermesTemplatePayload({
+        agentId: "agent-h1",
+        provisioner: {},
+        containerId: "hermes-container",
+        templatePayload: bundlePayload([]),
+        execute,
+      }),
+    ).resolves.toEqual({ applied: false, reason: "no-files" });
+
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("skips after the marker probe when a previous materialization is recorded", async () => {
+    const execute = buildExecuteMock({ markerPresent: true });
+
+    await expect(
+      materializeHermesTemplatePayload({
+        agentId: "agent-h1",
+        provisioner: {},
+        containerId: "hermes-container",
+        templatePayload: bundlePayload([{ path: "notes.md", contentBase64: encodeContent("n") }]),
+        execute,
+      }),
+    ).resolves.toEqual({ applied: false, reason: "marker-present" });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(String(execute.mock.calls[0][2])).toContain("/opt/data/.nora/template-applied");
+  });
+
+  it("maps workspace and .hermes-skills paths, repairs ownership, and writes the marker last", async () => {
+    const execute = buildExecuteMock();
+
+    const result = await materializeHermesTemplatePayload({
+      agentId: "agent-h1",
+      provisioner: {},
+      containerId: "hermes-container",
+      templatePayload: bundlePayload([
+        { path: "notes.md", contentBase64: encodeContent("# Notes"), mode: 0o644 },
+        { path: "scripts/run.sh", contentBase64: encodeContent("echo hi"), mode: 0o755 },
+        {
+          path: ".hermes-skills/pdf-tools/SKILL.md",
+          contentBase64: encodeContent("---\nname: pdf-tools\n---"),
+          mode: 0o644,
+        },
+      ]),
+      execute,
+    });
+
+    expect(result).toEqual({ applied: true, reason: null, fileCount: 3 });
+
+    const commands = execute.mock.calls.map((call) => String(call[2]));
+    // probe, one write batch, ownership repair, marker write
+    expect(commands).toHaveLength(4);
+    expect(commands[1]).toContain("'/opt/data/workspace/notes.md'");
+    expect(commands[1]).toContain("'/opt/data/workspace/scripts/run.sh'");
+    expect(commands[1]).toContain("chmod 0755 '/opt/data/workspace/scripts/run.sh'");
+    expect(commands[1]).toContain("'/opt/data/skills/pdf-tools/SKILL.md'");
+    expect(commands[1]).not.toContain(".hermes-skills");
+    expect(commands[2]).toContain("chown -R hermes:hermes '/opt/data/workspace'");
+    expect(commands[2]).toContain("chown -R hermes:hermes '/opt/data/skills'");
+    expect(commands[3]).toContain("mkdir -p '/opt/data/.nora'");
+    expect(commands[3]).toContain("'/opt/data/.nora/template-applied'");
+    // The marker write must come after every file write and the chown.
+    expect(commands[3]).not.toContain("base64 -d");
+  });
+
+  it("only repairs ownership on roots that were actually written", async () => {
+    const execute = buildExecuteMock();
+
+    await materializeHermesTemplatePayload({
+      agentId: "agent-h1",
+      provisioner: {},
+      containerId: "hermes-container",
+      templatePayload: bundlePayload([
+        { path: "notes.md", contentBase64: encodeContent("# Notes") },
+      ]),
+      execute,
+    });
+
+    const chownCommand = String(execute.mock.calls[2][2]);
+    expect(chownCommand).toContain("'/opt/data/workspace'");
+    expect(chownCommand).not.toContain("'/opt/data/skills'");
+  });
+
+  it.each([
+    ["an absolute path", "/etc/passwd"],
+    ["a dot-dot traversal", "../escape.md"],
+    ["a nested dot-dot traversal", "docs/../../escape.md"],
+    ["an empty path", ""],
+    ["an unsafe character", "notes;rm.md"],
+    ["a reserved skill directory", ".hermes-skills/nora-integrations/SKILL.md"],
+    ["a skills prefix without a file", ".hermes-skills/pdf-tools"],
+  ])("rejects %s without writing anything", async (_label, unsafePath) => {
+    const execute = buildExecuteMock();
+
+    await expect(
+      materializeHermesTemplatePayload({
+        agentId: "agent-h1",
+        provisioner: {},
+        containerId: "hermes-container",
+        templatePayload: bundlePayload([
+          { path: "notes.md", contentBase64: encodeContent("safe") },
+          { path: unsafePath, contentBase64: encodeContent("unsafe") },
+        ]),
+        execute,
+      }),
+    ).rejects.toThrow(/unsafe file path/i);
+
+    // Only the marker probe ran — no partial writes, no marker.
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("splits large payloads into multiple size-bounded write batches", async () => {
+    const execute = buildExecuteMock();
+    const bigContent = encodeContent("x".repeat(400 * 1024));
+
+    await materializeHermesTemplatePayload({
+      agentId: "agent-h1",
+      provisioner: {},
+      containerId: "hermes-container",
+      templatePayload: bundlePayload([
+        { path: "one.bin", contentBase64: bigContent },
+        { path: "two.bin", contentBase64: bigContent },
+        { path: "three.bin", contentBase64: bigContent },
+      ]),
+      execute,
+    });
+
+    const commands = execute.mock.calls.map((call) => String(call[2]));
+    // probe + 3 single-file batches (each exceeds the batch budget) + chown + marker
+    expect(commands).toHaveLength(6);
+    expect(commands[1]).toContain("'/opt/data/workspace/one.bin'");
+    expect(commands[2]).toContain("'/opt/data/workspace/two.bin'");
+    expect(commands[3]).toContain("'/opt/data/workspace/three.bin'");
   });
 });
 
@@ -1497,6 +1695,148 @@ describe("provisioner deployment lifecycle", () => {
       2,
       expect.objectContaining({ hostKey: "local", agentId: "agent-1", rangeMin: 19001 }),
     );
+  });
+
+  function queueLocalHermesAgentRow(overrides = {}) {
+    mockLockClient.query
+      .mockResolvedValueOnce({ rows: [{ locked: true }] })
+      .mockResolvedValueOnce({ rows: [{ pg_advisory_unlock: true }] });
+    mockWorkerDb.query.mockImplementation(async (sql) => {
+      const normalizedSql = String(sql);
+      if (normalizedSql.includes("SELECT image, template_payload")) {
+        return {
+          rows: [
+            {
+              image: "nousresearch/hermes-agent:latest",
+              template_payload: {},
+              sandbox_type: "standard",
+              backend_type: "docker",
+              runtime_family: "hermes",
+              deploy_target: "docker",
+              execution_target_id: "docker",
+              sandbox_profile: "standard",
+              gateway_token: null,
+              mcp_servers: [],
+              status: "queued",
+              container_id: null,
+              user_id: "user-1",
+              ...overrides,
+            },
+          ],
+        };
+      }
+      if (normalizedSql.includes("FROM llm_providers")) return { rows: [] };
+      if (normalizedSql.includes("FROM integrations")) return { rows: [] };
+      if (normalizedSql === "SELECT status FROM agents WHERE id = $1") {
+        return { rows: [{ status: "deploying" }] };
+      }
+      if (normalizedSql.includes("RETURNING id, container_id")) {
+        return { rows: [{ id: "agent-1", container_id: "hermes-local-container-1" }] };
+      }
+      if (normalizedSql === "SELECT id FROM agents WHERE id = $1") {
+        return { rows: [{ id: "agent-1" }] };
+      }
+      return { rows: [] };
+    });
+  }
+
+  function runLocalHermesDeployment() {
+    // The dashboard/gateway port allocation happens before the runtime is
+    // reachable; forcing a post-create authorization failure lets the test
+    // observe the create() call args without modeling the entire rest of the
+    // successful-deployment pipeline (health checks, MCP sync, final status
+    // updates), matching the pattern used by the Remote Docker tests above.
+    const revoked = Object.assign(new Error("Remote host access was revoked"), {
+      code: "REMOTE_HOST_ACCESS_REVOKED",
+      statusCode: 403,
+    });
+    mockAssertRemoteHostAgentUse
+      .mockResolvedValueOnce({ configured: true, enabled: true })
+      .mockRejectedValueOnce(revoked);
+    mockHermesProvisioner.create.mockImplementationOnce(async (config) => {
+      await config.onRuntimeIdentity({
+        containerId: "hermes-local-container-1",
+        containerName: "nora-hermes-local-agent-agent-1",
+      });
+      return {
+        containerId: "hermes-local-container-1",
+        containerName: "nora-hermes-local-agent-agent-1",
+        host: "10.0.0.9",
+        runtimeHost: "10.0.0.9",
+        runtimePort: 8642,
+        gatewayHost: "10.0.0.9",
+        gatewayPort: 8642,
+        gatewayHostPort: config.gatewayHostPort,
+        gatewayToken: "runtime-token",
+        dashboardPort: config.dashboardHostPort,
+      };
+    });
+
+    return expect(
+      mockDeploymentProcessor({
+        id: "deploy-agent-1",
+        data: {
+          id: "agent-1",
+          name: "Local Hermes Agent",
+          userId: "user-1",
+          specs: { vcpu: 2, ram_mb: 2048, disk_gb: 20 },
+        },
+        attemptsMade: 0,
+        opts: { attempts: 5, timeout: 900000 },
+      }),
+    ).rejects.toMatchObject({
+      name: "UnrecoverableError",
+      code: "REMOTE_HOST_ACCESS_REVOKED",
+    });
+  }
+
+  it("allocates a dashboard host port for local Docker Hermes", async () => {
+    const allocations = [];
+    mockAllocateGatewayPort.mockImplementation(async ({ purpose }) => {
+      const port = purpose === DASHBOARD_PORT_PURPOSE ? 19044 : 19500;
+      allocations.push({ purpose: purpose || GATEWAY_PORT_PURPOSE, port });
+      return port;
+    });
+    queueLocalHermesAgentRow();
+
+    await runLocalHermesDeployment();
+
+    expect(mockHermesProvisioner.create).toHaveBeenCalledTimes(1);
+    const createArgs = mockHermesProvisioner.create.mock.calls[0][0];
+    expect(createArgs.gatewayHostPort).toBe(19500);
+    expect(createArgs.dashboardHostPort).toBe(19044);
+
+    const purposes = allocations.map((a) => a.purpose);
+    expect(purposes).toContain(GATEWAY_PORT_PURPOSE);
+    expect(purposes).toContain(DASHBOARD_PORT_PURPOSE);
+  });
+
+  it("reallocates the local Docker Hermes dashboard port when it is already bound outside Nora's allocation table", async () => {
+    mockAllocateGatewayPort.mockImplementation(async ({ purpose }) =>
+      purpose === DASHBOARD_PORT_PURPOSE ? 19044 : 19500,
+    );
+    mockReallocateGatewayPort.mockImplementation(async ({ purpose }) =>
+      purpose === DASHBOARD_PORT_PURPOSE ? 19045 : 19501,
+    );
+    mockHermesProvisioner.isHostPortBound = jest
+      .fn()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValue(false);
+    queueLocalHermesAgentRow();
+
+    await runLocalHermesDeployment();
+
+    expect(mockHermesProvisioner.isHostPortBound).toHaveBeenCalledWith(19044, expect.any(Object));
+    expect(mockReallocateGatewayPort).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hostKey: "local",
+        agentId: "agent-1",
+        previousPort: 19044,
+        purpose: DASHBOARD_PORT_PURPOSE,
+      }),
+    );
+    const createArgs = mockHermesProvisioner.create.mock.calls[0][0];
+    expect(createArgs.dashboardHostPort).toBe(19045);
   });
 
   it("treats only the last configured attempt as terminal", () => {

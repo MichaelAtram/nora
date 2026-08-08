@@ -53,6 +53,9 @@ const {
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
 const { deriveHermesDashboardBasicAuth } = require("../../agent-runtime/lib/hermesDashboardAuth");
 const {
+  normalizeSavedHermesSkillEntries,
+} = require("../../agent-runtime/lib/hermesSkillsReconciliation");
+const {
   DEFAULT_RUNTIME_FAMILY,
   KNOWN_RUNTIME_FAMILIES,
   getRuntimeSelectionStatus,
@@ -249,6 +252,7 @@ function buildDemoDeploymentJob(agent, userId, demoProviderId, plan = "selfhoste
     model: null,
     migration_draft_id: null,
     clawhub_skills: [],
+    hermes_skills: [],
     llm_provider_id: demoProviderId,
   };
 }
@@ -605,6 +609,103 @@ function resolvePublishedGatewayProtocol(req) {
   return "http";
 }
 
+// Runtime API port inside the Hermes container (Nora's compose network talks
+// to this via runtime_host:runtime_port; this constant is only used to look
+// up the matching HOST-published port binding below).
+const HERMES_RUNTIME_PORT = 8642;
+
+// Externally-reachable connect info for Hermes Desktop / direct clients on a
+// LOCAL Docker agent. Nora's own traffic uses the compose-network address
+// (runtime_host:runtime_port); this is the host-published address instead:
+//   runtime API  -> DOCKER_AGENT_BIND_IP:<published 8642 host port>
+//   dashboard    -> DOCKER_AGENT_BIND_IP:<published 9119 host port>
+// Both host ports are read by inspecting the live container bindings (never
+// persisted — persisting the dashboard host port would corrupt the embed
+// proxy's resolveHermesDashboardAddress). The host shown to the operator is
+// whatever they browsed Nora on (X-Forwarded-Host / GATEWAY_HOST), matching
+// the OpenClaw ui-info pattern.
+// A published-port HostIp is usable as the advertised connect host only when it
+// is a concrete routable address. Docker's bind-all (0.0.0.0 / ::) and loopback
+// addresses tell us nothing about where an external client should connect, so
+// those fall back to the browsing-host heuristic.
+function isRoutablePublishHostIp(hostIp) {
+  const ip = String(hostIp || "").trim();
+  if (!ip) return false;
+  if (ip === "0.0.0.0" || ip === "::" || ip === "[::]") return false;
+  if (ip === "localhost" || ip === "::1" || ip === "[::1]") return false;
+  if (/^127\./.test(ip)) return false;
+  return true;
+}
+
+function formatHostForUrl(host) {
+  // Bracket IPv6 literals so their colons don't collide with the port separator.
+  return require("net").isIP(host) === 6 ? `[${host}]` : host;
+}
+
+async function resolveHermesConnectInfo(agent, req) {
+  // The connect block carries the decrypted runtime API key, so it is a
+  // management capability rather than ordinary status metadata. Keep the
+  // shared Hermes status route intact while omitting durable credentials for
+  // non-owner workspace members and control-plane API keys.
+  if (req?.apiKey || agent?.effective_role !== "owner") return null;
+
+  const runtimeFields = buildAgentRuntimeFields(agent);
+  if (runtimeFields.runtime_family !== "hermes") return null;
+  if (runtimeFields.deploy_target !== "docker") return null;
+  if (!agent.container_id) return null;
+
+  let runtimeApiHostPort = null;
+  let dashboardHostPort = null;
+  let runtimeHostIp = null;
+  try {
+    const Docker = require("dockerode");
+    const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+    const info = await docker.getContainer(agent.container_id).inspect();
+    const ports = info.NetworkSettings?.Ports || {};
+    const runtimeBinding = ports[`${HERMES_RUNTIME_PORT}/tcp`];
+    const dashboardBinding = ports[`${HERMES_DASHBOARD_PORT}/tcp`];
+    runtimeApiHostPort = runtimeBinding?.[0]?.HostPort
+      ? parseInt(runtimeBinding[0].HostPort, 10)
+      : null;
+    dashboardHostPort = dashboardBinding?.[0]?.HostPort
+      ? parseInt(dashboardBinding[0].HostPort, 10)
+      : null;
+    // The interface the ports are actually bound to (DOCKER_AGENT_BIND_IP).
+    runtimeHostIp = runtimeBinding?.[0]?.HostIp || null;
+  } catch (err) {
+    console.warn(
+      `[hermes-connect] Could not inspect published ports for agent ${agent.id}: ${err.message}`,
+    );
+    return null;
+  }
+
+  // No published runtime API port means the operator has not exposed it
+  // (DOCKER_AGENT_BIND_IP not set to a routable interface, or ports absent).
+  if (!runtimeApiHostPort) return null;
+
+  const proto = resolvePublishedGatewayProtocol(req);
+  // Prefer the actual publish interface (source of truth) when it is routable;
+  // otherwise fall back to the browsing-host heuristic (loopback default / the
+  // remote 0.0.0.0 variant, where the bind IP doesn't identify a reachable host).
+  const host = isRoutablePublishHostIp(runtimeHostIp)
+    ? formatHostForUrl(runtimeHostIp)
+    : resolvePublishedGatewayHost(req);
+  const apiKey = await resolveHermesApiToken(agent);
+  // The dashboard's basic-auth password is derived from the API key (the same
+  // seed the worker injects into the container), so we can surface it without
+  // storing it. Username is always "nora". The derived `secret` is not needed
+  // by the client and is deliberately not returned.
+  const dashboardAuth = apiKey ? deriveHermesDashboardBasicAuth(apiKey) : null;
+
+  return {
+    runtimeApiUrl: `${proto}://${host}:${runtimeApiHostPort}`,
+    dashboardUrl: dashboardHostPort ? `${proto}://${host}:${dashboardHostPort}` : null,
+    apiKey: apiKey || null,
+    dashboardUsername: dashboardAuth?.username ?? null,
+    dashboardPassword: dashboardAuth?.password ?? null,
+  };
+}
+
 function normalizeClawhubSkillEntry(entry) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     return null;
@@ -664,6 +765,26 @@ function normalizeClawhubSkills(entries) {
   }
 
   return normalized;
+}
+
+// Deploy requests may pre-select at most this many Hermes skills; extra
+// entries are silently truncated after validation/dedup.
+const MAX_HERMES_SKILLS_PER_DEPLOY = 20;
+
+/**
+ * Normalize the Hermes skill entries a deploy request may save on an agent
+ * row. Validation, dedup-by-name, and reserved-name filtering are delegated
+ * to the shared agent-runtime normalizer; deploy-time saves are always CLI
+ * installs resolved from a registry ref, so ref-less entries are dropped, and
+ * the list is capped at MAX_HERMES_SKILLS_PER_DEPLOY.
+ *
+ * @param {Array} entries - Raw skill entries from the request body.
+ * @returns {Array} Stable list of normalized Hermes skill descriptors.
+ */
+function normalizeHermesSkills(entries) {
+  return normalizeSavedHermesSkillEntries(Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry.ref)
+    .slice(0, MAX_HERMES_SKILLS_PER_DEPLOY);
 }
 
 router.get(
@@ -1425,6 +1546,8 @@ router.get(
       gatewayError = error.message || "Failed to read Hermes gateway state";
     }
 
+    const connect = await resolveHermesConnectInfo(agent, req);
+
     res.json({
       url: runtimeUrlForAgent(agent, "/v1"),
       runtime: runtimeAddress,
@@ -1436,6 +1559,7 @@ router.get(
       configuredProvider,
       configuredBaseUrl,
       directoryUpdatedAt,
+      ...(connect ? { connect } : {}),
       ...(gateway ? { gateway } : {}),
       ...(modelsError ? { modelsError } : {}),
       ...(gatewayError ? { gatewayError } : {}),
@@ -1872,9 +1996,9 @@ router.post("/activate-demo", requireSession, async (req, res) => {
     const result = await client.query(
       `INSERT INTO agents(
          user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
-         container_name, image, template_payload, clawhub_skills, runtime_family, deploy_target,
-         execution_target_id, sandbox_profile
-       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, '[]'::jsonb, $12, $13, $14, $15)
+         container_name, image, template_payload, clawhub_skills, hermes_skills, runtime_family,
+         deploy_target, execution_target_id, sandbox_profile
+       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, '[]'::jsonb, '[]'::jsonb, $12, $13, $14, $15)
        RETURNING *`,
       [
         userId,
@@ -1972,6 +2096,7 @@ router.post("/deploy", async (req, res) => {
   try {
     const requestBody = req.body || {};
     const clawhubSkills = normalizeClawhubSkills(requestBody.clawhub_skills);
+    const requestedHermesSkills = normalizeHermesSkills(requestBody.hermes_skills);
     let migrationDraft = null;
     if (requestBody.migration_draft_id) {
       if (req.apiKey) {
@@ -2009,6 +2134,10 @@ router.post("/deploy", async (req, res) => {
         runtime_family: runtimeFamily || DEFAULT_RUNTIME_FAMILY,
       },
     });
+    // Hermes skill pre-selection only applies to Hermes runtimes; the gate
+    // uses the RESOLVED family (unlike clawhub_skills, which is normalized
+    // before the family is known) so non-Hermes agents always store [].
+    const hermesSkills = runtimeFields.runtime_family === "hermes" ? requestedHermesSkills : [];
     if (!requireSessionForRemoteDockerPlacement(req, res, runtimeFields)) return;
     // Enforce billing only after authorization has rejected session-only
     // Remote Docker placement for workspace API keys.
@@ -2087,9 +2216,9 @@ router.post("/deploy", async (req, res) => {
       req,
       `INSERT INTO agents(
          user_id, name, status, node, backend_type, sandbox_type, vcpu, ram_mb, disk_gb,
-         container_name, image, template_payload, clawhub_skills, runtime_family, deploy_target,
-         execution_target_id, sandbox_profile
-       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16) RETURNING *`,
+         container_name, image, template_payload, clawhub_skills, hermes_skills, runtime_family,
+         deploy_target, execution_target_id, sandbox_profile
+       ) VALUES($1, $2, 'queued', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16, $17) RETURNING *`,
       [
         req.user.id,
         name,
@@ -2103,6 +2232,7 @@ router.post("/deploy", async (req, res) => {
         image,
         JSON.stringify(templatePayload),
         JSON.stringify(clawhubSkills),
+        JSON.stringify(hermesSkills),
         runtimeFields.runtime_family,
         runtimeFields.deploy_target,
         runtimeFields.execution_target_id,
@@ -2153,6 +2283,7 @@ router.post("/deploy", async (req, res) => {
       model: runtimeFields.sandbox_profile === "nemoclaw" ? req.body.model || null : null,
       migration_draft_id: migrationDraft?.id || null,
       clawhub_skills: clawhubSkills,
+      hermes_skills: hermesSkills,
     });
 
     const deployType = `${runtimeSelectionStatus.runtimeFamily}/${runtimeSelectionStatus.deployTarget}/${runtimeSelectionStatus.sandboxProfile}`;

@@ -21,6 +21,11 @@ import {
 import Layout from "../../components/layout/Layout";
 import { fetchWithAuth } from "../../lib/api";
 import { useToast } from "../../components/Toast";
+import {
+  formatRuntimeFamilyLabel,
+  listingRuntimeFamily,
+  runtimeFamilyFilterOptions,
+} from "../../lib/runtime";
 
 const AGENT_HUB_TABS = [
   { id: "presets", label: "Platform Presets" },
@@ -103,6 +108,7 @@ export default function AgentHub() {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("presets");
   const [category, setCategory] = useState("All");
+  const [familyFilter, setFamilyFilter] = useState("all");
   const [selectedItem, setSelectedItem] = useState(null);
   const [installName, setInstallName] = useState("");
   const [installingId, setInstallingId] = useState("");
@@ -169,6 +175,7 @@ export default function AgentHub() {
   function selectTab(nextTab) {
     setActiveTab(nextTab);
     setCategory("All");
+    setFamilyFilter("all");
     router.replace(
       {
         pathname: router.pathname,
@@ -187,8 +194,15 @@ export default function AgentHub() {
     "All",
     ...Array.from(new Set(scopedItems.map((item) => item.category).filter(Boolean))),
   ];
+  const familyOptions = runtimeFamilyFilterOptions(scopedItems);
+  const familyFilteredItems =
+    familyFilter === "all"
+      ? scopedItems
+      : scopedItems.filter((item) => listingRuntimeFamily(item) === familyFilter);
   const filteredItems =
-    category === "All" ? scopedItems : scopedItems.filter((item) => item.category === category);
+    category === "All"
+      ? familyFilteredItems
+      : familyFilteredItems.filter((item) => item.category === category);
 
   async function installAgent() {
     if (!selectedItem) return;
@@ -291,8 +305,8 @@ export default function AgentHub() {
             </h1>
             <p className="text-slate-400 font-medium text-lg leading-relaxed">
               Platform starter packs and internal shares stay separated from the hosted community
-              catalog. Inspect each template before installing, including the OpenClaw core files
-              that will ship with it.
+              catalog. Inspect each template before installing, including the OpenClaw core files or
+              Hermes workspace files that will ship with it.
             </p>
           </div>
         </header>
@@ -363,6 +377,25 @@ export default function AgentHub() {
                 : communityHub.error
                   ? `Community sync failed from ${communityHub.url || "the configured hub"}: ${communityHub.error}`
                   : `Community catalog synced from ${communityHub.url || "the configured hub"}. ${formatSyncCadence(communityHub)}`}
+            </div>
+          )}
+
+          {familyOptions.length > 0 && (
+            <div className="flex items-center gap-2 overflow-x-auto pb-1">
+              {["all", ...familyOptions].map((family) => (
+                <button
+                  key={family}
+                  onClick={() => setFamilyFilter(family)}
+                  className={clsx(
+                    "px-4 py-2 rounded-xl text-xs font-black uppercase tracking-[0.14em] transition-all whitespace-nowrap ring-1",
+                    familyFilter === family
+                      ? "bg-blue-600 text-white ring-blue-500/50"
+                      : "bg-white text-slate-500 hover:text-slate-900 hover:bg-slate-50 ring-slate-200",
+                  )}
+                >
+                  {family === "all" ? "All Runtimes" : formatRuntimeFamilyLabel(family)}
+                </button>
+              ))}
             </div>
           )}
 
@@ -475,6 +508,7 @@ function AgentHubCard({
   reporting,
 }) {
   const isPreset = item.source_type === "platform";
+  const familyLabel = formatRuntimeFamilyLabel(listingRuntimeFamily(item));
 
   return (
     <div className="group bg-white border border-slate-200 rounded-[2.3rem] shadow-sm hover:shadow-2xl hover:shadow-blue-500/10 hover:border-blue-500/20 transition-all duration-500 overflow-hidden flex flex-col p-1">
@@ -494,16 +528,21 @@ function AgentHubCard({
               <Users size={30} strokeWidth={2.4} />
             )}
           </div>
-          <span
-            className={clsx(
-              "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border",
-              isPreset
-                ? "bg-slate-100 text-slate-700 border-slate-200"
-                : "bg-emerald-50 text-emerald-700 border-emerald-200",
-            )}
-          >
-            {isPreset ? "Preset" : item.remote ? "Community" : "Shared"}
-          </span>
+          <div className="flex flex-col items-end gap-2">
+            <span
+              className={clsx(
+                "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border",
+                isPreset
+                  ? "bg-slate-100 text-slate-700 border-slate-200"
+                  : "bg-emerald-50 text-emerald-700 border-emerald-200",
+              )}
+            >
+              {isPreset ? "Preset" : item.remote ? "Community" : "Shared"}
+            </span>
+            <span className="px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border bg-blue-50/70 text-blue-700 border-blue-100">
+              {familyLabel}
+            </span>
+          </div>
         </div>
 
         <div className="space-y-2">
@@ -532,8 +571,12 @@ function AgentHubCard({
         <div className="grid grid-cols-2 gap-3">
           <TemplateInfoPill
             icon={Layers3}
-            label="Core Files"
-            value={`${item.template?.presentRequiredCoreCount || 0}/${item.template?.requiredCoreCount || 7}`}
+            label={familyLabel === "Hermes" ? "Bundle" : "Core Files"}
+            value={
+              familyLabel === "Hermes"
+                ? "Workspace files"
+                : `${item.template?.presentRequiredCoreCount || 0}/${item.template?.requiredCoreCount || 7}`
+            }
           />
           <TemplateInfoPill
             icon={FileText}
@@ -616,6 +659,7 @@ function AgentHubCard({
 
 function MyListingCard({ item, onDownload, downloading }) {
   const statusClass = STATUS_STYLES[item.status] || "bg-slate-100 text-slate-700 border-slate-200";
+  const familyLabel = formatRuntimeFamilyLabel(listingRuntimeFamily(item));
 
   return (
     <div className="bg-white border border-slate-200 rounded-[2.3rem] shadow-sm overflow-hidden flex flex-col p-6 gap-5">
@@ -630,6 +674,9 @@ function MyListingCard({ item, onDownload, downloading }) {
               )}
             >
               {String(item.status || "unknown").replace(/_/g, " ")}
+            </span>
+            <span className="px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border bg-blue-50/70 text-blue-700 border-blue-100">
+              {familyLabel}
             </span>
           </div>
           <p className="mt-2 text-sm text-slate-500 leading-relaxed">
@@ -675,10 +722,12 @@ function MyListingCard({ item, onDownload, downloading }) {
         </div>
         <div>
           <p className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
-            Core Files
+            {familyLabel === "Hermes" ? "Bundle" : "Core Files"}
           </p>
           <p className="mt-1 font-semibold text-slate-900">
-            {item.template?.presentRequiredCoreCount || 0}/{item.template?.requiredCoreCount || 7}
+            {familyLabel === "Hermes"
+              ? "Workspace files"
+              : `${item.template?.presentRequiredCoreCount || 0}/${item.template?.requiredCoreCount || 7}`}
           </p>
         </div>
         <div>

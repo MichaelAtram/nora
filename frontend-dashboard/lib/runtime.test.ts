@@ -3,7 +3,10 @@ import test from "node:test";
 
 import {
   activeExecutionTargetFromConfig,
+  listingRuntimeFamily,
   mergeRemoteHostsIntoConfig,
+  runtimeFamilyFilterOptions,
+  runtimeSupportsAgentHubSharing,
   visibleSandboxOptionsFromTarget,
 } from "./runtime";
 
@@ -158,5 +161,39 @@ test("unavailable or view-only remote hosts do not become deploy targets", () =>
   assert.equal(
     mergeRemoteHostsIntoConfig(backendConfig, [{ ...connectedHost, canDeploy: false }]),
     backendConfig,
+  );
+});
+
+test("runtimeSupportsAgentHubSharing includes both openclaw and hermes", () => {
+  assert.equal(runtimeSupportsAgentHubSharing("openclaw"), true);
+  assert.equal(runtimeSupportsAgentHubSharing("hermes"), true);
+  assert.equal(runtimeSupportsAgentHubSharing({ runtime_family: "hermes" }), true);
+  assert.equal(runtimeSupportsAgentHubSharing({}), true);
+  assert.equal(runtimeSupportsAgentHubSharing("quantumclaw"), false);
+});
+
+test("listingRuntimeFamily resolves the listing field, template summary, then openclaw", () => {
+  assert.equal(listingRuntimeFamily({ runtime_family: "hermes" }), "hermes");
+  assert.equal(listingRuntimeFamily({ runtimeFamily: "hermes" }), "hermes");
+  assert.equal(listingRuntimeFamily({ template: { runtimeFamily: "hermes" } }), "hermes");
+  assert.equal(
+    listingRuntimeFamily({ runtime_family: "openclaw", template: { runtimeFamily: "hermes" } }),
+    "openclaw",
+  );
+  assert.equal(listingRuntimeFamily({ runtime_family: "unknown-family" }), "openclaw");
+  assert.equal(listingRuntimeFamily({}), "openclaw");
+  assert.equal(listingRuntimeFamily(null), "openclaw");
+});
+
+test("runtimeFamilyFilterOptions only offers a filter when families are mixed", () => {
+  assert.deepEqual(runtimeFamilyFilterOptions([]), []);
+  assert.deepEqual(runtimeFamilyFilterOptions([{ runtime_family: "openclaw" }, {}]), []);
+  assert.deepEqual(
+    runtimeFamilyFilterOptions([{ runtime_family: "hermes" }, { runtime_family: "hermes" }]),
+    [],
+  );
+  assert.deepEqual(
+    runtimeFamilyFilterOptions([{ runtime_family: "hermes" }, { runtime_family: "openclaw" }, {}]),
+    ["openclaw", "hermes"],
   );
 });

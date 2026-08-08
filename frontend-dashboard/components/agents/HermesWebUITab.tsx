@@ -14,6 +14,7 @@ import HermesChannelsPanel from "./hermes/ChannelsPanel";
 import HermesChatPanel from "./hermes/ChatPanel";
 import HermesCronPanel from "./hermes/CronPanel";
 import OfficialDashboardPanel from "./hermes/OfficialDashboardPanel";
+import HermesSkillsPanel from "./hermes/SkillsPanel";
 import HermesStatusPanel from "./hermes/StatusPanel";
 
 const STATUS_POLL_MS = 5000;
@@ -23,6 +24,7 @@ const subTabs = [
   { id: "status", label: "Status", icon: Radio },
   { id: "chat", label: "Chat", icon: MessageSquare },
   { id: "integrations", label: "Integrations", icon: Puzzle },
+  { id: "skills", label: "Skills", icon: Puzzle },
   { id: "cron", label: "Cron", icon: CalendarClock },
   { id: "channels", label: "Channels", icon: MessagesSquare },
 ];
@@ -199,6 +201,9 @@ export default function HermesWebUITab({ agentId, agentStatus }) {
           />
         )}
         {activeSubTab === "integrations" && <HermesIntegrationsPanel agentId={agentId} />}
+        {activeSubTab === "skills" && (
+          <HermesSkillsPanel agentId={agentId} agentStatus={agentStatus} />
+        )}
         {activeSubTab === "cron" && <HermesCronPanel agentId={agentId} />}
         {activeSubTab === "channels" && <HermesChannelsPanel agentId={agentId} />}
       </div>

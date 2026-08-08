@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   Bot,
   CheckCircle2,
+  Eye,
+  EyeOff,
   Key,
   Loader2,
   RefreshCw,
@@ -10,6 +12,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { fetchWithAuth } from "../../../lib/api";
+import { connectFieldDisplay, isSecretRevealed } from "../../../lib/connectField";
 import { useToast } from "../../Toast";
 import { formatModelLabel, getProviderMeta, ProviderLogo } from "../providerLogos";
 
@@ -132,6 +135,124 @@ function resolveDefaultChoiceKey(savedProviders, options) {
   return providerMatch?.key || options[0]?.key || "";
 }
 
+// Legacy execCommand copy for non-secure contexts. navigator.clipboard is only
+// defined in a secure context (HTTPS, http://localhost / 127.0.0.1); over a
+// plain-HTTP non-localhost origin (e.g. http://<tailscale-ip>:8080) it is
+// undefined, so the native path throws.
+function legacyCopy(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+// Copy `value` to the clipboard, returning whether it succeeded. Uses the
+// async Clipboard API in a secure context and falls back to the legacy
+// execCommand path on plain-HTTP non-localhost origins. Success/failure
+// messaging (and the "reveal a masked secret so you can copy it" fallback) is
+// left to the caller, which knows whether the value is a masked secret.
+async function copyValue(value) {
+  if (!value) return false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+    return legacyCopy(value);
+  } catch {
+    return legacyCopy(value);
+  }
+}
+
+// A single "Connect Hermes Desktop" field: readonly value + Copy, selectable
+// while the real value is visible. Secret fields (API key, dashboard password)
+// are masked by default behind a reveal toggle; each owns its reveal state
+// (revealing one never reveals another) and Copy always copies the REAL value,
+// even while masked.
+function ConnectField({ label, value, Icon, mono = false, secret = false }) {
+  const toast = useToast();
+  // Track the exact value the field was revealed for (not a bare boolean), so a
+  // rotated credential re-masks automatically — see isSecretRevealed.
+  const [revealedFor, setRevealedFor] = useState(null);
+  const revealed = secret ? isSecretRevealed(revealedFor, value) : true;
+  const displayValue = connectFieldDisplay(value, { secret, revealed });
+
+  const handleCopy = async () => {
+    // copyValue copies the REAL value regardless of masking, and reports success.
+    const copied = await copyValue(value);
+    if (copied) {
+      toast.success(`${label} copied`);
+      return;
+    }
+    if (secret && !revealed) {
+      // Programmatic copy failed and the value is masked — selecting the field
+      // would copy the mask, so reveal it and let the user copy it manually.
+      setRevealedFor(value);
+      toast.error(
+        `Couldn't copy ${label} automatically — revealed it so you can select and copy it.`,
+      );
+    } else {
+      toast.error(`Couldn't copy ${label} — select the text to copy it manually.`);
+    }
+  };
+
+  return (
+    <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+      <Icon size={16} className="mt-0.5 shrink-0 text-slate-500" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">{label}</p>
+          <div className="flex shrink-0 items-center gap-3">
+            {secret ? (
+              <button
+                type="button"
+                onClick={() => setRevealedFor(revealed ? null : value)}
+                aria-label={revealed ? `Hide ${label}` : `Reveal ${label}`}
+                className="text-slate-400 hover:text-slate-600"
+              >
+                {revealed ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={handleCopy}
+              aria-label={`Copy ${label}`}
+              className="text-xs font-bold text-blue-600 hover:text-blue-700"
+            >
+              Copy
+            </button>
+          </div>
+        </div>
+        {/* Select-on-click only while the real value is visible: selecting a
+            masked field would put literal mask bullets on the clipboard, so a
+            masked field offers Copy / reveal instead of select-all. */}
+        <input
+          type="text"
+          readOnly
+          aria-label={label}
+          value={displayValue}
+          onFocus={(e) => revealed && e.currentTarget.select()}
+          onClick={(e) => revealed && e.currentTarget.select()}
+          className={`mt-1 block w-full break-all rounded-md border border-slate-200 bg-white px-2 py-1 text-sm font-medium text-slate-800 ${
+            revealed ? "select-all" : ""
+          } ${mono ? "font-mono" : ""}`}
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error, onRefresh }) {
   const [providers, setProviders] = useState(null);
   const [availableProviders, setAvailableProviders] = useState([]);
@@ -207,6 +328,9 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
   }, [providers, availableProviders]);
 
   const runtimeReady = Boolean(runtimeInfo?.health?.ok);
+  const connect = runtimeInfo?.connect || null;
+  // Connect fields render via the module-level <ConnectField> component (above),
+  // which owns its own reveal state and copy/toast handling.
   const models = Array.isArray(runtimeInfo?.models) ? runtimeInfo.models : [];
   const gateway: any = runtimeInfo?.gateway || {};
   const platformStates =
@@ -670,6 +794,53 @@ export default function HermesStatusPanel({ agentId, runtimeInfo, loading, error
             </div>
           </div>
         </section>
+
+        {connect ? (
+          <section className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+            <div className="border-b border-slate-200 px-4 py-3">
+              <p className="text-sm font-bold text-slate-900">Connect Hermes Desktop</p>
+              <p className="mt-1 text-xs text-slate-500">
+                Point Hermes Desktop (or any direct client) at this address. Reachable only on the
+                interface Nora publishes agent ports to (DOCKER_AGENT_BIND_IP).
+              </p>
+            </div>
+            <div className="space-y-3 p-4">
+              <ConnectField label="Runtime API" value={connect.runtimeApiUrl} Icon={Server} />
+              {connect.dashboardUrl ? (
+                <ConnectField label="Dashboard" value={connect.dashboardUrl} Icon={Workflow} />
+              ) : null}
+              {/* Dashboard login credentials are shown only alongside a dashboard
+                  URL to log into. With the 9119 port unpublished there is no
+                  direct dashboard to reach — the dashboard embedded in Nora
+                  authenticates itself — so credentials would only confuse. */}
+              {connect.dashboardUrl && connect.dashboardUsername ? (
+                <ConnectField
+                  label="Dashboard Username"
+                  value={connect.dashboardUsername}
+                  Icon={Bot}
+                />
+              ) : null}
+              {connect.dashboardUrl && connect.dashboardPassword ? (
+                <ConnectField
+                  label="Dashboard Password"
+                  value={connect.dashboardPassword}
+                  Icon={Key}
+                  mono
+                  secret
+                />
+              ) : null}
+              {connect.apiKey ? (
+                <ConnectField label="API Key" value={connect.apiKey} Icon={Key} mono secret />
+              ) : null}
+              <p className="text-xs text-slate-500">
+                These credentials rotate when the agent is redeployed — the API key and dashboard
+                password are regenerated on each deploy. The URLs above are plain HTTP unless you
+                have put TLS in front of them, so use them over a trusted network; the dashboard
+                embedded in Nora stays behind your Nora origin instead.
+              </p>
+            </div>
+          </section>
+        ) : null}
 
         <aside className="space-y-4">
           <section className="rounded-2xl border border-slate-200 bg-white shadow-sm">

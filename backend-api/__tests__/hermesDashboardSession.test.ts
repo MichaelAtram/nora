@@ -4,7 +4,10 @@ const {
   HERMES_DASHBOARD_LOGIN_PATH,
 } = require("../hermesDashboardSession");
 
-function res(status, { setCookie = [], location } = {}) {
+function res(
+  status,
+  { setCookie = [], location = null }: { setCookie?: string[]; location?: string | null } = {},
+) {
   const headers = {
     getSetCookie: () => setCookie,
     get: (name) => (name.toLowerCase() === "location" ? location || null : null),
@@ -53,13 +56,17 @@ describe("establishHermesDashboardSession", () => {
 
   it("returns null when login fails (non-2xx)", async () => {
     const fetchImpl = async () => res(401);
-    const cookie = await establishHermesDashboardSession({ host: "h", port: 9119 }, "seed", { fetchImpl });
+    const cookie = await establishHermesDashboardSession({ host: "h", port: 9119 }, "seed", {
+      fetchImpl,
+    });
     expect(cookie).toBeNull();
   });
 
   it("returns null when the login sets no cookie", async () => {
     const fetchImpl = async () => res(200, { setCookie: [] });
-    const cookie = await establishHermesDashboardSession({ host: "h", port: 9119 }, "seed", { fetchImpl });
+    const cookie = await establishHermesDashboardSession({ host: "h", port: 9119 }, "seed", {
+      fetchImpl,
+    });
     expect(cookie).toBeNull();
   });
 });

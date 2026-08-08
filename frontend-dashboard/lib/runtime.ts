@@ -522,5 +522,26 @@ export function runtimeSupportsAgentHubSharing(agentOrRuntimeFamily = {}) {
     typeof agentOrRuntimeFamily === "string"
       ? normalizeRuntimeFamily(agentOrRuntimeFamily)
       : resolveAgentRuntimeFamily(agentOrRuntimeFamily);
-  return runtimeFamily !== "hermes";
+  return runtimeFamily === "openclaw" || runtimeFamily === "hermes";
+}
+
+// Runtime family of an Agent Hub listing/detail. Mirrors the backend's
+// resolution order: the listing's runtime_family field first, then the
+// template summary's resolved family (covers remote details from hubs that
+// predate runtime_family), defaulting to OpenClaw.
+export function listingRuntimeFamily(listing: any = {}) {
+  return (
+    normalizeRuntimeFamily(listing?.runtime_family ?? listing?.runtimeFamily) ||
+    normalizeRuntimeFamily(listing?.template?.runtimeFamily) ||
+    "openclaw"
+  );
+}
+
+// Family filter options for a listing collection, in canonical family order.
+// Empty when every listing shares one family — a single-family catalog has
+// nothing to filter, so callers hide the chip row entirely.
+export function runtimeFamilyFilterOptions(listings: any[] = []) {
+  const present = new Set((Array.isArray(listings) ? listings : []).map(listingRuntimeFamily));
+  const families = Object.keys(RUNTIME_FAMILY_LABELS).filter((family) => present.has(family));
+  return families.length > 1 ? families : [];
 }

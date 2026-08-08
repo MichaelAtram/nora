@@ -184,20 +184,59 @@ function isIgnorableStopError(error) {
   return /already stopped|not running/i.test(String(error?.message || ""));
 }
 
+// Canonical in-container location of the worker's real backend adapters. They
+// live here in EVERY layout: the backend-api prod image COPYs them to
+// /app/backends, the worker-provisioner prod image has the worker itself at
+// /app (so /app/backends is the worker's own backends), and dev compose bind-
+// mounts ./workers/provisioner/backends to /app/backends in both services.
+const APP_BACKENDS_DIR = "/app/backends";
+
 /**
- * Resolve the path to a backend module.
- * In Docker: backends are mounted at /app/backends/ via docker-compose.
- * In dev/local: fall back to ../workers/provisioner/backends/ relative path.
+ * Ordered candidate paths for a backend adapter module, most-canonical first.
+ *
+ * /app/backends is tried FIRST because it always points at the worker's real
+ * adapters (see APP_BACKENDS_DIR). This is essential in the worker-provisioner
+ * prod image, where containerManager runs from /backend-api: there the
+ * __dirname-relative candidates resolve either to the re-export shims
+ * (backend-api/backends/{hermes,nemoclaw}, whose ../../workers/... require is
+ * dead — there is no /workers dir in that image) or to a nonexistent
+ * /workers/provisioner/backends path. Trying /app/backends first loads the real
+ * adapter directly and never touches the shims.
  */
-function resolveBackendPath(name) {
-  const localPath = path.resolve(__dirname, "backends", name);
-  const workerPath = path.resolve(__dirname, "../workers/provisioner/backends", name);
-  try {
-    require.resolve(localPath);
-    return localPath;
-  } catch {
-    return workerPath;
+function backendPathCandidates(
+  name,
+  { appBackendsDir = APP_BACKENDS_DIR, dirname = __dirname } = {},
+) {
+  return [
+    path.join(appBackendsDir, name),
+    path.resolve(dirname, "backends", name),
+    path.resolve(dirname, "../workers/provisioner/backends", name),
+  ];
+}
+
+/**
+ * Resolve the path to a backend module across the backend-api image, the
+ * worker-provisioner image, and dev bind-mount layouts. Returns the first
+ * candidate that resolves; if none do, returns the dev-sibling path so a
+ * downstream require failure names a real, meaningful location.
+ *
+ * @param {string} name Backend adapter name (e.g. "docker", "hermes").
+ * @param {Object} [opts]
+ * @param {(p: string) => string} [opts.resolve] Resolver (injectable for tests).
+ * @param {string} [opts.appBackendsDir] Override the canonical /app/backends dir.
+ * @param {string} [opts.dirname] Override __dirname (for tests).
+ */
+function resolveBackendPath(name, { resolve = require.resolve, appBackendsDir, dirname } = {}) {
+  const candidates = backendPathCandidates(name, { appBackendsDir, dirname });
+  for (const candidate of candidates) {
+    try {
+      resolve(candidate);
+      return candidate;
+    } catch {
+      // Try the next candidate layout.
+    }
   }
+  return candidates[candidates.length - 1];
 }
 
 /**
@@ -357,6 +396,9 @@ async function backendForCleanup(agent) {
 module.exports = {
   NoContainerError,
   ensureContainerId,
+  // Exported for layout-resolution regression tests (backendPathResolution.test.ts).
+  resolveBackendPath,
+  backendPathCandidates,
 
   /**
    * Start an agent's runtime through its backend adapter.

@@ -4,6 +4,7 @@ import { Search, X } from "lucide-react";
 type SkillSearchBarProps = {
   query: string;
   loading?: boolean;
+  placeholder?: string;
   onQueryChange: (value: string) => void;
   onSubmit: () => void;
   onClear: () => void;
@@ -12,6 +13,7 @@ type SkillSearchBarProps = {
 export default function SkillSearchBar({
   query,
   loading = false,
+  placeholder = "Search ClawHub skills and press Enter",
   onQueryChange,
   onSubmit,
   onClear,
@@ -36,7 +38,7 @@ export default function SkillSearchBar({
             type="text"
             value={query}
             onChange={(event) => onQueryChange(event.target.value)}
-            placeholder="Search ClawHub skills and press Enter"
+            placeholder={placeholder}
             className="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-10 pr-10 text-sm text-slate-900 outline-none transition-all focus:border-blue-400 focus:bg-white focus:ring-2 focus:ring-blue-100"
           />
           {query && (
