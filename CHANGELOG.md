@@ -4,6 +4,52 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.17.0](https://github.com/solomon2773/nora/releases/tag/v1.17.0) — 2026-08-08
+
+Hermes feature release: a complete skills pipeline (browse the Skills Hub, curate an instance
+library, pre-install at deploy, manage per-agent, survive redeploys), Agent Hub support for Hermes
+templates (publish and install preconfigured Hermes agents), durable local Docker Hermes state, and
+dashboard login credentials on the Connect card.
+
+### Added
+
+- **Hermes Skills**: browse and search the aggregated Hermes Skills Hub index (~90k skills across
+  ClawHub, skills.sh, and other registries) from a new per-agent **Skills** tab; install and remove
+  skills on a running agent with job tracking and drift statuses (healthy / missing / orphaned);
+  select skills during deploy via a dedicated picker step; saved skills reinstall automatically on
+  every redeploy. Installs run through the Hermes CLI so its built-in security scanner always
+  applies.
+- **Skills Library**: an instance-level curation tier — pin hub skills once and they surface first
+  in both the deploy picker and the per-agent Skills tab.
+- **Agent Hub Hermes templates**: publish a running Hermes agent as a hub listing (live workspace
+  capture with integration artifacts and dotfiles excluded, skills and model configuration carried
+  as metadata — provider credentials are never included) and install listings as new Hermes agents
+  (workspace materialization, skills and model replay on first boot). Hub cards and detail pages
+  show runtime-family badges with filtering, and `runtime_family` round-trips through hub
+  federation.
+- The Hermes Connect card now surfaces the dashboard login credentials (username in the clear,
+  password and API key masked behind reveal toggles); credentials rotate on redeploy.
+- Local Docker Hermes agents keep `/opt/data` (workspace, skills, configuration) on a named volume
+  that survives redeploys and image updates. Community contribution — thanks @mikelmao.
+
+### Changed
+
+- Sharing an agent to the Agent Hub now validates the runtime family server-side; unknown or
+  disabled families are rejected instead of producing an empty template.
+- Agent Hub documentation now describes the actual authorization model (browse/install for any
+  signed-in user, publish for the agent owner, moderation for platform admins) with
+  workspace-scoped permissions noted as roadmap.
+- Dependency refresh: `ip-address`, `hono`, `fast-uri`, `sanitize-html`, and `js-yaml` advisories
+  cleared across services.
+- Release metadata advances the Gemini extension manifest to `1.17.0` and the Helm chart to `0.8.0`
+  with application version `1.17.0`.
+
+### Fixed
+
+- Versioned boot migrations are strictly append-only again: a mid-array insertion introduced during
+  this cycle (never released) would have failed startup on existing databases; ordering is restored
+  and the append-only contract is now documented at the insertion point.
+
 ## [v1.16.6](https://github.com/solomon2773/nora/releases/tag/v1.16.6) — 2026-07-24
 
 Terminal/Logs connectivity, Hermes dashboard access, and CI/dependency hardening patch: agent
