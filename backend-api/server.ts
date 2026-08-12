@@ -42,7 +42,11 @@ const { STARTER_TEMPLATES } = require("./starterTemplates");
 const { allowsFirstAdminSignupClaim, getBootstrapAdminSeedConfig } = require("./bootstrapAdmin");
 const { ensureFirstRegisteredUserIsAdmin } = require("./ensureAdminUser");
 const { authenticateToken } = require("./middleware/auth");
-const { requireApiKeyAgentPathScope } = require("./middleware/ownership");
+const {
+  buildAccessibleAgentQuery,
+  requireApiKeyAgentPathScope,
+  roleSatisfies,
+} = require("./middleware/ownership");
 const { correlationId, errorHandler } = require("./middleware/errorHandler");
 const {
   createGatewayRouter,
@@ -444,12 +448,15 @@ function setProxyResponseHeaders(res, resp, { cachePolicy = "asset" } = {}) {
 }
 
 async function lookupEmbedAgent(agentId, userId) {
-  const result = await db.query(
-    `SELECT ${GATEWAY_EMBED_AGENT_COLUMNS.join(", ")}
-       FROM agents
-      WHERE id = $1 AND user_id = $2`,
-    [agentId, userId],
-  );
+  // Owner or sharing-workspace member, same as the Hermes lookup below. The
+  // OpenClaw callers all demand `editor` (see GATEWAY_EMBED_MIN_WORKSPACE_ROLE)
+  // rather than the Hermes per-method split: bootstrap.js hands the browser the
+  // decrypted gateway password, and the relay socket it configures is a live
+  // chat/terminal channel, so there is no coherent read-only mode to grant.
+  const result = await db.query(buildAccessibleAgentQuery(GATEWAY_EMBED_AGENT_COLUMNS), [
+    agentId,
+    userId,
+  ]);
   if (
     !result.rows[0] ||
     !isGatewayAvailableStatus(result.rows[0].status) ||
@@ -465,12 +472,21 @@ async function lookupHermesEmbedAgent(agentId, userId) {
   // user_id / gateway_host) the embed proxy's allowlist authorizes against — see
   // embedAgentColumns.ts. Omitting them would mis-route a remote-docker/k8s agent
   // or short-circuit the owner-scoping check.
-  const result = await db.query(
-    `SELECT ${HERMES_EMBED_AGENT_COLUMNS.join(", ")}
-       FROM agents
-      WHERE id = $1 AND user_id = $2`,
-    [agentId, userId],
-  );
+  //
+  // Access mirrors the native Hermes WebUI routes (routes/agents.ts →
+  // loadHermesUiAgent → findAccessibleAgent): the agent's owner, plus any member
+  // of a workspace the agent is shared into. An owner-only lookup here made the
+  // embedded dashboard the one Hermes surface a workspace member could see in
+  // the tab bar but never load. `user_id` stays selected because it is the
+  // *owner* the remote-host grant check authorizes against — never the caller.
+  //
+  // effective_role is the caller's highest role across the sharing workspaces;
+  // resolveEmbedAccess gates mutating embed requests on it so a viewer cannot
+  // reach through the proxy for writes the native panels reserve for editors.
+  const result = await db.query(buildAccessibleAgentQuery(HERMES_EMBED_AGENT_COLUMNS), [
+    agentId,
+    userId,
+  ]);
   if (
     !result.rows[0] ||
     !isGatewayAvailableStatus(result.rows[0].status) ||
@@ -490,12 +506,12 @@ async function fetchAgentForHermesRepair(agentId) {
 
 /**
  * Authenticate an embedded UI through a verified JWT or agent-scoped HttpOnly
- * session, verify direct ownership/runtime availability, and mint the scoped
+ * session, verify agent access/runtime availability, and mint the scoped
  * cookie when needed.
  *
  * @param {Object} req - Express embed request.
  * @param {Object} res - Express response used for auth failures and cookies.
- * @param {Object} [options={}] - Scope, cookie, lookup, and query-token policy.
+ * @param {Object} [options={}] - Scope, cookie, lookup, role, and query-token policy.
  * @returns {Promise<Object|null>} Authorized embed context, or `null` after responding.
  */
 async function resolveEmbedAccess(
@@ -506,6 +522,7 @@ async function resolveEmbedAccess(
     lookupAgent = lookupEmbedAgent,
     cookiePrefix = EMBED_SESSION_COOKIE_PREFIX,
     scope = "gateway-embed",
+    requiredRole = "viewer",
   } = {},
 ) {
   const jwt = require("jsonwebtoken");
@@ -567,6 +584,15 @@ async function resolveEmbedAccess(
   const agent = await lookupAgent(agentId, userId);
   if (!agent) {
     res.status(404).send("agent not found or not running");
+    return null;
+  }
+
+  // Owner-only lookups return no effective_role; the row *is* the owner's, so
+  // it satisfies every threshold. Workspace-aware lookups carry the caller's
+  // highest sharing role, which must clear this request's bar. 403 (not 404) is
+  // correct here: the caller already knows the agent exists.
+  if (!roleSatisfies(agent.effective_role || "owner", requiredRole)) {
+    res.status(403).send("insufficient workspace permissions for this agent");
     return null;
   }
 
@@ -880,6 +906,25 @@ app.get("/api-docs", (req, res) => {
 const gatewayUIAssetProxy = require("express").Router();
 const PREAUTH_ASSET_METHODS = new Set(["GET", "HEAD"]);
 const EMBED_PROXY_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]);
+const EMBED_READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+// Every OpenClaw gateway embed surface — the control UI, its assets, and the
+// bootstrap script — takes this single role instead of the Hermes per-method
+// split. bootstrap.js inlines the decrypted gateway password into browser JS
+// and rebinds the UI's WebSocket onto the relay, so even a GET here is a grant
+// of live control. A workspace viewer loses nothing: this surface was
+// owner-only before, so `editor` only ever widens access.
+const GATEWAY_EMBED_MIN_WORKSPACE_ROLE = "editor";
+
+// The embedded dashboard is a full control UI, so proxying it verbatim would let
+// any caller who can read it also write through it. Map the request method onto
+// the same viewer/editor split the native Hermes WebUI routes use
+// (routes/agents.ts: reads default to viewer, mutations require editor) so a
+// workspace viewer gets the read-only dashboard and nothing more. Re-derived per
+// request — the embed session cookie deliberately carries no role of its own.
+function embedRoleForMethod(method) {
+  return EMBED_READ_METHODS.has(String(method || "").toUpperCase()) ? "viewer" : "editor";
+}
 
 gatewayUIAssetProxy.use("/agents/:agentId/gateway", (req, res, next) => {
   if (!PREAUTH_ASSET_METHODS.has(req.method)) return next();
@@ -900,7 +945,9 @@ gatewayUIAssetProxy.use("/agents/:agentId/gateway", (req, res, next) => {
 // cookie so the control UI can keep using its own relative paths.
 gatewayUIAssetProxy.get("/agents/:agentId/gateway/embed/bootstrap.js", async (req, res) => {
   try {
-    const access = await resolveEmbedAccess(req, res);
+    const access = await resolveEmbedAccess(req, res, {
+      requiredRole: GATEWAY_EMBED_MIN_WORKSPACE_ROLE,
+    });
     if (!access) return;
 
     res.setHeader("Content-Type", "application/javascript; charset=utf-8");
@@ -938,7 +985,9 @@ gatewayUIAssetProxy.get("/agents/:agentId/gateway/embed/bootstrap.js", async (re
  */
 async function proxyEmbeddedGateway(req, res) {
   try {
-    const access = await resolveEmbedAccess(req, res);
+    const access = await resolveEmbedAccess(req, res, {
+      requiredRole: GATEWAY_EMBED_MIN_WORKSPACE_ROLE,
+    });
     if (!access) return;
 
     const gatewayPath = getEmbeddedGatewayPath(req);
@@ -1021,6 +1070,7 @@ async function proxyEmbeddedHermes(req, res) {
       lookupAgent: lookupHermesEmbedAgent,
       cookiePrefix: HERMES_EMBED_SESSION_COOKIE_PREFIX,
       scope: "hermes-embed",
+      requiredRole: embedRoleForMethod(req.method),
     });
     if (!access) return;
 
@@ -1191,7 +1241,9 @@ gatewayUIAssetProxy.use("/agents/:agentId/hermes-ui", (req, res, next) => {
  */
 async function proxyGatewayAsset(req, res) {
   try {
-    const access = await resolveEmbedAccess(req, res);
+    const access = await resolveEmbedAccess(req, res, {
+      requiredRole: GATEWAY_EMBED_MIN_WORKSPACE_ROLE,
+    });
     if (!access) return;
 
     const gatewayPath = req.path || "/";
