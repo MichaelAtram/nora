@@ -848,8 +848,10 @@ describe("gateway control-plane embed", () => {
     };
     mockDb.query.mockImplementation(async (sql) => {
       const text = String(sql);
-      if (text.includes("FROM agents") && text.includes("WHERE id = $1 AND user_id = $2")) {
-        return { rows: [agent] };
+      if (text.includes("FROM agents")) {
+        // The caller owns this agent, so the access lookup resolves it with the
+        // owner role; the grant re-check below is what must still reject it.
+        return { rows: [{ ...agent, effective_role: "owner" }] };
       }
       if (text.includes("FROM remote_hosts")) return { rows: [] };
       return { rows: [] };
@@ -881,8 +883,10 @@ describe("gateway control-plane embed", () => {
     const internalError = new Error("postgres://internal-user:secret@db/private");
     mockDb.query.mockImplementation(async (sql) => {
       const text = String(sql);
-      if (text.includes("FROM agents") && text.includes("WHERE id = $1 AND user_id = $2")) {
-        return { rows: [agent] };
+      if (text.includes("FROM agents")) {
+        // The caller owns this agent, so the access lookup resolves it with the
+        // owner role; the grant re-check below is what must still reject it.
+        return { rows: [{ ...agent, effective_role: "owner" }] };
       }
       if (text.includes("FROM remote_hosts")) throw internalError;
       return { rows: [] };
@@ -1396,6 +1400,128 @@ describe("gateway control-plane embed", () => {
     expect(res.status).toBe(401);
     expect(global.fetch).not.toHaveBeenCalled();
   });
+
+  // Unlike the Hermes dashboard, the OpenClaw control UI has no meaningful
+  // read-only mode: bootstrap.js hands the browser the decrypted gateway
+  // password and the relay WebSocket it drives is a live chat/terminal channel.
+  // The whole surface therefore takes `editor` rather than a per-method split.
+  describe("workspace-shared access", () => {
+    const OWNER_ID = "agent-owner";
+    const SHARED_AGENT = {
+      id: "agent-shared-oc",
+      host: "10.0.0.50",
+      gateway_token: "enc(gateway-password)",
+      gateway_host_port: null,
+      status: "running",
+      runtime_family: "openclaw",
+      deploy_target: "docker",
+      user_id: OWNER_ID,
+    };
+
+    // Honors an owner-scoped `AND user_id = $2` faithfully, so a lookup that
+    // never consults workspace_members cannot pass these tests by accident.
+    function mockSharedAgentLookup(memberships) {
+      mockDb.query.mockImplementation(async (sql, params = []) => {
+        const text = String(sql);
+        if (!/FROM agents/i.test(text)) return { rows: [] };
+        const [agentId, userId] = params;
+        if (agentId !== SHARED_AGENT.id) return { rows: [] };
+        if (userId === OWNER_ID) {
+          return { rows: [{ ...SHARED_AGENT, effective_role: "owner" }] };
+        }
+        if (!/workspace_members/i.test(text)) return { rows: [] };
+        const role = memberships[userId];
+        if (!role) return { rows: [] };
+        return { rows: [{ ...SHARED_AGENT, effective_role: role }] };
+      });
+    }
+
+    function memberToken(userId) {
+      return jwt.sign({ id: userId, role: "user" }, JWT_SECRET, { expiresIn: "1h" });
+    }
+
+    it.each(["editor", "admin", "owner"])(
+      "serves the gateway embed to a workspace %s who does not own the agent",
+      async (role) => {
+        mockSharedAgentLookup({ "member-1": role });
+        global.fetch.mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+          text: async () => "<html><head></head><body>ok</body></html>",
+        });
+
+        const res = await request(app)
+          .get(
+            `/agents/${SHARED_AGENT.id}/gateway/embed?token=${encodeURIComponent(memberToken("member-1"))}`,
+          )
+          .set("Host", "nora.test")
+          .set("Accept", "text/html");
+
+        expect(res.status).toBe(200);
+        expect(res.text).toContain(
+          `<script src="/api/agents/${SHARED_AGENT.id}/gateway/embed/bootstrap.js"></script>`,
+        );
+      },
+    );
+
+    it("gives a workspace editor the bootstrap script and its gateway credential", async () => {
+      mockSharedAgentLookup({ "member-1": "editor" });
+
+      const res = await request(app)
+        .get(
+          `/agents/${SHARED_AGENT.id}/gateway/embed/bootstrap.js?token=${encodeURIComponent(memberToken("member-1"))}`,
+        )
+        .set("Host", "nora.test");
+
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('"gateway-password"');
+    });
+
+    // A viewer gains nothing here today (the surface is owner-only), so holding
+    // the line at editor is not a regression — it keeps the runtime password
+    // away from the one role that cannot already operate the agent.
+    it("keeps the gateway embed away from a read-only workspace viewer", async () => {
+      mockSharedAgentLookup({ "member-1": "viewer" });
+
+      const res = await request(app)
+        .get(
+          `/agents/${SHARED_AGENT.id}/gateway/embed?token=${encodeURIComponent(memberToken("member-1"))}`,
+        )
+        .set("Host", "nora.test");
+
+      // 403, not 404: a viewer can already list this agent, so the role gap is
+      // the honest answer and hiding it would only be theatre.
+      expect(res.status).toBe(403);
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it("keeps the bootstrap credential away from a read-only workspace viewer", async () => {
+      mockSharedAgentLookup({ "member-1": "viewer" });
+
+      const res = await request(app)
+        .get(
+          `/agents/${SHARED_AGENT.id}/gateway/embed/bootstrap.js?token=${encodeURIComponent(memberToken("member-1"))}`,
+        )
+        .set("Host", "nora.test");
+
+      expect(res.status).toBe(403);
+      expect(res.text).not.toContain("gateway-password");
+    });
+
+    it("still hides the embed from a user with no membership in any sharing workspace", async () => {
+      mockSharedAgentLookup({ "member-1": "editor" });
+
+      const res = await request(app)
+        .get(
+          `/agents/${SHARED_AGENT.id}/gateway/embed?token=${encodeURIComponent(memberToken("stranger"))}`,
+        )
+        .set("Host", "nora.test");
+
+      expect(res.status).toBe(404);
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("Hermes dashboard embed", () => {
@@ -1791,6 +1917,145 @@ describe("Hermes dashboard embed", () => {
 
     expect(res.status).toBe(404);
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  describe("workspace-shared access", () => {
+    const OWNER_ID = "agent-owner";
+    const SHARED_AGENT = {
+      id: "agent-shared",
+      host: "10.0.0.44",
+      runtime_host: "10.0.0.44",
+      runtime_port: 8642,
+      runtime_family: "hermes",
+      backend_type: "docker",
+      deploy_target: "docker",
+      status: "running",
+      user_id: OWNER_ID,
+    };
+
+    // Stands in for the real `agents` lookup the embed proxy performs. It reads
+    // the SQL to decide *which* access model the query actually implements: a
+    // statement that never joins workspace_members can only ever authorize the
+    // agent's direct owner, which is exactly the bug these tests pin down.
+    function mockSharedAgentLookup(memberships) {
+      mockDb.query.mockImplementation(async (sql, params) => {
+        if (!/FROM agents/i.test(String(sql))) return { rows: [] };
+        const [agentId, userId, acceptableRoles] = params || [];
+        if (agentId !== SHARED_AGENT.id) return { rows: [] };
+        if (userId === OWNER_ID) {
+          return { rows: [{ ...SHARED_AGENT, effective_role: "owner" }] };
+        }
+        if (!/workspace_members/i.test(String(sql))) return { rows: [] };
+        const role = memberships[userId];
+        if (!role) return { rows: [] };
+        if (Array.isArray(acceptableRoles) && !acceptableRoles.includes(role)) {
+          return { rows: [] };
+        }
+        return { rows: [{ ...SHARED_AGENT, effective_role: role }] };
+      });
+    }
+
+    function memberToken(userId) {
+      return jwt.sign({ id: userId, role: "user" }, JWT_SECRET, { expiresIn: "1h" });
+    }
+
+    function mockDashboardHtml() {
+      global.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+        text: async () => "<html><head></head><body>ok</body></html>",
+      });
+    }
+
+    it.each(["viewer", "editor", "admin", "owner"])(
+      "serves the dashboard embed to a workspace %s who does not own the agent",
+      async (role) => {
+        mockSharedAgentLookup({ "member-1": role });
+        mockDashboardHtml();
+
+        const res = await request(app)
+          .get(
+            `/agents/${SHARED_AGENT.id}/hermes-ui/embed?token=${encodeURIComponent(memberToken("member-1"))}`,
+          )
+          .set("Host", "nora.test")
+          .set("Accept", "text/html");
+
+        expect(res.status).toBe(200);
+        expect(res.headers["set-cookie"]).toEqual(
+          expect.arrayContaining([
+            expect.stringContaining(`__nora_hermes_embed_${SHARED_AGENT.id}=`),
+          ]),
+        );
+      },
+    );
+
+    it("still hides the embed from a user with no access to the agent", async () => {
+      mockSharedAgentLookup({ "member-1": "editor" });
+
+      const res = await request(app)
+        .get(
+          `/agents/${SHARED_AGENT.id}/hermes-ui/embed?token=${encodeURIComponent(memberToken("stranger"))}`,
+        )
+        .set("Host", "nora.test");
+
+      expect(res.status).toBe(404);
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it("blocks a workspace viewer from writing through the embedded dashboard", async () => {
+      const agentClient = request.agent(app);
+      mockSharedAgentLookup({ "member-1": "viewer" });
+      mockDashboardHtml();
+
+      const htmlRes = await agentClient
+        .get(
+          `/agents/${SHARED_AGENT.id}/hermes-ui/embed?token=${encodeURIComponent(memberToken("member-1"))}`,
+        )
+        .set("Host", "nora.test");
+      expect(htmlRes.status).toBe(200);
+
+      global.fetch.mockClear();
+      const writeRes = await agentClient
+        .put(`/agents/${SHARED_AGENT.id}/hermes-ui/embed/api/config`)
+        .set("Host", "nora.test")
+        .send({ config: { model: "gpt-5.5" } });
+
+      // A viewer may read the dashboard but must not gain write capability the
+      // native Hermes panels reserve for editors.
+      expect(writeRes.status).toBe(403);
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it("lets a workspace editor write through the embedded dashboard", async () => {
+      const agentClient = request.agent(app);
+      mockSharedAgentLookup({ "member-1": "editor" });
+      mockDashboardHtml();
+
+      const htmlRes = await agentClient
+        .get(
+          `/agents/${SHARED_AGENT.id}/hermes-ui/embed?token=${encodeURIComponent(memberToken("member-1"))}`,
+        )
+        .set("Host", "nora.test");
+      expect(htmlRes.status).toBe(200);
+
+      global.fetch.mockClear();
+      global.fetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        arrayBuffer: async () => Buffer.from('{"ok":true}'),
+      });
+
+      const writeRes = await agentClient
+        .put(`/agents/${SHARED_AGENT.id}/hermes-ui/embed/api/config`)
+        .set("Host", "nora.test")
+        .send({ config: { model: "gpt-5.5" } });
+
+      expect(writeRes.status).toBe(200);
+      expect(global.fetch.mock.calls[0][0]).toBe("http://10.0.0.44:9119/api/config");
+      expect(global.fetch.mock.calls[0][1].method).toBe("PUT");
+    });
   });
 });
 
