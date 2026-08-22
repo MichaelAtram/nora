@@ -19,7 +19,7 @@ permissions:
   contents: read
   discussions: write
   issues: write
-  pull-requests: read
+  pull-requests: write
 
 concurrency:
   group: community-response-${{ github.event_name == 'schedule' && 'audit' || github.run_id }}
