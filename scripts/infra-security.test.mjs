@@ -1626,7 +1626,7 @@ test("community response automation acknowledges and escalates every public thre
   }
   assert.match(workflow, /^ {2}discussions: write$/m);
   assert.match(workflow, /^ {2}issues: write$/m);
-  assert.match(workflow, /^ {2}pull-requests: read$/m);
+  assert.match(workflow, /^ {2}pull-requests: write$/m);
   assert.match(workflow, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.match(workflow, /persist-credentials: false/);
   assert.match(workflow, /community-response\.mjs acknowledge/);
