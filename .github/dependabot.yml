@@ -32,6 +32,20 @@ updates:
       time: "07:00"
       timezone: Etc/UTC
     open-pull-requests-limit: 10
+    # sanitize-html 2.17.6+ depends on htmlparser2 v12, which is pure ESM with no
+    # CommonJS build. backend-api's Jest suite loads sanitize-html through
+    # agent-runtime's getSanitizeHtml(), and Jest's CJS sandbox cannot parse it —
+    # so any bump past 2.17.5 red-lines the suite. 2.17.5 already carries the
+    # GHSA-vccv-cmxp-4j9h fix, so holding here costs no security coverage.
+    #
+    # The exact "2.17.5" pin in package.json stops npm from drifting, but it does
+    # NOT stop Dependabot: a version update rewrites the manifest itself, and
+    # 2.17.5 -> 2.17.7 is a legitimate patch bump. This is the only place the
+    # constraint can be expressed. Lift both together once Jest can transform ESM
+    # dependencies, or once sanitize-html ships a CommonJS build again.
+    ignore:
+      - dependency-name: sanitize-html
+        versions: [">=2.17.6"]
     # Minor and patch updates land as one grouped PR per directory; majors stay
     # individual so a breaking bump is reviewed on its own.
     groups:
