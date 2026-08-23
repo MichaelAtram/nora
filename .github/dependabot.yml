@@ -59,15 +59,6 @@ updates:
       # and lift this once ts-jest and Next.js both support 7.
       - dependency-name: typescript
         versions: [">=7"]
-      # ioredis 6 has to follow a bullmq major, not precede it. bullmq@5.76.4
-      # pins ioredis to an exact 5.10.1, so bumping our direct dependency does
-      # not upgrade anything — it installs a SECOND copy
-      # (bullmq/node_modules/ioredis@5.10.1 alongside ioredis@6.0.0), leaving
-      # two Redis client implementations in one process while BullMQ, far and
-      # away the heaviest Redis user here, stays on v5. Revisit together with
-      # bullmq 6.x.
-      - dependency-name: ioredis
-        versions: [">=6"]
     # Minor and patch updates land as one grouped PR per directory; majors stay
     # individual so a breaking bump is reviewed on its own.
     groups:
