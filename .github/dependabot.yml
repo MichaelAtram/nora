@@ -1,0 +1,65 @@
+# Remediation half of the dependency-security loop.
+#
+# Detection already exists: GitHub Dependabot alerts are enabled repo-wide and
+# `.github/workflows/dependency-audit.yml` sweeps every package daily. What was
+# missing is anything that opens fix PRs on a predictable cadence — Dependabot
+# *security* updates alone declined the transitive npm bumps this repo needed
+# (js-yaml, nanoid, brace-expansion), even though a plain lockfile refresh
+# resolved them. Scheduled *version* updates close that gap by keeping parents
+# current instead of waiting for an advisory to force the issue.
+#
+# Every npm manifest in the repo is listed. When a new service is added, add its
+# directory here too, or it silently drops out of dependency maintenance.
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directories:
+      - /
+      - /admin-dashboard
+      - /agent-runtime
+      - /backend-api
+      - /cli
+      - /e2e
+      - /frontend-dashboard
+      - /frontend-marketing
+      - /mcp-server
+      - /workers/backup
+      - /workers/provisioner
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    # Minor and patch updates land as one grouped PR per directory; majors stay
+    # individual so a breaking bump is reviewed on its own.
+    groups:
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore
+      include: scope
+    labels:
+      - dependencies
+
+  # Actions are SHA-pinned across every workflow, so they never drift on their
+  # own — without this they stay frozen at whatever SHA was first pinned.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
