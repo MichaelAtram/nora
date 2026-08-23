@@ -238,8 +238,20 @@ jobs:
           cache-dependency-path: e2e/package-lock.json
       - run: npm ci
         working-directory: e2e
+      # The runner image ships browsers built for one exact Playwright version,
+      # so a hardcoded tag silently drifts the moment @playwright/test is bumped
+      # and every spec dies with "Executable doesn't exist at /ms-playwright/...".
+      # Deriving the tag from the installed package keeps them in lockstep.
+      - name: Resolve Playwright runner image
+        id: playwright-image
+        working-directory: e2e
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('@playwright/test/package.json').version")"
+          echo "image=mcr.microsoft.com/playwright:v${version}-noble" >> "$GITHUB_OUTPUT"
+          echo "Using Playwright runner image for @playwright/test ${version}"
       - name: Pull Playwright runner image
-        run: docker pull mcr.microsoft.com/playwright:v1.59.1-noble
+        run: docker pull "${{ steps.playwright-image.outputs.image }}"
       - name: Start compose stack
         run: docker compose -f docker-compose.e2e.yml up -d --build
       - name: Wait for Nora stack
@@ -261,7 +273,7 @@ jobs:
             -e CI \
             -v "${{ github.workspace }}:/work" \
             -w /work/e2e \
-            mcr.microsoft.com/playwright:v1.59.1-noble \
+            "${{ steps.playwright-image.outputs.image }}" \
             npx playwright test
       - name: Capture compose diagnostics
         if: failure()
