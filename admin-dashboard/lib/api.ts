@@ -25,6 +25,21 @@ function currentOperatorPath(path: string) {
 // the cookie on every API call. The Authorization header is still sent when
 // a legacy localStorage token exists, so sessions from before the cookie
 // migration keep working until they expire or the user logs in again.
+// CodeQL flags the fetch() below as request forgery, and the concern is real
+// even though every current caller passes a relative /api/... path: the legacy
+// Authorization header is attached unconditionally, so an absolute URL reaching
+// this function would hand a bearer token to another origin. Resolving against
+// the current origin and returning a path-only URL makes the request
+// same-origin by construction and rejects anything that tries to leave.
+function sameOriginPath(url: string): string {
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://nora.invalid";
+  const resolved = new URL(url, origin);
+  if (resolved.origin !== origin) {
+    throw new Error(`Refusing to send an authenticated request to ${resolved.origin}`);
+  }
+  return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+}
+
 export async function fetchWithAuth(url: string, options: FetchOptions = {}) {
   const legacyToken = typeof window !== "undefined" ? localStorage.getItem("token") : null;
   const headers: FetchHeaders = { ...(options.headers || {}) };
@@ -38,7 +53,7 @@ export async function fetchWithAuth(url: string, options: FetchOptions = {}) {
   ) {
     headers["Content-Type"] = "application/json";
   }
-  const res = await fetch(url, {
+  const res = await fetch(sameOriginPath(url), {
     ...options,
     headers,
     credentials: "include",
