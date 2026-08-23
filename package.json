@@ -16,7 +16,7 @@
     "ci:format:write": "prettier --write",
     "ci:license-check": "node .github/workflows/scripts/license-check.mjs",
     "ci:lint": "eslint --ext .js,.jsx,.ts,.tsx,.cjs,.mjs --max-warnings=0",
-    "ci:secret-scan": "node .github/workflows/scripts/scan-sensitive-config.mjs",
+    "ci:secret-scan": "node .github/workflows/scripts/scan-sensitive-config.mjs && node .github/workflows/scripts/scan-secrets.mjs && node --test .github/workflows/scripts/scan-secrets.test.mjs",
     "ci:validate-infra": "node .github/workflows/scripts/validate-infra.mjs && node --test scripts/infra-security.test.mjs"
   },
   "devDependencies": {
