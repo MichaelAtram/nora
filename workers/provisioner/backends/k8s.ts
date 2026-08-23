@@ -698,7 +698,9 @@ class K8sBackend extends ProvisionerBackend {
     try {
       parsed = JSON.parse(raw);
     } catch (error) {
-      throw new Error(`Kubernetes service annotations must be valid JSON: ${error.message}`);
+      throw new Error(`Kubernetes service annotations must be valid JSON: ${error.message}`, {
+        cause: error,
+      });
     }
 
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
