@@ -281,7 +281,9 @@ async function resolveGatewayHostForProxy(
   try {
     addresses = await dns.lookup(normalizedHost, { all: true, verbatim: true });
   } catch (error) {
-    throw new Error(`${label} host could not be resolved (${error.code || error.message})`);
+    throw new Error(`${label} host could not be resolved (${error.code || error.message})`, {
+      cause: error,
+    });
   }
 
   const firstAllowed = addresses.find(
