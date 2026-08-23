@@ -46,6 +46,28 @@ updates:
     ignore:
       - dependency-name: sanitize-html
         versions: [">=2.17.6"]
+      # TypeScript 7 is blocked on two independent toolchain gaps, in different
+      # packages, so it cannot land anywhere useful yet:
+      #   - ts-jest caps its typescript peer at ">=4.3 <7" in every published
+      #     version including the latest (29.4.12), so `npm ci` in backend-api
+      #     fails ERESOLVE outright.
+      #   - Next.js 16 crashes during `next build` under TS 7 ("The id argument
+      #     must be of type string"), taking out all three dashboards.
+      # The five remaining packages would compile, but all nine share
+      # tsconfig.base.json — running two compiler majors against one shared
+      # config invites divergence for no benefit. Hold the whole monorepo on 6
+      # and lift this once ts-jest and Next.js both support 7.
+      - dependency-name: typescript
+        versions: [">=7"]
+      # ioredis 6 has to follow a bullmq major, not precede it. bullmq@5.76.4
+      # pins ioredis to an exact 5.10.1, so bumping our direct dependency does
+      # not upgrade anything — it installs a SECOND copy
+      # (bullmq/node_modules/ioredis@5.10.1 alongside ioredis@6.0.0), leaving
+      # two Redis client implementations in one process while BullMQ, far and
+      # away the heaviest Redis user here, stays on v5. Revisit together with
+      # bullmq 6.x.
+      - dependency-name: ioredis
+        versions: [">=6"]
     # Minor and patch updates land as one grouped PR per directory; majors stay
     # individual so a breaking bump is reviewed on its own.
     groups:
