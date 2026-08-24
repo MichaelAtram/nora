@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      NORA_ENV_FILE: .env.test
+      NORA_ENV_FILE: .env.ci-k8s
       # The smoke script's EXIT trap tears down compose and deletes the kind
       # cluster. On a failure that destroys exactly the state worth looking at
       # before the diagnostics step can read it. The runner is ephemeral, so
@@ -61,11 +61,29 @@ jobs:
           cache-dependency-path: e2e/package-lock.json
       - run: npm ci
         working-directory: e2e
+      # docker-compose.yml binds six secret FILES out of .secrets/compose, which
+      # is gitignored and normally produced by setup.sh. Without them the stack
+      # dies before Kubernetes is ever reached ("bind source path does not
+      # exist: .secrets/compose/DB_PASSWORD"). .env.test supplies JWT_SECRET,
+      # ENCRYPTION_KEY and DB_PASSWORD but leaves the other three empty, and the
+      # materializer refuses to write an empty secret, so generate those here.
+      # Throwaway values for a throwaway cluster on an ephemeral runner.
+      - name: Materialize compose secrets
+        run: |
+          set -euo pipefail
+          cp .env.test .env.ci-k8s
+          {
+            echo "NORA_BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)"
+            echo "NORA_AGENT_HUB_API_KEY_HASH_SECRET=$(openssl rand -hex 32)"
+            echo "NORA_API_KEY_HASH_SECRET=$(openssl rand -hex 32)"
+          } >> .env.ci-k8s
+          bash scripts/materialize-compose-secrets.sh .env.ci-k8s
       - name: Run Kind Kubernetes smoke
         run: npm run smoke:k8s-kind
         working-directory: e2e
       - name: Capture diagnostics
         if: failure()
+        continue-on-error: true
         run: |
           set +e
           mkdir -p k8s-smoke-artifacts
@@ -76,6 +94,7 @@ jobs:
           docker ps -a > k8s-smoke-artifacts/docker-ps.txt 2>&1
           docker logs nora-kind-backend-api-1 > k8s-smoke-artifacts/backend-api.log 2>&1
           docker logs nora-kind-worker-provisioner-1 > k8s-smoke-artifacts/worker-provisioner.log 2>&1
+          exit 0
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
