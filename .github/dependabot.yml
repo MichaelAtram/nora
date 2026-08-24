@@ -59,24 +59,6 @@ updates:
       # and lift this once ts-jest and Next.js both support 7.
       - dependency-name: typescript
         versions: [">=7"]
-      # @kubernetes/client-node 2.0.0 cannot be validated with what we have, and
-      # the Kubernetes adapter is a GA deploy target — the wrong place to land an
-      # unverified major.
-      #
-      # The surface checks are reassuring: all 29 API methods and 8 constructors
-      # we call exist in 2.0.0, arity is unchanged from 1.4.0, and k8s.ts already
-      # reads results defensively (`res?.body || res`), so a body-unwrapping
-      # change would not break it. But none of that exercises auth, error shapes,
-      # or the Exec/Log streaming paths, which are where this library has broken
-      # across majors.
-      #
-      # Nothing else covers it either: workers/provisioner/backends/k8s.ts is
-      # @ts-nocheck so typecheck offers no protection, the unit suites mock the
-      # client entirely, and no CI workflow runs e2e's kind smoke. Lift this
-      # after `cd e2e && npm run smoke:k8s-kind` passes against 2.x, or after a
-      # deploy/exec/logs check on a real cluster.
-      - dependency-name: "@kubernetes/client-node"
-        versions: [">=2"]
     # Minor and patch updates land as one grouped PR per directory; majors stay
     # individual so a breaking bump is reviewed on its own.
     groups:
