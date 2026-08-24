@@ -1238,6 +1238,9 @@ app.use(createGatewayRouter());
 // ─── Protected Routes ─────────────────────────────────────────────
 app.use("/agents", require("./routes/agents"));
 app.use("/agents", require("./routes/backups"));
+// Account-scoped backup access by backup id. The agent-scoped router above
+// cannot reach a backup once its source agent is deleted (#338).
+app.use("/backups", require("./routes/accountBackups"));
 app.use("/agents", require("./routes/agentFiles"));
 app.use("/agents", require("./routes/channels"));
 app.use("/agents", require("./routes/nemoclaw"));
