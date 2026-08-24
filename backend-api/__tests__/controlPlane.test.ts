@@ -722,10 +722,38 @@ describe("gateway control-plane embed", () => {
     delete process.env.GATEWAY_HOST;
   });
 
+  // The embed role check used to read `effective_role || "owner"`, so a row
+  // without a role was treated as the owner's and cleared every threshold. Both
+  // production lookups go through buildAccessibleAgentQuery, which always
+  // projects a role, so that default was unreachable — but it failed open: any
+  // future projection that dropped the column would have silently promoted every
+  // caller to owner-level. It now denies instead.
+  it("denies an embed whose lookup returned no effective_role instead of assuming owner", async () => {
+    mockDb.query.mockResolvedValueOnce({
+      rows: [
+        {
+          host: "10.0.0.10",
+          gateway_token: "gateway-password",
+          gateway_host_port: null,
+          status: "running",
+          // effective_role deliberately absent.
+        },
+      ],
+    });
+
+    const res = await request(app)
+      .get(`/agents/agent-1/gateway/embed?token=${encodeURIComponent(token)}`)
+      .set("Host", "nora.test");
+
+    expect(res.status).toBe(403);
+  });
+
   it("proxies the gateway UI, sets an embed session cookie, and injects the bootstrap script", async () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: null,
@@ -781,6 +809,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: null,
@@ -814,6 +844,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "enc(gateway-password)",
           gateway_host_port: null,
@@ -910,6 +942,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: 19123,
@@ -942,6 +976,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: 19123,
@@ -977,6 +1013,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: 19123,
@@ -1012,6 +1050,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: 19123,
@@ -1044,6 +1084,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: 19123,
@@ -1064,6 +1106,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_token: "gateway-password",
           gateway_host_port: 19123,
@@ -1087,6 +1131,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "203.0.113.5",
           gateway_token: "gateway-password",
           gateway_host: "203.0.113.5",
@@ -1112,6 +1158,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "203.0.113.5",
           gateway_host: "203.0.113.5",
           gateway_port: 18789,
@@ -1136,6 +1184,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_host_port: 19123,
           status: "warning",
@@ -1167,6 +1217,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_host_port: 19123,
           status: "running",
@@ -1197,6 +1249,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_host_port: null,
           status: "running",
@@ -1225,6 +1279,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_host_port: 19123,
           status: "stopped",
@@ -1244,6 +1300,8 @@ describe("gateway control-plane embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.10",
           gateway_host_port: 19123,
           status: "error",
@@ -1309,6 +1367,8 @@ describe("gateway control-plane embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.10",
             gateway_token: "gateway-password",
             gateway_host_port: null,
@@ -1319,6 +1379,8 @@ describe("gateway control-plane embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.10",
             gateway_token: "gateway-password",
             gateway_host_port: null,
@@ -1329,6 +1391,8 @@ describe("gateway control-plane embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.10",
             gateway_token: "gateway-password",
             gateway_host_port: null,
@@ -1544,6 +1608,8 @@ describe("Hermes dashboard embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.40",
             runtime_host: "10.0.0.40",
             runtime_port: 8642,
@@ -1556,6 +1622,8 @@ describe("Hermes dashboard embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.40",
             runtime_host: "10.0.0.40",
             runtime_port: 8642,
@@ -1568,6 +1636,8 @@ describe("Hermes dashboard embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.40",
             runtime_host: "10.0.0.40",
             runtime_port: 8642,
@@ -1580,6 +1650,8 @@ describe("Hermes dashboard embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.40",
             runtime_host: "10.0.0.40",
             runtime_port: 8642,
@@ -1698,6 +1770,8 @@ describe("Hermes dashboard embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.41",
             runtime_host: "10.0.0.41",
             runtime_port: 8642,
@@ -1710,6 +1784,8 @@ describe("Hermes dashboard embed", () => {
       .mockResolvedValueOnce({
         rows: [
           {
+            // buildAccessibleAgentQuery always projects a role; model that.
+            effective_role: "owner",
             host: "10.0.0.41",
             runtime_host: "10.0.0.41",
             runtime_port: 8642,
@@ -1775,6 +1851,8 @@ describe("Hermes dashboard embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.42",
           runtime_host: "10.0.0.42",
           runtime_port: 8642,
@@ -1850,6 +1928,8 @@ describe("Hermes dashboard embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.43",
           runtime_host: "10.0.0.43",
           runtime_port: 8642,
@@ -1901,6 +1981,8 @@ describe("Hermes dashboard embed", () => {
     mockDb.query.mockResolvedValueOnce({
       rows: [
         {
+          // buildAccessibleAgentQuery always projects a role; model that.
+          effective_role: "owner",
           host: "10.0.0.40",
           runtime_host: "10.0.0.40",
           runtime_port: 8642,

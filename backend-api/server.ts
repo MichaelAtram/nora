@@ -587,11 +587,15 @@ async function resolveEmbedAccess(
     return null;
   }
 
-  // Owner-only lookups return no effective_role; the row *is* the owner's, so
-  // it satisfies every threshold. Workspace-aware lookups carry the caller's
-  // highest sharing role, which must clear this request's bar. 403 (not 404) is
-  // correct here: the caller already knows the agent exists.
-  if (!roleSatisfies(agent.effective_role || "owner", requiredRole)) {
+  // Both lookups that reach here (lookupEmbedAgent, lookupHermesEmbedAgent) go
+  // through buildAccessibleAgentQuery, whose CASE and WHERE together guarantee a
+  // non-null effective_role on every row it returns. So treat a missing role as
+  // a bug and deny, rather than defaulting it to "owner": the default was
+  // unreachable, and if a projection ever drops the column it would silently
+  // promote every caller to owner-level instead of failing visibly.
+  //
+  // 403 (not 404) is correct here: the caller already knows the agent exists.
+  if (!roleSatisfies(agent.effective_role, requiredRole)) {
     res.status(403).send("insufficient workspace permissions for this agent");
     return null;
   }
