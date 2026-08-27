@@ -8,6 +8,11 @@ const {
   buildPostgresConfig,
   createRedisClient,
 } = require("../../backend-api/lib/connectionConfig");
+const {
+  advisoryLockBusyError,
+  advisoryLockClientOptions,
+  isAdvisoryLockTimeout,
+} = require("../../backend-api/lib/advisoryLocks");
 const { getDefaultAgentImage } = require("../../agent-runtime/lib/agentImages");
 const { NEMOCLAW_DEFAULT_MODEL } = require("../../agent-runtime/lib/nemoclawDefaults");
 const {
@@ -151,7 +156,16 @@ function createProvisionerLockClient(scope) {
     ...process.env,
     DB_APPLICATION_NAME: `nora-worker-provisioner-${scope}`,
   });
-  return new Client(clientConfig);
+  // Bound every lock wait on these dedicated lock sessions. The provider
+  // mutation lock acquires with a blocking pg_advisory_lock, so without this a
+  // stuck holder makes the worker wait forever behind it (#406).
+  return new Client({
+    ...clientConfig,
+    options: advisoryLockClientOptions(
+      process.env.PROVISIONER_LOCK_TIMEOUT_MS,
+      clientConfig.options,
+    ),
+  });
 }
 
 // Hash any agent ID (uuid string or integer) to a signed 64-bit BigInt suitable
@@ -178,9 +192,29 @@ function advisoryLockKeyForAgent(agentId) {
  * to the pg client's session: a worker crash drops the connection and the
  * lock is released by Postgres automatically.
  */
+// Ceiling on how long one job may hold a per-agent provision lock. Set above
+// the deployment job timeout so it never interrupts a provision that is merely
+// slow — it exists for the case where the guarded work never returns at all and
+// the lock would otherwise be held until the process restarts (#406).
+function agentProvisionMaxHoldMs() {
+  const configured = Number.parseInt(process.env.PROVISION_LOCK_MAX_HOLD_MS, 10);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  const jobTimeout = Number.parseInt(
+    process.env.DEPLOYMENT_JOB_TIMEOUT_MS || process.env.PROVISION_TIMEOUT_MS,
+    10,
+  );
+  const base = Number.isFinite(jobTimeout) && jobTimeout > 0 ? jobTimeout : 900000;
+  return base + 300000;
+}
+
 async function acquireAgentProvisionLock(agentId) {
   const lockKey = advisoryLockKeyForAgent(agentId);
   return acquireDedicatedSessionLock({
+    maxHoldMs: agentProvisionMaxHoldMs(),
+    onHoldTimeout: (budgetMs) =>
+      console.error(
+        `[provisioner] Provision lock for agent ${agentId} exceeded ${budgetMs}ms and is being released by closing its session. The guarded provisioning work never completed; the job will fail and retry.`,
+      ),
     createClient: () => createProvisionerLockClient("agent-lock"),
     acquire: (client) =>
       client.query("SELECT pg_try_advisory_lock($1) AS locked", [lockKey.toString()]),
@@ -207,8 +241,19 @@ async function withProviderMutationLock(userId, operation) {
   const lockKey = providerMutationLockKey(userId);
   const lock = await acquireDedicatedSessionLock({
     createClient: () => createProvisionerLockClient("provider-mutation-lock"),
-    acquire: (client) =>
-      client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [lockKey]),
+    acquire: async (client) => {
+      try {
+        return await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [lockKey]);
+      } catch (error) {
+        if (isAdvisoryLockTimeout(error)) {
+          throw advisoryLockBusyError(
+            `Provider state for user ${userId} is locked by another operation`,
+            { code: "PROVIDER_MUTATION_LOCK_BUSY" },
+          );
+        }
+        throw error;
+      }
+    },
     release: (client) =>
       client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey]),
     onReleaseError: (error) =>
