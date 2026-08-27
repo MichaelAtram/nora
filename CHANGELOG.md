@@ -4,6 +4,69 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.18.0](https://github.com/solomon2773/nora/releases/tag/v1.18.0) — 2026-08-27
+
+Reliability and supply-chain hardening release: agents that previously needed manual repair now come
+up working (Hermes gateway auth, remote-docker connection details), stranded database locks no longer
+wedge deploys and provider saves, backups stay restorable after their agent is deleted, and the
+installer stops building runtimes you declined. Dependency, secret, and code scanning are now wired
+end to end.
+
+### Added
+
+- **Account-level backups**: a backup now outlives the agent it came from. New account routes
+  (`GET /backups`, `GET /backups/{id}/download`, `DELETE /backups/{id}`,
+  `POST /backups/{id}/restore`) list every backup you own, report whether the source agent still
+  exists, and restore an orphaned backup into a new agent. The service layer already supported
+  agent-less backups — only the routing was missing.
+- **Runtime opt-out during setup**: `setup.sh` and `setup.ps1` now ask whether you want OpenClaw
+  rather than assuming it, carry forward the runtime families already recorded in `.env` on re-runs
+  (previously they were pinned off, silently discarding earlier choices), only offer NemoClaw when
+  OpenClaw is enabled, and skip building images for runtimes you declined.
+- **CLI JSON output**: the `agents` and `monitoring` commands can emit JSON for scripting and
+  automation. Thanks to @har5h1tha.
+- **Dependabot configuration**: `.github/dependabot.yml` covers all eleven npm manifests plus GitHub
+  Actions. Two workflows already delegated remediation to Dependabot, but no configuration existed
+  for it to act on.
+
+### Fixed
+
+- **Hermes agents no longer 401 out of the box**: the runtime bootstrap reconciles `API_SERVER_KEY`
+  into the Hermes environment before the gateway starts, so a freshly deployed agent is reachable
+  without hand-editing it. Reconciliation is best-effort and can never stop the runtime from
+  starting.
+- **Stranded advisory locks no longer wedge deploys and provider saves**: PostgreSQL advisory-lock
+  acquisitions now run under an explicit `lock_timeout` and surface a clean timeout instead of
+  blocking forever, and long-held locks are released by a hold watchdog. Applied to LLM provider
+  saves, agent routes, the provisioner worker, and dedicated-session deployment locks.
+- **Agent migration drafts no longer erase their own id**: the draft preview stopped emitting a null
+  `id` that overwrote the real row value.
+- **remote-docker agents report a reachable host**: gateway and runtime endpoints now point at the
+  registered host rather than the Docker daemon's internal view of itself.
+- **Agent runtime consoles resolve through workspace membership**, so workspace members can reach
+  the consoles they are entitled to. Thanks to @MichaelAtram.
+- Embeds with no resolved role are denied instead of being treated as owner.
+- Closed the request-forgery gaps CodeQL flagged in the dashboards, pinning the validated origin
+  instead of returning a bare path.
+- Admin form fields announce their label instead of label plus hint to screen readers.
+
+### Security
+
+- **Repo-wide secret scanning** runs in the blocking `Security gate` alongside the existing config
+  linter, matching provider credential formats and Nora's own secret keys by assignment — with no
+  generic entropy heuristics, so it stays quiet enough to be trusted.
+- **CodeQL coverage widened to every shipped package**, including `cli/` and `mcp-server/`, which
+  were previously unscanned.
+- Pinned `sanitize-html` to 2.17.5 (2.17.6+ pulls an ESM-only `htmlparser2` that Jest cannot load)
+  and made the `postcss` override self-referencing so installs stop failing.
+
+### Infrastructure
+
+- The Kubernetes Kind smoke test runs in CI as a dispatch-only job and reports what it found, and it
+  validates `@kubernetes/client-node` 2 compatibility.
+- The Playwright runner image is derived from the installed package, so the runner and library can no
+  longer drift apart.
+
 ## [v1.17.0](https://github.com/solomon2773/nora/releases/tag/v1.17.0) — 2026-08-08
 
 Hermes feature release: a complete skills pipeline (browse the Skills Hub, curate an instance
