@@ -1115,7 +1115,7 @@ class DockerBackend extends ProvisionerBackend {
     }
   }
 
-  async destroy(containerId, { agentId: requestedAgentId } = {}) {
+  async destroy(containerId, { agentId: requestedAgentId, preserveState = false } = {}) {
     console.log(`[docker] Destroying container ${containerId}`);
     const container = this.docker.getContainer(containerId);
 
@@ -1145,7 +1145,15 @@ class DockerBackend extends ProvisionerBackend {
       console.log(`[docker] Container ${containerId} already absent`);
     }
 
-    if (agentId) {
+    // The redeploy path destroys the previous runtime and immediately recreates
+    // it, so honour preserveState here: nora_agent_home_* is the agent's real
+    // state root (/root/.openclaw), not scratch space. Only a true delete —
+    // which passes preserveState:false explicitly — may remove these.
+    if (agentId && preserveState) {
+      console.log(
+        `[docker] Preserving Nora-managed volumes for agent ${agentId} (state-preserving destroy)`,
+      );
+    } else if (agentId) {
       const volumeCleanupFailures = [];
       for (const volume of [`nora_agent_state_${agentId}`, `nora_agent_home_${agentId}`]) {
         try {

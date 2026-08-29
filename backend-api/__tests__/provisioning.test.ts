@@ -2098,6 +2098,26 @@ describe("docker gateway port allocation (BYOC Phase B)", () => {
     expect(removeVolume).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps agent volumes when the destroy is a redeploy (preserveState)", async () => {
+    const backend = mockDockerBackend();
+    const removeVolume = jest.fn().mockResolvedValue({});
+    backend.docker.getContainer.mockReturnValue({
+      inspect: jest.fn().mockResolvedValue({ Config: { Labels: {} }, State: { Running: true } }),
+      stop: jest.fn().mockResolvedValue({}),
+      remove: jest.fn().mockResolvedValue({}),
+    });
+    backend.docker.getVolume.mockImplementation(() => ({ remove: removeVolume }));
+
+    // The redeploy path destroys the previous runtime and immediately recreates
+    // it. Removing /root/.openclaw here erases the agent's real state root.
+    await expect(
+      backend.destroy("cid", { agentId: "agent-1", preserveState: true }),
+    ).resolves.toBeUndefined();
+
+    expect(backend.docker.getVolume).not.toHaveBeenCalled();
+    expect(removeVolume).not.toHaveBeenCalled();
+  });
+
   it("treats already-absent agent volumes as idempotent destroy success", async () => {
     const backend = mockDockerBackend();
     const notFound = Object.assign(new Error("No such volume"), { statusCode: 404 });

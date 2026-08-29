@@ -574,6 +574,18 @@ async function failDeploymentForUnresolvedRuntime({
   throw unresolvedError;
 }
 
+/**
+ * Tear down a runtime this job provisioned after the deploy failed or was
+ * canceled.
+ *
+ * `preserveState` defaults to true because this is a rollback, not a delete:
+ * the agent row normally survives and the deploy is retried, so removing the
+ * data volume would turn a recoverable failure into permanent data loss. Only
+ * a caller that has positively established the agent is gone may pass false.
+ * The cost of that default is an empty volume left behind by a first deploy
+ * that never succeeded; create() reuses it idempotently and agent deletion
+ * removes it.
+ */
 async function cleanupProvisionedRuntimeAfterFailure({
   queryable = db,
   provisioner,
@@ -581,6 +593,7 @@ async function cleanupProvisionedRuntimeAfterFailure({
   containerId,
   destroyAllowed = true,
   persistIdentity = true,
+  preserveState = true,
 } = {}) {
   if (!containerId) {
     return { destroyed: false, reason: "no-runtime", retrySafe: true };
@@ -612,7 +625,7 @@ async function cleanupProvisionedRuntimeAfterFailure({
   }
 
   try {
-    await provisioner.destroy(containerId, { agentId });
+    await provisioner.destroy(containerId, { agentId, preserveState });
   } catch (error) {
     console.error(
       `[provisioner] Failed to clean runtime ${containerId} for agent ${agentId}: ${error.message}`,
@@ -682,6 +695,40 @@ async function reconcileProvisioningFailureRuntime({
   return { ...cleanup, containerId: unresolvedContainerId };
 }
 
+/**
+ * Establish whether an agent row still exists, failing safe.
+ *
+ * An unreadable database is not proof of deletion, so an error reports the
+ * agent as present — the caller uses this to decide whether erasing durable
+ * state is authorized.
+ *
+ * @param {Object} queryable - Database client.
+ * @param {string} agentId - Agent whose row is probed.
+ * @returns {Promise<boolean>} True when the row exists or cannot be checked.
+ */
+async function agentRowStillExists(queryable, agentId) {
+  if (!agentId) return false;
+  try {
+    const result = await queryable.query("SELECT id FROM agents WHERE id = $1", [agentId]);
+    return Boolean(result.rows[0]);
+  } catch (error) {
+    console.error(
+      `[provisioner] Could not confirm whether agent ${agentId} still exists (${error.message}); preserving durable state`,
+    );
+    return true;
+  }
+}
+
+/**
+ * Clean up a runtime whose deploy was canceled mid-flight.
+ *
+ * A cancel covers two very different situations. Either the agent really was
+ * deleted, in which case its durable state should go with it, or the job simply
+ * lost a compare-and-swap because something else touched the row — a
+ * replacement deploy, or a background status sweep landing inside the deploy
+ * window. Only the first authorizes erasing the data volume, so require the
+ * agent row to be positively absent before destroying state.
+ */
 async function cleanupCanceledProvisionedRuntime({
   queryable = db,
   provisioner,
@@ -689,11 +736,18 @@ async function cleanupCanceledProvisionedRuntime({
   containerId,
   reason,
 } = {}) {
+  const agentPresent = await agentRowStillExists(queryable, agentId);
+  if (agentPresent) {
+    console.warn(
+      `[provisioner] Cancel cleanup for agent ${agentId} (${reason || "unspecified"}): agent row still exists, so this is a lost compare-and-swap rather than a delete; preserving durable state`,
+    );
+  }
   const cleanup = await cleanupProvisionedRuntimeAfterFailure({
     queryable,
     provisioner,
     agentId,
     containerId,
+    preserveState: agentPresent,
   });
   if (!cleanup.retrySafe) {
     const error = buildUnresolvedRuntimeError({
@@ -5538,6 +5592,7 @@ module.exports = {
   buildProvisionerExecCleanupCommand,
   buildTrackedProvisionerCommand,
   buildUnresolvedRuntimeError,
+  cleanupCanceledProvisionedRuntime,
   cleanupProvisionedRuntimeAfterFailure,
   failDeploymentForUnresolvedRuntime,
   fetchDeploymentProvider,

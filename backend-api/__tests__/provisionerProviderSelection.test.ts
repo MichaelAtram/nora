@@ -129,6 +129,7 @@ const {
   allocateAvailableLocalDockerGatewayPort,
   buildUnresolvedRuntimeError,
   cleanupProvisionedRuntimeAfterFailure,
+  cleanupCanceledProvisionedRuntime,
   fetchDeploymentProvider,
   fetchUserLlmEnvVars,
   guardRemoteProvisioner,
@@ -1550,6 +1551,8 @@ describe("provisioner deployment lifecycle", () => {
     expect(mockGetDeploymentProvider).toHaveBeenCalledWith("user-1", null, mockWorkerDb);
     expect(mockRemoteProvisioner.destroy).toHaveBeenCalledWith("remote-container-1", {
       agentId: "agent-1",
+      // Rollback of a failed deploy, not a delete: durable state must survive.
+      preserveState: true,
     });
     expect(mockWorkerDb.query).toHaveBeenCalledWith(
       expect.stringMatching(/SET container_id = NULL/),
@@ -2058,6 +2061,8 @@ describe("provisioner deployment lifecycle", () => {
 
     expect(provisioner.destroy).toHaveBeenCalledWith("nora-oclaw-agent-1", {
       agentId: "agent-1",
+      // Rollback of a failed deploy, not a delete: durable state must survive.
+      preserveState: true,
     });
     expect(queryable.query).toHaveBeenCalledWith(expect.stringMatching(/SET container_id = NULL/), [
       "agent-1",
@@ -2185,5 +2190,92 @@ describe("provisioner deployment lifecycle", () => {
       )?.[0],
     ).toMatch(/\buser_id\b/);
     expect(mockLockClient.end).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("provisioner runtime cleanup state safety", () => {
+  it("preserves durable state when rolling back a failed deploy", async () => {
+    const provisioner = { destroy: jest.fn().mockResolvedValue(undefined) };
+    const queryable = { query: jest.fn().mockResolvedValue({ rows: [{ id: "agent-1" }] }) };
+
+    await cleanupProvisionedRuntimeAfterFailure({
+      queryable,
+      provisioner,
+      agentId: "agent-1",
+      containerId: "nora-hermes-agent-1",
+    });
+
+    // A failed deploy is retried; erasing the volume turns a recoverable
+    // failure into permanent data loss.
+    expect(provisioner.destroy).toHaveBeenCalledWith(
+      "nora-hermes-agent-1",
+      expect.objectContaining({ agentId: "agent-1", preserveState: true }),
+    );
+  });
+
+  it("preserves durable state when a cancel is really a lost compare-and-swap", async () => {
+    const provisioner = { destroy: jest.fn().mockResolvedValue(undefined) };
+    // The agent row still exists — the deploy lost its CAS because something
+    // else (a status sweep, a replacement) touched the row mid-deploy.
+    const queryable = { query: jest.fn().mockResolvedValue({ rows: [{ id: "agent-1" }] }) };
+
+    await cleanupCanceledProvisionedRuntime({
+      queryable,
+      provisioner,
+      agentId: "agent-1",
+      containerId: "nora-hermes-agent-1",
+      reason: "agent-deleted-before-metadata-persistence",
+    });
+
+    expect(provisioner.destroy).toHaveBeenCalledWith(
+      "nora-hermes-agent-1",
+      expect.objectContaining({ agentId: "agent-1", preserveState: true }),
+    );
+  });
+
+  it("removes durable state only with positive proof the agent row is gone", async () => {
+    const provisioner = { destroy: jest.fn().mockResolvedValue(undefined) };
+    const queryable = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [] }) // existence probe: agent truly deleted
+        .mockResolvedValue({ rows: [{ id: "agent-1" }] }),
+    };
+
+    await cleanupCanceledProvisionedRuntime({
+      queryable,
+      provisioner,
+      agentId: "agent-1",
+      containerId: "nora-hermes-agent-1",
+      reason: "agent-deleted-during-create",
+    });
+
+    expect(provisioner.destroy).toHaveBeenCalledWith(
+      "nora-hermes-agent-1",
+      expect.objectContaining({ agentId: "agent-1", preserveState: false }),
+    );
+  });
+
+  it("fails safe and preserves state when the existence probe errors", async () => {
+    const provisioner = { destroy: jest.fn().mockResolvedValue(undefined) };
+    const queryable = {
+      query: jest
+        .fn()
+        .mockRejectedValueOnce(new Error("database unavailable"))
+        .mockResolvedValue({ rows: [{ id: "agent-1" }] }),
+    };
+
+    await cleanupCanceledProvisionedRuntime({
+      queryable,
+      provisioner,
+      agentId: "agent-1",
+      containerId: "nora-hermes-agent-1",
+      reason: "agent-deleted-before-readiness-finalization",
+    });
+
+    expect(provisioner.destroy).toHaveBeenCalledWith(
+      "nora-hermes-agent-1",
+      expect.objectContaining({ preserveState: true }),
+    );
   });
 });
