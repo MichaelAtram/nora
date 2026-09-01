@@ -136,6 +136,8 @@ const {
   isFinalDeploymentAttempt,
   persistProvisioningFailure,
   prepareReplacementRuntime,
+  reconcileProvisioningFailureRuntime,
+  shouldPreserveDurableState,
   resolveCanonicalDeploymentOwnerUserId,
   runProvisionerExecCommand,
   seedHermesArchiveForDeployment,
@@ -1550,6 +1552,9 @@ describe("provisioner deployment lifecycle", () => {
     expect(mockGetDeploymentProvider).toHaveBeenCalledWith("user-1", null, mockWorkerDb);
     expect(mockRemoteProvisioner.destroy).toHaveBeenCalledWith("remote-container-1", {
       agentId: "agent-1",
+      // Revoking a host grant retires the runtime; it must not delete the
+      // agent's durable state, because the agent itself still exists.
+      preserveState: true,
     });
     expect(mockWorkerDb.query).toHaveBeenCalledWith(
       expect.stringMatching(/SET container_id = NULL/),
@@ -2058,6 +2063,7 @@ describe("provisioner deployment lifecycle", () => {
 
     expect(provisioner.destroy).toHaveBeenCalledWith("nora-oclaw-agent-1", {
       agentId: "agent-1",
+      preserveState: true,
     });
     expect(queryable.query).toHaveBeenCalledWith(expect.stringMatching(/SET container_id = NULL/), [
       "agent-1",
@@ -2185,5 +2191,76 @@ describe("provisioner deployment lifecycle", () => {
       )?.[0],
     ).toMatch(/\buser_id\b/);
     expect(mockLockClient.end).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A redeploy destroys the previous runtime and recreates it against the same
+// durable state, which is keyed by agent id rather than container id. When the
+// replacement then fails, cleanup must not treat "remove the runtime I just
+// created" as "delete this agent's data" — that wiped three operators' Hermes
+// /opt/data volumes when three redeploys ran concurrently.
+describe("deployment cleanup durable-state policy", () => {
+  it("keeps durable state while the agent row still exists", async () => {
+    const queryable = { query: jest.fn().mockResolvedValue({ rows: [{ id: "agent-1" }] }) };
+
+    await expect(shouldPreserveDurableState({ queryable, agentId: "agent-1" })).resolves.toBe(true);
+  });
+
+  it("releases durable state once the agent is gone", async () => {
+    const queryable = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+
+    await expect(shouldPreserveDurableState({ queryable, agentId: "agent-1" })).resolves.toBe(
+      false,
+    );
+  });
+
+  it("keeps durable state when the agent's existence cannot be confirmed", async () => {
+    const queryable = { query: jest.fn().mockRejectedValue(new Error("connection terminated")) };
+
+    await expect(shouldPreserveDurableState({ queryable, agentId: "agent-1" })).resolves.toBe(true);
+  });
+
+  it("preserves the volume when a redeploy fails for an agent that still exists", async () => {
+    const queryable = {
+      query: jest
+        .fn()
+        .mockImplementation(async (sql) =>
+          String(sql).includes("SELECT id FROM agents")
+            ? { rows: [{ id: "agent-1" }] }
+            : { rows: [] },
+        ),
+    };
+    const provisioner = { destroy: jest.fn().mockResolvedValue(undefined) };
+
+    await reconcileProvisioningFailureRuntime({
+      queryable,
+      provisioner,
+      agentId: "agent-1",
+      containerId: "nora-hermes-agent-1",
+      error: new Error("Hermes runtime did not recover after configuration change"),
+    });
+
+    expect(provisioner.destroy).toHaveBeenCalledWith("nora-hermes-agent-1", {
+      agentId: "agent-1",
+      preserveState: true,
+    });
+  });
+
+  it("removes durable state when the failed deployment's agent was deleted", async () => {
+    const queryable = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const provisioner = { destroy: jest.fn().mockResolvedValue(undefined) };
+
+    await reconcileProvisioningFailureRuntime({
+      queryable,
+      provisioner,
+      agentId: "agent-1",
+      containerId: "nora-hermes-agent-1",
+      error: new Error("provisioning failed"),
+    });
+
+    expect(provisioner.destroy).toHaveBeenCalledWith("nora-hermes-agent-1", {
+      agentId: "agent-1",
+      preserveState: false,
+    });
   });
 });

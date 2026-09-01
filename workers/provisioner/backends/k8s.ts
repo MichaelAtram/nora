@@ -2422,12 +2422,28 @@ class K8sBackend extends ProvisionerBackend {
     });
   }
 
+  /**
+   * Delete an agent's Deployment and the resources created alongside it.
+   *
+   * @param {string} containerId - Deployment name to delete.
+   * @param {Object} [options]
+   * @param {boolean} [options.preserveState=false] - Keep the state
+   * PersistentVolumeClaim. The redeploy path sets this because it recreates the
+   * Deployment against the same claim; deleting it there discards the agent's
+   * durable state exactly as the operator asked for an in-place replacement.
+   * @returns {Promise<void>} Resolves once deletion finishes.
+   */
   async destroy(containerId, options = {}) {
     const deployName = containerId;
     if (!deployName) return;
 
+    const preserveState = options?.preserveState === true;
     const namespaces = this._candidateNamespacesForDestroy(deployName, options);
-    console.log(`[k8s] Destroying deployment ${deployName} in ${namespaces.join(", ")}`);
+    console.log(
+      `[k8s] Destroying deployment ${deployName} in ${namespaces.join(", ")}${
+        preserveState ? " (keeping state claim for runtime replacement)" : ""
+      }`,
+    );
 
     let deletedAny = false;
     for (const namespace of namespaces) {
@@ -2437,7 +2453,9 @@ class K8sBackend extends ProvisionerBackend {
       const deletedSecret = await this._deleteEnvSecretIfExists(deployName, namespace);
       // Deployment deletion above is Foreground, so no pod holds the claim by
       // the time this runs.
-      const deletedStateClaim = await this._deleteStateVolumeClaimIfExists(deployName, namespace);
+      const deletedStateClaim = preserveState
+        ? false
+        : await this._deleteStateVolumeClaimIfExists(deployName, namespace);
       deletedAny =
         deletedAny ||
         deletedDeployment ||
