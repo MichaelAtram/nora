@@ -4,6 +4,44 @@ All notable changes to Nora are documented here. Each entry summarizes the
 corresponding [GitHub release](https://github.com/solomon2773/nora/releases),
 which carries the full notes and verification details.
 
+## [v1.19.0](https://github.com/solomon2773/nora/releases/tag/v1.19.0) — 2026-09-01
+
+Redeploy data-integrity release. Redeploying an agent could delete the durable state it was supposed
+to preserve — under concurrency for Hermes, and on every redeploy for OpenClaw on Docker and for
+Kubernetes. Upgrade before your next redeploy.
+
+### Fixed
+
+- **A failed redeploy no longer deletes the agent's data.** Durable agent state is keyed by agent id,
+  not container id, so the cleanup that removed a failed replacement runtime was also removing the
+  state of the agent it was replacing — and the queued retry then rebuilt the runtime against an
+  empty volume, leaving an agent that looked healthy with none of its configuration. Deployment
+  cleanup now preserves state for any agent that still exists; removing it belongs solely to agent
+  deletion, which already runs under the same per-agent provision lock. That also protects an agent
+  whose runtime a newer deployment has already taken over.
+- **OpenClaw on Docker keeps `/root/.openclaw` across a redeploy**, and **Kubernetes keeps its state
+  claim**. `preserveState` was implemented only in the Hermes adapter, so the redeploy path's request
+  to preserve was a silent no-op for both — every OpenClaw Docker redeploy discarded the agent's
+  state root, and every Kubernetes redeploy deleted its PersistentVolumeClaim.
+- **A failed container create no longer removes volumes it did not create.** `create()` now cleans up
+  only the volumes it brought into existence, so a transient failure during a replacement cannot
+  erase state that predates it.
+- **A slow Hermes restart no longer destroys a healthy runtime.** Reapplying saved model
+  configuration and channels restarts Hermes and waits for its runtime API; a container slow to come
+  back — several concurrent redeploys contending for one host — used to fail the whole deployment.
+  The reseed is now warn-only, matching the OpenClaw channel reseed beside it, and the agent is left
+  in `warning` with an `agent_deployed_degraded` event naming what did not apply. A runtime that is
+  genuinely unreachable still fails through the readiness barrier as before.
+
+### Changed
+
+- **Backend adapters preserve durable state by default.** `preserveState` previously had to be passed
+  to keep data, so any caller that omitted it deleted an agent's volumes. Omitting it now leaks a
+  volume — recoverable — instead of destroying configuration, which is not; only an explicit
+  `preserveState: false` removes state. `containerManager.destroy` still defaults to removing state,
+  so deleting an agent is unchanged. The requirement is now documented on `ProvisionerBackend.destroy`
+  and in the backend adapter README so a new adapter cannot drop it silently.
+
 ## [v1.18.0](https://github.com/solomon2773/nora/releases/tag/v1.18.0) — 2026-08-27
 
 Reliability and supply-chain hardening release: agents that previously needed manual repair now come
