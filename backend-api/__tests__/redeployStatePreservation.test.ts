@@ -29,11 +29,19 @@ describe("DockerBackend.destroy state preservation", () => {
   it("removes the state and home volumes on a true delete", async () => {
     const { backend, removedVolumes } = mockDockerBackend();
 
-    await backend.destroy("cid", { agentId: "123" });
+    await backend.destroy("cid", { agentId: "123", preserveState: false });
 
     expect(removedVolumes).toEqual(
       expect.arrayContaining(["nora_agent_state_123", "nora_agent_home_123"]),
     );
+  });
+
+  it("keeps them when the caller omits preserveState", async () => {
+    const { backend, removedVolumes } = mockDockerBackend();
+
+    await backend.destroy("cid", { agentId: "123" });
+
+    expect(removedVolumes).toEqual([]);
   });
 
   it("keeps /root/.openclaw and the state volume across a redeploy", async () => {

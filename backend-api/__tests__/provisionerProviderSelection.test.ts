@@ -134,6 +134,7 @@ const {
   guardRemoteProvisioner,
   isRemoteAuthorizationFailure,
   isFinalDeploymentAttempt,
+  markDeploymentDegraded,
   persistProvisioningFailure,
   prepareReplacementRuntime,
   reconcileProvisioningFailureRuntime,
@@ -2262,5 +2263,72 @@ describe("deployment cleanup durable-state policy", () => {
       agentId: "agent-1",
       preserveState: false,
     });
+  });
+});
+
+// A Hermes runtime that started but could not finish re-applying its saved model
+// config and channels is a configuration problem, not a provisioning failure.
+// Tearing the runtime down there costs the operator a working agent over a
+// reseed a retry can finish.
+describe("degraded deployment reporting", () => {
+  it("parks a running agent in warning and records why", async () => {
+    const queryable = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [{ id: "agent-1" }] })
+        .mockResolvedValueOnce({ rows: [] }),
+    };
+
+    await expect(
+      markDeploymentDegraded({
+        queryable,
+        agentId: "agent-1",
+        containerId: "nora-hermes-agent-1",
+        reason: "Hermes started, but its saved model configuration could not be reapplied",
+      }),
+    ).resolves.toBe(true);
+
+    expect(queryable.query).toHaveBeenNthCalledWith(
+      1,
+      expect.stringMatching(/status = 'warning'/),
+      ["agent-1", "nora-hermes-agent-1"],
+    );
+    expect(queryable.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("INSERT INTO events"),
+      [
+        "agent_deployed_degraded",
+        "Hermes started, but its saved model configuration could not be reapplied",
+        JSON.stringify({ agentId: "agent-1", containerId: "nora-hermes-agent-1" }),
+      ],
+    );
+  });
+
+  it("does not touch an agent whose runtime was already replaced", async () => {
+    const queryable = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+
+    await expect(
+      markDeploymentDegraded({
+        queryable,
+        agentId: "agent-1",
+        containerId: "stale-container",
+        reason: "reseed failed",
+      }),
+    ).resolves.toBe(false);
+
+    expect(queryable.query).toHaveBeenCalledTimes(1);
+  });
+
+  it("never fails a completed deployment over its own bookkeeping", async () => {
+    const queryable = { query: jest.fn().mockRejectedValue(new Error("connection terminated")) };
+
+    await expect(
+      markDeploymentDegraded({
+        queryable,
+        agentId: "agent-1",
+        containerId: "nora-hermes-agent-1",
+        reason: "reseed failed",
+      }),
+    ).resolves.toBe(false);
   });
 });

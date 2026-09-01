@@ -31,8 +31,10 @@ class ProvisionerBackend {
    * @param {string} containerId
    * @param {Object} [options]
    * @param {string} [options.agentId] - Agent that owns the runtime and its state.
-   * @param {boolean} [options.preserveState=false] - Keep durable agent state;
-   * remove only the runtime itself.
+   * @param {boolean} [options.preserveState=true] - Keep durable agent state;
+   * remove only the runtime itself. Preserving is the default so an adapter
+   * caller that omits the flag leaks state rather than destroying it; a real
+   * delete passes `false` explicitly.
    * @returns {Promise<void>}
    */
   async destroy(containerId, options = {}) {
