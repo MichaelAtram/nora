@@ -458,6 +458,43 @@ async function allocateAvailableLocalDockerGatewayPort({
   throw error;
 }
 
+/**
+ * Park a deployed agent in `warning` when its runtime came up but a post-start
+ * configuration step did not complete.
+ *
+ * The runtime is healthy and must be kept: tearing it down would cost the
+ * operator a working agent over a reseed that a retry can finish. The status and
+ * the recorded event are what tell them the agent is up but not fully wired.
+ *
+ * @param {Object} [params={}] - Database handle, agent, runtime, and reason.
+ * @returns {Promise<boolean>} True when the agent row was moved to `warning`.
+ */
+async function markDeploymentDegraded({ queryable = db, agentId, containerId, reason } = {}) {
+  try {
+    const updated = await queryable.query(
+      `UPDATE agents
+          SET status = 'warning'
+        WHERE id = $1
+          AND status = 'running'
+          AND container_id IS NOT DISTINCT FROM $2
+        RETURNING id`,
+      [agentId, containerId],
+    );
+    if (!updated.rows[0]) return false;
+    await queryable.query("INSERT INTO events(type, message, metadata) VALUES($1, $2, $3)", [
+      "agent_deployed_degraded",
+      reason,
+      JSON.stringify({ agentId, containerId }),
+    ]);
+    return true;
+  } catch (error) {
+    console.error(
+      `[provisioner] Could not record degraded deployment state for agent ${agentId}: ${error.message}`,
+    );
+    return false;
+  }
+}
+
 async function persistProvisioningFailure({
   queryable = db,
   job,
@@ -4541,6 +4578,10 @@ const worker = new Worker(
         Math.max(60000, jobTimeout - 60000),
       );
 
+      // Set when the runtime came up but a post-start configuration step did
+      // not. The deployment still completes — the runtime exists and is healthy
+      // — but the agent is parked in `warning` with the reason recorded.
+      let degradedReason = null;
       let containerId,
         host,
         gatewayToken,
@@ -4872,31 +4913,47 @@ const worker = new Worker(
             hasMeaningfulHermesModelConfig(persistedHermesState?.modelConfig) ||
             (persistedHermesState?.channels || []).length > 0
           ) {
-            await applyPersistedHermesState(
-              {
-                id,
-                user_id: ownerUserId,
-                container_id: containerId,
-                container_name: containerName || container_name || null,
-                image: resolvedImage,
-                backend_type: resolvedBackend,
-                runtime_family: "hermes",
-                deploy_target: resolvedRuntimeFields.deploy_target,
-                execution_target_id: resolvedRuntimeFields.execution_target_id,
-                sandbox_profile: resolvedRuntimeFields.sandbox_profile,
-                sandbox_type: resolvedRuntimeFields.sandbox_type,
-                host,
-                runtime_host: runtimeHost,
-                runtime_port: runtimePort,
-                gateway_host_port: gatewayHostPort,
-                gateway_host: gatewayHost,
-                gateway_port: gatewayPort,
-                gateway_token: gatewayToken,
-                dashboard_port: dashboardPort,
-              },
-              persistedHermesState,
-              { restart: true },
-            );
+            // Reseeding model config and channels restarts Hermes and waits for
+            // its runtime API to answer. A container that is slow to come back —
+            // three concurrent redeploys contending for one host, say — used to
+            // throw from here into the provisioning failure path, which tore the
+            // runtime down. The runtime itself is fine at this point, so treat a
+            // failed reseed the way the OpenClaw channel reseed below already
+            // does: keep the runtime, degrade the agent, and say what is missing.
+            try {
+              await applyPersistedHermesState(
+                {
+                  id,
+                  user_id: ownerUserId,
+                  container_id: containerId,
+                  container_name: containerName || container_name || null,
+                  image: resolvedImage,
+                  backend_type: resolvedBackend,
+                  runtime_family: "hermes",
+                  deploy_target: resolvedRuntimeFields.deploy_target,
+                  execution_target_id: resolvedRuntimeFields.execution_target_id,
+                  sandbox_profile: resolvedRuntimeFields.sandbox_profile,
+                  sandbox_type: resolvedRuntimeFields.sandbox_type,
+                  host,
+                  runtime_host: runtimeHost,
+                  runtime_port: runtimePort,
+                  gateway_host_port: gatewayHostPort,
+                  gateway_host: gatewayHost,
+                  gateway_port: gatewayPort,
+                  gateway_token: gatewayToken,
+                  dashboard_port: dashboardPort,
+                },
+                persistedHermesState,
+                { restart: true },
+              );
+            } catch (e) {
+              throwIfRemoteAuthorizationFailure(e);
+              console.warn(
+                `[provisioner] Failed to reapply persisted Hermes configuration for agent ${id}:`,
+                e.message,
+              );
+              degradedReason = `Hermes started, but its saved model configuration and channels could not be reapplied: ${e.message}`;
+            }
           }
         }
       } catch (err) {
@@ -5116,6 +5173,15 @@ const worker = new Worker(
             );
           }
           console.log(`Agent ${id} deployed: containerId=${containerId} host=${host}`);
+          if (degradedReason) {
+            await markDeploymentDegraded({
+              queryable: db,
+              agentId: id,
+              containerId,
+              reason: degradedReason,
+            });
+            console.warn(`[provisioner] Agent ${id} deployed degraded: ${degradedReason}`);
+          }
         }
 
         // Reseed persisted channel config before skills/integrations so a
@@ -5583,6 +5649,7 @@ module.exports = {
   isRemoteAuthorizationFailure,
   isFinalDeploymentAttempt,
   loadBackend,
+  markDeploymentDegraded,
   normalizeProvisionerDeployTarget,
   normalizeProvisionerExecutionTargetId,
   persistProvisionedRuntimeIdentity,

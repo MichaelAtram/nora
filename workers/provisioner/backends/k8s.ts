@@ -2427,17 +2427,20 @@ class K8sBackend extends ProvisionerBackend {
    *
    * @param {string} containerId - Deployment name to delete.
    * @param {Object} [options]
-   * @param {boolean} [options.preserveState=false] - Keep the state
-   * PersistentVolumeClaim. The redeploy path sets this because it recreates the
-   * Deployment against the same claim; deleting it there discards the agent's
-   * durable state exactly as the operator asked for an in-place replacement.
+   * @param {boolean} [options.preserveState=true] - Keep the state
+   * PersistentVolumeClaim. The redeploy path relies on this because it recreates
+   * the Deployment against the same claim; deleting it there discards the
+   * agent's durable state on what the operator asked to be an in-place
+   * replacement. It defaults to preserving so an omitted flag leaks a claim
+   * rather than destroying data; only an explicit `preserveState: false` — a
+   * real delete — removes it.
    * @returns {Promise<void>} Resolves once deletion finishes.
    */
   async destroy(containerId, options = {}) {
     const deployName = containerId;
     if (!deployName) return;
 
-    const preserveState = options?.preserveState === true;
+    const preserveState = options?.preserveState !== false;
     const namespaces = this._candidateNamespacesForDestroy(deployName, options);
     console.log(
       `[k8s] Destroying deployment ${deployName} in ${namespaces.join(", ")}${
