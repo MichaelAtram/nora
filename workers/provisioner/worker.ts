@@ -574,6 +574,36 @@ async function failDeploymentForUnresolvedRuntime({
   throw unresolvedError;
 }
 
+/**
+ * Decide whether a deployment cleanup may remove the agent's durable state.
+ *
+ * Durable state (Docker named volumes, the k8s state claim) is keyed by agent
+ * id, not by container id. A cleanup that removes it therefore destroys the
+ * data of whatever runtime that agent owns right now — the runtime this job was
+ * replacing on a redeploy, or a newer deployment that already superseded this
+ * one. Only a genuine agent delete may remove that state, and `destroyAgent` in
+ * the control plane owns it, under the same per-agent provision lock.
+ *
+ * So cleanup keeps state for any agent row that still exists and removes it only
+ * for an agent that is gone. An unreachable database resolves to preserving:
+ * leaking a volume is recoverable, deleting an operator's configuration is not.
+ *
+ * @param {Object} [params={}] - Database handle and the agent being cleaned up.
+ * @returns {Promise<boolean>} True when the backend must keep durable state.
+ */
+async function shouldPreserveDurableState({ queryable = db, agentId } = {}) {
+  if (agentId == null) return true;
+  try {
+    const existing = await queryable.query("SELECT id FROM agents WHERE id = $1", [agentId]);
+    return Boolean(existing.rows[0]);
+  } catch (error) {
+    console.warn(
+      `[provisioner] Could not confirm whether agent ${agentId} still exists; keeping its durable state: ${error.message}`,
+    );
+    return true;
+  }
+}
+
 async function cleanupProvisionedRuntimeAfterFailure({
   queryable = db,
   provisioner,
@@ -581,6 +611,7 @@ async function cleanupProvisionedRuntimeAfterFailure({
   containerId,
   destroyAllowed = true,
   persistIdentity = true,
+  preserveState = true,
 } = {}) {
   if (!containerId) {
     return { destroyed: false, reason: "no-runtime", retrySafe: true };
@@ -612,7 +643,7 @@ async function cleanupProvisionedRuntimeAfterFailure({
   }
 
   try {
-    await provisioner.destroy(containerId, { agentId });
+    await provisioner.destroy(containerId, { agentId, preserveState });
   } catch (error) {
     console.error(
       `[provisioner] Failed to clean runtime ${containerId} for agent ${agentId}: ${error.message}`,
@@ -678,6 +709,7 @@ async function reconcileProvisioningFailureRuntime({
     containerId: unresolvedContainerId,
     destroyAllowed: runtimeIdentity?.destroyAllowed !== false,
     persistIdentity: runtimeIdentity?.persistIdentity !== false,
+    preserveState: await shouldPreserveDurableState({ queryable, agentId }),
   });
   return { ...cleanup, containerId: unresolvedContainerId };
 }
@@ -694,6 +726,10 @@ async function cleanupCanceledProvisionedRuntime({
     provisioner,
     agentId,
     containerId,
+    // A canceled deployment means the agent was deleted *or* a newer deployment
+    // took over its runtime identity. Only the first may drop durable state, and
+    // a surviving row tells the two apart.
+    preserveState: await shouldPreserveDurableState({ queryable, agentId }),
   });
   if (!cleanup.retrySafe) {
     const error = buildUnresolvedRuntimeError({
@@ -5557,6 +5593,7 @@ module.exports = {
   resolveCanonicalDeploymentOwnerUserId,
   runRuntimeCommand,
   runProvisionerExecCommand,
+  shouldPreserveDurableState,
   seedHermesArchiveForDeployment,
   materializeHermesTemplatePayload,
   toUnrecoverableRuntimeSelectionError,

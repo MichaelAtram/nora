@@ -1115,7 +1115,22 @@ class DockerBackend extends ProvisionerBackend {
     }
   }
 
-  async destroy(containerId, { agentId: requestedAgentId } = {}) {
+  /**
+   * Remove an agent's container and, unless the caller is replacing the runtime
+   * in place, its Nora-managed named volumes.
+   *
+   * @param {string} containerId - Container to remove.
+   * @param {Object} [options]
+   * @param {string} [options.agentId] - Agent whose volumes are named after it;
+   * falls back to the container's `openclaw.agent.id` label.
+   * @param {boolean} [options.preserveState=false] - Keep `nora_agent_state_*`
+   * and `nora_agent_home_*`. The redeploy path sets this because it recreates
+   * the container against the same volumes: `/root/.openclaw` is the agent's
+   * state root and must survive an image update or replacement.
+   * @returns {Promise<void>} Resolves once the container (and, when requested,
+   * the volumes) are gone.
+   */
+  async destroy(containerId, { agentId: requestedAgentId, preserveState = false } = {}) {
     console.log(`[docker] Destroying container ${containerId}`);
     const container = this.docker.getContainer(containerId);
 
@@ -1143,6 +1158,13 @@ class DockerBackend extends ProvisionerBackend {
       }
     } else {
       console.log(`[docker] Container ${containerId} already absent`);
+    }
+
+    if (preserveState) {
+      console.log(
+        `[docker] Keeping Nora-managed volumes for agent ${agentId || "unknown"} (runtime replacement)`,
+      );
+      return;
     }
 
     if (agentId) {
