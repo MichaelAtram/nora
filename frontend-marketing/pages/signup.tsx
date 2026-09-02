@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { useRouter } from "next/router";
 import Script from "next/script";
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowUpRight, CheckCircle2, Loader2, Lock, Mail, Server, Shield, Zap } from "lucide-react";
 import { useAuthBootstrap } from "../components/AuthBootstrapProvider";
 import LanguageSwitcher from "../components/LanguageSwitcher";
@@ -41,6 +41,113 @@ const DEMO_NEXT_STEPS = [
   "Deploy the demo agent from Getting Started with one click.",
   "Validate chat, logs, metrics, and terminal access from the operator dashboard.",
 ];
+
+export function SignupAccessState({
+  loading,
+  error,
+  disabled,
+  children,
+}: {
+  loading: boolean;
+  error: string;
+  disabled: boolean;
+  children: ReactNode;
+}) {
+  if (loading) {
+    return (
+      <div
+        aria-live="polite"
+        className="flex min-h-[240px] items-center justify-center gap-2 text-sm font-semibold text-slate-600"
+      >
+        <Loader2 size={17} className="animate-spin" />
+        Loading signup verification configuration...
+      </div>
+    );
+  }
+
+  if (disabled) {
+    return (
+      <>
+        <div className="eyebrow eyebrow-warm mb-5">
+          <Shield size={14} />
+          Account access
+        </div>
+        <h2 className="text-3xl font-black leading-tight text-slate-950">
+          Registration is disabled
+        </h2>
+        <p className="mt-3 text-sm leading-7 text-slate-700">
+          This Nora operator is not accepting new accounts. Contact the administrator for access.
+        </p>
+        <Link
+          href="/login"
+          className="mt-6 inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-4 text-sm font-black text-white transition-transform hover:-translate-y-0.5"
+        >
+          Return to login
+        </Link>
+      </>
+    );
+  }
+
+  if (error) {
+    return (
+      <>
+        <div className="eyebrow eyebrow-warm mb-5">
+          <Shield size={14} />
+          Account access
+        </div>
+        <h2 className="text-3xl font-black leading-tight text-slate-950">
+          Registration is unavailable
+        </h2>
+        <div
+          role="alert"
+          data-testid="signup-protection-configuration-error"
+          className="mt-4 rounded-[22px] border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-semibold text-red-700"
+        >
+          {error}
+        </div>
+        <Link
+          href="/login"
+          className="mt-6 inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-4 text-sm font-black text-white transition-transform hover:-translate-y-0.5"
+        >
+          Return to login
+        </Link>
+      </>
+    );
+  }
+
+  return children;
+}
+
+export function SignupSupportingPanel({
+  disabled,
+  children,
+}: {
+  disabled: boolean;
+  children: ReactNode;
+}) {
+  if (!disabled) return children;
+
+  return (
+    <>
+      <div className="eyebrow mb-5">
+        <Shield size={14} />
+        Account access
+      </div>
+      <h1 className="max-w-xl text-4xl font-black leading-tight text-white sm:text-5xl">
+        Registration is disabled on this Nora instance.
+      </h1>
+      <p className="mt-5 max-w-xl text-base leading-8 text-slate-300">
+        Existing operators can return to login. Contact the administrator for access.
+      </p>
+      <Link
+        href="/login"
+        className="mt-8 inline-flex items-center justify-center rounded-full border border-[#8ae6ff]/25 bg-[#8ae6ff]/10 px-5 py-3 text-sm font-black text-white transition-colors hover:bg-[#8ae6ff]/20"
+      >
+        Return to login
+      </Link>
+    </>
+  );
+}
 
 export default function Signup() {
   const router = useRouter();
@@ -287,27 +394,29 @@ export default function Signup() {
 
         <main className="mx-auto grid max-w-6xl gap-6 pt-10 lg:grid-cols-[minmax(0,1.02fr)_420px] lg:pt-12">
           <section className="order-2 rounded-[36px] panel-shell px-6 py-8 sm:px-8 lg:order-1 lg:px-10">
-            <div className="eyebrow mb-5">
-              <Server size={14} />
-              Open-source operator signup
-            </div>
-            <h1 className="max-w-xl text-4xl font-black leading-tight text-white sm:text-5xl">
-              {isDemoIntent
-                ? "Try Nora without an API key."
-                : needsFirstAdmin
-                  ? "Claim this Nora server."
-                  : "Create the operator account for this Nora instance."}
-            </h1>
-            {needsFirstAdmin && (
-              <p className="mt-3 max-w-xl text-sm font-bold uppercase tracking-[0.2em] text-[#f2d7a1]">
-                First-run setup — the account you create here becomes the platform admin.
-              </p>
-            )}
-            <p className="mt-5 max-w-xl text-base leading-8 text-slate-300">
-              {isDemoIntent
-                ? "Create an account, then use Getting Started to enable Nora's built-in deterministic demo provider and deploy a working agent with zero external keys and zero model cost."
-                : "Use this account to enter the Nora dashboard, add provider keys, create workspaces, and deploy OpenClaw or Hermes runtimes on infrastructure you control. The source stays public, and the deployment path stays self-hostable."}
-            </p>
+            <SignupSupportingPanel disabled={signupDisabled}>
+              <>
+                <div className="eyebrow mb-5">
+                  <Server size={14} />
+                  Open-source operator signup
+                </div>
+                <h1 className="max-w-xl text-4xl font-black leading-tight text-white sm:text-5xl">
+                  {isDemoIntent
+                    ? "Try Nora without an API key."
+                    : needsFirstAdmin
+                      ? "Claim this Nora server."
+                      : "Create the operator account for this Nora instance."}
+                </h1>
+                {needsFirstAdmin && (
+                  <p className="mt-3 max-w-xl text-sm font-bold uppercase tracking-[0.2em] text-[#f2d7a1]">
+                    First-run setup — the account you create here becomes the platform admin.
+                  </p>
+                )}
+                <p className="mt-5 max-w-xl text-base leading-8 text-slate-300">
+                  {isDemoIntent
+                    ? "Create an account, then use Getting Started to enable Nora's built-in deterministic demo provider and deploy a working agent with zero external keys and zero model cost."
+                    : "Use this account to enter the Nora dashboard, add provider keys, create workspaces, and deploy OpenClaw or Hermes runtimes on infrastructure you control. The source stays public, and the deployment path stays self-hostable."}
+                </p>
 
             <div className="mt-8 rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
               <div className="text-xs font-black uppercase tracking-[0.28em] text-[#f2d7a1]">
@@ -360,68 +469,28 @@ export default function Signup() {
               </a>
             </div>
 
-            <div className="mt-6 rounded-[28px] border border-[#8ae6ff]/18 bg-[#8ae6ff]/7 px-5 py-5">
-              <div className="text-xs font-black uppercase tracking-[0.28em] text-[#eef4fb]">
-                Instance note
-              </div>
-              <p className="mt-3 text-sm leading-7 text-slate-300">
-                {platformMode === "selfhosted"
-                  ? "This account belongs to this self-hosted Nora instance. On a brand-new Nora instance, the first created account becomes the admin account. If a bootstrap operator was already created during setup, use that instead of creating a duplicate."
-                  : platformMode === "paas"
-                    ? "This account belongs to this hosted Nora instance. If you already created one earlier, use the login page instead."
-                    : "Account registration is configured by the operator of this Nora instance."}
-              </p>
-            </div>
+                <div className="mt-6 rounded-[28px] border border-[#8ae6ff]/18 bg-[#8ae6ff]/7 px-5 py-5">
+                  <div className="text-xs font-black uppercase tracking-[0.28em] text-[#eef4fb]">
+                    Instance note
+                  </div>
+                  <p className="mt-3 text-sm leading-7 text-slate-300">
+                    {platformMode === "selfhosted"
+                      ? "This account belongs to this self-hosted Nora instance. On a brand-new Nora instance, the first created account becomes the admin account. If a bootstrap operator was already created during setup, use that instead of creating a duplicate."
+                      : platformMode === "paas"
+                        ? "This account belongs to this hosted Nora instance. If you already created one earlier, use the login page instead."
+                        : "Account registration is configured by the operator of this Nora instance."}
+                  </p>
+                </div>
+              </>
+            </SignupSupportingPanel>
           </section>
 
           <section className="order-1 rounded-[36px] panel-warm px-6 py-8 sm:px-8 lg:order-2">
-            {bootstrapLoading ? (
-              <div
-                aria-live="polite"
-                className="flex min-h-[240px] items-center justify-center gap-2 text-sm font-semibold text-slate-600"
-              >
-                <Loader2 size={17} className="animate-spin" />
-                Loading signup verification configuration...
-              </div>
-            ) : signupDisabled ? (
-              <>
-                <div className="eyebrow eyebrow-warm mb-5">
-                  <Shield size={14} />
-                  Account access
-                </div>
-                <h2 className="text-3xl font-black leading-tight text-slate-950">Registration is disabled</h2>
-                <p className="mt-3 text-sm leading-7 text-slate-700">This Nora operator is not accepting new accounts. Contact the administrator for access.</p>
-                <Link
-                  href="/login"
-                  className="mt-6 inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-4 text-sm font-black text-white transition-transform hover:-translate-y-0.5"
-                >
-                  Return to login
-                </Link>
-              </>
-            ) : bootstrapError ? (
-              <>
-                <div className="eyebrow eyebrow-warm mb-5">
-                  <Shield size={14} />
-                  Account access
-                </div>
-                <h2 className="text-3xl font-black leading-tight text-slate-950">
-                  Registration is unavailable
-                </h2>
-                <div
-                  role="alert"
-                  data-testid="signup-protection-configuration-error"
-                  className="mt-4 rounded-[22px] border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-semibold text-red-700"
-                >
-                  {bootstrapError}
-                </div>
-                <Link
-                  href="/login"
-                  className="mt-6 inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-4 text-sm font-black text-white transition-transform hover:-translate-y-0.5"
-                >
-                  Return to login
-                </Link>
-              </>
-            ) : (
+            <SignupAccessState
+              loading={bootstrapLoading}
+              error={bootstrapError}
+              disabled={signupDisabled}
+            >
               <>
                 <div className="eyebrow eyebrow-warm mb-5">
                   <Shield size={14} />
@@ -641,7 +710,7 @@ export default function Signup() {
                   </p>
                 </div>
               </>
-            )}
+            </SignupAccessState>
           </section>
         </main>
       </div>

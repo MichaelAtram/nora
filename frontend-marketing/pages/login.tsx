@@ -438,17 +438,17 @@ export default function Login() {
             </form>
 
             <div className="mt-6 flex flex-col gap-3 text-sm text-slate-700">
-              <p>
-                Need an account?{" "}
-                <SignupGate>
+              <SignupGate>
+                <p>
+                  Need an account?{" "}
                   <Link
                     href="/signup"
                     className="font-black text-slate-950 underline underline-offset-4"
                   >
                     Create one here.
                   </Link>
-                </SignupGate>
-              </p>
+                </p>
+              </SignupGate>
               <p>
                 Prefer to self-host first?{" "}
                 <a
