@@ -13,6 +13,7 @@ export type AuthBootstrapStatus = {
   needsFirstAdmin: boolean;
   oauthLoginEnabled: boolean;
   platformMode: PlatformMode;
+  signupEnabled: boolean;
   signupBotProtection: SignupBotProtectionConfig;
 };
 
@@ -32,6 +33,9 @@ export function parseAuthBootstrapStatus(value: unknown): AuthBootstrapStatus {
   }
   if (typeof raw.oauthLoginEnabled !== "boolean") {
     throw new Error("OAuth metadata is invalid");
+  }
+  if (typeof raw.signupEnabled !== "boolean") {
+    throw new Error("Signup availability metadata is invalid");
   }
 
   const protection = raw.signupBotProtection;
@@ -95,6 +99,7 @@ export function parseAuthBootstrapStatus(value: unknown): AuthBootstrapStatus {
     needsFirstAdmin: raw.needsFirstAdmin,
     oauthLoginEnabled: raw.oauthLoginEnabled,
     platformMode: parsePlatformMode(raw.platformMode),
+    signupEnabled: raw.signupEnabled,
     signupBotProtection: {
       enabled,
       provider,
