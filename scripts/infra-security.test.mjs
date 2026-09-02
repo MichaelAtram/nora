@@ -842,10 +842,7 @@ test("setup persists signup availability across existing and generated environme
     /# ── Public Signup Abuse Protection[^\n]*\n([\s\S]*?)(?=\n# ──)/,
   )?.[1];
   assert.ok(exampleSignupSection, ".env.example must expose the public signup section");
-  assert.match(
-    exampleSignupSection,
-    /^SIGNUP_ENABLED=true\nSIGNUP_RATE_LIMIT_BURST_MAX=5$/m,
-  );
+  assert.match(exampleSignupSection, /^SIGNUP_ENABLED=true\nSIGNUP_RATE_LIMIT_BURST_MAX=5$/m);
 
   const bashUpdateHelper = bashSetup.match(
     /^ensure_signup_protection_env\(\) \{\n([\s\S]*?)^\}/m,
@@ -891,10 +888,7 @@ test("setup persists signup availability across existing and generated environme
   const powershellGeneratedSignupSection = powershellSetup.match(
     /# ── Public Signup Abuse Protection[^\n]*\n([\s\S]*?)(?=\n# ── Platform Mode)/,
   )?.[1];
-  assert.ok(
-    powershellGeneratedSignupSection,
-    "setup.ps1 must generate the public signup section",
-  );
+  assert.ok(powershellGeneratedSignupSection, "setup.ps1 must generate the public signup section");
   assert.match(
     powershellGeneratedSignupSection,
     /^SIGNUP_ENABLED=\$SIGNUP_ENABLED\nSIGNUP_RATE_LIMIT_BURST_MAX=\$SIGNUP_RATE_LIMIT_BURST_MAX$/m,

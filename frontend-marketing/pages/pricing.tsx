@@ -317,7 +317,9 @@ export default function Pricing() {
 
                   return item.href === SIGNUP_URL ? (
                     <SignupGate key={item.label}>{entryLink}</SignupGate>
-                  ) : entryLink;
+                  ) : (
+                    entryLink
+                  );
                 })}
               </div>
             </div>

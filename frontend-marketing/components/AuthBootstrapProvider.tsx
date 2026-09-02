@@ -1,9 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import {
-  fetchAuthBootstrapStatus,
-  type AuthBootstrapStatus,
-} from "../lib/authBootstrap";
+import { fetchAuthBootstrapStatus, type AuthBootstrapStatus } from "../lib/authBootstrap";
 
 export type AuthBootstrapContextValue = {
   status: AuthBootstrapStatus | null;
@@ -35,12 +32,7 @@ export function AuthBootstrapProvider({ children }: { children: ReactNode }) {
         setLoading(false);
       })
       .catch((cause: unknown) => {
-        if (
-          cause &&
-          typeof cause === "object" &&
-          "name" in cause &&
-          cause.name === "AbortError"
-        ) {
+        if (cause && typeof cause === "object" && "name" in cause && cause.name === "AbortError") {
           return;
         }
 
