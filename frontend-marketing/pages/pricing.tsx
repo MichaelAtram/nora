@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import LanguageSwitcher from "../components/LanguageSwitcher";
 import SeoHead from "../components/SeoHead";
+import { SignupGate } from "../components/SignupGate";
 
 const OSS_REPO_URL = "https://github.com/solomon2773/nora";
 const QUICKSTART_URL = `${OSS_REPO_URL}#quick-start`;
@@ -134,12 +135,14 @@ export default function Pricing() {
             >
               Log In
             </Link>
-            <Link
-              href="/signup"
-              className="rounded-full bg-brand-cyan px-4 py-2 text-sm font-black text-brand-ink shadow-lg shadow-brand-cyan/25 transition-transform hover:-translate-y-0.5"
-            >
-              Create Account
-            </Link>
+            <SignupGate>
+              <Link
+                href="/signup"
+                className="rounded-full bg-brand-cyan px-4 py-2 text-sm font-black text-brand-ink shadow-lg shadow-brand-cyan/25 transition-transform hover:-translate-y-0.5"
+              >
+                Create Account
+              </Link>
+            </SignupGate>
           </div>
         </header>
 
@@ -168,12 +171,14 @@ export default function Pricing() {
                 >
                   Open Quick Start <ArrowRight size={16} />
                 </a>
-                <Link
-                  href="/signup"
-                  className="inline-flex items-center justify-center gap-2 rounded-full border border-brand-ink/10 bg-white/70 px-6 py-3 text-sm font-bold text-brand-ink transition-colors hover:bg-brand-cyan/16"
-                >
-                  Create Account
-                </Link>
+                <SignupGate>
+                  <Link
+                    href="/signup"
+                    className="inline-flex items-center justify-center gap-2 rounded-full border border-brand-ink/10 bg-white/70 px-6 py-3 text-sm font-bold text-brand-ink transition-colors hover:bg-brand-cyan/16"
+                  >
+                    Create Account
+                  </Link>
+                </SignupGate>
                 <a
                   href={OSS_REPO_URL}
                   target="_blank"

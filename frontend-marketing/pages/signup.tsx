@@ -3,9 +3,9 @@ import { useRouter } from "next/router";
 import Script from "next/script";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, CheckCircle2, Loader2, Lock, Mail, Server, Shield, Zap } from "lucide-react";
+import { useAuthBootstrap } from "../components/AuthBootstrapProvider";
 import LanguageSwitcher from "../components/LanguageSwitcher";
 import SeoHead from "../components/SeoHead";
-import { fetchAuthBootstrapStatus, type AuthBootstrapStatus } from "../lib/authBootstrap";
 import { normalizeLocale, useI18n } from "../lib/i18n";
 import { trackEvent } from "../lib/analytics";
 
@@ -51,12 +51,17 @@ export default function Signup() {
   const [oauthLoading, setOauthLoading] = useState("");
   const [error, setError] = useState("");
   const [botProtectionToken, setBotProtectionToken] = useState("");
-  const [bootstrapStatus, setBootstrapStatus] = useState<AuthBootstrapStatus | null>(null);
-  const [bootstrapError, setBootstrapError] = useState("");
+  const {
+    status: bootstrapStatus,
+    error: bootstrapLoadError,
+    loading: bootstrapLoading,
+  } = useAuthBootstrap();
+  const bootstrapError = bootstrapLoadError ? SIGNUP_CONFIG_LOAD_ERROR : "";
   const [challengeLoadError, setChallengeLoadError] = useState("");
   const botProtectionRef = useRef<HTMLDivElement | null>(null);
   const botProtectionWidgetId = useRef<string | number | null>(null);
   const needsFirstAdmin = bootstrapStatus?.needsFirstAdmin === true;
+  const signupDisabled = bootstrapStatus?.signupEnabled === false;
   const oauthLoginEnabled = bootstrapStatus?.oauthLoginEnabled === true;
   const platformMode = bootstrapStatus?.platformMode || null;
   const botProtection = bootstrapStatus?.signupBotProtection || null;
@@ -75,32 +80,13 @@ export default function Signup() {
         "Signup verification is enabled, but its runtime configuration is incomplete. Contact the administrator."
       : "") ||
     challengeLoadError;
-  const bootstrapLoading = bootstrapStatus == null && !bootstrapError;
   const signupBlocked =
     bootstrapLoading ||
+    signupDisabled ||
     Boolean(botProtectionConfigurationError) ||
     (botProtectionEnabled && !botProtectionToken);
   const isDemoIntent = router.query.intent === "demo";
   const nextSteps = isDemoIntent ? DEMO_NEXT_STEPS : NEXT_STEPS;
-
-  useEffect(() => {
-    const controller = new AbortController();
-    async function loadBootstrapStatus() {
-      try {
-        const status = await fetchAuthBootstrapStatus(controller.signal);
-        setBootstrapStatus(status);
-        setBootstrapError("");
-      } catch (bootstrapStatusError) {
-        if (controller.signal.aborted) return;
-        console.error(bootstrapStatusError);
-        setBootstrapError(SIGNUP_CONFIG_LOAD_ERROR);
-      }
-    }
-    void loadBootstrapStatus();
-    return () => {
-      controller.abort();
-    };
-  }, []);
 
   const resetBotProtection = useCallback(() => {
     setBotProtectionToken("");
@@ -241,7 +227,7 @@ export default function Signup() {
         }
         path="/signup"
       />
-      {botProtectionReady && botProtectionProvider === "turnstile" && (
+      {!signupDisabled && botProtectionReady && botProtectionProvider === "turnstile" && (
         <Script
           id="signup-turnstile-script"
           src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
@@ -254,7 +240,7 @@ export default function Signup() {
           }
         />
       )}
-      {botProtectionReady && botProtectionProvider === "recaptcha" && (
+      {!signupDisabled && botProtectionReady && botProtectionProvider === "recaptcha" && (
         <Script
           id="signup-recaptcha-script"
           src="https://www.google.com/recaptcha/api.js?render=explicit"
@@ -389,22 +375,70 @@ export default function Signup() {
           </section>
 
           <section className="order-1 rounded-[36px] panel-warm px-6 py-8 sm:px-8 lg:order-2">
-            <div className="eyebrow eyebrow-warm mb-5">
-              <Shield size={14} />
-              Easy account creation
-            </div>
-            <h2 className="text-3xl font-black leading-tight text-slate-950">
-              {isDemoIntent
-                ? "Start the zero-key demo"
-                : needsFirstAdmin
-                  ? "Claim this server"
-                  : "Create operator account"}
-            </h2>
-            <p className="mt-3 text-sm leading-7 text-slate-700">
-              {isDemoIntent
-                ? "After signup, Nora sends you directly to Getting Started, where the demo provider and demo agent are one click away."
-                : "Use this account to enter the Nora operator surface for OpenClaw and Hermes deployments on this instance. OAuth appears here only when it is enabled."}
-            </p>
+            {bootstrapLoading ? (
+              <div
+                aria-live="polite"
+                className="flex min-h-[240px] items-center justify-center gap-2 text-sm font-semibold text-slate-600"
+              >
+                <Loader2 size={17} className="animate-spin" />
+                Loading signup verification configuration...
+              </div>
+            ) : signupDisabled ? (
+              <>
+                <div className="eyebrow eyebrow-warm mb-5">
+                  <Shield size={14} />
+                  Account access
+                </div>
+                <h2 className="text-3xl font-black leading-tight text-slate-950">Registration is disabled</h2>
+                <p className="mt-3 text-sm leading-7 text-slate-700">This Nora operator is not accepting new accounts. Contact the administrator for access.</p>
+                <Link
+                  href="/login"
+                  className="mt-6 inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-4 text-sm font-black text-white transition-transform hover:-translate-y-0.5"
+                >
+                  Return to login
+                </Link>
+              </>
+            ) : bootstrapError ? (
+              <>
+                <div className="eyebrow eyebrow-warm mb-5">
+                  <Shield size={14} />
+                  Account access
+                </div>
+                <h2 className="text-3xl font-black leading-tight text-slate-950">
+                  Registration is unavailable
+                </h2>
+                <div
+                  role="alert"
+                  data-testid="signup-protection-configuration-error"
+                  className="mt-4 rounded-[22px] border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm font-semibold text-red-700"
+                >
+                  {bootstrapError}
+                </div>
+                <Link
+                  href="/login"
+                  className="mt-6 inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-4 text-sm font-black text-white transition-transform hover:-translate-y-0.5"
+                >
+                  Return to login
+                </Link>
+              </>
+            ) : (
+              <>
+                <div className="eyebrow eyebrow-warm mb-5">
+                  <Shield size={14} />
+                  Easy account creation
+                </div>
+                <h2 className="text-3xl font-black leading-tight text-slate-950">
+                  {isDemoIntent
+                    ? "Start the zero-key demo"
+                    : needsFirstAdmin
+                      ? "Claim this server"
+                      : "Create operator account"}
+                </h2>
+                <p className="mt-3 text-sm leading-7 text-slate-700">
+                  {isDemoIntent
+                    ? "After signup, Nora sends you directly to Getting Started, where the demo provider and demo agent are one click away."
+                    : "Use this account to enter the Nora operator surface for OpenClaw and Hermes deployments on this instance. OAuth appears here only when it is enabled."}
+                </p>
 
             {oauthLoginEnabled && (
               <div className="mt-6 flex flex-col gap-3">
@@ -584,28 +618,30 @@ export default function Signup() {
               </p>
             </form>
 
-            <div className="mt-6 flex flex-col gap-3 text-sm text-slate-700">
-              <p>
-                Already have an account?{" "}
-                <Link
-                  href="/login"
-                  className="font-black text-slate-950 underline underline-offset-4"
-                >
-                  Log in here.
-                </Link>
-              </p>
-              <p>
-                Prefer to self-host first?{" "}
-                <a
-                  href={QUICKSTART_URL}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="font-black text-slate-950 underline underline-offset-4"
-                >
-                  Open the quick start.
-                </a>
-              </p>
-            </div>
+                <div className="mt-6 flex flex-col gap-3 text-sm text-slate-700">
+                  <p>
+                    Already have an account?{" "}
+                    <Link
+                      href="/login"
+                      className="font-black text-slate-950 underline underline-offset-4"
+                    >
+                      Log in here.
+                    </Link>
+                  </p>
+                  <p>
+                    Prefer to self-host first?{" "}
+                    <a
+                      href={QUICKSTART_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="font-black text-slate-950 underline underline-offset-4"
+                    >
+                      Open the quick start.
+                    </a>
+                  </p>
+                </div>
+              </>
+            )}
           </section>
         </main>
       </div>
