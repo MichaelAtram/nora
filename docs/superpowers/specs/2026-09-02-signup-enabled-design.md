@@ -4,6 +4,28 @@
 
 Add an operator-controlled `SIGNUP_ENABLED` environment variable that defaults to `true`. When set to `false`, Nora must reject public account creation at the backend, hide public registration links and buttons, and explain that registration is disabled when someone visits `/signup` directly.
 
+## Implementation status
+
+Implemented across the backend auth routes and OpenAPI contract, the marketing bootstrap parser and
+signup UI, Bash and PowerShell setup paths, Compose/Helm wiring, hosted-PaaS preflight, and operator
+documentation.
+
+- The public call-to-action inventory covers the homepage, login, Privacy, Terms, and Pricing pages,
+  including Pricing's data-driven "Create account" link as well as its direct signup links.
+- Frontend tests exercise rendered enabled, disabled, loading, and bootstrap-error behavior. They
+  verify that registration controls are absent unless signup is confirmed enabled and that the
+  disabled state retains a route back to login.
+- Setup preserves the existing `SIGNUP_ENABLED` value when refreshing an environment. Its env
+  readers select the last assignment when duplicate keys are present, including quoted values, so
+  an operator's final override is retained.
+
+Validation under Node 24 passes the backend auth suite (79 tests), the complete OpenAPI suite (22
+tests), and the marketing bootstrap/signup suite (15 tests). Infrastructure validation passes the
+signup-specific setup-persistence and hosted-PaaS preflight cases. The repository-wide
+infrastructure suite is not a clean baseline on this macOS checkout: 9 unrelated setup/OS-sensitive
+tests fail and 4 PowerShell-dependent tests are skipped; the structural PowerShell last-assignment
+regression check still passes.
+
 ## Configuration contract
 
 - `SIGNUP_ENABLED` is evaluated by the backend at runtime so the same published frontend images can be reused across deployments.
@@ -50,7 +72,7 @@ The public bootstrap-status parser carries `signupEnabled` to the marketing fron
 
 ## Testing
 
-Backend tests will demonstrate that:
+Backend tests demonstrate that:
 
 - signup remains enabled when `SIGNUP_ENABLED` is absent;
 - accepted false-like values disable signup;
@@ -59,13 +81,13 @@ Backend tests will demonstrate that:
 - bootstrap status reports the effective boolean;
 - enabled signup retains current account-creation behavior.
 
-Frontend tests will demonstrate that:
+Frontend tests demonstrate that:
 
 - bootstrap metadata requires and parses `signupEnabled`;
 - registration calls to action appear only when signup is confirmed enabled;
 - `/signup` shows the disabled-registration state without rendering or submitting the form.
 
-Configuration and documentation tests will confirm that installation paths preserve the default-enabled setting.
+Configuration and documentation tests confirm that installation paths preserve the default-enabled setting and that invalid hosted-PaaS values do not bypass signup-protection preflight.
 
 ## Scope exclusions
 
