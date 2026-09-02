@@ -25,10 +25,7 @@ test("parses signup availability", () => {
 test("rejects missing signup availability", () => {
   const { signupEnabled: _signupEnabled, ...missingSignupEnabled } = validBootstrap;
 
-  assert.throws(
-    () => parseAuthBootstrapStatus(missingSignupEnabled),
-    /signup availability/i,
-  );
+  assert.throws(() => parseAuthBootstrapStatus(missingSignupEnabled), /signup availability/i);
 });
 
 test("rejects non-boolean signup availability", () => {

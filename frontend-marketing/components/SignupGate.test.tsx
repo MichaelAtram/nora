@@ -118,7 +118,7 @@ test("public signup destinations are all enclosed by SignupGate", () => {
       dataDrivenDestination:
         /\{\s*label:\s*"Create account",\s*href:\s*SIGNUP_URL,\s*text:\s*"nora\.solomontsao\.com\/signup"\s*\}/g,
       gatedDataDrivenDestination:
-        /item\.href\s*===\s*SIGNUP_URL\s*\?\s*\(\s*<SignupGate key=\{item\.label\}>\{entryLink\}<\/SignupGate>\s*\)\s*:\s*entryLink/g,
+        /item\.href\s*===\s*SIGNUP_URL\s*\?\s*\(\s*<SignupGate key=\{item\.label\}>\{entryLink\}<\/SignupGate>\s*\)\s*:\s*\(?\s*entryLink\s*\)?/g,
     },
     { name: "privacy.tsx", expectedCount: 1, destination: '"/signup"' },
     { name: "terms.tsx", expectedCount: 1, destination: '"/signup"' },
@@ -132,10 +132,7 @@ test("public signup destinations are all enclosed by SignupGate", () => {
     gatedDataDrivenDestination,
   } of pages) {
     const source = readFileSync(path.join(process.cwd(), "pages", name), "utf8");
-    const signupDestination = new RegExp(
-      String.raw`<Link\b[^>]*\bhref=${destination}[^>]*>`,
-      "g",
-    );
+    const signupDestination = new RegExp(String.raw`<Link\b[^>]*\bhref=${destination}[^>]*>`, "g");
     const gatedSignupDestination = new RegExp(
       String.raw`<SignupGate>\s*(?:<p>\s*Need an account\?\{" "\}\s*)?<Link\b(?=[^>]*\bhref=${destination})[^>]*>[\s\S]*?<\/Link>\s*(?:<\/p>\s*)?<\/SignupGate>`,
       "g",
@@ -146,15 +143,9 @@ test("public signup destinations are all enclosed by SignupGate", () => {
       (dataDrivenDestination ? (source.match(dataDrivenDestination)?.length ?? 0) : 0);
     const gatedDestinationCount =
       (source.match(gatedSignupDestination)?.length ?? 0) +
-      (gatedDataDrivenDestination
-        ? (source.match(gatedDataDrivenDestination)?.length ?? 0)
-        : 0);
+      (gatedDataDrivenDestination ? (source.match(gatedDataDrivenDestination)?.length ?? 0) : 0);
 
-    assert.equal(
-      destinationCount,
-      expectedCount,
-      `${name} signup destination inventory changed`,
-    );
+    assert.equal(destinationCount, expectedCount, `${name} signup destination inventory changed`);
     assert.equal(
       gatedDestinationCount,
       expectedCount,

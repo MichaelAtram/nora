@@ -240,13 +240,10 @@ describe("password signup availability configuration", () => {
     expect(authRouteTestHelpers.isSignupEnabled()).toBe(true);
   });
 
-  it.each(["false", "0", "NO", " off ", "invalid"])(
-    "disables password signup for %p",
-    (value) => {
-      process.env.SIGNUP_ENABLED = value;
-      expect(authRouteTestHelpers.isSignupEnabled()).toBe(false);
-    },
-  );
+  it.each(["false", "0", "NO", " off ", "invalid"])("disables password signup for %p", (value) => {
+    process.env.SIGNUP_ENABLED = value;
+    expect(authRouteTestHelpers.isSignupEnabled()).toBe(false);
+  });
 });
 
 describe("bootstrap admin startup gate", () => {
