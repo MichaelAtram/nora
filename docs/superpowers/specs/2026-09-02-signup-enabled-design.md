@@ -19,7 +19,7 @@ documentation.
   readers select the last assignment when duplicate keys are present, including quoted values, so
   an operator's final override is retained.
 
-Validation under Node 24 passes the backend auth suite (79 tests), the complete OpenAPI suite (22
+Validation under Node 24 passes the backend auth suite (80 tests), the complete OpenAPI suite (22
 tests), and the marketing bootstrap/signup suite (15 tests). Infrastructure validation passes the
 signup-specific setup-persistence and hosted-PaaS preflight cases. The repository-wide
 infrastructure suite is not a clean baseline on this macOS checkout: 9 unrelated setup/OS-sensitive
