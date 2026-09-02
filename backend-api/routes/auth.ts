@@ -35,6 +35,10 @@ function isSignupEnabled() {
   return ["true", "1", "yes", "on"].includes(value);
 }
 
+function sendSignupDisabled(res) {
+  return res.status(403).json({ error: SIGNUP_DISABLED_MESSAGE, code: SIGNUP_DISABLED_CODE });
+}
+
 function getPublicPlatformMode() {
   return String(process.env.PLATFORM_MODE || "selfhosted")
     .trim()
@@ -408,7 +412,7 @@ router.get("/bootstrap-status", async (req, res) => {
 
 router.post("/signup", signupBurstLimiter, signupDailyLimiter, async (req, res) => {
   if (!isSignupEnabled()) {
-    return res.status(403).json({ error: SIGNUP_DISABLED_MESSAGE, code: SIGNUP_DISABLED_CODE });
+    return sendSignupDisabled(res);
   }
 
   const { email, password } = req.body;
@@ -550,6 +554,13 @@ router.post("/oauth-login", authLimiter, async (req, res, next) => {
         throw error;
       }
 
+      if (!linkedUser && !existingUser && !isSignupEnabled()) {
+        const error = new Error(SIGNUP_DISABLED_MESSAGE);
+        error.statusCode = 403;
+        error.code = SIGNUP_DISABLED_CODE;
+        throw error;
+      }
+
       const role = existingUser?.role || (await nextRegisteredUserRole(client));
       const result = await client.query(
         `INSERT INTO users(email, name, provider, provider_id, role)
@@ -583,6 +594,9 @@ router.post("/oauth-login", authLimiter, async (req, res, next) => {
     }
     if (e.statusCode === 409) {
       return res.status(409).json({ error: e.message });
+    }
+    if (e.code === SIGNUP_DISABLED_CODE) {
+      return sendSignupDisabled(res);
     }
     if (
       /verification failed|audience mismatch|email is not verified|email is missing or unverified|did not match|required/i.test(

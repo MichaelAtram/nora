@@ -1146,6 +1146,107 @@ describe("OAuth hardening", () => {
     expect(decoded).toMatchObject({ id: "user-1", email: "user@example.com", role: "user" });
   });
 
+  it("rejects OAuth registration when signup is disabled", async () => {
+    process.env.OAUTH_LOGIN_ENABLED = "true";
+    process.env.SIGNUP_ENABLED = "false";
+    global.fetch.mockResolvedValueOnce(
+      jsonResponse({
+        sub: "google-sub-new",
+        email: "new-user@example.com",
+        email_verified: "true",
+        aud: "google-client-id",
+        name: "New Google User",
+      }),
+    );
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ has_users: true }] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "new-user-1",
+            email: "new-user@example.com",
+            role: "user",
+            name: "New Google User",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app).post("/auth/oauth-login").send({
+      email: "new-user@example.com",
+      provider: "google",
+      providerId: "google-sub-new",
+      oauthIdToken: "google-id-token",
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({
+      error: "Registration is disabled by this Nora operator.",
+      code: "SIGNUP_DISABLED",
+    });
+    expect(
+      mockDb.query.mock.calls.some(([query]) => /INSERT INTO users/i.test(String(query))),
+    ).toBe(false);
+  });
+
+  it("allows existing OAuth users to log in when signup is disabled", async () => {
+    process.env.OAUTH_LOGIN_ENABLED = "true";
+    process.env.SIGNUP_ENABLED = "false";
+    global.fetch.mockResolvedValueOnce(
+      jsonResponse({
+        sub: "google-sub-existing",
+        email: "existing-user@example.com",
+        email_verified: "true",
+        aud: "google-client-id",
+        name: "Existing Google User",
+      }),
+    );
+    const existingUser = {
+      id: "existing-user-1",
+      email: "existing-user@example.com",
+      role: "user",
+      name: "Existing Google User",
+      provider: "google",
+      provider_id: "google-sub-existing",
+      password_hash: null,
+    };
+    mockDb.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [existingUser] })
+      .mockResolvedValueOnce({ rows: [existingUser] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: existingUser.id,
+            email: existingUser.email,
+            role: existingUser.role,
+            name: existingUser.name,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app).post("/auth/oauth-login").send({
+      email: existingUser.email,
+      provider: "google",
+      providerId: existingUser.provider_id,
+      oauthIdToken: "google-id-token",
+    });
+
+    expect(res.status).toBe(200);
+    const decoded = jwt.verify(res.body.token, JWT_SECRET);
+    expect(decoded).toMatchObject({
+      id: existingUser.id,
+      email: existingUser.email,
+      role: existingUser.role,
+    });
+  });
+
   it("assigns admin role to the first OAuth-created user", async () => {
     process.env.OAUTH_LOGIN_ENABLED = "true";
     global.fetch.mockResolvedValueOnce(
