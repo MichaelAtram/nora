@@ -10,6 +10,7 @@ Add an operator-controlled `SIGNUP_ENABLED` environment variable that defaults t
 - The variable defaults to enabled when it is absent, preserving the behavior of existing installations.
 - Values are parsed using Nora's conventional environment-boolean forms. A missing or empty value defaults to enabled; `true`, `1`, `yes`, and `on` enable signup; and `false`, `0`, `no`, and `off` disable it. An unrecognized non-empty value fails closed by disabling signup.
 - `.env.example`, setup-generated environment files, Docker Compose runtime wiring, and the environment-variable documentation expose the setting with a default of `true`.
+- Hosted-PaaS signup-challenge preflight is skipped when signup is explicitly disabled, because no public registration request can reach challenge verification.
 
 ## Backend behavior
 
