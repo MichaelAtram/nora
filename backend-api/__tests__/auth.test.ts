@@ -293,6 +293,36 @@ describe("POST /auth/signup", () => {
     }
   });
 
+  it("returns the disabled response without consuming the same IP's signup quota", async () => {
+    process.env.SIGNUP_ENABLED = "false";
+    const ip = "198.51.100.251";
+    const hashSpy = jest.spyOn(bcrypt, "hash");
+    const disabledResponse = {
+      error: "Registration is disabled by this Nora operator.",
+      code: "SIGNUP_DISABLED",
+    };
+
+    try {
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const res = await signupRequest(ip).send({});
+
+        expect(res.status).toBe(403);
+        expect(res.body).toEqual(disabledResponse);
+      }
+
+      process.env.SIGNUP_ENABLED = "true";
+      const enabledRes = await signupRequest(ip).send({});
+      expect(enabledRes.status).toBe(400);
+      expect(enabledRes.body.error).toMatch(/email/i);
+
+      expect(hashSpy).not.toHaveBeenCalled();
+      expect(mockDb.query).not.toHaveBeenCalled();
+      expect(mockDb.connect).not.toHaveBeenCalled();
+    } finally {
+      hashSpy.mockRestore();
+    }
+  });
+
   it("rejects missing email", async () => {
     const res = await signupRequest().send({ password: "testpassword123" });
     expect(res.status).toBe(400);
