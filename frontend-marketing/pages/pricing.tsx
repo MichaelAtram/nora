@@ -299,20 +299,26 @@ export default function Pricing() {
               </div>
 
               <div className="space-y-3">
-                {ENTRY_LINKS.map((item) => (
-                  <a
-                    key={item.label}
-                    href={item.href}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="block rounded-[26px] border border-white/10 bg-white/[0.03] px-4 py-4 transition-colors hover:bg-white/[0.06]"
-                  >
-                    <div className="text-xs font-black uppercase tracking-[0.28em] text-slate-500">
-                      {item.label}
-                    </div>
-                    <div className="mt-2 text-lg font-black text-white">{item.text}</div>
-                  </a>
-                ))}
+                {ENTRY_LINKS.map((item) => {
+                  const entryLink = (
+                    <a
+                      key={item.label}
+                      href={item.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="block rounded-[26px] border border-white/10 bg-white/[0.03] px-4 py-4 transition-colors hover:bg-white/[0.06]"
+                    >
+                      <div className="text-xs font-black uppercase tracking-[0.28em] text-slate-500">
+                        {item.label}
+                      </div>
+                      <div className="mt-2 text-lg font-black text-white">{item.text}</div>
+                    </a>
+                  );
+
+                  return item.href === SIGNUP_URL ? (
+                    <SignupGate key={item.label}>{entryLink}</SignupGate>
+                  ) : entryLink;
+                })}
               </div>
             </div>
           </section>
