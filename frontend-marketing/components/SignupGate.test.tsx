@@ -45,15 +45,35 @@ test("renders nothing while bootstrap status is unavailable", () => {
 });
 
 test("public signup destinations are all enclosed by SignupGate", () => {
-  const pages = [
+  const pages: Array<{
+    name: string;
+    expectedCount: number;
+    destination: string;
+    dataDrivenDestination?: RegExp;
+    gatedDataDrivenDestination?: RegExp;
+  }> = [
     { name: "index.tsx", expectedCount: 5, destination: String.raw`\{DEMO_SIGNUP_PATH\}` },
     { name: "login.tsx", expectedCount: 2, destination: '"/signup"' },
-    { name: "pricing.tsx", expectedCount: 2, destination: '"/signup"' },
+    {
+      name: "pricing.tsx",
+      expectedCount: 3,
+      destination: '"/signup"',
+      dataDrivenDestination:
+        /\{\s*label:\s*"Create account",\s*href:\s*SIGNUP_URL,\s*text:\s*"nora\.solomontsao\.com\/signup"\s*\}/g,
+      gatedDataDrivenDestination:
+        /item\.href\s*===\s*SIGNUP_URL\s*\?\s*\(\s*<SignupGate key=\{item\.label\}>\{entryLink\}<\/SignupGate>\s*\)\s*:\s*entryLink/g,
+    },
     { name: "privacy.tsx", expectedCount: 1, destination: '"/signup"' },
     { name: "terms.tsx", expectedCount: 1, destination: '"/signup"' },
   ];
 
-  for (const { name, expectedCount, destination } of pages) {
+  for (const {
+    name,
+    expectedCount,
+    destination,
+    dataDrivenDestination,
+    gatedDataDrivenDestination,
+  } of pages) {
     const source = readFileSync(path.join(process.cwd(), "pages", name), "utf8");
     const signupDestination = new RegExp(
       String.raw`<Link\b[^>]*\bhref=${destination}[^>]*>`,
@@ -64,20 +84,29 @@ test("public signup destinations are all enclosed by SignupGate", () => {
       "g",
     );
 
+    const destinationCount =
+      (source.match(signupDestination)?.length ?? 0) +
+      (dataDrivenDestination ? (source.match(dataDrivenDestination)?.length ?? 0) : 0);
+    const gatedDestinationCount =
+      (source.match(gatedSignupDestination)?.length ?? 0) +
+      (gatedDataDrivenDestination
+        ? (source.match(gatedDataDrivenDestination)?.length ?? 0)
+        : 0);
+
     assert.equal(
-      source.match(signupDestination)?.length ?? 0,
+      destinationCount,
       expectedCount,
       `${name} signup destination inventory changed`,
     );
     assert.equal(
-      source.match(/<SignupGate>/g)?.length ?? 0,
-      expectedCount,
-      `${name} must contain exactly ${expectedCount} SignupGate wrappers`,
-    );
-    assert.equal(
-      source.match(gatedSignupDestination)?.length ?? 0,
+      gatedDestinationCount,
       expectedCount,
       `${name} has a signup destination outside its SignupGate wrapper`,
+    );
+    assert.equal(
+      source.match(/<SignupGate(?:\s+key=\{item\.label\})?>/g)?.length ?? 0,
+      expectedCount,
+      `${name} must contain exactly ${expectedCount} SignupGate wrappers`,
     );
   }
 });
