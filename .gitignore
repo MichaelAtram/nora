@@ -30,4 +30,5 @@ e2e/artifacts/
 
 # Local-only tooling and per-user state
 .claude/
+.worktrees/
 .secrets/

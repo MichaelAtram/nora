@@ -11,6 +11,7 @@ test.describe("Auth gates", () => {
         body: JSON.stringify({
           needsFirstAdmin: false,
           oauthLoginEnabled: true,
+          signupEnabled: true,
           platformMode: "paas",
           signupBotProtection: {
             enabled: true,
@@ -84,6 +85,7 @@ test.describe("Auth gates", () => {
         body: JSON.stringify({
           needsFirstAdmin: false,
           oauthLoginEnabled: false,
+          signupEnabled: true,
           platformMode: "selfhosted",
           signupBotProtection: {
             enabled: true,
@@ -123,6 +125,7 @@ test.describe("Auth gates", () => {
         body: JSON.stringify({
           needsFirstAdmin: false,
           oauthLoginEnabled: true,
+          signupEnabled: true,
           platformMode: "paas",
           signupBotProtection: {
             enabled: "true",
@@ -140,7 +143,7 @@ test.describe("Auth gates", () => {
     await expect(page.getByTestId("signup-protection-configuration-error")).toContainText(
       /could not load signup verification configuration/i,
     );
-    await expect(page.getByRole("button", { name: /create account/i })).toBeDisabled();
+    await expect(page.getByRole("button", { name: /create account/i })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /continue with google/i })).toHaveCount(0);
   });
 
@@ -152,6 +155,7 @@ test.describe("Auth gates", () => {
         body: JSON.stringify({
           needsFirstAdmin: false,
           oauthLoginEnabled: true,
+          signupEnabled: true,
           platformMode: "paas",
           signupBotProtection: {
             enabled: false,
@@ -199,6 +203,7 @@ test.describe("Auth gates", () => {
         body: JSON.stringify({
           needsFirstAdmin: false,
           oauthLoginEnabled: false,
+          signupEnabled: true,
           platformMode: "selfhosted",
           signupBotProtection: {
             enabled: false,
@@ -273,6 +278,7 @@ test.describe("Auth gates", () => {
         body: JSON.stringify({
           needsFirstAdmin: false,
           oauthLoginEnabled: false,
+          signupEnabled: true,
           platformMode: "selfhosted",
           signupBotProtection: {
             enabled: false,
@@ -372,6 +378,7 @@ test.describe("Auth gates", () => {
         body: JSON.stringify({
           needsFirstAdmin: false,
           oauthLoginEnabled: false,
+          signupEnabled: true,
           platformMode: "selfhosted",
           signupBotProtection: {
             enabled: false,
