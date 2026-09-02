@@ -39,6 +39,11 @@ function sendSignupDisabled(res) {
   return res.status(403).json({ error: SIGNUP_DISABLED_MESSAGE, code: SIGNUP_DISABLED_CODE });
 }
 
+function requireSignupEnabled(_req, res, next) {
+  if (!isSignupEnabled()) return sendSignupDisabled(res);
+  next();
+}
+
 function getPublicPlatformMode() {
   return String(process.env.PLATFORM_MODE || "selfhosted")
     .trim()
@@ -410,47 +415,49 @@ router.get("/bootstrap-status", async (req, res) => {
   }
 });
 
-router.post("/signup", signupBurstLimiter, signupDailyLimiter, async (req, res) => {
-  if (!isSignupEnabled()) {
-    return sendSignupDisabled(res);
-  }
+router.post(
+  "/signup",
+  requireSignupEnabled,
+  signupBurstLimiter,
+  signupDailyLimiter,
+  async (req, res) => {
+    const { email, password } = req.body;
+    const normalizedEmail = normalizeEmail(email);
+    const emailErr = validateEmail(normalizedEmail);
+    if (emailErr) return res.status(400).json({ error: emailErr });
+    const pwErr = validatePassword(password);
+    if (pwErr) return res.status(400).json({ error: pwErr });
+    try {
+      await verifySignupBotProtection(req);
+      const existingUser = await findExistingUserByEmail(normalizedEmail);
+      if (existingUser) return res.status(409).json({ error: DUPLICATE_SIGNUP_MESSAGE });
 
-  const { email, password } = req.body;
-  const normalizedEmail = normalizeEmail(email);
-  const emailErr = validateEmail(normalizedEmail);
-  if (emailErr) return res.status(400).json({ error: emailErr });
-  const pwErr = validatePassword(password);
-  if (pwErr) return res.status(400).json({ error: pwErr });
-  try {
-    await verifySignupBotProtection(req);
-    const existingUser = await findExistingUserByEmail(normalizedEmail);
-    if (existingUser) return res.status(409).json({ error: DUPLICATE_SIGNUP_MESSAGE });
-
-    const hash = await bcrypt.hash(password, 10);
-    const user = await withUserCreationLock(async (client) => {
-      const role = await nextRegisteredUserRole(client);
-      const result = await client.query(
-        "INSERT INTO users(email, password_hash, role) VALUES($1, $2, $3) RETURNING id, email, role",
-        [normalizedEmail, hash, role],
-      );
-      return result.rows[0];
-    });
-    res.json(user);
-  } catch (e) {
-    if (isDuplicateUserError(e)) {
-      return res.status(409).json({ error: DUPLICATE_SIGNUP_MESSAGE });
+      const hash = await bcrypt.hash(password, 10);
+      const user = await withUserCreationLock(async (client) => {
+        const role = await nextRegisteredUserRole(client);
+        const result = await client.query(
+          "INSERT INTO users(email, password_hash, role) VALUES($1, $2, $3) RETURNING id, email, role",
+          [normalizedEmail, hash, role],
+        );
+        return result.rows[0];
+      });
+      res.json(user);
+    } catch (e) {
+      if (isDuplicateUserError(e)) {
+        return res.status(409).json({ error: DUPLICATE_SIGNUP_MESSAGE });
+      }
+      const statusCode = e.statusCode || 500;
+      if (e.code === "PAAS_BOOTSTRAP_ADMIN_REQUIRED") {
+        return res.status(statusCode).json({ error: e.message, code: e.code });
+      }
+      if (statusCode >= 500) {
+        console.error("Signup failed:", e.message);
+        return res.status(500).json({ error: "Could not create account" });
+      }
+      res.status(statusCode).json({ error: e.message });
     }
-    const statusCode = e.statusCode || 500;
-    if (e.code === "PAAS_BOOTSTRAP_ADMIN_REQUIRED") {
-      return res.status(statusCode).json({ error: e.message, code: e.code });
-    }
-    if (statusCode >= 500) {
-      console.error("Signup failed:", e.message);
-      return res.status(500).json({ error: "Could not create account" });
-    }
-    res.status(statusCode).json({ error: e.message });
-  }
-});
+  },
+);
 
 router.post("/login", authLimiter, async (req, res) => {
   const { email, password } = req.body;
