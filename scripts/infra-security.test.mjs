@@ -901,6 +901,16 @@ test("setup persists signup availability across existing and generated environme
   );
 });
 
+test("PowerShell env reader scans all assignments before returning the last match", () => {
+  const powershellSetup = read("setup.ps1");
+  const reader = powershellSetup.match(/^function Read-EnvValue \{\n([\s\S]*?)^\}/m)?.[1];
+  assert.ok(reader, "setup.ps1 must expose Read-EnvValue");
+  assert.match(
+    reader,
+    /\$matchedValue = \$null\s+\$foundMatch = \$false[\s\S]*?foreach \(\$line in Get-Content -LiteralPath \$EnvPath\) \{\s+if \(\$line -match \$pattern\) \{\s+\$matchedValue = \$matches\[1\]\.Trim\(\)\s+\$foundMatch = \$true\s+\}\s+\}\s+if \(\$foundMatch\) \{\s+return ConvertFrom-ComposeEnvLiteral -Value \$matchedValue\s+\}/,
+  );
+});
+
 test("production deploy rejects PaaS without complete signup bot protection", () => {
   const workflow = read(".github/workflows/deploy-production.yml");
   const validator = path.join(repoRoot, "scripts", "validate-paas-signup-protection.sh");
@@ -1034,6 +1044,51 @@ const hasPowerShell =
   spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "exit 0"], {
     cwd: repoRoot,
   }).status === 0;
+
+test(
+  "PowerShell env reader uses the last duplicate assignment",
+  {
+    skip: hasPowerShell
+      ? false
+      : "pwsh unavailable; structural last-match regression remains enforced",
+  },
+  () => {
+    runChecked("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "-"], {
+      input: `$ErrorActionPreference = "Stop"
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+  (Resolve-Path "setup.ps1"),
+  [ref]$tokens,
+  [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+foreach ($name in @("ConvertFrom-ComposeEnvLiteral", "Read-EnvValue")) {
+  $definition = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+  }, $true)
+  if (-not $definition) { throw "Missing function $name" }
+  Invoke-Expression $definition.Extent.Text
+}
+$fixture = Join-Path ([System.IO.Path]::GetTempPath()) ("nora-env-reader-" + [guid]::NewGuid().ToString("N"))
+try {
+  Set-Content -LiteralPath $fixture -Value @(
+    "SIGNUP_ENABLED=true",
+    'QUOTED_VALUE="first value"',
+    'SIGNUP_ENABLED="false"',
+    "QUOTED_VALUE='last value'"
+  )
+  if ((Read-EnvValue -EnvPath $fixture -Name "SIGNUP_ENABLED" -Default "fallback") -ne "false") { throw "Did not select last duplicate assignment" }
+  if ((Read-EnvValue -EnvPath $fixture -Name "QUOTED_VALUE" -Default "fallback") -ne "last value") { throw "Last quoted assignment was not decoded" }
+  if ((Read-EnvValue -EnvPath $fixture -Name "MISSING" -Default "fallback") -ne "fallback") { throw "Missing key did not use default" }
+  if ((Read-EnvValue -EnvPath "$fixture.missing" -Name "SIGNUP_ENABLED" -Default "fallback") -ne "fallback") { throw "Missing file did not use default" }
+} finally {
+  Remove-Item -LiteralPath $fixture -Force -ErrorAction SilentlyContinue
+}`,
+    });
+  },
+);
 
 test(
   "PowerShell setup applies immutable-aware NemoClaw image policy",

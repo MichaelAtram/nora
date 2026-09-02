@@ -986,13 +986,18 @@ function Read-EnvValue {
     }
 
     $pattern = '^\s*' + [regex]::Escape($Name) + '\s*=(.*)$'
+    $matchedValue = $null
+    $foundMatch = $false
     foreach ($line in Get-Content -LiteralPath $EnvPath) {
         if ($line -match $pattern) {
-            $value = $matches[1].Trim()
-            return ConvertFrom-ComposeEnvLiteral -Value $value
+            $matchedValue = $matches[1].Trim()
+            $foundMatch = $true
         }
     }
 
+    if ($foundMatch) {
+        return ConvertFrom-ComposeEnvLiteral -Value $matchedValue
+    }
     return $Default
 }
 
