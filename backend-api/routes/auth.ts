@@ -17,12 +17,22 @@ const {
 const router = express.Router();
 const FIRST_USER_ADMIN_LOCK_KEY = 20260408;
 const DUPLICATE_SIGNUP_MESSAGE = "Account already exists for this email";
+const SIGNUP_DISABLED_MESSAGE = "Registration is disabled by this Nora operator.";
+const SIGNUP_DISABLED_CODE = "SIGNUP_DISABLED";
 const SIGNUP_CHALLENGE_MESSAGE = "Complete the verification challenge and try again";
 const TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const RECAPTCHA_SITEVERIFY_URL = "https://www.google.com/recaptcha/api/siteverify";
 
 function isOAuthLoginEnabled() {
   return process.env.OAUTH_LOGIN_ENABLED === "true";
+}
+
+function isSignupEnabled() {
+  const value = String(process.env.SIGNUP_ENABLED ?? "")
+    .trim()
+    .toLowerCase();
+  if (!value) return true;
+  return ["true", "1", "yes", "on"].includes(value);
 }
 
 function getPublicPlatformMode() {
@@ -383,8 +393,10 @@ router.get("/bootstrap-status", async (req, res) => {
   try {
     const { rows } = await db.query("SELECT 1 FROM users LIMIT 1");
     const firstAdminClaimAllowed = allowsFirstAdminSignupClaim();
+    const signupEnabled = isSignupEnabled();
     res.json({
-      needsFirstAdmin: rows.length === 0 && firstAdminClaimAllowed,
+      needsFirstAdmin: signupEnabled && rows.length === 0 && firstAdminClaimAllowed,
+      signupEnabled,
       oauthLoginEnabled: isOAuthLoginEnabled(),
       platformMode: getPublicPlatformMode(),
       signupBotProtection: getPublicSignupBotProtectionConfig(),
@@ -395,6 +407,10 @@ router.get("/bootstrap-status", async (req, res) => {
 });
 
 router.post("/signup", signupBurstLimiter, signupDailyLimiter, async (req, res) => {
+  if (!isSignupEnabled()) {
+    return res.status(403).json({ error: SIGNUP_DISABLED_MESSAGE, code: SIGNUP_DISABLED_CODE });
+  }
+
   const { email, password } = req.body;
   const normalizedEmail = normalizeEmail(email);
   const emailErr = validateEmail(normalizedEmail);
@@ -739,4 +755,8 @@ router.post("/logout", (req, res) => {
 });
 
 module.exports = router;
-module.exports.__test = Object.freeze({ getAuthRateLimitConfig, parsePositiveIntegerEnv });
+module.exports.__test = Object.freeze({
+  getAuthRateLimitConfig,
+  isSignupEnabled,
+  parsePositiveIntegerEnv,
+});

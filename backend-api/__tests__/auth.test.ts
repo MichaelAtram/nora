@@ -162,6 +162,7 @@ beforeEach(() => {
   process.env.OAUTH_LOGIN_ENABLED = "false";
   process.env.PLATFORM_MODE = "selfhosted";
   process.env.GOOGLE_CLIENT_ID = "google-client-id";
+  delete process.env.SIGNUP_ENABLED;
   delete process.env.SIGNUP_BOT_PROTECTION_PROVIDER;
   delete process.env.NEXT_PUBLIC_SIGNUP_BOT_PROTECTION_PROVIDER;
   delete process.env.SIGNUP_TURNSTILE_SECRET;
@@ -225,6 +226,29 @@ describe("auth rate limit configuration", () => {
   );
 });
 
+describe("password signup availability configuration", () => {
+  it("defaults absent or blank values to enabled", () => {
+    delete process.env.SIGNUP_ENABLED;
+    expect(authRouteTestHelpers.isSignupEnabled()).toBe(true);
+
+    process.env.SIGNUP_ENABLED = "   ";
+    expect(authRouteTestHelpers.isSignupEnabled()).toBe(true);
+  });
+
+  it.each(["true", "1", "YES", " on "])("enables password signup for %p", (value) => {
+    process.env.SIGNUP_ENABLED = value;
+    expect(authRouteTestHelpers.isSignupEnabled()).toBe(true);
+  });
+
+  it.each(["false", "0", "NO", " off ", "invalid"])(
+    "disables password signup for %p",
+    (value) => {
+      process.env.SIGNUP_ENABLED = value;
+      expect(authRouteTestHelpers.isSignupEnabled()).toBe(false);
+    },
+  );
+});
+
 describe("bootstrap admin startup gate", () => {
   it("refuses an empty hosted PaaS database without explicit bootstrap credentials", async () => {
     const originalEmail = process.env.DEFAULT_ADMIN_EMAIL;
@@ -249,6 +273,26 @@ describe("bootstrap admin startup gate", () => {
 });
 
 describe("POST /auth/signup", () => {
+  it("rejects disabled password signup before validation or work", async () => {
+    process.env.SIGNUP_ENABLED = "false";
+    const hashSpy = jest.spyOn(bcrypt, "hash");
+
+    try {
+      const res = await signupRequest().send({});
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({
+        error: "Registration is disabled by this Nora operator.",
+        code: "SIGNUP_DISABLED",
+      });
+      expect(hashSpy).not.toHaveBeenCalled();
+      expect(mockDb.query).not.toHaveBeenCalled();
+      expect(mockDb.connect).not.toHaveBeenCalled();
+    } finally {
+      hashSpy.mockRestore();
+    }
+  });
+
   it("rejects missing email", async () => {
     const res = await signupRequest().send({ password: "testpassword123" });
     expect(res.status).toBe(400);
@@ -1303,6 +1347,7 @@ describe("GET /auth/bootstrap-status", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       needsFirstAdmin: true,
+      signupEnabled: true,
       oauthLoginEnabled: false,
       platformMode: "selfhosted",
       signupBotProtection: disabledSignupBotProtection,
@@ -1315,6 +1360,23 @@ describe("GET /auth/bootstrap-status", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       needsFirstAdmin: false,
+      signupEnabled: true,
+      oauthLoginEnabled: false,
+      platformMode: "selfhosted",
+      signupBotProtection: disabledSignupBotProtection,
+    });
+  });
+
+  it("does not advertise first-admin signup when password registration is disabled", async () => {
+    process.env.SIGNUP_ENABLED = "false";
+    mockDb.query.mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app).get("/auth/bootstrap-status");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      needsFirstAdmin: false,
+      signupEnabled: false,
       oauthLoginEnabled: false,
       platformMode: "selfhosted",
       signupBotProtection: disabledSignupBotProtection,
@@ -1342,6 +1404,7 @@ describe("GET /auth/bootstrap-status", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       needsFirstAdmin: false,
+      signupEnabled: true,
       oauthLoginEnabled: true,
       platformMode: "paas",
       signupBotProtection: {
@@ -1365,6 +1428,7 @@ describe("GET /auth/bootstrap-status", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       needsFirstAdmin: false,
+      signupEnabled: true,
       oauthLoginEnabled: false,
       platformMode: "selfhosted",
       signupBotProtection: {
