@@ -13,6 +13,7 @@
 ### Task 1: Backend password-signup availability contract
 
 **Files:**
+
 - Modify: `backend-api/__tests__/auth.test.ts`
 - Modify: `backend-api/routes/auth.ts`
 
@@ -61,7 +62,9 @@ const SIGNUP_DISABLED_MESSAGE = "Registration is disabled by this Nora operator.
 const SIGNUP_ENABLED_VALUES = new Set(["true", "1", "yes", "on"]);
 
 function isSignupEnabled(value = process.env.SIGNUP_ENABLED) {
-  const normalized = String(value ?? "").trim().toLowerCase();
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
   if (!normalized) return true;
   return SIGNUP_ENABLED_VALUES.has(normalized);
 }
@@ -91,6 +94,7 @@ git commit -m "feat(auth): add runtime signup availability gate"
 ### Task 2: Prevent OAuth registration while preserving OAuth login
 
 **Files:**
+
 - Modify: `backend-api/__tests__/auth.test.ts`
 - Modify: `backend-api/routes/auth.ts`
 
@@ -151,6 +155,7 @@ git commit -m "fix(auth): close OAuth registration when signup is disabled"
 ### Task 3: Publish and parse one shared frontend contract
 
 **Files:**
+
 - Modify: `frontend-marketing/package.json`
 - Create: `frontend-marketing/lib/authBootstrap.test.ts`
 - Modify: `frontend-marketing/lib/authBootstrap.ts`
@@ -169,14 +174,18 @@ In `SignupGate.test.tsx`, render with `react-dom/server` and the exported contex
 test("renders children only when signup is explicitly enabled", () => {
   const enabled = renderToStaticMarkup(
     <AuthBootstrapContext.Provider value={{ status: validStatus, error: "", loading: false }}>
-      <SignupGate><a href="/signup">Create Account</a></SignupGate>
+      <SignupGate>
+        <a href="/signup">Create Account</a>
+      </SignupGate>
     </AuthBootstrapContext.Provider>,
   );
   const disabled = renderToStaticMarkup(
     <AuthBootstrapContext.Provider
       value={{ status: { ...validStatus, signupEnabled: false }, error: "", loading: false }}
     >
-      <SignupGate><a href="/signup">Create Account</a></SignupGate>
+      <SignupGate>
+        <a href="/signup">Create Account</a>
+      </SignupGate>
     </AuthBootstrapContext.Provider>,
   );
   assert.match(enabled, /Create Account/);
@@ -232,6 +241,7 @@ git commit -m "feat(marketing): share runtime signup availability"
 ### Task 4: Hide registration CTAs and render the disabled page
 
 **Files:**
+
 - Modify: `frontend-marketing/pages/index.tsx`
 - Modify: `frontend-marketing/pages/login.tsx`
 - Modify: `frontend-marketing/pages/pricing.tsx`
@@ -245,7 +255,13 @@ git commit -m "feat(marketing): share runtime signup availability"
 Extend `SignupGate.test.tsx` to read the five CTA pages and assert every JSX signup destination is enclosed by `SignupGate`. Assert current per-page gated counts: index 5, login 2, pricing 2, privacy 1, terms 1. Assert `signup.tsx` contains the exact disabled heading/message and a `signupEnabled === false` branch.
 
 ```tsx
-const expectedCounts = { "index.tsx": 5, "login.tsx": 2, "pricing.tsx": 2, "privacy.tsx": 1, "terms.tsx": 1 };
+const expectedCounts = {
+  "index.tsx": 5,
+  "login.tsx": 2,
+  "pricing.tsx": 2,
+  "privacy.tsx": 1,
+  "terms.tsx": 1,
+};
 for (const [page, count] of Object.entries(expectedCounts)) {
   const source = readFileSync(path.join(pagesDir, page), "utf8");
   assert.equal((source.match(/<SignupGate>/g) || []).length, count);
@@ -307,6 +323,7 @@ git commit -m "feat(marketing): hide registration when disabled"
 ### Task 5: Persist configuration and skip irrelevant PaaS preflight
 
 **Files:**
+
 - Modify: `scripts/infra-security.test.mjs`
 - Modify: `.env.example`
 - Modify: `setup.sh`
@@ -356,6 +373,7 @@ git commit -m "feat(setup): persist signup availability setting"
 ### Task 6: Document the API and operator setting
 
 **Files:**
+
 - Modify: `backend-api/__tests__/openapi.test.ts`
 - Modify: `backend-api/openapi/paths/auth.js`
 - Modify: `docs/configuration/environment-variables.mdx`
@@ -412,6 +430,7 @@ git commit -m "docs(auth): document signup availability"
 ### Task 7: Verify, review, push, and open the requested PR
 
 **Files:**
+
 - Verify: all modified files
 - Read: `.github/pull_request_template.md`
 
