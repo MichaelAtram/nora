@@ -170,9 +170,16 @@ test.describe("Auth gates", () => {
 
     await page.goto("/signup");
 
-    await expect(page.getByRole("heading", { name: /registration is disabled/i })).toBeVisible();
+    // Both the supporting panel (h1) and the access state (h2) announce the
+    // disabled state — assert each level explicitly.
+    await expect(
+      page.getByRole("heading", { level: 1, name: /registration is disabled on this nora/i }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { level: 2, name: "Registration is disabled", exact: true }),
+    ).toBeVisible();
     await expect(page.getByText(/not accepting new accounts/i)).toBeVisible();
-    await expect(page.getByRole("link", { name: /return to login/i })).toBeVisible();
+    await expect(page.getByRole("link", { name: /return to login/i }).first()).toBeVisible();
     await expect(page.getByRole("button", { name: /create account/i })).toHaveCount(0);
     await expect(page.locator('input[type="password"]')).toHaveCount(0);
     await expect(page.getByRole("button", { name: /continue with google/i })).toHaveCount(0);
