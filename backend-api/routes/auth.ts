@@ -4,7 +4,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const db = require("../db");
-const { allowsFirstAdminSignupClaim } = require("../bootstrapAdmin");
+const { allowsFirstAdminSignupClaim, isSignupEnabled } = require("../bootstrapAdmin");
 const { authenticateToken, requireSession } = require("../middleware/auth");
 const { setAuthCookie, clearAuthCookie } = require("../authCookie");
 const { normalizeEmail, normalizeProvider, verifyOAuthIdentity } = require("../oauthProviders");
@@ -25,14 +25,6 @@ const RECAPTCHA_SITEVERIFY_URL = "https://www.google.com/recaptcha/api/siteverif
 
 function isOAuthLoginEnabled() {
   return process.env.OAUTH_LOGIN_ENABLED === "true";
-}
-
-function isSignupEnabled() {
-  const value = String(process.env.SIGNUP_ENABLED ?? "")
-    .trim()
-    .toLowerCase();
-  if (!value) return true;
-  return ["true", "1", "yes", "on"].includes(value);
 }
 
 function sendSignupDisabled(res) {

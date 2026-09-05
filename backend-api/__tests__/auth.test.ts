@@ -177,6 +177,9 @@ beforeEach(() => {
 
 afterAll(() => {
   mockVerifyApiKey.mockRestore();
+  // The last-run test's value must not leak into later test files in the same
+  // Jest worker — beforeEach only resets it within this file.
+  delete process.env.SIGNUP_ENABLED;
 });
 
 describe("auth rate limit configuration", () => {

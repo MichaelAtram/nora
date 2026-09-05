@@ -34,9 +34,14 @@ export function parseAuthBootstrapStatus(value: unknown): AuthBootstrapStatus {
   if (typeof raw.oauthLoginEnabled !== "boolean") {
     throw new Error("OAuth metadata is invalid");
   }
-  if (typeof raw.signupEnabled !== "boolean") {
+  // Tolerate a missing field (an older backend during a rolling deploy) by
+  // defaulting to enabled — the backend's SIGNUP_DISABLED guard is the
+  // security boundary, and rejecting the whole payload here would blank the
+  // rest of the bootstrap-driven UI. Reject only a present-but-wrong type.
+  if (raw.signupEnabled !== undefined && typeof raw.signupEnabled !== "boolean") {
     throw new Error("Signup availability metadata is invalid");
   }
+  const signupEnabled = raw.signupEnabled !== false;
 
   const protection = raw.signupBotProtection;
   if (!protection || typeof protection !== "object") {
@@ -99,7 +104,7 @@ export function parseAuthBootstrapStatus(value: unknown): AuthBootstrapStatus {
     needsFirstAdmin: raw.needsFirstAdmin,
     oauthLoginEnabled: raw.oauthLoginEnabled,
     platformMode: parsePlatformMode(raw.platformMode),
-    signupEnabled: raw.signupEnabled,
+    signupEnabled,
     signupBotProtection: {
       enabled,
       provider,

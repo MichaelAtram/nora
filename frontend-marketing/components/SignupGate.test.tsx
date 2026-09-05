@@ -89,16 +89,19 @@ function assertRegistrationControlsAbsent(markup: string) {
   assert.doesNotMatch(markup, /data-testid="enabled-signup-controls"/);
 }
 
-test("renders children when signup availability is exactly true", () => {
+test("renders children when signup availability is true", () => {
   assert.match(renderGate(validStatus), /Create Account/);
 });
 
-test("renders nothing when signup is disabled", () => {
+test("renders nothing when signup is explicitly disabled", () => {
   assert.equal(renderGate({ ...validStatus, signupEnabled: false }), "");
 });
 
-test("renders nothing while bootstrap status is unavailable", () => {
-  assert.equal(renderGate(null), "");
+test("fails open while bootstrap status is unavailable", () => {
+  // The backend's SIGNUP_DISABLED guard is the security boundary; while the
+  // bootstrap status is loading or failed to fetch, the CTAs must stay in the
+  // (server-rendered) markup instead of popping in after hydration.
+  assert.match(renderGate(null), /Create Account/);
 });
 
 test("public signup destinations are all enclosed by SignupGate", () => {

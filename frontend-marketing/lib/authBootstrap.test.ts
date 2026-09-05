@@ -22,10 +22,19 @@ test("parses signup availability", () => {
   assert.equal(result.signupEnabled, true);
 });
 
-test("rejects missing signup availability", () => {
+test("defaults missing signup availability to enabled (older backend)", () => {
+  // A backend that predates SIGNUP_ENABLED omits the field during a rolling
+  // deploy; the parser must not reject the whole payload for it.
   const { signupEnabled: _signupEnabled, ...missingSignupEnabled } = validBootstrap;
 
-  assert.throws(() => parseAuthBootstrapStatus(missingSignupEnabled), /signup availability/i);
+  assert.equal(parseAuthBootstrapStatus(missingSignupEnabled).signupEnabled, true);
+});
+
+test("parses explicitly disabled signup availability", () => {
+  assert.equal(
+    parseAuthBootstrapStatus({ ...validBootstrap, signupEnabled: false }).signupEnabled,
+    false,
+  );
 });
 
 test("rejects non-boolean signup availability", () => {

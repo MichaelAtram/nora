@@ -611,16 +611,6 @@ export default function Signup() {
                     </div>
                   </label>
 
-                  {bootstrapLoading && (
-                    <div
-                      aria-live="polite"
-                      className="flex min-h-[72px] items-center justify-center gap-2 rounded-[24px] border border-black/10 bg-white/60 px-4 py-4 text-sm font-semibold text-slate-600"
-                    >
-                      <Loader2 size={17} className="animate-spin" />
-                      Loading signup verification configuration...
-                    </div>
-                  )}
-
                   {botProtectionReady && (
                     <div className="rounded-[24px] border border-black/10 bg-white/60 px-4 py-4">
                       <div
